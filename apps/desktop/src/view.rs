@@ -4058,7 +4058,10 @@ fn composer(
             )
         })
         .when(image_options, |composer| {
-            composer.child(strip_metadata(this.settings.strip_metadata, cx))
+            composer.child(strip_metadata(
+                this.strips_metadata(&(server.id.clone(), channel.id)),
+                cx,
+            ))
         })
         .child(
             layout::row()

@@ -181,6 +181,8 @@ struct Outgoing {
     attachments: Vec<Attachment>,
     /// The server's image and text limits.
     limits: (usize, usize),
+    /// Strip metadata, as it was ticked when the message was sent.
+    strip_metadata: bool,
 }
 
 pub struct Desktop {
@@ -337,6 +339,9 @@ pub struct Desktop {
     /// What each conversation's composer has attached, and a line about it.
     attachments: BTreeMap<(String, u32), Vec<Attachment>>,
     pub attach_note: Option<((String, u32), String)>,
+    /// The conversation whose message is being composed with Strip metadata
+    /// unticked. Every other message has it ticked.
+    unstripped: Option<(String, u32)>,
     attachment_ids: u64,
     /// Files being dragged over the conversation (see view::file_drop).
     pub dragged_files: std::rc::Rc<std::cell::RefCell<Option<Vec<std::path::PathBuf>>>>,
@@ -618,6 +623,7 @@ impl Desktop {
             drafts: BTreeMap::new(),
             attachments: BTreeMap::new(),
             attach_note: None,
+            unstripped: None,
             attachment_ids: 0,
             dragged_files: Default::default(),
             outgoing: std::collections::VecDeque::new(),
@@ -863,6 +869,7 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.tick_strip_metadata();
         if let Some(selected) = self.client.navigation.selection().cloned() {
             // An edit in progress ends; what it replaced is the draft.
             let draft = self
@@ -1808,6 +1815,7 @@ impl Desktop {
         if let Err(nuschl_client::SendError::TooLong) = self.client.send_text(body) {
             self.error = Some("Message exceeds 256 KiB.".into());
         }
+        self.tick_strip_metadata();
         self.expire_typing(cx);
         cx.notify();
     }
@@ -1961,15 +1969,15 @@ impl Desktop {
                 .filter(|attachment| matches!(attachment, Attachment::Image { .. }))
                 .count()
         });
-        let refusal = if !limits.allow_html {
-            Some("this server does not accept images".to_owned())
+        let source = if !limits.allow_html {
+            Err("this server does not accept images".to_owned())
         } else if images >= crate::attachments::MAX_IMAGES {
-            Some(format!(
+            Err(format!(
                 "a message can carry up to {} images; send these first",
                 crate::attachments::MAX_IMAGES
             ))
         } else {
-            None
+            Ok(source)
         };
         let id = self.next_attachment();
         let tray = self.attachments.entry(key.clone()).or_default();
@@ -1979,12 +1987,15 @@ impl Desktop {
             file,
             prepared: None,
         });
-        if let Some(reason) = refusal {
-            let note =
-                crate::attachments::settle(tray, id, Err(reason), self.settings.strip_metadata);
-            self.attachments.retain(|_, tray| !tray.is_empty());
-            return note;
-        }
+        let source = match source {
+            Ok(source) => source,
+            Err(reason) => {
+                let strip_metadata = self.unstripped.as_ref() != Some(key);
+                let note = crate::attachments::settle(tray, id, Err(reason), strip_metadata);
+                self.attachments.retain(|_, tray| !tray.is_empty());
+                return note;
+            }
+        };
         let limit = limits.inline_image_byte_budget().min(MAX_CONTENT_BYTES);
         let budget = limit
             .saturating_sub(crate::attachments::CAPTION_ROOM)
@@ -2011,21 +2022,28 @@ impl Desktop {
                 image: false,
             });
     }
-    /// Strip metadata, from the image tray: turned on, it also takes back
-    /// the originals waiting to go as files.
+    /// Whether the message being composed in `key` has Strip metadata ticked.
+    pub fn strips_metadata(&self, key: &(String, u32)) -> bool {
+        self.unstripped.as_ref() != Some(key)
+    }
+    /// The Strip metadata checkbox of the open conversation's message.
     pub fn toggle_strip_metadata(&mut self) {
-        let on = !self.settings.strip_metadata;
-        self.update_settings(|settings| settings.strip_metadata = on);
-        if self.settings.strip_metadata {
-            let trays = self.attachments.values_mut();
-            let batches = self.outgoing.iter_mut().map(|batch| &mut batch.attachments);
-            for tray in trays.chain(batches) {
-                tray.retain(|attachment| {
-                    !matches!(attachment, Attachment::File { image: true, .. })
-                });
-            }
-            self.attachments.retain(|_, tray| !tray.is_empty());
+        if self.unstripped.is_some() && self.unstripped == self.selected_key() {
+            self.tick_strip_metadata();
+        } else {
+            self.unstripped = self.selected_key();
         }
+    }
+    /// Tick Strip metadata again: a new message, or another conversation.
+    /// The originals that waited to go as files leave the tray.
+    fn tick_strip_metadata(&mut self) {
+        let Some(key) = self.unstripped.take() else {
+            return;
+        };
+        if let Some(tray) = self.attachments.get_mut(&key) {
+            tray.retain(|attachment| !matches!(attachment, Attachment::File { image: true, .. }));
+        }
+        self.attachments.retain(|_, tray| !tray.is_empty());
     }
     pub fn remove_attachment(&mut self, id: u64) {
         for tray in self.attachments.values_mut() {
@@ -2040,6 +2058,7 @@ impl Desktop {
             return false;
         };
         self.attach_note = None;
+        self.tick_strip_metadata();
         self.attachments.remove(&key).is_some()
     }
     /// The content worker prepared an attached image, or could not.
@@ -2061,16 +2080,19 @@ impl Desktop {
             _ => Err("the thumbnail is missing".to_owned()),
         });
         // In a composer's tray, or in a sent message waiting for it.
-        let strip_metadata = self.settings.strip_metadata;
-        let trays = self.attachments.iter_mut();
+        let unstripped = self.unstripped.as_ref();
+        let trays = self
+            .attachments
+            .iter_mut()
+            .map(|(key, tray)| (key, tray, unstripped != Some(key)));
         let batches = self
             .outgoing
             .iter_mut()
-            .map(|batch| (&batch.key, &mut batch.attachments));
+            .map(|batch| (&batch.key, &mut batch.attachments, batch.strip_metadata));
         let note = trays
             .chain(batches)
-            .find(|(_, tray)| tray.iter().any(|attachment| attachment.id() == id))
-            .and_then(|(key, tray)| {
+            .find(|(_, tray, _)| tray.iter().any(|attachment| attachment.id() == id))
+            .and_then(|(key, tray, strip_metadata)| {
                 let note = crate::attachments::settle(tray, id, thumbnail, strip_metadata)?;
                 Some((key.clone(), note))
             });
@@ -2149,7 +2171,9 @@ impl Desktop {
                     limits.message_length
                 },
             ),
+            strip_metadata: self.unstripped.as_ref() != Some(&key),
         });
+        self.unstripped = None;
         self.attach_note = None;
         self.drafts.remove(&key);
         self.composer

@@ -24,7 +24,7 @@ pub enum Attachment {
         path: PathBuf,
         size: u64,
         /// An image's original, with its metadata: it leaves the tray when
-        /// Strip metadata is turned on.
+        /// Strip metadata is ticked again.
         image: bool,
     },
 }
@@ -113,7 +113,8 @@ pub fn check(path: &Path) -> Result<Kind, Refusal> {
 
 /// Settle image `id` in `tray` (a composer's, or a sent message's) with the
 /// content worker's result. One that cannot go re-encoded goes as its
-/// original file only with Strip metadata off; otherwise it leaves the tray.
+/// original file only when its message has Strip metadata unticked;
+/// otherwise it leaves the tray.
 /// Returns a note for the user.
 pub fn settle(
     tray: &mut Vec<Attachment>,
@@ -324,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn images_that_cannot_be_re_encoded_go_as_files_only_with_strip_metadata_off() {
+    fn images_that_cannot_be_re_encoded_go_as_files_only_when_their_message_is_unticked() {
         let image = |id, file: bool| Attachment::Image {
             id,
             name: format!("IMG_{id}.jpg"),
@@ -340,8 +341,8 @@ mod tests {
         };
         let failed = || Err("it is larger than 8 MB".to_owned());
 
-        // On: every failure, from a file or pasted, leaves the tray with a note;
-        // the tray (or sent message) keeps no path to the original.
+        // Ticked: every failure, from a file or pasted, leaves the tray with a
+        // note; the tray (or sent message) keeps no path to the original.
         let mut tray = vec![image(1, true), pdf, image(2, false), image(3, true)];
         for id in [1, 2, 3] {
             let note = settle(&mut tray, id, failed(), true).unwrap();
@@ -361,8 +362,8 @@ mod tests {
         assert!(tray.iter().all(Attachment::ready));
         assert_eq!(settle(&mut tray, 1, failed(), true), None);
 
-        // Off: an image from a file goes as its original, marked as such; a
-        // pasted one has no file to go as.
+        // Unticked for its message: an image from a file goes as its
+        // original, marked as such; a pasted one has no file to go as.
         let mut tray = vec![image(1, true), image(2, false)];
         let note = settle(&mut tray, 1, failed(), false).unwrap();
         assert_eq!(note, "IMG_1.jpg goes as a file: it is larger than 8 MB.");

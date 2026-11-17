@@ -7,14 +7,14 @@ a stand-in that hands out only this test's files, against a loopback Murmur, a
 scripted peer and a private magic-wormhole mailbox and relay. No host
 clipboard, audio, profile or file chooser is used. Checks that:
 
-- with Strip metadata on (the default), an image over 8 MB and a PNG the
+- with Strip metadata ticked (the default), an image over 8 MB and a PNG the
   content worker cannot decode leave a note and nothing in the tray, and the
   peer receives no file offer;
-- the checkbox is a check box named "Strip metadata" with its description,
-  checked, and unticking it is saved in settings.json;
+- the checkbox is a check box named "Strip metadata" with its description;
 - unticked, the image over 8 MB goes into the tray as its original file;
   ticking the box again takes it back out;
-- unticked and sent, it reaches the peer as a file offer.
+- unticked and sent, it reaches the peer as a file offer;
+- the next message has the box ticked again.
 
 python3 tests/image_metadata.py target/debug --murmur <mumble-server>
     --at-spi <at-spi2-core> --wormhole-python <python with magic-wormhole servers>
@@ -168,12 +168,9 @@ def main():
         print("Strip metadata on: the oversized and the undecodable image were refused with a note.", flush=True)
         shell.screenshot(root / "refused.png")
 
-        # Off: saved, and the oversized image goes into the tray as its file.
+        # Unticked: the oversized image goes into the tray as its file.
         node.call("Action", "DoAction", "i", "0")
         eventually(lambda: not checkbox()[3] & CHECKED, "Strip metadata did not untick")
-        settings = profile / "config/settings.json"
-        eventually(lambda: settings.exists() and json.loads(settings.read_text()).get("strip_metadata") is False,
-                   "unticking Strip metadata was not saved")
         attach(photo)
         find(lambda _, __, name, ___: name == f"{photo.name} goes as a file: it is larger than 8 MB.",
              "the oversized image was not attached as a file")
@@ -198,6 +195,13 @@ def main():
                           and "receive " in e["body"], timeout=60)
         print(f"Strip metadata off: the original went as a file offer: {offer['body'][:120]!r}", flush=True)
         shell.screenshot(root / "offered.png")
+
+        # The next message: ticked again.
+        attach(photo)
+        find(lambda _, __, name, ___: name == f"Could not attach {photo.name}: it is larger than 8 MB.",
+             "the oversized image was not refused in the next message")
+        assert checkbox()[3] & CHECKED, "Strip metadata is not ticked for the next message"
+        print("The next message had Strip metadata ticked again.", flush=True)
     finally:
         if peer:
             peer.close()

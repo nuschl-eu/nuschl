@@ -161,7 +161,6 @@ let
     "share_web_host"
     "call_host"
     "voice_bitrate"
-    "strip_metadata"
   ];
   unknownSettings = lib.subtractLists settingNames (lib.attrNames cfg.settings);
   # `programs.nuschl.keyTransparency`, in the format of `key_transparency`.

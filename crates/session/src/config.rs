@@ -320,12 +320,6 @@ pub struct ClientSettings {
     /// managed.json (and, once, from a settings.json written by hand).
     #[serde(skip_serializing)]
     pub voice_bitrate: u32,
-    /// Images go only re-encoded, without the original's metadata (GPS
-    /// coordinates, capture time, device model) or file name. Off: an image
-    /// that cannot be re-encoded goes as its original file. Written only when
-    /// off, so settings.json stays readable by released versions otherwise.
-    #[serde(skip_serializing_if = "is_true")]
-    pub strip_metadata: bool,
 }
 
 /// Light or dark, or as the desktop prefers.
@@ -398,10 +392,6 @@ where
         .map_err(|_| serde::de::Error::custom("invalid link preview settings"))
 }
 
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
 fn preview_settings_default(settings: &nuschl_link_preview::policy::Settings) -> bool {
     *settings == nuschl_link_preview::policy::Settings::default()
 }
@@ -440,7 +430,6 @@ impl Default for ClientSettings {
             share_web_host: String::new(),
             call_host: String::new(),
             voice_bitrate: nuschl_core::audio::DEFAULT_VOICE_BITRATE,
-            strip_metadata: true,
         }
     }
 }
@@ -3288,24 +3277,6 @@ mod tests {
     }
     fn sidecar(profile: &Profile) -> Option<String> {
         fs::read_to_string(profile.config_dir.join("voice-quality.json")).ok()
-    }
-
-    #[test]
-    fn strip_metadata_is_written_only_when_off() {
-        let (root, profile) = temporary_profile("strip-metadata");
-        let loaded = profile.load();
-        assert!(loaded.settings.strip_metadata);
-        let mut settings = loaded.settings.clone();
-        settings.strip_metadata = false;
-        profile.save_settings(&settings, &loaded.managed).unwrap();
-        let saved: Value = serde_json::from_str(&read(&profile, "settings.json")).unwrap();
-        assert_eq!(saved["strip_metadata"], false);
-        assert!(!profile.load().settings.strip_metadata);
-        settings.strip_metadata = true;
-        profile.save_settings(&settings, &loaded.managed).unwrap();
-        assert_eq!(settings_keys(&profile), released_keys());
-        assert!(profile.load().settings.strip_metadata);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
