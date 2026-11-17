@@ -191,18 +191,16 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
         // Sent re-encoded as JPEG or PNG, which every Mumble client shows.
         ImageFormat::WebP,
     ];
-    let mut image = decode(bytes, &formats, MAX_PASTE_DIMENSION, 256 * 1024 * 1024)
-        .ok_or(Error::InvalidImage)?;
+    let mut image = visible(
+        decode(bytes, &formats, MAX_PASTE_DIMENSION, 256 * 1024 * 1024)
+            .ok_or(Error::InvalidImage)?,
+    );
     if image.width() > VIEW_WIDTH || image.height() > VIEW_HEIGHT {
-        image = image.resize(
-            VIEW_WIDTH,
-            VIEW_HEIGHT,
-            image::imageops::FilterType::Triangle,
-        );
+        image = fit(image, VIEW_WIDTH, VIEW_HEIGHT);
     }
     let thumbnail =
         if image.width() > ATTACHMENT_THUMBNAIL || image.height() > ATTACHMENT_THUMBNAIL {
-            image.thumbnail(ATTACHMENT_THUMBNAIL, ATTACHMENT_THUMBNAIL)
+            fit(image.clone(), ATTACHMENT_THUMBNAIL, ATTACHMENT_THUMBNAIL)
         } else {
             image.clone()
         }
@@ -241,7 +239,61 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
         if width < 16 || height < 16 {
             return Err(Error::ImageTooLarge(limit));
         }
-        image = image.resize(width, height, image::imageops::FilterType::Triangle);
+        image = fit(image, width, height);
+    }
+}
+
+/// `image` with only the colour that can be seen: a transparent image goes
+/// through premultiplied 8-bit alpha and back, so a fully transparent pixel
+/// carries no colour and a nearly transparent one only what it shows.
+#[cfg(feature = "images")]
+fn visible(image: DynamicImage) -> DynamicImage {
+    if !image.color().has_alpha() {
+        return image;
+    }
+    let mut pixels = image.into_rgba8();
+    premultiply(&mut pixels);
+    unpremultiply(&mut pixels);
+    pixels.into()
+}
+
+/// Resize to fit `width` × `height`, keeping the aspect ratio, filtering a
+/// transparent image premultiplied, so transparent pixels lend visible ones
+/// none of their colour.
+#[cfg(feature = "images")]
+fn fit(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
+    let filter = image::imageops::FilterType::Triangle;
+    let DynamicImage::ImageRgba8(mut pixels) = image else {
+        return image.resize(width, height, filter);
+    };
+    premultiply(&mut pixels);
+    let mut resized = DynamicImage::ImageRgba8(pixels)
+        .resize(width, height, filter)
+        .into_rgba8();
+    unpremultiply(&mut resized);
+    resized.into()
+}
+
+#[cfg(feature = "images")]
+fn premultiply(pixels: &mut image::RgbaImage) {
+    for pixel in pixels.pixels_mut() {
+        let alpha = u16::from(pixel[3]);
+        for channel in &mut pixel.0[..3] {
+            *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+        }
+    }
+}
+
+#[cfg(feature = "images")]
+fn unpremultiply(pixels: &mut image::RgbaImage) {
+    for pixel in pixels.pixels_mut() {
+        let alpha = u16::from(pixel[3]);
+        for channel in &mut pixel.0[..3] {
+            *channel = match alpha {
+                0 => 0,
+                _ => ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8,
+            };
+        }
     }
 }
 
@@ -937,6 +989,72 @@ mod tests {
                 assert!(sent.ends_with(&[0xff, 0xd9]), "{format}");
             }
         }
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn transparent_pixels_carry_no_colour_after_re_encoding() {
+        // Left half: a pattern hidden under alpha 0; right half: opaque blue.
+        // Wider than 1600 pixels, so it is resized on the way.
+        let hidden = |x: u32, y: u32| image::Rgba([200, (x * 7) as u8, (y * 13) as u8, 0]);
+        let pixels = image::RgbaImage::from_fn(2000, 400, |x, y| {
+            if x < 1000 {
+                hidden(x, y)
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(pixels.clone())
+            .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        // Only blue is visible: no red or green anywhere a pixel shows, and
+        // no colour at all where none does.
+        let blue_only = |image: &image::RgbaImage| {
+            image.pixels().all(|pixel| match pixel.0 {
+                [_, _, _, 0] => pixel.0 == [0; 4],
+                [red, green, _, _] => red == 0 && green == 0,
+            })
+        };
+
+        let (element, _) = encode_image_message(&png, 131_072).unwrap();
+        assert!(element.starts_with("<img src=\"data:image/png;base64,"));
+        let source = element
+            .strip_prefix("<img src=\"")
+            .unwrap()
+            .strip_suffix("\" />")
+            .unwrap();
+        let sent = image::load_from_memory(&nuschl_core::data_uri_image(source).unwrap().0)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(sent.dimensions(), (1600, 320));
+        assert!(blue_only(&sent));
+
+        // Unresized, resized and as a thumbnail.
+        let clean = visible(DynamicImage::ImageRgba8(pixels));
+        assert!(blue_only(&clean.to_rgba8()));
+        for (width, height) in [(500, 100), (128, 128)] {
+            let resized = fit(clean.clone(), width, height).to_rgba8();
+            assert!(blue_only(&resized), "{width}×{height}");
+            // The edge shows blue fading out, not the hidden colour.
+            let edge = resized.get_pixel(resized.width() / 2 - 1, 1).0;
+            assert!(edge[3] > 0 && edge[3] < 255 && edge[2] == 255, "{edge:?}");
+        }
+
+        // JPEG blends onto white: the transparent half is white, the rest
+        // white, blue or between them.
+        let jpeg = encode_jpeg(&flatten(&clean), 85).unwrap();
+        let sent = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert!(sent.pixels().all(|pixel| {
+            let [red, green, blue] = pixel.0.map(i16::from);
+            (red - green).abs() <= 12 && blue >= red.max(green) - 12
+        }));
+        assert!(
+            sent.get_pixel(10, 10)
+                .0
+                .iter()
+                .all(|&channel| channel >= 250)
+        );
     }
 
     #[test]
