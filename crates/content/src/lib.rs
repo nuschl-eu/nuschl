@@ -552,23 +552,30 @@ mod tests {
         types
     }
 
+    /// A PNG chunk of `kind` holding `data`.
+    #[cfg(feature = "images")]
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let typed = [kind.as_slice(), data].concat();
+        let crc = !typed.iter().fold(!0u32, |crc, &byte| {
+            (0..8).fold(crc ^ byte as u32, |crc, _| {
+                (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg())
+            })
+        });
+        [
+            &(data.len() as u32).to_be_bytes(),
+            &typed[..],
+            &crc.to_be_bytes(),
+        ]
+        .concat()
+    }
+
     #[test]
     #[cfg(feature = "images")]
     fn artwork_thumbnails_are_bare_rgba_pngs_with_the_source_pixels() {
         // A source PNG with a text chunk after its header.
         let source = png(8, 6);
-        let crc = |bytes: &[u8]| {
-            !bytes.iter().fold(!0u32, |crc, &byte| {
-                (0..8).fold(crc ^ byte as u32, |crc, _| {
-                    (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg())
-                })
-            })
-        };
-        let text = b"tEXtComment\0tracking id 1234";
         let mut tagged = source[..33].to_vec();
-        tagged.extend_from_slice(&((text.len() - 4) as u32).to_be_bytes());
-        tagged.extend_from_slice(text);
-        tagged.extend_from_slice(&crc(text).to_be_bytes());
+        tagged.extend(png_chunk(b"tEXt", b"Comment\0tracking id 1234"));
         tagged.extend_from_slice(&source[33..]);
         assert!(chunk_types(&tagged).contains(&"tEXt".to_owned()));
 
@@ -786,6 +793,150 @@ mod tests {
         assert!(element.len() <= 20_000);
         let (width, _) = received(&element);
         assert!(width < 1600, "{width}");
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn sent_images_carry_none_of_the_original_metadata() {
+        let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
+            image::Rgba([(x * 5) as u8, ((y * 7) ^ (x * 13)) as u8, 90, 255])
+        });
+        let encoded = |format| {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(pixels.clone())
+                .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+                .unwrap();
+            bytes
+        };
+
+        // JPEG: EXIF with GPS, XMP, an ICC profile and a comment, and data
+        // after the end of the image.
+        let segment = |marker: u8, body: &[u8]| {
+            [
+                &[0xff, marker][..],
+                &(body.len() as u16 + 2).to_be_bytes(),
+                body,
+            ]
+            .concat()
+        };
+        let mut rgb = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut rgb, 90)
+            .write_image(
+                image::DynamicImage::ImageRgba8(pixels.clone())
+                    .to_rgb8()
+                    .as_raw(),
+                48,
+                32,
+                ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let jpeg = [
+            &rgb[..2],
+            &segment(
+                0xe1,
+                b"Exif\0\0MM\0*\0\0\0\x08NUSCHL-GPS 48.2082N 16.3738E Pixel 9",
+            ),
+            &segment(
+                0xe1,
+                b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>NUSCHL-XMP</x:xmpmeta>",
+            ),
+            &segment(0xe2, b"ICC_PROFILE\0\x01\x01NUSCHL-ICC"),
+            &segment(0xfe, b"NUSCHL-COMMENT"),
+            &rgb[2..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // PNG: text, XMP, EXIF and time chunks, and data after IEND.
+        let source = encoded(ImageFormat::Png);
+        let png = [
+            &source[..33],
+            &png_chunk(b"tEXt", b"Comment\0NUSCHL-COMMENT"),
+            &png_chunk(b"iTXt", b"XML:com.adobe.xmp\0\0\0\0\0NUSCHL-XMP"),
+            &png_chunk(b"eXIf", b"MM\0*\0\0\0\x08NUSCHL-GPS"),
+            &png_chunk(b"tIME", &[0x07, 0xea, 11, 3, 14, 30, 12]),
+            &source[33..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // WebP: the extended format with EXIF and XMP chunks.
+        let lossless = encoded(ImageFormat::WebP);
+        let riff = |kind: &[u8; 4], data: &[u8]| {
+            let pad = vec![0; data.len() % 2];
+            [
+                kind.as_slice(),
+                &(data.len() as u32).to_le_bytes(),
+                data,
+                &pad,
+            ]
+            .concat()
+        };
+        // Alpha, EXIF and XMP; then the canvas size, less one, in 24 bits each.
+        let header = [
+            &[0x1c, 0, 0, 0][..],
+            &47u32.to_le_bytes()[..3],
+            &31u32.to_le_bytes()[..3],
+        ]
+        .concat();
+        let body = [
+            &b"WEBP"[..],
+            &riff(b"VP8X", &header),
+            &lossless[12..],
+            &riff(b"EXIF", b"MM\0*\0\0\0\x08NUSCHL-GPS"),
+            &riff(b"XMP ", b"<x:xmpmeta>NUSCHL-XMP</x:xmpmeta>"),
+        ]
+        .concat();
+        let webp = [&b"RIFF"[..], &(body.len() as u32).to_le_bytes(), &body].concat();
+
+        // GIF: a comment extension after the global colour table.
+        let source = encoded(ImageFormat::Gif);
+        let table = if source[10] & 0x80 != 0 {
+            3 << ((source[10] & 7) + 1)
+        } else {
+            0
+        };
+        let comment = [&[0x21, 0xfe, 14][..], b"NUSCHL-COMMENT", &[0]].concat();
+        let gif = [&source[..13 + table], &comment, &source[13 + table..]].concat();
+
+        for (format, input) in [("JPEG", jpeg), ("PNG", png), ("WebP", webp), ("GIF", gif)] {
+            assert!(input.windows(6).any(|window| window == b"NUSCHL"));
+            let (element, _) = encode_image_message(&input, 131_072)
+                .unwrap_or_else(|error| panic!("{format}: {error}"));
+            let source = element
+                .strip_prefix("<img src=\"")
+                .unwrap()
+                .strip_suffix("\" />")
+                .unwrap();
+            let (sent, _) = nuschl_core::data_uri_image(source).unwrap();
+            assert!(
+                !sent.windows(6).any(|window| window == b"NUSCHL"),
+                "{format}"
+            );
+            if sent.starts_with(b"\x89PNG\r\n\x1a\n") {
+                let chunks = chunk_types(&sent);
+                assert!(
+                    chunks
+                        .iter()
+                        .all(|kind| ["IHDR", "IDAT", "IEND"].contains(&kind.as_str())),
+                    "{format}: {chunks:?}"
+                );
+                assert!(sent.ends_with(&png_chunk(b"IEND", b"")), "{format}");
+            } else {
+                assert!(sent.starts_with(&[0xff, 0xd8]), "{format}");
+                // The segments up to the scan: no APP1–APP15 and no comment.
+                let mut at = 2;
+                while sent[at + 1] != 0xda {
+                    let marker = sent[at + 1];
+                    assert!(
+                        !(0xe1..=0xef).contains(&marker) && marker != 0xfe,
+                        "{format}: {marker:#x}"
+                    );
+                    at += 2 + u16::from_be_bytes([sent[at + 2], sent[at + 3]]) as usize;
+                }
+                assert!(sent.ends_with(&[0xff, 0xd9]), "{format}");
+            }
+        }
     }
 
     #[test]
