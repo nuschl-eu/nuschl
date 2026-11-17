@@ -4325,8 +4325,10 @@ fn strip_metadata(on: bool, cx: &mut Context<Desktop>) -> AnyElement {
                 }),
         )
         .child(text!("Strip metadata").with_id("strip-metadata-label"));
-    layout::row()
+    div()
         .px_1()
+        .flex()
+        .items_center()
         .gap_1()
         .text_xs()
         .text_color(color(TEXT_MUTED))
@@ -4334,6 +4336,7 @@ fn strip_metadata(on: bool, cx: &mut Context<Desktop>) -> AnyElement {
         .child(
             div()
                 .id("strip-metadata-help")
+                .flex()
                 .tooltip(|_, cx| cx.new(|_| Tooltip(HELP.into())).into())
                 .child(icon("info", 14., color(TEXT_FAINT))),
         )
