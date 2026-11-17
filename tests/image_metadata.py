@@ -14,7 +14,7 @@ clipboard, audio, profile or file chooser is used. Checks that:
 - unticked, the image over 8 MB goes into the tray as its original file;
   ticking the box again takes it back out;
 - unticked and sent, it reaches the peer as a file offer;
-- the next message has the box ticked again.
+- the next message has the box ticked again, and a HEIC file is refused.
 
 python3 tests/image_metadata.py target/debug --murmur <mumble-server>
     --at-spi <at-spi2-core> --wormhole-python <python with magic-wormhole servers>
@@ -196,12 +196,17 @@ def main():
         print(f"Strip metadata off: the original went as a file offer: {offer['body'][:120]!r}", flush=True)
         shell.screenshot(root / "offered.png")
 
-        # The next message: ticked again.
-        attach(photo)
-        find(lambda _, __, name, ___: name == f"Could not attach {photo.name}: it is larger than 8 MB.",
-             "the oversized image was not refused in the next message")
+        # The next message: ticked again, and a HEIC photo is refused.
+        heic = root / "IMG_0042.HEIC"
+        heic.write_bytes(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic" + bytes(64))
+        attach(heic)
+        find(lambda _, __, name, ___: name == f"Could not attach {heic.name}: HEIC cannot be re-encoded.",
+             "the HEIC photo was not refused")
         assert checkbox()[3] & CHECKED, "Strip metadata is not ticked for the next message"
-        print("The next message had Strip metadata ticked again.", flush=True)
+        assert not present(lambda _, role, name, __: role == "list item" and heic.name in name)
+        time.sleep(3)
+        assert not any(heic.name in e.get("body", "") for e in offers()), offers()
+        print("The next message had Strip metadata ticked again; the HEIC photo was refused.", flush=True)
     finally:
         if peer:
             peer.close()

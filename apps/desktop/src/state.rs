@@ -1863,7 +1863,7 @@ impl Desktop {
         self.attach_note = None;
         let name =
             crate::attachments::pasted_name(self.attachments.get(&key).map_or(&[], Vec::as_slice));
-        if let Some(note) = self.attach_image(&key, name, Source::Bytes(image), None) {
+        if let Some(note) = self.attach_image(&key, name, Ok(Source::Bytes(image)), None) {
             self.attach_note = Some((key, note));
         }
         cx.notify();
@@ -1924,7 +1924,12 @@ impl Desktop {
                     );
                     match checked {
                         Ok(Kind::Image { size }) => {
-                            let source = Source::File(path.clone());
+                            let source = Ok(Source::File(path.clone()));
+                            let file = Some((path, size));
+                            notes.extend(this.attach_image(&key, name, source, file));
+                        }
+                        Ok(Kind::Unsupported { size, format }) => {
+                            let source = Err(format!("{format} cannot be re-encoded"));
                             let file = Some((path, size));
                             notes.extend(this.attach_image(&key, name, source, file));
                         }
@@ -1952,12 +1957,13 @@ impl Desktop {
     }
     /// Add an image to a conversation's tray and have the worker prepare it
     /// for that server's image limit, keeping room for the text. Returns a
-    /// note when it cannot go as an image (see `attachments::settle`).
+    /// note when it cannot go as an image (see `attachments::settle`); a
+    /// `source` that is an error cannot.
     fn attach_image(
         &mut self,
         key: &(String, u32),
         name: String,
-        source: Source,
+        source: Result<Source, String>,
         file: Option<(std::path::PathBuf, u64)>,
     ) -> Option<String> {
         let server = self.client.servers.iter().find(|server| server.id == key.0);
@@ -1969,16 +1975,18 @@ impl Desktop {
                 .filter(|attachment| matches!(attachment, Attachment::Image { .. }))
                 .count()
         });
-        let source = if !limits.allow_html {
-            Err("this server does not accept images".to_owned())
-        } else if images >= crate::attachments::MAX_IMAGES {
-            Err(format!(
-                "a message can carry up to {} images; send these first",
-                crate::attachments::MAX_IMAGES
-            ))
-        } else {
-            Ok(source)
-        };
+        let source = source.and_then(|source| {
+            if !limits.allow_html {
+                Err("this server does not accept images".to_owned())
+            } else if images >= crate::attachments::MAX_IMAGES {
+                Err(format!(
+                    "a message can carry up to {} images; send these first",
+                    crate::attachments::MAX_IMAGES
+                ))
+            } else {
+                Ok(source)
+            }
+        });
         let id = self.next_attachment();
         let tray = self.attachments.entry(key.clone()).or_default();
         tray.push(Attachment::Image {

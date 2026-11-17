@@ -69,6 +69,11 @@ pub enum Kind {
     Image {
         size: u64,
     },
+    /// An image in a format the content worker does not re-encode.
+    Unsupported {
+        size: u64,
+        format: &'static str,
+    },
     File {
         size: u64,
     },
@@ -91,8 +96,8 @@ pub fn check(path: &Path) -> Result<Kind, Refusal> {
         return Err(Refusal::Folder);
     }
     let size = metadata.len();
-    let mut head = Vec::with_capacity(12);
-    file.take(12).read_to_end(&mut head).map_err(unreadable)?;
+    let mut head = Vec::with_capacity(512);
+    file.take(512).read_to_end(&mut head).map_err(unreadable)?;
     let webp = head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP");
     let image = webp
         || [
@@ -106,9 +111,50 @@ pub fn check(path: &Path) -> Result<Kind, Refusal> {
         .any(|magic| head.starts_with(magic));
     Ok(if image {
         Kind::Image { size }
+    } else if let Some(format) = unsupported(&head) {
+        Kind::Unsupported { size, format }
     } else {
         Kind::File { size }
     })
+}
+
+/// HEIC, AVIF, TIFF, JPEG XL or SVG, judged from the first bytes.
+fn unsupported(head: &[u8]) -> Option<&'static str> {
+    if [&b"II*\0"[..], b"MM\0*", b"II+\0", b"MM\0+"]
+        .iter()
+        .any(|magic| head.starts_with(magic))
+    {
+        return Some("TIFF");
+    }
+    if head.starts_with(b"\xff\x0a") || head.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") {
+        return Some("JPEG XL");
+    }
+    if head.get(4..8) == Some(b"ftyp") {
+        // The major brand, and the compatible brands after the minor version.
+        let end = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        let major = head[8..].as_chunks::<4>().0.first();
+        let compatible = head.get(16..end.min(head.len())).unwrap_or_default();
+        let brands = || major.into_iter().chain(compatible.as_chunks::<4>().0);
+        if brands().any(|brand| matches!(brand, b"avif" | b"avis")) {
+            return Some("AVIF");
+        }
+        let heif = [
+            b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1",
+            b"msf1",
+        ];
+        if brands().any(|brand| heif.contains(&brand)) {
+            return Some("HEIC");
+        }
+    }
+    let text = head
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(head)
+        .trim_ascii_start();
+    let prologue = [&b"<?xml"[..], b"<!--", b"<!DOCTYPE svg"]
+        .iter()
+        .any(|start| text.starts_with(start));
+    (text.starts_with(b"<svg") || prologue && text.windows(4).any(|window| window == b"<svg"))
+        .then_some("SVG")
 }
 
 /// Settle image `id` in `tray` (a composer's, or a sent message's) with the
@@ -299,6 +345,39 @@ mod tests {
         assert_eq!(check(&write("empty.txt", b"")), Ok(Kind::File { size: 0 }));
         let webp = write("photo.webp", b"RIFF\0\0\0\0WEBP");
         assert_eq!(check(&webp), Ok(Kind::Image { size: 12 }));
+        // Images the content worker does not re-encode, whatever their name.
+        for (format, bytes) in [
+            ("HEIC", &b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"[..]),
+            ("HEIC", b"\0\0\0\x18ftypmif1\0\0\0\0mif1miaf"),
+            ("AVIF", b"\0\0\0\x1cftypavif\0\0\0\0avifmif1miaf"),
+            ("AVIF", b"\0\0\0\x18ftypmif1\0\0\0\0mif1avif"),
+            ("TIFF", b"II*\0\x08\0\0\0"),
+            ("TIFF", b"MM\0*\0\0\0\x08"),
+            ("JPEG XL", b"\xff\x0a\0\0"),
+            ("JPEG XL", b"\0\0\0\x0cJXL \r\n\x87\n"),
+            ("SVG", b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
+            (
+                "SVG",
+                b"\xef\xbb\xbf\n<?xml version='1.0'?>\n<!-- Editor -->\n<svg/>",
+            ),
+        ] {
+            let size = bytes.len() as u64;
+            assert_eq!(
+                check(&write("photo", bytes)),
+                Ok(Kind::Unsupported { size, format }),
+                "{format}"
+            );
+        }
+        // Videos and other XML go as files; the minor version is no brand.
+        for bytes in [
+            &b"\0\0\0\x18ftypisom\0\0\0\0isommp42"[..],
+            b"\0\0\0\x10ftypisomavif",
+            b"<?xml version='1.0'?><feed/>",
+            b"<!DOCTYPE html><svg/>",
+        ] {
+            let size = bytes.len() as u64;
+            assert_eq!(check(&write("other", bytes)), Ok(Kind::File { size }));
+        }
         assert_eq!(check(&directory), Err(Refusal::Folder));
         assert!(matches!(
             check(&directory.join("missing.png")),
