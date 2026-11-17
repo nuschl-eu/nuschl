@@ -3955,6 +3955,15 @@ fn composer(
         })
         .map(|(_, note)| note.clone());
     let attachments = this.attachments();
+    // Beside images in the tray, and beside a note on one that was refused.
+    let image_options = note.is_some()
+        || attachments.iter().any(|attachment| {
+            matches!(
+                attachment,
+                crate::attachments::Attachment::Image { .. }
+                    | crate::attachments::Attachment::File { image: true, .. }
+            )
+        });
     let details = div()
         .w_full()
         .min_w_0()
@@ -4047,6 +4056,9 @@ fn composer(
                             .map(|attachment| attachment_chip(attachment, cx)),
                     ),
             )
+        })
+        .when(image_options, |composer| {
+            composer.child(strip_metadata(this.settings.strip_metadata, cx))
         })
         .child(
             layout::row()
@@ -4265,6 +4277,62 @@ fn composer(
                     .absolute()
                     .inset_0(),
                 ),
+        )
+        .into_any_element()
+}
+
+/// The Strip metadata checkbox, with what it does on an (i) beside it.
+fn strip_metadata(on: bool, cx: &mut Context<Desktop>) -> AnyElement {
+    const HELP: &str =
+        "Remove image metadata such as GPS coordinates, capture time, device model, etc.";
+    let control = div()
+        .id("strip-metadata")
+        .role(Role::CheckBox)
+        .aria_label("Strip metadata")
+        .aria_description(HELP)
+        .aria_toggled(if on { Toggled::True } else { Toggled::False })
+        .tab_index(0)
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.toggle_strip_metadata();
+            cx.notify();
+        }))
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            if activation_key(event) {
+                this.toggle_strip_metadata();
+                cx.notify();
+                cx.stop_propagation();
+            }
+        }))
+        .child(
+            div()
+                .size(px(14.))
+                .rounded(px(3.))
+                .border_1()
+                .border_color(color(if on { ACCENT } else { BORDER_STRONG }))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(on, |box_| {
+                    box_.bg(color(ACCENT))
+                        .child(icon("check", 12., color(WHITE)))
+                }),
+        )
+        .child(text!("Strip metadata").with_id("strip-metadata-label"));
+    layout::row()
+        .px_1()
+        .gap_1()
+        .text_xs()
+        .text_color(color(TEXT_MUTED))
+        .child(crate::layout::focusable("strip-metadata", control))
+        .child(
+            div()
+                .id("strip-metadata-help")
+                .tooltip(|_, cx| cx.new(|_| Tooltip(HELP.into())).into())
+                .child(icon("info", 14., color(TEXT_FAINT))),
         )
         .into_any_element()
 }

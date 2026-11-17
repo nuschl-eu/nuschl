@@ -10,8 +10,7 @@ use std::{
 };
 
 pub enum Attachment {
-    /// Re-encoded by the content worker once attached. One from a file goes
-    /// as a file instead if the worker cannot encode it.
+    /// Re-encoded by the content worker once attached (see [`settle`]).
     Image {
         id: u64,
         name: String,
@@ -24,6 +23,9 @@ pub enum Attachment {
         name: String,
         path: PathBuf,
         size: u64,
+        /// An image's original, with its metadata: it leaves the tray when
+        /// Strip metadata is turned on.
+        image: bool,
     },
 }
 
@@ -53,8 +55,7 @@ pub enum Source {
 /// Images one message may carry. Each keeps up to 256 KiB to send and a
 /// thumbnail; a hundred take two minutes to leave at stock Murmur's rate limit.
 pub const MAX_IMAGES: usize = 100;
-/// An image's base64 must fit one content worker frame (`MAX_FRAME_BYTES`);
-/// a larger one goes as a file.
+/// An image's base64 must fit one content worker frame (`MAX_FRAME_BYTES`).
 pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 /// Room kept beside every image for the text, which goes with the first.
 pub const CAPTION_ROOM: usize = 1024;
@@ -64,7 +65,7 @@ const BREAK: &str = "<br/>";
 /// What a dropped or chosen path can be sent as.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// PNG, JPEG, GIF or BMP, small enough for the content worker.
+    /// PNG, JPEG, GIF, BMP or WebP.
     Image {
         size: u64,
     },
@@ -103,11 +104,56 @@ pub fn check(path: &Path) -> Result<Kind, Refusal> {
         ]
         .iter()
         .any(|magic| head.starts_with(magic));
-    Ok(if image && size <= MAX_IMAGE_BYTES {
+    Ok(if image {
         Kind::Image { size }
     } else {
         Kind::File { size }
     })
+}
+
+/// Settle image `id` in `tray` (a composer's, or a sent message's) with the
+/// content worker's result. One that cannot go re-encoded goes as its
+/// original file only with Strip metadata off; otherwise it leaves the tray.
+/// Returns a note for the user.
+pub fn settle(
+    tray: &mut Vec<Attachment>,
+    id: u64,
+    result: Result<(String, Arc<RenderImage>), String>,
+    strip_metadata: bool,
+) -> Option<String> {
+    let position = tray.iter().position(|attachment| attachment.id() == id)?;
+    let Attachment::Image {
+        name,
+        file,
+        prepared,
+        ..
+    } = &mut tray[position]
+    else {
+        return None;
+    };
+    match (result, file.take()) {
+        (Ok(image), _) => {
+            *prepared = Some(image);
+            None
+        }
+        (Err(reason), Some((path, size))) if !strip_metadata => {
+            let name = std::mem::take(name);
+            let note = format!("{name} goes as a file: {reason}.");
+            tray[position] = Attachment::File {
+                id,
+                name,
+                path,
+                size,
+                image: true,
+            };
+            Some(note)
+        }
+        (Err(reason), _) => {
+            let note = format!("Could not attach {name}: {reason}.");
+            tray.remove(position);
+            Some(note)
+        }
+    }
 }
 
 /// Read an attached image, refusing one that has grown past the limit.
@@ -257,7 +303,8 @@ mod tests {
             check(&directory.join("missing.png")),
             Err(Refusal::Unreadable(_))
         ));
-        // An image too large for the content worker goes as a file.
+        // An image too large for the content worker goes to it all the same,
+        // which refuses it (see `settle`).
         let large = write("large.png", b"\x89PNG\r\n\x1a\n");
         std::fs::File::options()
             .write(true)
@@ -267,13 +314,80 @@ mod tests {
             .unwrap();
         assert_eq!(
             check(&large),
-            Ok(Kind::File {
+            Ok(Kind::Image {
                 size: MAX_IMAGE_BYTES + 1
             })
         );
         assert!(read(&large).is_err());
         assert_eq!(read(&png).unwrap().len(), 16);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn images_that_cannot_be_re_encoded_go_as_files_only_with_strip_metadata_off() {
+        let image = |id, file: bool| Attachment::Image {
+            id,
+            name: format!("IMG_{id}.jpg"),
+            file: file.then(|| (PathBuf::from(format!("/photos/IMG_{id}.jpg")), 9_000_000)),
+            prepared: None,
+        };
+        let pdf = Attachment::File {
+            id: 9,
+            name: "report.pdf".into(),
+            path: "/report.pdf".into(),
+            size: 8,
+            image: false,
+        };
+        let failed = || Err("it is larger than 8 MB".to_owned());
+
+        // On: every failure, from a file or pasted, leaves the tray with a note;
+        // the tray (or sent message) keeps no path to the original.
+        let mut tray = vec![image(1, true), pdf, image(2, false), image(3, true)];
+        for id in [1, 2, 3] {
+            let note = settle(&mut tray, id, failed(), true).unwrap();
+            assert_eq!(
+                note,
+                format!("Could not attach IMG_{id}.jpg: it is larger than 8 MB.")
+            );
+        }
+        assert!(matches!(
+            tray.as_slice(),
+            [Attachment::File {
+                id: 9,
+                image: false,
+                ..
+            }]
+        ));
+        assert!(tray.iter().all(Attachment::ready));
+        assert_eq!(settle(&mut tray, 1, failed(), true), None);
+
+        // Off: an image from a file goes as its original, marked as such; a
+        // pasted one has no file to go as.
+        let mut tray = vec![image(1, true), image(2, false)];
+        let note = settle(&mut tray, 1, failed(), false).unwrap();
+        assert_eq!(note, "IMG_1.jpg goes as a file: it is larger than 8 MB.");
+        assert!(
+            matches!(&tray[0], Attachment::File { id: 1, size: 9_000_000, image: true, path, .. }
+            if path == Path::new("/photos/IMG_1.jpg"))
+        );
+        settle(&mut tray, 2, failed(), false).unwrap();
+        assert_eq!(tray.len(), 1);
+
+        // Prepared: the re-encoded image, and no original left to fall back to.
+        let mut tray = vec![image(4, true)];
+        let thumbnail = crate::document::render_image(1, 1, "AAAA/w==").unwrap();
+        assert_eq!(
+            settle(&mut tray, 4, Ok(("<img />".into(), thumbnail)), false),
+            None
+        );
+        assert!(matches!(
+            &tray[0],
+            Attachment::Image {
+                file: None,
+                prepared: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

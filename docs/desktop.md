@@ -106,6 +106,11 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
   sends it. Other files go through the paperclip or a drop: Nuschl offers them
   peer to peer, with a magic-wormhole code in the message that stock Mumble users
   can use with any wormhole client, and shows offers as file cards.
+- Attached images go re-encoded, without the original's metadata (GPS
+  coordinates, capture time, device model) or file name. With **Strip metadata**
+  ticked beside them (the default), an image that cannot be re-encoded, such as
+  one over 8 MB, stays unsent with a note. Unticked, it goes as its original
+  file. Re-encoding keeps what the picture itself shows.
 
 - Links in welcome cards, channel descriptions and user comments support clicking,
   Tab/Shift+Tab and Enter, and screen-reader activation. They use the same URL
