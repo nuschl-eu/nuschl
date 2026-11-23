@@ -209,8 +209,10 @@ Realtime AV1 estimates from published guidance (±50 %), to be measured by S0f:
 
 Grid tiles request 360p, the large view 720p or more. Cameras need several
 resolutions at once, so cameras publish three spatial layers (SVC) or three
-simulcast encodings, chosen by S0f; screens use temporal layers and, where the
-encoder offers them, spatial layers.
+simulcast encodings, chosen by S0f; screens use temporal layers (`L1T3`).
+Chromium's AV1 encoder in screen-content mode writes key pictures with an
+undecodable inter-layer predicted frame (dav1d and libaom fail in its tile
+data), so screens keep one resolution.
 
 Local S0f throughput sample on a Radeon RX 7900 XTX with Mesa 26.3.0 and
 FFmpeg 9.0.2. The input is ten seconds of moving `testsrc2` with one

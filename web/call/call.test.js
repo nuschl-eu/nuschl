@@ -350,9 +350,9 @@ test("one AV1 encoding uses layers with confirmed encoder support", async () => 
     assert.equal(type, "webrtc");
     assert.equal(video.contentType, "video/AV1");
     assert.equal(video.width, 1920);
-    return { supported: true, smooth: video.scalabilityMode === "L2T2_KEY" };
+    return { supported: true, smooth: video.scalabilityMode === "L1T3" };
   } } } };
-  assert.equal(await scalabilityMode(scope, "av1", "screen", video), "L2T2_KEY");
+  assert.equal(await scalabilityMode(scope, "av1", "screen", video), "L1T3");
   assert.equal(await scalabilityMode(scope, "av1", "camera", video), undefined);
   assert.equal(await scalabilityMode(scope, "vp9", "screen", video), undefined);
   assert.equal(await scalabilityMode({}, "av1", "screen", video), undefined);
