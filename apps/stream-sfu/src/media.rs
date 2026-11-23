@@ -527,8 +527,16 @@ impl Core {
                         opened.push((forward.from, forward.source));
                     }
                 }
+                // A layered source's selector asks once the receiver has a target.
                 for (from, source) in opened {
-                    self.keyframe(from, source, now);
+                    let layered = self.peers.get(&from).is_some_and(|p| {
+                        p.sources.iter().any(|s| {
+                            s.mid == source && s.video.as_ref().is_some_and(|v| v.layers.layered())
+                        })
+                    });
+                    if !layered {
+                        self.keyframe(from, source, now);
+                    }
                 }
                 self.dirty.push((id, Leg::Subscribe));
                 self.negotiate(id);
@@ -1002,7 +1010,7 @@ impl Core {
                 .filter(|p| *p != from)
                 .collect()
         });
-        let mut dropped = matches!(frame, Some(None));
+        let mut keyframe = matches!(frame, Some(None));
         for id in receivers {
             let Some(peer) = self.peers.get_mut(&id) else {
                 continue;
@@ -1036,7 +1044,7 @@ impl Core {
                 if let Some(frame) = &layered {
                     view.selector.dropped(frame);
                 }
-                dropped |= frame.is_some();
+                keyframe |= view.selector.needs_keyframe();
                 continue;
             }
             let marker = match &frame {
@@ -1046,7 +1054,7 @@ impl Core {
                     .selector
                     .forward(frame, timestamp, packet.header.marker),
             };
-            dropped |= view.selector.waiting();
+            keyframe |= view.selector.needs_keyframe();
             let Some(marker) = marker else {
                 view.rewrite.skip(*packet.seq_no);
                 continue;
@@ -1069,7 +1077,7 @@ impl Core {
                     }
                     VideoAdmission::RequestKeyframe => {
                         view.rewrite.skip(*packet.seq_no);
-                        dropped = true;
+                        keyframe = true;
                         continue;
                     }
                 }
@@ -1095,7 +1103,7 @@ impl Core {
                         view.selector.dropped(frame);
                     }
                 }
-                dropped |= frame.is_some();
+                keyframe |= view.selector.needs_keyframe();
                 continue;
             }
             let Some(seq) = view.rewrite.forward(*packet.seq_no) else {
@@ -1121,7 +1129,7 @@ impl Core {
             );
             self.dirty.push((id, Leg::Subscribe));
         }
-        if dropped {
+        if keyframe {
             self.keyframe(from, mid, now);
         }
     }

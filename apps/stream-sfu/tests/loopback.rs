@@ -74,6 +74,8 @@ struct Leg {
     rtc: Rtc,
     socket: UdpSocket,
     events: Vec<Event>,
+    /// Drops every nth incoming AV1 media packet; retransmissions pass.
+    loss: Option<(u64, u64)>,
 }
 
 impl Leg {
@@ -92,7 +94,27 @@ impl Leg {
             rtc,
             socket,
             events: Vec::new(),
+            loss: None,
         }
+    }
+
+    fn lost(&mut self, datagram: &[u8]) -> bool {
+        let Some((every, count)) = &mut self.loss else {
+            return false;
+        };
+        let rtp = datagram.len() > 12 && datagram[0] >> 6 == 2;
+        let pt = datagram.get(1).map(|b| b & 0x7f);
+        let av1 = self
+            .rtc
+            .codec_config()
+            .params()
+            .iter()
+            .any(|p| p.spec().codec == Codec::Av1 && Some(*p.pt()) == pt);
+        if !rtp || !av1 {
+            return false;
+        }
+        *count += 1;
+        *count % *every == 0
     }
 
     fn poll(&mut self) {
@@ -112,6 +134,9 @@ impl Leg {
         let local = self.socket.local_addr().expect("address");
         let mut buffer = [0; 2048];
         while let Ok((length, source)) = self.socket.recv_from(&mut buffer) {
+            if self.lost(&buffer[..length]) {
+                continue;
+            }
             let input = Input::Receive(
                 Instant::now(),
                 Receive {
@@ -1234,6 +1259,17 @@ async fn the_traffic_budget_refuses_new_video() {
     assert_eq!(refused, json!({"type": "error", "reason": "traffic"}));
 }
 
+/// Replays `host`'s recording for two seconds without viewers, so a viewer joins
+/// a running source.
+async fn replay_alone(host: &mut Peer) {
+    let running = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < running {
+        host.step();
+        host.send_replay();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Steps `host`, replaying its recording, and `viewer` until `done` accepts the
 /// viewer's decodable frames, checked once a second; every whole frame the
 /// viewer gets must be decodable.
@@ -1267,17 +1303,19 @@ async fn replay_until(
 /// Chromium's L2T2_KEY screen: a viewer starts on the base layer and moves to the
 /// full layer once its budget allows (after the 30 s step-up hold), at a key
 /// picture: the full layer's delta frames are switch points only for receivers
-/// that hold its chain. Every whole frame it gets stays decodable.
+/// that hold its chain. Every whole frame it gets stays decodable, and the SFU
+/// asks the publisher for a key frame only where the viewer lacks a chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_layered_screen_switches_up_at_a_key_picture() {
     let sfu = start("lease_secs = 3600");
     let url = sfu.url.as_str();
     let (mut host, _) = join(url, &ADMIT, true, true).await;
-    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
     host.replay = Some(Replay::new(fixture(include_str!(
         "fixtures/chrome-l2t2-key.txt"
     ))));
     host.publish_source(Codec::Av1, true);
+    replay_alone(&mut host).await;
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
     let capacity = |screen| {
         let decode = nuschl_stream_quality::DecodeCapacity { camera: 3, screen };
         json!({"type": "capacity", "decode": hex::encode(decode.to_bytes())})
@@ -1305,6 +1343,8 @@ async fn a_layered_screen_switches_up_at_a_key_picture() {
         },
     )
     .await;
+    // One for the viewer's start, one for the switch.
+    assert_eq!(host.keyframe_requests, 2, "key frame requests");
 }
 
 /// Chromium's L3T3_KEY camera: a viewer on an upper layer that asks for the
@@ -1338,4 +1378,73 @@ async fn a_layered_camera_switches_down_at_a_key_picture() {
         },
     )
     .await;
+}
+
+/// A viewer that loses one in 30 AV1 packets on its downlink gets them again
+/// from the SFU's retransmission buffer: every frame arrives whole and
+/// decodable, and the publisher sends one key frame, for the viewer's start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_packets_return_through_nack() {
+    let sfu = start("");
+    let url = sfu.url.as_str();
+    let (mut host, _) = join(url, &ADMIT, true, true).await;
+    host.replay = Some(Replay::new(fixture(include_str!(
+        "fixtures/chrome-l3t3-key.txt"
+    ))));
+    host.publish_source(Codec::Av1, false);
+    replay_alone(&mut host).await;
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
+    let publisher = host.id;
+    let frames = |viewer: &Peer| -> std::collections::HashSet<u16> {
+        let packets = viewer.received.get(&publisher).into_iter().flatten();
+        packets
+            .filter_map(|p| {
+                Some(u16::from_be_bytes(
+                    p.descriptor.as_ref()?.0[1..3].try_into().ok()?,
+                ))
+            })
+            .collect()
+    };
+    // Repairs take a round trip, so the frames are checked after the replay.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while frames(&viewer).len() < 300 {
+        assert!(
+            Instant::now() < deadline,
+            "{} frames",
+            frames(&viewer).len()
+        );
+        host.step();
+        viewer.step();
+        host.send_replay();
+        if let Some(leg) = &mut viewer.subscribe {
+            leg.loss.get_or_insert((30, 0));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let repaired = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < repaired {
+        host.step();
+        viewer.step();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let leg = viewer.subscribe.as_ref().expect("subscribed");
+    assert!(
+        leg.loss.is_some_and(|(_, count)| count >= 300),
+        "{:?}",
+        leg.loss
+    );
+    let (decoded, broken) = decodable(&viewer.received[&host.id]);
+    assert!(broken.is_empty(), "undecodable frames {broken:?}");
+    // The replay may stop inside a frame.
+    let seen = frames(&viewer).len();
+    assert!(
+        decoded.len() + 3 >= seen,
+        "{} of {seen} frames whole",
+        decoded.len()
+    );
+    assert!(
+        host.keyframe_requests <= 1,
+        "{} key frame requests",
+        host.keyframe_requests
+    );
 }
