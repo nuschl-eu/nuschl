@@ -90,8 +90,8 @@ async fn native_call_switches_paths_and_sources() {
                 }
                 event = publisher.next() => match event.unwrap().unwrap() {
                     MediaEvent::SourceReady { .. } => ready = true,
-                    MediaEvent::Direct { active: true } => sender_direct = true,
-                    MediaEvent::Direct { active: false } => sender_relayed = true,
+                    MediaEvent::Route(Route::Direct) => sender_direct = true,
+                    MediaEvent::Route(Route::Sfu(_)) if sender_direct => sender_relayed = true,
                     MediaEvent::SourceKeyframeRequired { .. } if requested_keyframe && outage.is_none() => {
                         // Drop packets after the direct leg delivered the viewer's request.
                         publisher.lose_direct().await;
@@ -100,8 +100,8 @@ async fn native_call_switches_paths_and_sources() {
                     _ => {}
                 },
                 event = viewer.next() => match event.unwrap().unwrap() {
-                    MediaEvent::Direct { active: true } => receiver_direct = true,
-                    MediaEvent::Direct { active: false } => receiver_relayed = true,
+                    MediaEvent::Route(Route::Direct) => receiver_direct = true,
+                    MediaEvent::Route(Route::Sfu(_)) if receiver_direct => receiver_relayed = true,
                     MediaEvent::Frame { publisher: sender, purpose, contiguous, key_frame, data, .. } => {
                         assert_eq!(sender, from);
                         assert_eq!(purpose, Purpose::Camera);
@@ -325,7 +325,7 @@ async fn native_call_switches_paths_and_sources() {
                     assert_eq!(data, pictures[sender]);
                     seen[receiver] = true;
                 }
-                MediaEvent::Direct { active: true } => {
+                MediaEvent::Route(Route::Direct) => {
                     panic!("a group call selected a direct path")
                 }
                 _ => {}

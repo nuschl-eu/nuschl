@@ -3,8 +3,8 @@
 //! receives from one publisher. The SFU transports sealed signaling.
 
 use super::{
-    Command, Connection, Description, Error, Instant, Leg, LegRole, Network, Purpose, Track,
-    Worker, describe, done,
+    Command, Connection, Description, Error, Instant, Leg, LegRole, Network, Purpose, Reason,
+    Route, Track, Worker, describe, done,
 };
 use crate::sfu::turn::turn_address;
 use futures_util::{FutureExt, future::BoxFuture};
@@ -109,18 +109,19 @@ pub(super) enum Role {
     Receive(u64),
 }
 
-pub(super) fn role(peers: &[u64], publishing: bool, subscribed: &[Track]) -> Option<Role> {
+pub(super) fn role(peers: &[u64], publishing: bool, subscribed: &[Track]) -> Result<Role, Reason> {
     match (publishing, subscribed) {
-        (true, []) if (1..=MAX_DIRECT_SEND_LEGS).contains(&peers.len()) => {
-            Some(Role::Send(peers.to_vec()))
-        }
-        (false, [first, rest @ ..]) => {
-            let publisher = first.publisher?;
-            rest.iter()
-                .all(|track| track.publisher == Some(publisher))
-                .then_some(Role::Receive(publisher))
-        }
-        _ => None,
+        (true, []) if peers.is_empty() => Err(Reason::Viewer),
+        (true, []) if peers.len() > MAX_DIRECT_SEND_LEGS => Err(Reason::Viewers),
+        (true, []) => Ok(Role::Send(peers.to_vec())),
+        (true, _) => Err(Reason::TwoWay),
+        (false, []) => Err(Reason::Sender),
+        (false, [first, rest @ ..]) => match first.publisher {
+            Some(publisher) if rest.iter().all(|track| track.publisher == Some(publisher)) => {
+                Ok(Role::Receive(publisher))
+            }
+            _ => Err(Reason::Senders),
+        },
     }
 }
 
@@ -134,6 +135,8 @@ pub(super) struct Direct {
     /// All legs of one role; a publisher selects them together.
     pub(super) legs: Vec<Attempt>,
     retry: Instant,
+    /// Why the last attempt closed, until the next one starts.
+    closed: Option<Reason>,
 }
 
 pub(super) struct Attempt {
@@ -160,7 +163,29 @@ impl Direct {
             asked: false,
             legs: Vec::new(),
             retry: Instant::now(),
+            closed: None,
         }
+    }
+
+    /// `upload` tells whether the publisher's probed upload carries the
+    /// stream to every viewer.
+    pub(super) fn route(&self, role: &Result<Role, Reason>, upload: Option<bool>) -> Route {
+        let reason = match role {
+            Err(reason) => *reason,
+            Ok(_) if self.selected() => return Route::Direct,
+            Ok(Role::Send(viewers))
+                if !viewers.iter().all(|viewer| self.ready.contains(viewer)) =>
+            {
+                Reason::Viewer
+            }
+            Ok(Role::Send(_)) if upload.is_none() => Reason::Measuring,
+            Ok(Role::Send(_)) if upload == Some(false) => Reason::Upload,
+            Ok(_) if !self.legs.is_empty() => Reason::Connecting,
+            Ok(_) if let Some(reason) = self.closed => reason,
+            Ok(Role::Send(_)) => Reason::Connecting,
+            Ok(Role::Receive(_)) => Reason::Sender,
+        };
+        Route::Sfu(reason)
     }
 
     pub(super) fn can_offer(&self) -> bool {
@@ -371,14 +396,18 @@ impl Direct {
         Ok(())
     }
 
-    /// Close every leg and return each peer with its attempt.
+    /// Close every leg for `cause`, `None` for a role change, and return each
+    /// peer with its attempt.
     pub(super) async fn close(
         &mut self,
         worker: &mut Worker,
         publish: Option<&mut Leg>,
+        cause: Option<Reason>,
     ) -> Result<Vec<(u64, [u8; 16])>, Error> {
         self.retry = Instant::now() + COOLDOWN;
         let legs = std::mem::take(&mut self.legs);
+        let connected = legs.iter().all(|attempt| attempt.transport.connected);
+        self.closed = cause.map(|cause| if connected { cause } else { Reason::Failed });
         let retired = match publish.filter(|_| legs.iter().any(|leg| leg.transport.selected)) {
             Some(publish) => {
                 // Switching retires the selected direct send legs in the worker.
@@ -583,14 +612,44 @@ mod tests {
             purpose: Purpose::ScreenVideo,
             publisher: Some(publisher),
         };
-        assert_eq!(role(&[2], true, &[]), Some(Role::Send(vec![2])));
-        assert_eq!(role(&[2, 3], true, &[]), Some(Role::Send(vec![2, 3])));
-        assert_eq!(role(&[2, 3, 4], true, &[]), None);
-        assert_eq!(role(&[], true, &[]), None);
-        assert_eq!(role(&[2], true, &[screen(2)]), None);
-        assert_eq!(role(&[2, 3], false, &[screen(2)]), Some(Role::Receive(2)));
-        assert_eq!(role(&[2, 3], false, &[screen(2), screen(3)]), None);
-        assert_eq!(role(&[2], false, &[]), None);
+        assert_eq!(role(&[2], true, &[]), Ok(Role::Send(vec![2])));
+        assert_eq!(role(&[2, 3], true, &[]), Ok(Role::Send(vec![2, 3])));
+        assert_eq!(role(&[2, 3, 4], true, &[]), Err(Reason::Viewers));
+        assert_eq!(role(&[], true, &[]), Err(Reason::Viewer));
+        assert_eq!(role(&[2], true, &[screen(2)]), Err(Reason::TwoWay));
+        assert_eq!(role(&[2, 3], false, &[screen(2)]), Ok(Role::Receive(2)));
+        assert_eq!(
+            role(&[2, 3], false, &[screen(2), screen(3)]),
+            Err(Reason::Senders)
+        );
+        assert_eq!(role(&[2], false, &[]), Err(Reason::Sender));
+    }
+
+    #[test]
+    fn the_route_names_why_video_stays_on_the_sfu() {
+        let mut direct = Direct::new("127.0.0.1".parse().unwrap(), &[]);
+        let send = Ok(Role::Send(vec![2, 3]));
+        let receive = Ok(Role::Receive(2));
+        let sfu = |reason| Route::Sfu(reason);
+        let fits = Some(true);
+        assert_eq!(
+            direct.route(&Err(Reason::TwoWay), fits),
+            sfu(Reason::TwoWay)
+        );
+        direct.ready.push(2);
+        assert_eq!(direct.route(&send, fits), sfu(Reason::Viewer));
+        direct.ready.push(3);
+        assert_eq!(direct.route(&send, None), sfu(Reason::Measuring));
+        assert_eq!(direct.route(&send, Some(false)), sfu(Reason::Upload));
+        assert_eq!(direct.route(&send, fits), sfu(Reason::Connecting));
+        direct.closed = Some(Reason::Failed);
+        assert_eq!(direct.route(&send, fits), sfu(Reason::Failed));
+        assert_eq!(direct.route(&receive, None), sfu(Reason::Failed));
+        direct.closed = Some(Reason::Upload);
+        assert_eq!(direct.route(&send, fits), sfu(Reason::Upload));
+        direct.closed = None;
+        assert_eq!(direct.route(&send, fits), sfu(Reason::Connecting));
+        assert_eq!(direct.route(&receive, None), sfu(Reason::Sender));
     }
 
     #[test]

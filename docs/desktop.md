@@ -229,10 +229,11 @@ The **Quality** dropdown selects a resolution and frame-rate ceiling. With
 received resolution. A 1440p tier can carry 3440 × 1440 when the capture,
 encoder and connection support it. Open **Video options** and choose
 **Video stats** for delivered dimensions, frame rate, encoded payload rate
-and the current route. Presenters also see the server ceiling, estimated
-budget and encoder target for the selected source. The stats overlay leaves
-the video size unchanged. Viewer Auto fits the video tile and requests at
-least the 1080p tier for screen shares to keep text readable.
+and the current route. On the call server, the route names the reason, such
+as "relay-only" or "upload too low for direct". Presenters also see the server
+ceiling, estimated budget and encoder target for the selected source. The
+stats overlay leaves the video size unchanged. Viewer Auto fits the video tile
+and requests at least the 1080p tier for screen shares to keep text readable.
 
 A native presenter can send its video directly to one or two native viewers
 when 80 % of its upload carries the video to each of them, and returns to the

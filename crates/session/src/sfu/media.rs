@@ -76,10 +76,9 @@ pub enum MediaEvent {
         publisher: u64,
         purpose: Purpose,
     },
-    /// The active media path changed. The SFU stays available for fallback.
-    Direct {
-        active: bool,
-    },
+    /// The path of this endpoint's video changed. The SFU stays available
+    /// for fallback.
+    Route(Route),
     /// A negotiated video source was removed while the publisher stayed in the room.
     SourceEnded {
         publisher: u64,
@@ -93,6 +92,37 @@ pub enum MediaEvent {
         key_frame: bool,
         data: Vec<u8>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    Direct,
+    Sfu(Reason),
+}
+
+/// Why video stays on the SFU (docs/video-plan.md §5.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    /// This endpoint is in relay-only mode.
+    RelayOnly,
+    /// This endpoint sends and receives video.
+    TwoWay,
+    /// More than two people receive this publisher's video.
+    Viewers,
+    /// This viewer receives video from several publishers.
+    Senders,
+    /// A viewer has not asked for a direct leg: it is a browser, relay-only or
+    /// still starting, or nobody watches.
+    Viewer,
+    /// The publisher has not offered a direct leg.
+    Sender,
+    /// No fresh probe of the upload exists yet.
+    Measuring,
+    /// 80 % of the probed upload is below the stream rate for every viewer.
+    Upload,
+    Connecting,
+    /// A direct leg failed to connect or lost its connection.
+    Failed,
 }
 
 enum QueuedEvent {
@@ -832,7 +862,9 @@ async fn run(
         .map(|peer| peer.id)
         .collect();
     let mut remotes = HashSet::new();
-    let mut role = None;
+    let mut role = Err(Reason::Sender);
+    let mut upload = None;
+    let mut reported = None;
     let mut key_tick = interval(Duration::from_millis(250));
     key_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut offered: Option<Description> = None;
@@ -878,9 +910,17 @@ async fn run(
     let mut send_gates = std::array::from_fn::<_, 2, _>(|_| FrameGate::new());
     let mut sequence = [0_u64; 2];
     loop {
+        let route = direct
+            .as_ref()
+            .map_or(Route::Sfu(Reason::RelayOnly), |direct| {
+                direct.route(&role, upload)
+            });
+        if reported.replace(route) != Some(route) && !output.call(MediaEvent::Route(route)).await {
+            return Ok(());
+        }
         let selected = direct.as_ref().is_some_and(Direct::selected);
-        let sending_direct = selected && matches!(role, Some(Role::Send(_)));
-        let receiving_direct = selected && matches!(role, Some(Role::Receive(_)));
+        let sending_direct = selected && matches!(role, Ok(Role::Send(_)));
+        let receiving_direct = selected && matches!(role, Ok(Role::Receive(_)));
         let attempting_direct = direct
             .as_ref()
             .is_some_and(|direct| !direct.legs.is_empty())
@@ -891,6 +931,7 @@ async fn run(
         let subscribe_wake = subscribe.wake;
         let next_quality = quality.next_request(&subscribed);
         let mut retreat = false;
+        let mut cause = Some(Reason::Failed);
         tokio::select! {
             message = connection.next() => match message? {
                 ServerMessage::Joined { peer, .. } => {
@@ -962,9 +1003,9 @@ async fn run(
                     {
                         // `publisher` names this endpoint's authenticated side of the pair.
                         let paired = match &role {
-                            Some(Role::Send(viewers)) => publisher && viewers.contains(&from),
-                            Some(Role::Receive(sender)) => !publisher && *sender == from,
-                            None => false,
+                            Ok(Role::Send(viewers)) => publisher && viewers.contains(&from),
+                            Ok(Role::Receive(sender)) => !publisher && *sender == from,
+                            Err(_) => false,
                         };
                         let result = match signal {
                             Signal::Ready if publisher => {
@@ -990,6 +1031,9 @@ async fn run(
                             }
                             Signal::Close { id } => {
                                 retreat = direct.legs.iter().any(|attempt| attempt.peer == from && attempt.id == id);
+                                if !publisher {
+                                    cause = Some(Reason::Sender);
+                                }
                                 Ok(())
                             }
                             _ => Ok(()),
@@ -1120,7 +1164,7 @@ async fn run(
             }
             result = direct::next_prepared(&mut discovery) => {
                 discovery = None;
-                if let (Some(direct), Some(role)) = (&mut direct, &role) {
+                if let (Some(direct), Ok(role)) = (&mut direct, &role) {
                     let publisher = matches!(role, Role::Send(_));
                     retreat = match result {
                         Ok(prepared) => match direct.complete(worker, codec, prepared).await {
@@ -1141,7 +1185,7 @@ async fn run(
             }
             () = wake(subscribe_wake) => { drain(worker, &mut subscribe, !receiving_direct, false, &output).await?; }
             () = wake(direct_wake) => {
-                let receiving = matches!(role, Some(Role::Receive(_)));
+                let receiving = matches!(role, Ok(Role::Receive(_)));
                 let now = Instant::now();
                 for attempt in direct.iter_mut().flat_map(|direct| &mut direct.legs) {
                     if attempt.answered && attempt.transport.wake.is_some_and(|at| at <= now) {
@@ -1246,7 +1290,10 @@ async fn run(
         };
         let publishing = source.tracks.iter().any(Option::is_some);
         let next_role = direct::role(&peers, publishing, &subscribed);
-        retreat |= next_role != role;
+        if next_role != role {
+            retreat = true;
+            cause = None;
+        }
         let desired = source
             .tracks
             .iter()
@@ -1263,20 +1310,24 @@ async fn run(
         if let Some(desired) = desired
             && direct.selected()
         {
-            retreat |= direct.legs.iter().any(|attempt| {
+            let slow = direct.legs.iter().any(|attempt| {
                 attempt
                     .transport
                     .bandwidth
                     .is_some_and(|(_, rate)| !direct::sustains(rate, desired))
             });
+            if slow {
+                retreat = true;
+                cause = Some(Reason::Upload);
+            }
         }
         if retreat {
             discovery = None;
-            if let Some(current) = &role {
+            if let Ok(current) = &role {
                 let sender = matches!(current, Role::Send(_));
                 let was_selected = direct.selected();
                 let closed = direct
-                    .close(worker, publish.as_mut().filter(|_| sender))
+                    .close(worker, publish.as_mut().filter(|_| sender), cause)
                     .await?;
                 for (peer, id) in closed {
                     let _ = direct::send(connection, peer, sender, &Signal::Close { id }).await;
@@ -1299,9 +1350,6 @@ async fn run(
                             }
                         }
                     }
-                    if !output.call(MediaEvent::Direct { active: false }).await {
-                        return Ok(());
-                    }
                 }
             }
         }
@@ -1309,10 +1357,16 @@ async fn run(
             role = next_role;
             direct.asked = false;
         }
+        upload = match (&role, &publish, desired) {
+            (Ok(Role::Send(viewers)), Some(publish), Some(desired)) => {
+                direct::upload(publish.bandwidth, desired, viewers.len())
+            }
+            _ => None,
+        };
         match &role {
             // Verify that the fallback can deliver this publisher's media before
             // requesting a direct route. A grant can arrive before the sender rotates.
-            Some(Role::Receive(publisher)) => {
+            Ok(Role::Receive(publisher)) => {
                 if !direct.asked
                     && subscribe
                         .video_gates
@@ -1332,21 +1386,16 @@ async fn run(
                         .await
                         .is_err()
                     {
-                        direct.close(worker, None).await?;
+                        direct.close(worker, None, Some(Reason::Failed)).await?;
                     }
                 }
             }
-            Some(Role::Send(viewers)) => {
+            Ok(Role::Send(viewers)) => {
                 // 80 % of the probed upload carries the stream to every viewer.
-                let Some(publish) = publish.as_ref() else {
-                    continue;
-                };
                 if direct.selected()
+                    || upload != Some(true)
                     || !sending.iter().any(Option::is_some)
                     || !viewers.iter().all(|viewer| direct.ready.contains(viewer))
-                    || !desired.is_some_and(|desired| {
-                        direct::upload(publish.bandwidth, desired, viewers.len()) == Some(true)
-                    })
                 {
                     continue;
                 }
@@ -1379,7 +1428,7 @@ async fn run(
                         .kind,
                     Reply::Done,
                 ) {
-                    for (peer, id) in direct.close(worker, None).await? {
+                    for (peer, id) in direct.close(worker, None, Some(Reason::Failed)).await? {
                         let _ = direct::send(connection, peer, true, &Signal::Close { id }).await;
                     }
                     continue;
@@ -1396,11 +1445,8 @@ async fn run(
                         output.keyframe(index);
                     }
                 }
-                if !output.call(MediaEvent::Direct { active: true }).await {
-                    return Ok(());
-                }
             }
-            None => {}
+            Err(_) => {}
         }
     }
 }
@@ -1543,7 +1589,6 @@ async fn drain(
                     contiguous,
                     key_frame,
                 } if receiving => {
-                    let upgrading = leg.id >= rtc::FIRST_DIRECT_LEG && !leg.selected;
                     let Some(gate) = leg.video_gates.get_mut(&(publisher, purpose)) else {
                         continue;
                     };
@@ -1561,17 +1606,8 @@ async fn drain(
                             .is_ok()
                     {
                         gate.arrived(key_frame);
-                        if upgrading {
-                            leg.selected = true;
-                            if output
-                                .events
-                                .send(Ok(QueuedEvent::Call(MediaEvent::Direct { active: true })))
-                                .await
-                                .is_err()
-                            {
-                                return Ok(());
-                            }
-                        }
+                        // A delivered frame verifies a direct leg.
+                        leg.selected |= leg.id >= rtc::FIRST_DIRECT_LEG;
                     } else {
                         leg.request_keyframe(worker, publisher, purpose).await?;
                     }

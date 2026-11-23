@@ -189,7 +189,16 @@ async fn two_native_peers_admit_and_signal_through_the_sfu_over_wss() {
             .await
             .unwrap();
         write(&mut alice.socket, &ClientMessage::End).await.unwrap();
-        let event = timeout(HANDSHAKE, bob.next()).await.unwrap();
+        let event = timeout(HANDSHAKE, async {
+            loop {
+                match bob.next().await {
+                    Some(Ok(MediaEvent::Route(_))) => {}
+                    event => return event,
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert!(matches!(event, Some(Err(Error::Refused(reason))) if reason == "ended"));
         bob.stop().await.unwrap();
     }

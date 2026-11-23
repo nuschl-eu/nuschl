@@ -6,7 +6,7 @@ use super::{
     video_kind,
 };
 use futures_util::{FutureExt as _, future::BoxFuture, stream::FuturesUnordered};
-use nuschl_client::native::sfu::{Media, MediaEvent, Purpose, VideoKind};
+use nuschl_client::native::sfu::{Media, MediaEvent, Purpose, Reason, Route, VideoKind};
 use nuschl_ipc::video::{Capture, CaptureLimits, Error, Source, VideoFrame};
 #[cfg(target_os = "linux")]
 use nuschl_ipc::video::{CaptureFailure, portal};
@@ -106,7 +106,7 @@ pub(super) struct Publisher {
     pub reopening: Option<Reopening>,
     next_preview: u64,
     estimate: Option<u64>,
-    direct: bool,
+    route: Route,
     relay_only: bool,
 }
 
@@ -118,7 +118,7 @@ impl Publisher {
             reopening: None,
             next_preview: 0,
             estimate: None,
-            direct: false,
+            route: Route::Sfu(Reason::Connecting),
             relay_only,
         }
     }
@@ -151,7 +151,7 @@ impl Publisher {
             kind: video_kind(source),
             remote: None,
             remote_limit: None,
-            direct: self.direct,
+            direct: self.route == Route::Direct,
             bitrate_estimate: None,
             hardware: None,
             capture_format: None,
@@ -196,7 +196,7 @@ impl Publisher {
         });
         tracing::info!(target: "nuschl_capture", ?source, mode = ?attempt.mode, attempt = attempt.number, "capture worker started");
         let mut stats = stats::Stats::new(self.relay_only, Instant::now());
-        stats.direct(self.direct);
+        stats.route(self.route);
         self.slots[index(source)] = Some(LocalVideo {
             capture,
             preview,
@@ -346,12 +346,15 @@ impl Publisher {
                 }
             }
             MediaEvent::BandwidthEstimate { bitrate } => self.estimate = Some(bitrate),
-            MediaEvent::Direct { active } => {
-                self.direct = active;
-                self.estimate = None;
+            MediaEvent::Route(route) => {
+                let direct = route == Route::Direct;
+                if direct != (self.route == Route::Direct) {
+                    self.estimate = None;
+                }
+                self.route = route;
                 for track in self.slots.iter_mut().flatten() {
-                    track.encoding.direct = active;
-                    track.stats.direct(active);
+                    track.encoding.direct = direct;
+                    track.stats.route(route);
                 }
             }
             _ => {}
