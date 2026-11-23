@@ -1583,7 +1583,7 @@ async fn a_listener_that_loses_listen_ends_for_stock_and_nuschl_clients() {
         let state = fixture.running.server.lock();
         state.persist_channel(radio);
         let message = state.channel_state(state.channels.get(radio).unwrap(), 0);
-        state.broadcast_channel_state(&message);
+        state.broadcast_channel_state(&message, true);
     }
     for client in [&mut alice, &mut carol] {
         client

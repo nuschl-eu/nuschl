@@ -37,6 +37,9 @@ const OWNED: u32 = 2;
 const PRIVATE: u32 = 3;
 /// A temporary channel the owner made.
 const TEMP: u32 = i32::MAX as u32;
+/// A Private channel ([`Fixture::add_secret`]) and its subchannel.
+const SECRET: u32 = 5;
+const INNER: u32 = 6;
 
 const ADMIN: u32 = 2;
 const OWNER: u32 = 3;
@@ -1886,6 +1889,343 @@ fn a_listener_ends_when_unregistering_takes_its_listen_away() {
     assert!(!f.state.registry.users.contains_key(&REGISTERED));
     assert!(listening(&f, registered).is_empty());
     assert_eq!(told(&mut f, guest, registered), (vec![PRIVATE], vec![]));
+}
+
+// ---- what each client sees (#341) ----
+
+impl Fixture {
+    /// A Private channel below the root, as the channel type stores it
+    /// (`@all` denied and `@admin` allowed Traverse, Enter, Listen, Speak,
+    /// Whisper, Text message, here and in subchannels), with the member's row
+    /// and Write for the owner, and a subchannel; created at once, as a
+    /// client would see a channel created with its rules.
+    fn add_secret(&mut self) {
+        let access = perm::TRAVERSE
+            | perm::ENTER
+            | perm::LISTEN
+            | perm::SPEAK
+            | perm::WHISPER
+            | perm::TEXT_MESSAGE;
+        let mut secret = Channel::new(SECRET, Some(0), "Secret".into());
+        secret.node.acls = vec![
+            entry("all", None, 0, access),
+            entry("admin", None, access, 0),
+            entry("", Some(MEMBER), access, 0),
+            entry("", Some(OWNER), perm::WRITE, 0),
+        ];
+        secret.children.push(INNER);
+        let inner = Channel::new(INNER, Some(SECRET), "Inner".into());
+        for channel in [secret, inner] {
+            self.state
+                .conversations
+                .add_channel(channel.conversation_id, channel.id);
+            self.state.channels.0.insert(channel.id, channel);
+        }
+        if let Some(root) = self.state.channels.get_mut(0) {
+            root.children.push(SECRET);
+        }
+        self.state.invalidate();
+        self.state.channel_added(SECRET);
+        self.state.channel_added(INNER);
+    }
+
+    fn hidden(&self, kind: &str) -> Vec<u32> {
+        self.state.users[&self.actor(kind)]
+            .hidden
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+/// What a client heard about channels and people: added or changed channels,
+/// removed channels, users shown, users removed (each in order).
+#[derive(Debug, Default, PartialEq)]
+struct Heard {
+    channels: Vec<u32>,
+    removed_channels: Vec<u32>,
+    users: Vec<u32>,
+    removed_users: Vec<u32>,
+}
+
+impl Heard {
+    fn of(frames: &[(u16, Bytes)]) -> Self {
+        use prost::Message as _;
+        let mut heard = Self::default();
+        for (kind, payload) in frames {
+            match *kind {
+                kind::CHANNEL_STATE => heard.channels.extend(
+                    proto::ChannelState::decode(payload.clone())
+                        .unwrap()
+                        .channel_id,
+                ),
+                kind::CHANNEL_REMOVE => heard.removed_channels.push(
+                    proto::ChannelRemove::decode(payload.clone())
+                        .unwrap()
+                        .channel_id,
+                ),
+                kind::USER_STATE => heard
+                    .users
+                    .extend(proto::UserState::decode(payload.clone()).unwrap().session),
+                kind::USER_REMOVE => heard
+                    .removed_users
+                    .push(proto::UserRemove::decode(payload.clone()).unwrap().session),
+                _ => {}
+            }
+        }
+        heard
+    }
+}
+
+#[test]
+fn a_private_channel_and_its_subtree_reach_only_those_who_may_traverse_it() {
+    let mut f = Fixture::new(Config::default());
+    for session in f.actors {
+        f.received(session);
+    }
+    f.add_secret();
+    assert_eq!(f.state.guarded_channels(), [SECRET, INNER]);
+    // SuperUser and the administrators (Write at the root), the owner (Write
+    // in the channel) and the member (allowed by name) see both.
+    for kind in ["superuser", "admin", "owner", "member"] {
+        assert_eq!(f.hidden(kind), [] as [u32; 0], "{kind}");
+        let session = f.actor(kind);
+        assert_eq!(
+            Heard::of(&f.received(session)).channels,
+            [SECRET, INNER],
+            "{kind}"
+        );
+    }
+    // Nobody else hears of them.
+    for kind in ["registered", "guest", "anonymous"] {
+        assert_eq!(f.hidden(kind), [SECRET, INNER], "{kind}");
+        let session = f.actor(kind);
+        assert_eq!(Heard::of(&f.received(session)), Heard::default(), "{kind}");
+        assert!(!f.state.sees_channel(session, SECRET));
+        assert!(!f.state.sees_channel(session, INNER));
+    }
+    // Write at the root sees a channel that denies the administrators.
+    f.state
+        .channels
+        .get_mut(SECRET)
+        .unwrap()
+        .node
+        .acls
+        .push(entry("admin", None, 0, perm::TRAVERSE | perm::WRITE));
+    f.state.authz_changed(crate::conversations::Scope::All);
+    f.state.invalidate();
+    f.state.finish();
+    assert_eq!(f.hidden("admin"), [] as [u32; 0]);
+}
+
+#[test]
+fn people_in_a_private_channel_come_and_go_as_seen_from_outside() {
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, anonymous] = f.actors;
+    for session in f.actors {
+        f.received(session);
+    }
+    // The member goes in: outside, it leaves.
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.state.users[&member].channel, SECRET);
+    assert_eq!(Heard::of(&f.received(anonymous)).removed_users, [member]);
+    assert!(!f.state.sees_user(anonymous, member));
+    assert_eq!(Heard::of(&f.received(admin)).users, [member]);
+    // And comes back.
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(LOBBY),
+            ..Default::default()
+        },
+    );
+    let back = f.received(anonymous);
+    assert!(
+        Heard::of(&back)
+            .users
+            .iter()
+            .all(|session| *session == member)
+    );
+    let state = back
+        .iter()
+        .find(|(kind, _)| *kind == kind::USER_STATE)
+        .map(|(_, payload)| {
+            use prost::Message as _;
+            proto::UserState::decode(payload.clone()).unwrap()
+        })
+        .unwrap();
+    assert_eq!(
+        (state.name.as_deref(), state.channel_id),
+        (Some("member"), Some(LOBBY)),
+        "the whole user, as for someone who connects"
+    );
+
+    // Moved in by an administrator, a registered user sees the channel it is
+    // in (before it hears of the move) without its subchannel, and loses it
+    // again after leaving.
+    f.received(registered);
+    f.handle(
+        admin,
+        kind::USER_STATE,
+        &proto::UserState {
+            session: Some(registered),
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.hidden("registered"), [INNER]);
+    let heard = Heard::of(&f.received(registered));
+    assert_eq!(heard.channels, [SECRET]);
+    assert_eq!(heard.users, [registered]);
+    assert_eq!(
+        Heard::of(&f.received(anonymous)).removed_users,
+        [registered]
+    );
+    f.handle(
+        registered,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(LOBBY),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.hidden("registered"), [SECRET, INNER]);
+    let heard = f.received(registered);
+    let kinds: Vec<u16> = heard.iter().map(|(kind, _)| *kind).collect();
+    let moved = kinds.iter().position(|kind| *kind == kind::USER_STATE);
+    let removed = kinds.iter().position(|kind| *kind == kind::CHANNEL_REMOVE);
+    assert!(moved < removed, "its move first, then the channel goes");
+    assert_eq!(Heard::of(&heard).removed_channels, [SECRET]);
+}
+
+#[test]
+fn group_membership_shows_and_hides_a_private_channel_with_its_people() {
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(INNER),
+            ..Default::default()
+        },
+    );
+    // SuperUser may not speak: suppressed once permissions are evaluated.
+    f.state.permissions_changed(None);
+    f.received(registered);
+    let acl = |members: Vec<u32>| {
+        let access = perm::TRAVERSE
+            | perm::ENTER
+            | perm::LISTEN
+            | perm::SPEAK
+            | perm::WHISPER
+            | perm::TEXT_MESSAGE;
+        let rule = |group: &str, user_id: Option<u32>, grant, deny| proto::acl::ChanAcl {
+            apply_here: Some(true),
+            apply_subs: Some(true),
+            group: user_id.is_none().then(|| group.to_owned()),
+            user_id,
+            grant: Some(grant),
+            deny: Some(deny),
+            ..Default::default()
+        };
+        proto::Acl {
+            channel_id: SECRET,
+            inherit_acls: Some(true),
+            groups: vec![proto::acl::ChanGroup {
+                name: "admin".into(),
+                inherit: Some(true),
+                inheritable: Some(true),
+                add: members,
+                ..Default::default()
+            }],
+            acls: vec![
+                rule("all", None, 0, access),
+                rule("admin", None, access, 0),
+                rule("", Some(MEMBER), access, 0),
+            ],
+            ..Default::default()
+        }
+    };
+    // Added to the channel's admin group: the channel, its subchannel and
+    // the member in it appear, parents first, then the people.
+    f.handle(admin, kind::ACL, &acl(vec![REGISTERED]));
+    assert_eq!(f.hidden("registered"), [] as [u32; 0]);
+    let heard = Heard::of(&f.received(registered));
+    assert_eq!(heard.channels, [SECRET, INNER]);
+    assert_eq!(heard.users, [member]);
+    // Removed: the people first, then the channels, children first.
+    f.handle(admin, kind::ACL, &acl(Vec::new()));
+    assert_eq!(f.hidden("registered"), [SECRET, INNER]);
+    let heard = Heard::of(&f.received(registered));
+    assert_eq!(heard.removed_users, [member]);
+    assert_eq!(heard.removed_channels, [INNER, SECRET]);
+}
+
+#[test]
+fn a_new_channel_reaches_only_those_who_see_it() {
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, anonymous] = f.actors;
+    for session in f.actors {
+        f.received(session);
+    }
+    f.handle(
+        admin,
+        kind::CHANNEL_STATE,
+        &proto::ChannelState {
+            parent: Some(INNER),
+            name: Some("Deeper".into()),
+            ..Default::default()
+        },
+    );
+    let deeper = Heard::of(&f.received(member)).channels;
+    assert_eq!(deeper.len(), 1);
+    assert!(f.state.channels.get(deeper[0]).is_some());
+    assert_eq!(Heard::of(&f.received(registered)), Heard::default());
+    assert!(f.state.users[&registered].hidden.contains(&deeper[0]));
+    // Removed again: only those who knew it hear of it.
+    f.handle(
+        admin,
+        kind::CHANNEL_REMOVE,
+        &proto::ChannelRemove {
+            channel_id: deeper[0],
+        },
+    );
+    assert_eq!(Heard::of(&f.received(member)).removed_channels, deeper);
+    assert_eq!(Heard::of(&f.received(registered)), Heard::default());
+    assert!(!f.state.users[&registered].hidden.contains(&deeper[0]));
+
+    // A temporary channel in view: everyone who sees it sees the creator
+    // move in, nobody sees it leave.
+    f.received(anonymous);
+    f.handle(
+        registered,
+        kind::CHANNEL_STATE,
+        &proto::ChannelState {
+            parent: Some(LOBBY),
+            name: Some("Talk".into()),
+            temporary: Some(true),
+            ..Default::default()
+        },
+    );
+    let talk = f.state.users[&registered].channel;
+    assert!(f.state.channels.get(talk).is_some_and(|c| c.temporary));
+    let heard = Heard::of(&f.received(anonymous));
+    assert_eq!(
+        (heard.channels, heard.users, heard.removed_users),
+        (vec![talk], vec![registered], vec![])
+    );
 }
 
 // ---- nothing else decides ----

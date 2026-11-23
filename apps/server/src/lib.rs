@@ -36,6 +36,7 @@ pub mod text;
 pub mod timefmt;
 pub mod tls;
 pub mod udp;
+pub mod visibility;
 
 /// The ACL engine's data types (its evaluation is private to [`authz`]).
 pub use authz::acl;

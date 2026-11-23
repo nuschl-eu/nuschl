@@ -1169,26 +1169,6 @@ impl State {
         }
     }
 
-    /// Send a `ChannelState` to everyone; Nuschl connections also get the
-    /// channel's extension properties, stock clients never see them.
-    pub fn broadcast_channel_state(&self, message: &proto::ChannelState) {
-        let Some(plain) =
-            nuschl_protocol::encode_control(nuschl_protocol::kind::CHANNEL_STATE, message)
-        else {
-            return;
-        };
-        let extended = message
-            .channel_id
-            .and_then(|id| self.channels.get(id))
-            .and_then(|channel| nuschl::channel_state_frame(message, self.channel_info(channel)));
-        for user in self.users.values() {
-            match (&extended, &user.extension) {
-                (Some(frame), Some(_)) => user.link.send(frame.clone()),
-                _ => user.link.send(plain.clone()),
-            }
-        }
-    }
-
     fn channel_settings(
         &mut self,
         session: u32,
@@ -1248,10 +1228,13 @@ impl State {
             changed = true;
         }
         if changed {
-            self.broadcast_channel_state(&proto::ChannelState {
-                channel_id: Some(channel),
-                ..Default::default()
-            });
+            self.broadcast_channel_state(
+                &proto::ChannelState {
+                    channel_id: Some(channel),
+                    ..Default::default()
+                },
+                true,
+            );
         }
         self.send(
             session,

@@ -262,6 +262,7 @@ impl State {
         // authorisation change before the lock is released (docs/extension.md
         // §5): a listener that lost Listen no longer makes its channel readable.
         self.revoke_listeners();
+        self.sync_visibility();
         self.reevaluate();
     }
 
@@ -293,6 +294,7 @@ impl State {
             .channels
             .0
             .keys()
+            .filter(|&&channel| self.sees_channel(session, channel))
             .map(|&channel| proto::ChannelState {
                 channel_id: Some(channel),
                 can_enter: Some(self.allowed(session, Action::Enter { channel })),
@@ -755,7 +757,7 @@ impl State {
                 message.listening_volume_adjustment.clear();
             }
             if self.settings.config.broadcast_listener_volume_adjustments || !volume_only {
-                self.broadcast(kind::USER_STATE, &message, Some(source));
+                self.broadcast_user(&message, Some(source));
             }
             if registered {
                 self.permissions_changed(Some(target));
@@ -783,6 +785,7 @@ impl State {
             next.users.push(session);
         }
         self.invalidate();
+        self.moved(session, old);
         let may_speak = self.allowed(session, Action::Speak { channel });
         if let Some(user) = self.users.get_mut(&session) {
             if may_speak == user.suppress {
@@ -976,7 +979,8 @@ impl State {
             "{}",
             if ban { "kickbanned" } else { "kicked" }
         );
-        self.broadcast(kind::USER_REMOVE, &message, None);
+        let channel = destination.channel;
+        self.broadcast_user_remove(channel, &message);
         self.disconnect(target, false);
     }
 
@@ -1040,13 +1044,12 @@ impl State {
             self.persist_registration(id);
         }
         if announce {
-            self.broadcast(
-                kind::USER_REMOVE,
+            self.broadcast_user_remove(
+                user.channel,
                 &proto::UserRemove {
                     session,
                     ..Default::default()
                 },
-                None,
             );
         }
         user.link.close();
@@ -1124,8 +1127,7 @@ impl State {
                         if let Some(user) = self.users.get_mut(&session) {
                             user.name = name.clone();
                         }
-                        self.broadcast(
-                            kind::USER_STATE,
+                        self.broadcast_user(
                             &proto::UserState {
                                 session: Some(session),
                                 actor: Some(source),
@@ -1184,8 +1186,7 @@ impl State {
                 user.user_id = None;
                 user.account = None;
             }
-            self.broadcast(
-                kind::USER_STATE,
+            self.broadcast_user(
                 &proto::UserState {
                     session: Some(session),
                     user_id: Some(u32::MAX),
@@ -1734,12 +1735,11 @@ impl State {
                 ..Default::default()
             };
             self.enter_channel(session, target, &mut message);
-            self.broadcast(kind::USER_STATE, &message, None);
+            self.broadcast_user(&message, None);
         }
         for session in listeners {
             self.remove_listener(session, id);
-            self.broadcast(
-                kind::USER_STATE,
+            self.broadcast_user(
                 &proto::UserState {
                     session: Some(session),
                     listening_channel_remove: vec![id],
@@ -1748,11 +1748,7 @@ impl State {
                 None,
             );
         }
-        self.broadcast(
-            kind::CHANNEL_REMOVE,
-            &proto::ChannelRemove { channel_id: id },
-            None,
-        );
+        self.broadcast_channel_remove(id);
         if !temporary {
             self.storage.delete_channel(id);
         }
@@ -1902,7 +1898,7 @@ impl State {
     fn create_channel(
         &mut self,
         source: u32,
-        mut message: proto::ChannelState,
+        message: proto::ChannelState,
         version: &crate::state::ClientInfo,
     ) {
         let (Some(parent), Some(name)) = (message.parent, message.name.clone()) else {
@@ -1967,7 +1963,6 @@ impl State {
             admins.add.insert(user_id);
             channel.node.groups.insert("admin".into(), admins);
         }
-        let description_hash = channel.description_hash;
         self.conversations.add_channel(channel.conversation_id, id);
         self.channels.0.insert(id, channel);
         if let Some(parent) = self.channels.get_mut(parent) {
@@ -1993,12 +1988,7 @@ impl State {
         }
         self.persist_channel(id);
         tracing::info!(actor = %self.log_name(source), channel = id, parent, "added channel");
-        message.channel_id = Some(id);
-        if let Some(hash) = description_hash {
-            message.description = None;
-            message.description_hash = Some(hash.to_vec());
-        }
-        self.broadcast_channel_state(&message);
+        self.channel_added(id);
         if temporary {
             let mut state = proto::UserState {
                 session: Some(source),
@@ -2006,7 +1996,7 @@ impl State {
                 ..Default::default()
             };
             self.enter_channel(source, id, &mut state);
-            self.broadcast(kind::USER_STATE, &state, None);
+            self.broadcast_user(&state, None);
         }
     }
 
@@ -2115,7 +2105,10 @@ impl State {
             message.description = None;
             message.description_hash = Some(hash.to_vec());
         }
-        self.broadcast(kind::CHANNEL_STATE, &message, None);
+        if message.parent.is_some() {
+            self.reveal_to_everyone();
+        }
+        self.broadcast_channel_state(&message, false);
     }
 
     fn link(&mut self, a: u32, b: u32) {
@@ -2332,7 +2325,12 @@ impl State {
             return;
         };
         let restricted = channel.is_enter_restricted();
-        let sessions: Vec<u32> = self.users.keys().copied().collect();
+        let sessions: Vec<u32> = self
+            .users
+            .keys()
+            .copied()
+            .filter(|session| self.sees_channel(*session, id))
+            .collect();
         for session in sessions {
             let state = proto::ChannelState {
                 channel_id: Some(id),

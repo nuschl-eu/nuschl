@@ -278,7 +278,7 @@ impl State {
             ..Default::default()
         };
         self.enter_channel(p.session, p.channel, &mut message);
-        self.broadcast(stock::USER_STATE, &message, None);
+        self.broadcast_user(&message, None);
         self.resolve_knock(id, Some(grant));
         let name = self
             .users

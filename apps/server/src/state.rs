@@ -272,6 +272,10 @@ pub struct User {
     pub plugin_identity: String,
     /// Channel → volume adjustment.
     pub listening: BTreeMap<u32, f32>,
+    /// Channels this client was not told about, or was told are gone: those
+    /// it may not traverse ([`State::hidden_channels`]). It knows a user
+    /// exactly when it knows the user's channel (visibility.rs).
+    pub hidden: BTreeSet<u32>,
     pub targets: HashMap<u8, WhisperTarget>,
     pub target_cache: RefCell<HashMap<u8, TargetCache>>,
     pub voice: Voice,
@@ -957,22 +961,7 @@ impl State {
         limit != 0 && channel.users.len() >= limit as usize
     }
 
-    // ---- sending ----
-
-    /// Encode once and queue for every authenticated user (except one).
-    /// Phase 2: connections that negotiated the Nuschl extension may get a
-    /// second encoding with extension fields; stock clients never do.
-    pub fn broadcast(&self, kind: u16, message: &impl prost::Message, except: Option<u32>) {
-        let Some(frame) = encode_control(kind, message) else {
-            tracing::warn!(kind, "dropped a broadcast larger than clients accept");
-            return;
-        };
-        for user in self.users.values() {
-            if Some(user.session) != except {
-                user.link.send(frame.clone());
-            }
-        }
-    }
+    // ---- sending (what goes to everyone is in visibility.rs) ----
 
     pub fn send(&self, session: u32, kind: u16, message: &impl prost::Message) {
         if let Some(user) = self.users.get(&session) {
@@ -1004,6 +993,7 @@ impl State {
             ),
             position: Some(channel.position),
             max_users: Some(channel.max_users),
+            temporary: channel.temporary.then_some(true),
             is_enter_restricted: Some(channel.is_enter_restricted()),
             can_enter: Some(self.allowed(
                 viewer,
