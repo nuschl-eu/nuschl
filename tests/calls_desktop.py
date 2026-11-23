@@ -402,6 +402,13 @@ class CallTest(VoiceTest):
             eventually(lambda: self.find(cara, "tree item", "Lobby"), "Cara cannot see Lobby").press()
             self.press(cara, "Join voice")
             self.control(self.invitation(cara, inline=False), "Join video call", subtree=True)
+            self.press(cara, "Join video call")
+            self.inline(cara)
+            # The stage replaces the card in the same frame.
+            assert not self.find(cara, "panel", f"Video call · Andi · {self.call_host}"), \
+                "the call stage shows the invitation card of the open call"
+            self.press(cara, "Leave video")
+            self.control(self.invitation(cara, inline=False), "Join video call", subtree=True)
             self.press(andi, "Minimize call")
             own = self.invitation(andi, "You")
             self.copy_link(own, andi_pid, link)

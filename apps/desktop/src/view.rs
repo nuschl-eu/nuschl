@@ -16,11 +16,16 @@ use crate::{
 };
 use gpui_kit::{base::input::Textarea, prelude::*, *};
 use nuschl_client::{
-    HistorySource, SessionSecurity, conversation::Entry, timeline::Message, tree::TreeKey,
+    HistorySource, SessionSecurity, client::Call, conversation::Entry, timeline::Message,
+    tree::TreeKey,
 };
 use nuschl_core::{ContentBlock, TextRole};
 use nuschl_session::connection::{TextTarget, User};
-use std::{cell::Cell, collections::HashMap, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, HashMap},
+    rc::Rc,
+};
 
 // Match the existing rail, splitter, icon controls and composer padding.
 // Viewport fitting preserves the saved sidebar preference.
@@ -3364,39 +3369,13 @@ fn unmatched_call_card(
         .client
         .own_call()
         .filter(|call| call.server == server.id && call.target == *target);
-    let incoming = this.client.calls_in(index, target);
-    if own.is_none() && incoming.is_empty() {
-        return None;
-    }
-    let mut announced: HashMap<&str, Vec<&Message>> = HashMap::new();
-    for message in &channel.timeline.messages {
-        if let Some(url) = invitation_url(message) {
-            announced.entry(url).or_default().push(message);
-        }
-    }
-    let (who, link, inviter) = own
-        .map(|call| ("You", call.link.as_str(), None))
-        .filter(|(_, url, _)| {
-            !announced
-                .get(url)
-                .is_some_and(|rows| rows.iter().any(|message| message.outgoing))
-        })
-        .into_iter()
-        .chain(incoming.iter().filter_map(|call| {
-            if announced
-                .get(call.link.as_str())
-                .is_some_and(|rows| rows.iter().any(|message| call.matches_author(message)))
-            {
-                return None;
-            }
-            let user = server.users.get(&call.sender)?;
-            Some((
-                user.name.as_str(),
-                call.link.as_str(),
-                Some((call.sender, call.sender_instance)),
-            ))
-        }))
-        .find_map(|(who, url, inviter)| Some((who, guest_link(url)?, inviter)))?;
+    let (who, link, inviter) = unmatched_invitation(
+        &server.users,
+        own.map(|call| call.link.as_str()),
+        &this.client.calls_in(index, target),
+        &channel.timeline.messages,
+        this.native_call_in(&server.id, target),
+    )?;
     Some(video_call_card(
         this,
         index,
@@ -3406,6 +3385,52 @@ fn unmatched_call_card(
         &link,
         cx,
     ))
+}
+
+/// Who sent an invitation, its guest link and the inviter's presence.
+type Invitation<'a> = (&'a str, nuschl_stream::Link, Option<(u32, u64)>);
+
+/// The first live invitation whose message the timeline lacks. While this
+/// client is in the call, the call view's controls leave or end it and the
+/// conversation shows no such card.
+fn unmatched_invitation<'a>(
+    users: &'a BTreeMap<u32, User>,
+    own: Option<&'a str>,
+    incoming: &[&'a Call],
+    messages: &[Message],
+    in_call: bool,
+) -> Option<Invitation<'a>> {
+    if in_call || (own.is_none() && incoming.is_empty()) {
+        return None;
+    }
+    let mut announced: HashMap<&str, Vec<&Message>> = HashMap::new();
+    for message in messages {
+        if let Some(url) = invitation_url(message) {
+            announced.entry(url).or_default().push(message);
+        }
+    }
+    own.map(|url| ("You", url, None))
+        .filter(|(_, url, _)| {
+            !announced
+                .get(url)
+                .is_some_and(|rows| rows.iter().any(|message| message.outgoing))
+        })
+        .into_iter()
+        .chain(incoming.iter().filter_map(|&call| {
+            if announced
+                .get(call.link.as_str())
+                .is_some_and(|rows| rows.iter().any(|message| call.matches_author(message)))
+            {
+                return None;
+            }
+            let user = users.get(&call.sender)?;
+            Some((
+                user.name.as_str(),
+                call.link.as_str(),
+                Some((call.sender, call.sender_instance)),
+            ))
+        }))
+        .find_map(|(who, url, inviter)| Some((who, guest_link(url)?, inviter)))
 }
 
 #[derive(Clone, Copy)]
@@ -4906,5 +4931,48 @@ mod viewport_tests {
         assert_eq!(wrapped.sidebar, single.sidebar);
         assert!(!single.dense && wrapped.dense);
         assert_ne!(single.auxiliary, wrapped.auxiliary);
+    }
+}
+
+#[cfg(test)]
+mod call_card_tests {
+    use super::{BTreeMap, Call, TextTarget, User, unmatched_invitation};
+    use nuschl_stream::Link;
+
+    #[test]
+    fn an_invitation_missing_from_the_timeline_shows_outside_its_call() {
+        let url = || {
+            Link::generate("stream.example", &mut getrandom::SysRng)
+                .unwrap()
+                .url()
+        };
+        let (theirs, ours) = (url(), url());
+        let users = BTreeMap::from([(
+            2,
+            User {
+                name: "Andi".into(),
+                ..User::default()
+            },
+        )]);
+        let call = Call {
+            sender: 2,
+            sender_instance: 22,
+            target: TextTarget::Channel(1),
+            link: theirs.clone(),
+        };
+        let card = |own: Option<&str>, incoming: &[&Call], in_call| {
+            unmatched_invitation(&users, own, incoming, &[], in_call)
+                .map(|(who, link, inviter)| (who.to_owned(), link.url(), inviter))
+        };
+        assert_eq!(
+            card(None, &[&call], false),
+            Some(("Andi".into(), theirs, Some((2, 22))))
+        );
+        assert_eq!(card(None, &[&call], true), None);
+        assert_eq!(
+            card(Some(&ours), &[], false),
+            Some(("You".into(), ours.clone(), None))
+        );
+        assert_eq!(card(Some(&ours), &[], true), None);
     }
 }
