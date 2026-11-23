@@ -1,0 +1,98 @@
+--- a/sys/va/gstvaav1enc.c
++++ b/sys/va/gstvaav1enc.c
+@@ -283,6 +283,8 @@
+     guint32 max_qindex;
+     guint32 mbbrc;
+   } rc;
++  /* A new bitrate for the running encoder, applied with the next frame. */
++  gint rate_update;
+ 
+   struct
+   {
+@@ -2551,6 +2553,30 @@
+   self->rc.cpb_length_bits = cpb_bits_size;
+ }
+ 
++/* Recompute the bitrates and the HRD buffer from the bitrate property for
++ * the running encoder. The level and tier stay as configured. */
++static void
++_av1_update_bitrate (GstVaAV1Enc * self)
++{
++  guint bitrate, cpb_size;
++
++  GST_OBJECT_LOCK (self);
++  bitrate = self->prop.bitrate;
++  cpb_size = self->prop.cpb_size;
++  GST_OBJECT_UNLOCK (self);
++
++  self->rc.target_bitrate = bitrate;
++  if (self->rc.rc_ctrl_mode == VA_RC_CBR)
++    self->rc.max_bitrate = bitrate;
++  else
++    self->rc.max_bitrate = (guint) gst_util_uint64_scale_int (bitrate, 100,
++        self->rc.target_percentage);
++  self->rc.cpb_size = cpb_size;
++  _av1_calculate_bitrate_hrd (self);
++
++  GST_INFO_OBJECT (self, "Update target bitrate to %u kbps", bitrate);
++}
++
+ /* Estimates a good enough bitrate if none was supplied */
+ static gboolean
+ _av1_ensure_rate_control (GstVaAV1Enc * self)
+@@ -3896,6 +3922,7 @@
+     self->inside_tu = FALSE;
+   } else {
+     guint size_offset = 0;
++    gboolean rate_update;
+ 
+     g_assert (va_frame->base.picture == NULL);
+     va_frame->base.picture = gst_va_encode_picture_new (base->encoder,
+@@ -3915,6 +3942,11 @@
+       self->inside_tu = FALSE;
+     }
+ 
++    rate_update =
++        g_atomic_int_compare_and_exchange (&self->rate_update, TRUE, FALSE);
++    if (rate_update)
++      _av1_update_bitrate (self);
++
+     /* Repeat the sequence for each key. */
+     if (va_frame->frame_num == 0) {
+       if (!gst_va_base_enc_add_rate_control_parameter (base,
+@@ -3944,6 +3976,19 @@
+       if ((self->packed_headers & VA_ENC_PACKED_HEADER_SEQUENCE) &&
+           !_av1_add_sequence_header (self, va_frame, &size_offset))
+         return GST_FLOW_ERROR;
++    } else if (rate_update) {
++      /* Rate control parameters apply to the current sequence from this
++         frame on, without a new key frame. */
++      if (!gst_va_base_enc_add_rate_control_parameter (base,
++              va_frame->base.picture,
++              self->rc.rc_ctrl_mode, self->rc.max_bitrate_bits,
++              self->rc.target_percentage, self->rc.base_qindex,
++              self->rc.min_qindex, self->rc.max_qindex, self->rc.mbbrc))
++        return GST_FLOW_ERROR;
++
++      if (!gst_va_base_enc_add_hrd_parameter (base, va_frame->base.picture,
++              self->rc.rc_ctrl_mode, self->rc.cpb_length_bits))
++        return GST_FLOW_ERROR;
+     }
+ 
+     if (!_av1_encode_one_frame (self, va_frame, size_offset)) {
+@@ -4245,7 +4290,14 @@
+     case PROP_BITRATE:
+       self->prop.bitrate = g_value_get_uint (value);
+       no_effect = FALSE;
+-      g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
++      /* A running encoder with a bitrate-driven rate control takes a new
++         bitrate with its next frame. Other changes reconfigure it. */
++      if (self->prop.bitrate > 0 && (self->rc.rc_ctrl_mode == VA_RC_CBR
++              || self->rc.rc_ctrl_mode == VA_RC_VBR
++              || self->rc.rc_ctrl_mode == VA_RC_QVBR))
++        g_atomic_int_set (&self->rate_update, TRUE);
++      else
++        g_atomic_int_set (&GST_VA_BASE_ENC (self)->reconf, TRUE);
+       break;
+     case PROP_NUM_TILE_COLS:
+       self->prop.num_tile_cols = g_value_get_uint (value);

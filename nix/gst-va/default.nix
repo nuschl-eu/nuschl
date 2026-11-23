@@ -7,7 +7,10 @@ in
 pkgs.stdenv.mkDerivation {
   pname = "gst-plugins-bad-va";
   inherit (bad) version src;
-  patches = [ ./coded-buffer.patch ];
+  patches = [
+    ./coded-buffer.patch
+    ./rate-update.patch
+  ];
   postPatch = "patchShebangs --build scripts";
   strictDeps = true;
   nativeBuildInputs = [

@@ -265,6 +265,8 @@ context.objects = [
     let updated_at = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             let current = capture.next().await.expect("the encoder keeps running");
+            // VA-API takes a new bitrate within the current sequence.
+            assert!(!hardware || !current.keyframe);
             if current.bitrate_bps == 900_000 {
                 assert!(!current.av1.is_empty());
                 break current.capture_time_us;
@@ -274,7 +276,9 @@ context.objects = [
     .await
     .expect("the new target is applied within the running capture");
     assert!(updated_at > frame.capture_time_us);
-    assert_eq!(capture.next().await.unwrap().bitrate_bps, 900_000);
+    let next = capture.next().await.unwrap();
+    assert_eq!(next.bitrate_bps, 900_000);
+    assert!(!hardware || !next.keyframe);
     let shorter_side = frame.width.min(frame.height);
     let limits = CaptureLimits {
         // The hardware fixture negotiates the encoder's minimum size.
