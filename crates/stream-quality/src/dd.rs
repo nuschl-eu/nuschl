@@ -19,6 +19,8 @@ const MAX_TARGETS: usize = 32;
 /// Frame numbers a receiver's [`Selector`] remembers; a chain's frame diff has
 /// eight bits.
 const HISTORY: usize = 256;
+/// Frame diffs kept per frame; libwebrtc decodes frames with at most five.
+const MAX_FDIFFS: usize = 8;
 /// The window over which [`Layers`] measures rates.
 const WINDOW: Duration = Duration::from_secs(1);
 
@@ -97,8 +99,25 @@ impl Bits<'_> {
 struct Template {
     layer: Target,
     dtis: Dtis,
+    fdiffs: Fdiffs,
     /// Per chain, the frame diff to the previous frame of the chain.
     chains: [u8; MAX_TARGETS],
+}
+
+/// The frame diffs to the frames a frame references, the first [`MAX_FDIFFS`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Fdiffs {
+    diffs: [u16; MAX_FDIFFS],
+    count: u8,
+}
+
+impl Fdiffs {
+    fn push(&mut self, diff: u32) {
+        if let Some(slot) = self.diffs.get_mut(usize::from(self.count)) {
+            *slot = diff as u16;
+            self.count += 1;
+        }
+    }
 }
 
 /// A template dependency structure, sent with key frames.
@@ -127,6 +146,7 @@ impl Structure {
             templates.push(Template {
                 layer,
                 dtis: Dtis::default(),
+                fdiffs: Fdiffs::default(),
                 chains: [0; MAX_TARGETS],
             });
             match bits.read(2)? {
@@ -144,10 +164,9 @@ impl Structure {
         for template in &mut templates {
             template.dtis = Dtis::read(bits, count)?;
         }
-        // Frame diffs matter to decoders; this reads past them.
-        for _ in &templates {
+        for template in &mut templates {
             while bits.flag()? {
-                bits.read(4)?;
+                template.fdiffs.push(bits.read(4)? + 1);
             }
         }
         let chains = bits.ns(count as u32 + 1)?;
@@ -202,6 +221,7 @@ pub struct Frame {
     pub number: u16,
     pub layer: Target,
     dtis: Dtis,
+    fdiffs: Fdiffs,
     /// Per decode target, the frame diff to the previous frame of the chain
     /// protecting it; `None` for a structure without chains.
     chains: Option<[u8; MAX_TARGETS]>,
@@ -210,6 +230,12 @@ pub struct Frame {
 impl Frame {
     pub fn dti(&self, target: usize) -> Dti {
         self.dtis.get(target)
+    }
+
+    /// The frame numbers of the frames this one references.
+    pub fn references(&self) -> impl Iterator<Item = u16> + '_ {
+        let fdiffs = &self.fdiffs.diffs[..usize::from(self.fdiffs.count)];
+        fdiffs.iter().map(|&d| self.number.wrapping_sub(d))
     }
 
     /// The frame diff to the previous frame of the chain protecting `target`.
@@ -300,12 +326,14 @@ impl Layers {
         } else {
             template.dtis
         };
+        let mut fdiffs = template.fdiffs;
         if custom_fdiffs {
+            fdiffs = Fdiffs::default();
             loop {
                 match bits.read(2)? {
                     0 => break,
-                    size => bits.read(4 * size)?,
-                };
+                    size => fdiffs.push(bits.read(4 * size)? + 1),
+                }
             }
         }
         let mut diffs = template.chains;
@@ -327,6 +355,7 @@ impl Layers {
             number,
             layer: template.layer,
             dtis,
+            fdiffs,
             chains,
         };
         if new.is_some() {
@@ -897,6 +926,7 @@ mod tests {
         w.put(7, 8);
         w.put(9, 8);
         let custom = layers.packet(&w.bytes(), 1, Duration::ZERO).expect("valid");
+        assert_eq!(custom.references().collect::<Vec<_>>(), [2, 65523]);
         assert_eq!(custom.chain_diff(0), Some(7));
         assert_eq!(custom.chain_diff(3), Some(9));
     }

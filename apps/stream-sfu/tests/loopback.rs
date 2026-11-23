@@ -6,11 +6,12 @@
 //! reach the named peer only. Wrong proofs, unknown rooms, oversized key
 //! messages and host actions by participants are refused. The call codec
 //! follows the peers' decoders. The creator's lease renews with `host_key`, and
-//! ending it disconnects everyone.
+//! ending it disconnects everyone. Chromium's layered AV1, recorded at the sender
+//! (`tests/fixtures`), reaches each receiver as frames a decoder can use.
 
 use futures_util::{SinkExt, StreamExt};
 use hmac::{KeyInit, Mac};
-use nuschl_stream_quality::{Kind, QualityRequest};
+use nuschl_stream_quality::{Kind, QualityRequest, dd::Layers};
 use nuschl_stream_sfu::quality::{DESCRIPTOR_ID, Descriptor, descriptor_extension};
 use serde_json::{Value, json};
 use std::{
@@ -134,8 +135,162 @@ impl Leg {
 struct Received {
     seq: u64,
     pt: u8,
+    timestamp: u32,
+    marker: bool,
     payload: Vec<u8>,
     descriptor: Option<Descriptor>,
+}
+
+/// One frame of a recorded source (`tests/fixtures/chrome-*.txt`).
+struct Recorded {
+    delay: Duration,
+    timestamp: u32,
+    packets: usize,
+    bytes: usize,
+    marker: bool,
+    first: Vec<u8>,
+    rest: Option<Vec<u8>>,
+}
+
+fn fixture(text: &str) -> Vec<Recorded> {
+    let hex = |text: &str| hex::decode(text).expect("hex");
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let f: Vec<&str> = line.split(' ').collect();
+            let number = |i: usize| f[i].parse::<u64>().expect("a number");
+            Recorded {
+                delay: Duration::from_millis(number(0)),
+                timestamp: number(1) as u32,
+                packets: number(2) as usize,
+                bytes: number(3) as usize,
+                marker: f[4] == "1",
+                first: hex(f[5]),
+                rest: (f[6] != "-").then(|| hex(f[6])),
+            }
+        })
+        .collect()
+}
+
+/// A recorded source sent frame by frame at its recorded pace. The end of the
+/// recording, and a key frame request after [`KEY_DELAY`], start it over at its
+/// key picture; frame numbers and timestamps keep rising.
+struct Replay {
+    frames: Vec<Recorded>,
+    next: usize,
+    /// Added to the recorded frame numbers.
+    offset: u16,
+    number: u16,
+    timestamp: u32,
+    sent_at: Option<Instant>,
+    restart: Option<Instant>,
+}
+
+/// How long a replayed publisher takes to answer a key frame request, like a
+/// busy encoder: frames already on their way arrive first.
+const KEY_DELAY: Duration = Duration::from_millis(250);
+
+impl Replay {
+    fn new(frames: Vec<Recorded>) -> Self {
+        Self {
+            frames,
+            next: 0,
+            offset: 0,
+            number: 0,
+            timestamp: 0,
+            sent_at: None,
+            restart: None,
+        }
+    }
+}
+
+/// What a libwebrtc receiver can decode of `packets`: a frame is whole when its
+/// packets from start to end have consecutive sequence numbers, and decodable
+/// when every frame it references is. Every temporal unit of whole frames but
+/// the last, which may still be arriving, must end with exactly one marker, on
+/// its last packet. Returns the decodable frames' numbers and spatial layers,
+/// and the whole frames that are not decodable.
+fn decodable(packets: &[Received]) -> (Vec<(u16, u8)>, Vec<u16>) {
+    // Retransmissions arrive late.
+    let mut sorted: Vec<&Received> = packets.iter().collect();
+    sorted.sort_by_key(|p| p.seq);
+    #[derive(Default)]
+    struct Frame {
+        number: u16,
+        start: Option<u64>,
+        end: Option<u64>,
+        packets: u64,
+        spatial: u8,
+        references: Vec<u16>,
+    }
+    let mut layers = Layers::default();
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut indices = HashMap::new();
+    for &packet in &sorted {
+        let descriptor = packet.descriptor.as_ref().expect("a descriptor");
+        let Some(frame) = layers.packet(&descriptor.0, 0, Duration::ZERO) else {
+            continue;
+        };
+        let index = *indices.entry(frame.number).or_insert_with(|| {
+            frames.push(Frame {
+                number: frame.number,
+                spatial: frame.layer.spatial,
+                ..Frame::default()
+            });
+            frames.len() - 1
+        });
+        let entry = &mut frames[index];
+        entry.packets += 1;
+        if frame.start {
+            entry.start = Some(packet.seq);
+            entry.references = frame.references().collect();
+        }
+        if frame.end {
+            entry.end = Some(packet.seq);
+        }
+    }
+    let whole = |frame: &Frame| {
+        let (Some(start), Some(end)) = (frame.start, frame.end) else {
+            return false;
+        };
+        end + 1 - start == frame.packets
+    };
+    // The last unit may still be arriving.
+    let units: Vec<&[&Received]> = sorted.chunk_by(|a, b| a.timestamp == b.timestamp).collect();
+    for unit in units.iter().rev().skip(1) {
+        let numbers = unit
+            .iter()
+            .filter_map(|p| Some(p.descriptor.as_ref()?.0[1..3].to_vec()));
+        if !numbers
+            .map(|n| u16::from_be_bytes([n[0], n[1]]))
+            .all(|n| indices.get(&n).is_some_and(|&i| whole(&frames[i])))
+        {
+            continue;
+        }
+        let markers: Vec<bool> = unit.iter().map(|p| p.marker).collect();
+        assert_eq!(
+            markers.iter().filter(|&&m| m).count(),
+            1,
+            "one marker per temporal unit {}",
+            unit[0].timestamp
+        );
+        assert!(
+            markers.last().expect("a packet"),
+            "the marker ends the unit"
+        );
+    }
+    let mut decoded: Vec<(u16, u8)> = Vec::new();
+    let mut numbers = std::collections::HashSet::new();
+    let mut broken = Vec::new();
+    for frame in frames.iter().filter(|f| whole(f)) {
+        if frame.references.iter().all(|r| numbers.contains(r)) {
+            numbers.insert(frame.number);
+            decoded.push((frame.number, frame.spatial));
+        } else {
+            broken.push(frame.number);
+        }
+    }
+    (decoded, broken)
 }
 
 /// An L1T3 Dependency Descriptor with libwebrtc's decode target indications:
@@ -186,6 +341,8 @@ struct Peer {
     frame: u32,
     frame_packets: usize,
     last_frame: Option<Instant>,
+    replay: Option<Replay>,
+    keyframe_requests: usize,
     messages: Vec<Value>,
 }
 
@@ -281,6 +438,8 @@ async fn join_decoding(
         frame: 0,
         frame_packets: 1,
         last_frame: None,
+        replay: None,
+        keyframe_requests: 0,
         messages: Vec::new(),
     };
     (peer, answer)
@@ -293,11 +452,20 @@ impl Peer {
     }
 
     fn start_publishing(&mut self, codec: Codec) {
+        self.publish_source(codec, false);
+    }
+
+    fn publish_source(&mut self, codec: Codec, screen: bool) {
         let mut leg = Leg::new();
         let mut api = leg.rtc.sdp_api();
         let mid = api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
         let (offer, pending) = api.apply().expect("offer");
-        self.send(json!({"type": "offer", "sdp": offer.to_sdp_string()}));
+        let screens: Vec<String> = if screen {
+            vec![mid.to_string()]
+        } else {
+            Vec::new()
+        };
+        self.send(json!({"type": "offer", "sdp": offer.to_sdp_string(), "screens": screens}));
         self.publish = Some((leg, Some(pending), mid, codec));
     }
 
@@ -354,6 +522,8 @@ impl Peer {
                     self.received.entry(from).or_default().push(Received {
                         seq: *packet.seq_no,
                         pt: *packet.header.payload_type,
+                        timestamp: packet.header.timestamp,
+                        marker: packet.header.marker,
                         payload: packet.payload.to_vec(),
                         descriptor: packet
                             .header
@@ -367,7 +537,85 @@ impl Peer {
         }
         if let Some((leg, ..)) = &mut self.publish {
             leg.step();
-            leg.events.clear();
+            for event in leg.events.drain(..) {
+                if let Event::KeyframeRequest(_) = event {
+                    self.keyframe_requests += 1;
+                    if let Some(replay) = &mut self.replay {
+                        replay.restart.get_or_insert(Instant::now() + KEY_DELAY);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends the recorded frames that are due, AV1 with their descriptors.
+    fn send_replay(&mut self) {
+        let (Some((leg, None, mid, _)), Some(replay)) = (&mut self.publish, &mut self.replay)
+        else {
+            return;
+        };
+        if !leg.rtc.is_connected() {
+            return;
+        }
+        let media = leg.rtc.media(*mid).expect("media");
+        let pt = leg
+            .rtc
+            .codec_config()
+            .params()
+            .iter()
+            .find(|p| p.spec().codec == Codec::Av1 && media.remote_pts().contains(&p.pt()))
+            .expect("AV1")
+            .pt();
+        let mut api = leg.rtc.direct_api();
+        let stream = api.stream_tx_by_mid(*mid, None).expect("stream");
+        let now = Instant::now();
+        loop {
+            let at_unit_start =
+                replay.next == replay.frames.len() || replay.frames[replay.next].timestamp != 0;
+            let requested = replay.restart.is_some_and(|at| at <= now);
+            if at_unit_start && (requested || replay.next == replay.frames.len()) {
+                let recorded = |f: &Recorded| u16::from_be_bytes([f.first[1], f.first[2]]);
+                replay.offset = replay
+                    .number
+                    .wrapping_add(1)
+                    .wrapping_sub(recorded(&replay.frames[0]));
+                replay.next = 0;
+                replay.timestamp = replay.timestamp.wrapping_add(3000);
+                replay.restart = None;
+            }
+            let frame = &replay.frames[replay.next];
+            let due = replay.sent_at.map_or(now, |at| at + frame.delay);
+            if due > now {
+                return;
+            }
+            replay.sent_at = Some(due.max(now - Duration::from_millis(100)));
+            replay.next += 1;
+            replay.timestamp = replay.timestamp.wrapping_add(frame.timestamp);
+            replay.number =
+                u16::from_be_bytes([frame.first[1], frame.first[2]]).wrapping_add(replay.offset);
+            let size = frame.bytes / frame.packets;
+            for index in 0..frame.packets {
+                let (first, last) = (index == 0, index + 1 == frame.packets);
+                let mut descriptor = match (&frame.rest, first) {
+                    (_, true) => frame.first.clone(),
+                    (Some(rest), false) => rest.clone(),
+                    (None, false) => frame.first[..3].to_vec(),
+                };
+                descriptor[0] =
+                    (descriptor[0] & 0x3f) | (u8::from(first) << 7) | (u8::from(last) << 6);
+                descriptor[1..3].copy_from_slice(&replay.number.to_be_bytes());
+                self.seq += 1;
+                let mut payload = vec![0x10; size.max(3)];
+                payload[1..3].copy_from_slice(&replay.number.to_be_bytes());
+                let mut values = ExtensionValues::default();
+                values.user_values.set(Descriptor(descriptor));
+                stream.write_rtp(
+                    RtpWrite::new(pt, self.seq.into(), replay.timestamp, now, payload)
+                        .marker(last && frame.marker)
+                        .ext_vals(values)
+                        .nackable(true),
+                );
+            }
         }
     }
 
@@ -476,9 +724,13 @@ fn frames(receiver: &Peer, publisher: &Peer) -> Vec<u64> {
 }
 
 fn quality_request(publisher: u64, tier: u8) -> Value {
+    source_request(publisher, Kind::Camera, tier)
+}
+
+fn source_request(publisher: u64, kind: Kind, tier: u8) -> Value {
     let request = QualityRequest {
         publisher,
-        kind: Kind::Camera,
+        kind,
         tier,
     };
     json!({"type": "quality", "request": hex::encode(request.to_bytes())})
@@ -980,4 +1232,110 @@ async fn the_traffic_budget_refuses_new_video() {
     }
     let (_, refused) = join(url, &ADMIT, false, false).await;
     assert_eq!(refused, json!({"type": "error", "reason": "traffic"}));
+}
+
+/// Steps `host`, replaying its recording, and `viewer` until `done` accepts the
+/// viewer's decodable frames, checked once a second; every whole frame the
+/// viewer gets must be decodable.
+async fn replay_until(
+    host: &mut Peer,
+    viewer: &mut Peer,
+    limit: Duration,
+    mut done: impl FnMut(&mut Peer, &[(u16, u8)]) -> bool,
+) {
+    let deadline = Instant::now() + limit;
+    let mut checked = Instant::now();
+    loop {
+        host.step();
+        viewer.step();
+        host.send_replay();
+        if checked.elapsed() >= Duration::from_secs(1) {
+            checked = Instant::now();
+            let packets = viewer.received.get(&host.id).map_or(&[][..], Vec::as_slice);
+            let (decoded, broken) = decodable(packets);
+            assert!(broken.is_empty(), "undecodable frames {broken:?}");
+            if done(viewer, &decoded) {
+                return;
+            }
+            let spatial: Vec<u8> = decoded.iter().map(|f| f.1).collect();
+            assert!(Instant::now() < deadline, "decoded layers {spatial:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Chromium's L2T2_KEY screen: a viewer starts on the base layer and moves to the
+/// full layer once its budget allows (after the 30 s step-up hold), at a key
+/// picture: the full layer's delta frames are switch points only for receivers
+/// that hold its chain. Every whole frame it gets stays decodable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_layered_screen_switches_up_at_a_key_picture() {
+    let sfu = start("lease_secs = 3600");
+    let url = sfu.url.as_str();
+    let (mut host, _) = join(url, &ADMIT, true, true).await;
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
+    host.replay = Some(Replay::new(fixture(include_str!(
+        "fixtures/chrome-l2t2-key.txt"
+    ))));
+    host.publish_source(Codec::Av1, true);
+    let capacity = |screen| {
+        let decode = nuschl_stream_quality::DecodeCapacity { camera: 3, screen };
+        json!({"type": "capacity", "decode": hex::encode(decode.to_bytes())})
+    };
+    let (mut asked, mut up) = (false, None);
+    replay_until(
+        &mut host,
+        &mut viewer,
+        Duration::from_secs(90),
+        |viewer, decoded| {
+            if !asked && !viewer.tracks.is_empty() {
+                // The base layer first.
+                viewer.send(capacity(0));
+                asked = true;
+            }
+            let Some(at) = up else {
+                if decoded.iter().rev().take_while(|f| f.1 == 0).count() >= 20 {
+                    up = Some(decoded.len());
+                }
+                return false;
+            };
+            // The SFU takes one report a second; this repeats it until it passes.
+            viewer.send(capacity(3));
+            decoded[at..].iter().filter(|f| f.1 == 1).count() >= 60
+        },
+    )
+    .await;
+}
+
+/// Chromium's L3T3_KEY camera: a viewer on an upper layer that asks for the
+/// lowest tier moves down at a key picture, since each spatial layer has its own
+/// chain, and every whole frame it gets stays decodable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_layered_camera_switches_down_at_a_key_picture() {
+    let sfu = start("");
+    let url = sfu.url.as_str();
+    let (mut host, _) = join(url, &ADMIT, true, true).await;
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
+    host.replay = Some(Replay::new(fixture(include_str!(
+        "fixtures/chrome-l3t3-key.txt"
+    ))));
+    host.publish_source(Codec::Av1, false);
+    let publisher = host.id;
+    let mut down: Option<usize> = None;
+    replay_until(
+        &mut host,
+        &mut viewer,
+        Duration::from_secs(30),
+        |viewer, decoded| {
+            let Some(at) = down else {
+                if decoded.iter().filter(|f| f.1 > 0).count() >= 20 {
+                    viewer.send(quality_request(publisher, 0));
+                    down = Some(decoded.len());
+                }
+                return false;
+            };
+            decoded[at..].iter().rev().take_while(|f| f.1 == 0).count() >= 30
+        },
+    )
+    .await;
 }
