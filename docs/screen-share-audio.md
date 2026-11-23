@@ -55,7 +55,9 @@ The exclusion covers Nuschl's streams on PipeWire, PulseAudio clients of
 pipewire-pulse included. Audio that another application records and plays
 again by its own means, and sound reaching a microphone, are outside it.
 `tests/share_audio.py` checks it in a private PipeWire session with synthetic
-tones, directly and in the sandbox.
+tones, directly and in the sandbox. `tests/shared_audio_desktop.py` (local)
+runs two desktops in a real call; the call page VM test plays a native
+publisher's shared audio and a browser tab's from the screen tile.
 
 ## Current implementation and prerequisites
 

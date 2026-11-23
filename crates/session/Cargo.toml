@@ -54,6 +54,11 @@ sha1 = "0.11"
 rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"] }
 turn-client-proto = "0.8.0"
 
+[features]
+# Local GUI tests only: call hosts may also present a certificate from the CA
+# that NUSCHL_CALL_TEST_CA names. Release builds leave it off.
+call-test-roots = []
+
 [dev-dependencies]
 nuschl-testkit.workspace = true
 tempfile = "3.27.0"

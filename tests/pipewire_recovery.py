@@ -137,11 +137,13 @@ NO_X11_BELL = "context.properties = { module.x11.bell = false }\n"
 
 
 class PipeWire:
-    def __init__(self, pipewire, wireplumber, dbus_daemon, root):
+    def __init__(self, pipewire, wireplumber, dbus_daemon, root, runtime=None):
+        """`runtime`: an existing runtime directory to serve in (a private desktop session's)."""
         self.pipewire, self.wireplumber = Path(pipewire), Path(wireplumber)
         self.root = root
-        self.runtime = root / "run"
-        self.runtime.mkdir(mode=0o700, parents=True)
+        self.runtime = runtime or root / "run"
+        self.runtime.mkdir(mode=0o700, parents=True, exist_ok=runtime is not None)
+        root.mkdir(parents=True, exist_ok=True)
         self.config = root / "config"
         (self.config / "pipewire/pipewire.conf.d").mkdir(parents=True)
         (self.config / "pipewire/pipewire.conf.d/05-no-x11-bell.conf").write_text(NO_X11_BELL)

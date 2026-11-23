@@ -24321,9 +24321,10 @@ rec {
           }
         ];
         features = {
+          "call-test-roots" = [ "nuschl-session/call-test-roots" ];
           "frame-timing" = [ "dep:gpui-profiler" ];
         };
-        resolvedDefaultFeatures = [ "frame-timing" ];
+        resolvedDefaultFeatures = [ "call-test-roots" "frame-timing" ];
       };
       "nuschl-audio-jitter" = rec {
         crateName = "nuschl-audio-jitter";
@@ -26092,7 +26093,9 @@ rec {
             features = [ "test-util" ];
           }
         ];
-
+        features = {
+        };
+        resolvedDefaultFeatures = [ "call-test-roots" ];
       };
       "nuschl-sframe" = rec {
         crateName = "nuschl-sframe";

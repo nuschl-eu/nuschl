@@ -87,13 +87,32 @@ pub async fn run(
     mut stop: oneshot::Receiver<()>,
     events: mpsc::Sender<ServiceEvent>,
 ) {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(5)))
         .max_redirects(0)
         .http_status_as_error(false)
-        .user_agent("Nuschl")
-        .build()
-        .into();
+        .user_agent("Nuschl");
+    // Local GUI tests lease their call host's room with the CA that
+    // `NUSCHL_CALL_TEST_CA` names, as the call itself does.
+    #[cfg(feature = "call-test-roots")]
+    let config =
+        match std::env::var_os("NUSCHL_CALL_TEST_CA").and_then(|path| std::fs::read(path).ok()) {
+            Some(pem) => {
+                let certificates: Vec<_> = ureq::tls::parse_pem(&pem)
+                    .filter_map(|item| match item {
+                        Ok(ureq::tls::PemItem::Certificate(certificate)) => Some(certificate),
+                        _ => None,
+                    })
+                    .collect();
+                config.tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        .root_certs(ureq::tls::RootCerts::new_with_certs(&certificates))
+                        .build(),
+                )
+            }
+            None => config,
+        };
+    let agent: ureq::Agent = config.build().into();
     let request = move |method: &'static str| {
         let (agent, url, body) = (agent.clone(), url.clone(), body.clone());
         tokio::task::spawn_blocking(move || {

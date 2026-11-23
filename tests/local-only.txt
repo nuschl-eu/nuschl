@@ -7,6 +7,7 @@ bitrate_web.py	not wired into a check yet (#313)
 build_cache.py	not wired into a check yet (#313)
 build_cache_cross.py	not wired into a check yet (#313)
 calls_desktop.py	not wired into a check yet (#313)
+shared_audio_desktop.py	needs GNOME Shell with the ScreenCast portal and a desktop built with nuschl/call-test-roots
 capture_echo.py	not wired into a check yet (#313)
 capture_quality_test.py	not wired into a check yet (#313)
 chat_scrollbar.py	not wired into a check yet (#313)
