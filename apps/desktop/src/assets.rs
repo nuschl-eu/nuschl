@@ -60,6 +60,7 @@ const ICONS: &[(&str, &[u8])] = icons!(
     "user",
     "video",
     "volume",
+    "volume-off",
     "whisper",
     "window-close",
     "window-maximize",

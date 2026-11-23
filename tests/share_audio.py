@@ -15,7 +15,8 @@ synthetic tone of its own pitch:
 
 The call audio worker shares the desktop's audio. Its Opus packets, decoded
 with reference libopus, hold the applications' tones and none of Nuschl's or
-the microphone's. The second application's tone arrives once it plays, and
+the microphone's. Muting the received stream silences it on the speakers
+while its packets keep arriving, and unmuting brings it back. The second application's tone arrives once it plays, and
 the first one's leaves once it quits. After the share stops, its node and
 links are gone and every other link is still in place. The run repeats with
 the worker in the sandbox a call gives it (`nuschl media-sandbox
@@ -247,6 +248,22 @@ def check_share(command, binary, pipewire, opus, output, label):
         application.wait(timeout=5)
         levels = heard(opus, worker, 2, f"{label}: the first application quits")
         assert levels[SECOND] > 0.08 and levels[APPLICATION] < 0.01, levels
+
+        def speakers(name):
+            """The received audio's level on the speakers over the next second."""
+            recorder = pipewire.record(output / f"{label}-{name}.wav")
+            time.sleep(1.5)
+            samples = [sample / 32768 for sample in recorder.stop()]
+            return level(samples[len(samples) // 3:], RECEIVED)
+
+        assert speakers("heard") > 0.03
+        worker.send({"kind": "volume", "publisher": 7, "volume": 0.0})
+        time.sleep(0.5)
+        assert speakers("muted") < 0.003, "muted received audio still plays"
+        worker.send({"kind": "volume", "publisher": 7, "volume": 1.0})
+        time.sleep(0.5)
+        assert speakers("unmuted") > 0.03, "the received stream did not continue through the mute"
+        print(f"{label}: muting silenced the received stream locally; it played again on unmute.", flush=True)
 
         worker.send({"kind": "share", "active": False})
         time.sleep(1)

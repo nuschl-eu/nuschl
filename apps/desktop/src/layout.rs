@@ -132,6 +132,23 @@ pub fn focusable_button(
     .into_any_element()
 }
 
+/// A [`focusable_button`] whose focus the caller follows through `handle`.
+pub fn focusable_button_with_handle(
+    id: impl Into<ElementId>,
+    handle: FocusHandle,
+    child: Stateful<Div>,
+    click: impl Fn(&FocusHandle, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    Focusable {
+        id: id.into(),
+        child,
+        outset: px(0.),
+        handle: Some(handle),
+        click: Some(Rc::new(click)),
+    }
+    .into_any_element()
+}
+
 /// Reveal a virtualized list using its retained keyboard-navigation handle.
 /// The caller owns the handle for this control's lifetime; its element key must
 /// change when that lifetime ends, just like other retained focus state.

@@ -2,15 +2,17 @@
 //! Shared audio in a call: the desktop's audio while the screen is shared,
 //! and the shared audio others send. One confined call audio worker
 //! (`nuschl_ipc::call_audio`) records, encodes and plays it. Sharing audio
-//! is its own choice and never opens the microphone.
+//! is its own choice and never opens the microphone. Each received stream
+//! plays at the volume this viewer set on its tile.
 
+use super::Latest;
 use nuschl_client::native::sfu::{Media, MediaEvent, Purpose};
-use nuschl_ipc::call_audio::{Event, Request as WorkerRequest, Worker};
+use nuschl_ipc::call_audio::{Event, Request, Worker};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     future::pending,
     path::PathBuf,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -30,35 +32,31 @@ pub(super) fn can_share() -> bool {
     EXECUTABLE.is_some()
 }
 
-#[derive(Clone, Copy)]
-pub enum Request {
-    Share(bool),
-    Volume(f32),
-}
+/// Each publisher's volume as this viewer set it, 0 (muted) to 1.
+pub type Volumes = BTreeMap<u64, f32>;
 
-/// What changed for the call's controls.
-pub enum Change {
-    Sharing(bool, Option<String>),
-    Receiving(bool),
-}
+/// Whether this page shares audio now, and why it stopped.
+pub struct Change(pub bool, pub Option<String>);
 
 pub(super) struct Audio {
     worker: Option<Worker>,
     sharing: bool,
-    /// Publishers whose shared audio this call receives.
+    /// Publishers whose shared audio this call receives, shown on their tiles.
     playing: BTreeSet<u64>,
-    volume: f32,
+    volumes: Volumes,
+    updates: Arc<Latest>,
     failures: u8,
     retry: Instant,
 }
 
 impl Audio {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(updates: Arc<Latest>) -> Self {
         Self {
             worker: None,
             sharing: false,
             playing: BTreeSet::new(),
-            volume: 1.,
+            volumes: Volumes::new(),
+            updates,
             failures: 0,
             retry: Instant::now(),
         }
@@ -74,9 +72,9 @@ impl Audio {
         if self.worker.is_none() && self.failures < MAX_FAILURES && Instant::now() >= self.retry {
             match Worker::start(EXECUTABLE.as_ref()?).await {
                 Ok(worker) => {
-                    worker.send(WorkerRequest::Volume {
-                        volume: self.volume,
-                    });
+                    for (&publisher, &volume) in &self.volumes {
+                        worker.send(Request::Volume { publisher, volume });
+                    }
                     self.worker = Some(worker);
                 }
                 Err(error) => {
@@ -94,15 +92,14 @@ impl Audio {
     }
 
     /// Take the shared audio events and pass the others on.
-    pub(super) async fn event(&mut self, event: MediaEvent) -> Result<MediaEvent, Option<Change>> {
+    pub(super) async fn event(&mut self, event: MediaEvent) -> Option<MediaEvent> {
         match event {
             MediaEvent::SourceAvailable {
                 publisher,
                 purpose: Purpose::SystemAudio,
             } => {
-                let first = self.playing.is_empty();
                 self.playing.insert(publisher);
-                Err(first.then_some(Change::Receiving(true)))
+                self.updates.shared_audio(self.playing.clone());
             }
             MediaEvent::SourceEnded {
                 publisher,
@@ -111,10 +108,10 @@ impl Audio {
                 if self.playing.remove(&publisher)
                     && let Some(worker) = &self.worker
                 {
-                    worker.send(WorkerRequest::End { publisher });
+                    worker.send(Request::End { publisher });
                 }
+                self.updates.shared_audio(self.playing.clone());
                 self.retire().await;
-                Err(self.playing.is_empty().then_some(Change::Receiving(false)))
             }
             MediaEvent::Frame {
                 publisher,
@@ -128,27 +125,19 @@ impl Audio {
                 {
                     worker.play(publisher, timestamp, data);
                 }
-                Err(None)
             }
-            event => Ok(event),
+            event => return Some(event),
         }
+        None
     }
 
-    pub(super) async fn request(
-        &mut self,
-        media: &mut Media,
-        request: Request,
-    ) -> Result<Option<Change>, String> {
-        match request {
-            Request::Share(active) => self.share(media, active).await,
-            Request::Volume(volume) => {
-                self.volume = volume.clamp(0., 1.);
-                if let Some(worker) = &self.worker {
-                    worker.send(WorkerRequest::Volume {
-                        volume: self.volume,
-                    });
-                }
-                Ok(None)
+    /// Apply the volumes the viewer changed.
+    pub(super) fn set_volumes(&mut self, volumes: &Volumes) {
+        for (&publisher, &volume) in volumes {
+            if self.volumes.insert(publisher, volume) != Some(volume)
+                && let Some(worker) = &self.worker
+            {
+                worker.send(Request::Volume { publisher, volume });
             }
         }
     }
@@ -160,26 +149,27 @@ impl Audio {
         active: bool,
     ) -> Result<Option<Change>, String> {
         if active == self.sharing {
-            return Ok(Some(Change::Sharing(active, None)));
+            return Ok(Some(Change(active, None)));
         }
         if !active {
             return self.stop_sharing(media, None).await;
         }
-        if !can_share() {
-            return Ok(Some(Change::Sharing(false, Some(unavailable()))));
-        }
-        let started = self
-            .worker()
-            .await
-            .is_some_and(|worker| worker.send(WorkerRequest::Share { active: true }));
+        let started = can_share()
+            && self
+                .worker()
+                .await
+                .is_some_and(|worker| worker.send(Request::Share { active: true }));
         if !started {
-            return Ok(Some(Change::Sharing(false, Some(unavailable()))));
+            return Ok(Some(Change(
+                false,
+                Some("Audio sharing unavailable".into()),
+            )));
         }
         media
             .set_source(Purpose::SystemAudio, true)
             .map_err(|error| error.to_string())?;
         self.sharing = true;
-        Ok(Some(Change::Sharing(true, None)))
+        Ok(Some(Change(true, None)))
     }
 
     async fn stop_sharing(
@@ -193,11 +183,11 @@ impl Audio {
                 .set_source(Purpose::SystemAudio, false)
                 .map_err(|error| error.to_string())?;
             if let Some(worker) = &self.worker {
-                worker.send(WorkerRequest::Share { active: false });
+                worker.send(Request::Share { active: false });
             }
         }
         self.retire().await;
-        Ok(sharing.then_some(Change::Sharing(false, notice)))
+        Ok(sharing.then_some(Change(false, notice)))
     }
 
     /// Stop a worker with nothing to share or play.
@@ -210,7 +200,7 @@ impl Audio {
         }
     }
 
-    /// The worker's next event, applied to the call.
+    /// The worker's next event; `Event::Stopped` with no reason is its exit.
     pub(super) async fn next(&mut self) -> Option<Event> {
         match &mut self.worker {
             Some(worker) => worker.next().await.or(Some(Event::Stopped {
@@ -220,7 +210,6 @@ impl Audio {
         }
     }
 
-    /// Apply a worker event; `Event::Stopped` with no reason is a worker exit.
     pub(super) async fn handle(
         &mut self,
         media: &mut Media,
@@ -245,7 +234,7 @@ impl Audio {
                 // After repeated failures received audio stops for this call.
                 let given_up = self.failures == MAX_FAILURES && !self.playing.is_empty();
                 Ok(change.or_else(|| {
-                    given_up.then(|| Change::Sharing(false, Some("Shared audio stopped".into())))
+                    given_up.then(|| Change(false, Some("Shared audio stopped".into())))
                 }))
             }
             Event::Stopped { reason } => self.stop_sharing(media, Some(reason)).await,
@@ -257,8 +246,4 @@ impl Audio {
             worker.stop().await;
         }
     }
-}
-
-fn unavailable() -> String {
-    "Audio sharing unavailable".into()
 }

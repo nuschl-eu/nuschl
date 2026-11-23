@@ -12,8 +12,11 @@ without audio.
 - **Controls.** While the screen is shared, *Share audio* sends the desktop's
   audio, which is every application's playback except Nuschl's own. It starts
   off, stops with the screen share and leaves the microphone as it is.
-  Received shared audio plays as a stream of its own, "Shared audio", with its
-  own volume in the system mixer and in the call's options menu.
+  Received shared audio plays as a stream of its own, "Shared audio". Every
+  received screen share's tile, in the call and on the stage, carries a speaker
+  that mutes and unmutes it, with a volume slider while the pointer or the
+  keyboard is on it; it is greyed out ("No shared audio") while the share
+  carries none. The web call page shows the same control on the tile.
 - **Worker.** One call audio worker per call (`nuschl-media-worker
   --call-audio`, in the media role's sandbox) records, encodes and plays shared
   audio. It starts when the call first needs it and ends with the call. A

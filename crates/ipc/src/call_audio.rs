@@ -35,8 +35,8 @@ pub enum Request {
     },
     /// `publisher` stopped sharing audio.
     End { publisher: u64 },
-    /// Received shared audio plays at `volume`, from 0 to 1.
-    Volume { volume: f32 },
+    /// `publisher`'s shared audio plays at `volume`, from 0 (muted) to 1.
+    Volume { publisher: u64, volume: f32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -55,7 +55,7 @@ impl Request {
             Self::Play {
                 publisher, opus, ..
             } => *publisher != 0 && (1..=MAX_OPUS).contains(&opus.len()),
-            Self::Volume { volume } => (0.0..=1.0).contains(volume),
+            Self::Volume { publisher, volume } => *publisher != 0 && (0.0..=1.0).contains(volume),
             Self::Share { .. } | Self::End { .. } => true,
         }
     }
@@ -194,8 +194,21 @@ mod tests {
             .valid()
         );
         for volume in [-0.1, 1.1, f32::NAN] {
-            assert!(!Request::Volume { volume }.valid());
+            assert!(
+                !Request::Volume {
+                    publisher: 1,
+                    volume
+                }
+                .valid()
+            );
         }
+        assert!(
+            !Request::Volume {
+                publisher: 0,
+                volume: 1.
+            }
+            .valid()
+        );
         let mut bytes = Vec::new();
         write_frame_within(&mut bytes, &Envelope::new(0, packet(MAX_OPUS)), MAX_FRAME).unwrap();
         let event = Event::Packet {

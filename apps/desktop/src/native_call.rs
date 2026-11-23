@@ -2,6 +2,7 @@
 //! Desktop calls. Capture and decoding use confined video workers.
 
 mod audio;
+mod audio_control;
 mod gallery;
 mod publisher;
 mod stage;
@@ -33,6 +34,7 @@ use nuschl_protocol::sfu::Codec;
 use nuschl_session::{config::ClientSettings, identity::CryptoHandle};
 use std::{
     cell::Cell,
+    collections::BTreeSet,
     future::pending,
     path::{Path, PathBuf},
     rc::Rc,
@@ -72,10 +74,8 @@ pub struct Active {
     minimized: bool,
     stage: Option<stage::Controls>,
     monitor: bool,
-    audio_requests: mpsc::Sender<audio::Request>,
+    audio_requests: mpsc::Sender<bool>,
     sharing_audio: bool,
-    receiving_audio: bool,
-    shared_volume: f32,
 }
 
 pub enum Finish {
@@ -110,7 +110,8 @@ pub struct Start {
     policy: PeerPolicy,
     source: Option<Source>,
     source_requests: [mpsc::Receiver<SourceRequest>; 2],
-    audio_requests: mpsc::Receiver<audio::Request>,
+    audio_requests: mpsc::Receiver<bool>,
+    volumes: watch::Receiver<audio::Volumes>,
     updates: Arc<Latest>,
     quality: watch::Receiver<Selection>,
     stop: oneshot::Receiver<()>,
@@ -144,6 +145,8 @@ struct Update {
     stats: Option<Arc<VideoStats>>,
     sources: Sources,
     visible: bool,
+    /// Publishers whose screen share carries audio.
+    audio: BTreeSet<u64>,
 }
 
 #[derive(Default)]
@@ -192,6 +195,14 @@ impl Latest {
             drop(update);
             self.ready.notify_one();
         }
+    }
+
+    fn shared_audio(&self, publishers: BTreeSet<u64>) {
+        self.update
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .audio = publishers;
+        self.ready.notify_one();
     }
 
     fn status(&self, status: impl Into<String>) {
@@ -282,6 +293,7 @@ struct Surface {
     stats: Option<Arc<VideoStats>>,
     sources: Sources,
     quality: watch::Sender<Selection>,
+    audio: audio_control::Controls,
     _updates: Task<()>,
 }
 
@@ -290,12 +302,13 @@ impl Surface {
         updates: Arc<Latest>,
         status: &str,
         quality: watch::Sender<Selection>,
+        audio: audio_control::Controls,
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.spawn(async move |this, cx| {
             loop {
                 updates.ready.notified().await;
-                let (status, tiles, stats, sources, visible) = {
+                let (status, tiles, stats, sources, visible, audio) = {
                     let mut update = updates
                         .update
                         .lock()
@@ -309,6 +322,7 @@ impl Surface {
                         update.stats.clone(),
                         update.sources,
                         update.visible,
+                        update.audio.clone(),
                     )
                 };
                 if this
@@ -316,6 +330,7 @@ impl Surface {
                         this.status = status;
                         this.stats = stats;
                         this.sources = sources;
+                        this.audio.audio = audio;
                         this.pictures = tiles.map(|(stream, frame, failed)| {
                             let stream = stream?;
                             let image = (visible && !failed)
@@ -346,6 +361,7 @@ impl Surface {
             stats: None,
             sources: Sources::default(),
             quality,
+            audio,
             _updates: observe,
         }
     }
@@ -359,8 +375,13 @@ impl Surface {
         failed: bool,
         gallery: bool,
         window: &Window,
+        cx: &Context<Self>,
     ) -> AnyElement {
         let label = stream.feed.label();
+        let shared_audio = stream
+            .feed
+            .publisher
+            .filter(|_| stream.feed.kind == VideoKind::Screen);
         div()
             .id(format!("call-picture:{}", label))
             .role(Role::Image)
@@ -434,13 +455,24 @@ impl Surface {
                         .child(gpui_kit::text!(label)),
                 )
             })
+            .when_some(shared_audio, |tile, publisher| {
+                tile.child(audio_control::control(&self.audio, publisher, window, cx))
+            })
             .into_any_element()
     }
 }
 
 impl Render for Surface {
-    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::images::collect(window);
+        let screens = self.pictures.iter().flatten().filter_map(|(stream, _, _)| {
+            stream
+                .feed
+                .publisher
+                .filter(|_| stream.feed.kind == VideoKind::Screen)
+        });
+        self.audio
+            .prepare(screens.collect::<Vec<_>>().into_iter(), cx);
         let mut pictures = self.pictures.each_mut().map(|picture| {
             picture.as_mut().map(|(stream, image, failed)| {
                 (*stream, image.as_mut().map(VideoImage::for_render), *failed)
@@ -473,7 +505,7 @@ impl Render for Surface {
                     .min_h_0()
                     .when(gallery, |row| row.gap_1())
                     .children(row.iter_mut().flatten().map(|(stream, image, failed)| {
-                        self.tile(*stream, image.take(), *failed, gallery, window)
+                        self.tile(*stream, image.take(), *failed, gallery, window, cx)
                     }))
             }))
     }
@@ -552,6 +584,7 @@ impl Desktop {
                 stats: None,
                 sources: Sources::default(),
                 visible: true,
+                audio: BTreeSet::new(),
             }),
             ready: Notify::new(),
         });
@@ -563,6 +596,10 @@ impl Desktop {
         ] = std::array::from_fn(|_| mpsc::channel(1));
         let (selection, quality) = watch::channel(Selection::default());
         let (request_audio, audio_requests) = mpsc::channel(4);
+        let (set_volumes, volumes) = watch::channel(audio::Volumes::new());
+        let controls = audio_control::Controls::new(set_volumes);
+        let surface =
+            cx.new(|cx| Surface::new(updates.clone(), status, selection.clone(), controls, cx));
         let policy = PeerPolicy {
             relay_only: self.settings.relay_only,
         };
@@ -575,7 +612,7 @@ impl Desktop {
             server,
             conversation,
             voice_generation,
-            surface: cx.new(|cx| Surface::new(updates.clone(), status, selection.clone(), cx)),
+            surface,
             quality: selection,
             stats_open: false,
             local_sources: [false; 2],
@@ -590,8 +627,6 @@ impl Desktop {
             monitor: false,
             audio_requests: request_audio,
             sharing_audio: false,
-            receiving_audio: false,
-            shared_volume: 1.,
         });
         self.services.native_call(Start {
             owner,
@@ -603,6 +638,7 @@ impl Desktop {
             source,
             source_requests: [camera_requests, screen_requests],
             audio_requests,
+            volumes,
             updates,
             quality,
             stop: stopped,
@@ -790,7 +826,6 @@ impl Desktop {
             SourceChange::MediaClosed => {
                 call.can_publish = false;
                 call.sharing_audio = false;
-                call.receiving_audio = false;
                 call.local_sources = [false; 2];
                 call.source_pending = None;
                 call.reopening_screen = false;
@@ -819,12 +854,7 @@ impl Desktop {
                 source
             }
             SourceChange::Cancelled(source) => source,
-            SourceChange::Audio(audio::Change::Receiving(receiving)) => {
-                call.receiving_audio = receiving;
-                cx.notify();
-                return;
-            }
-            SourceChange::Audio(audio::Change::Sharing(active, notice)) => {
+            SourceChange::Audio(audio::Change(active, notice)) => {
                 call.sharing_audio = active;
                 if let Some(notice) = notice
                     && let Some(server) = self.client.servers.iter_mut().find(|server| {
@@ -1300,48 +1330,7 @@ impl Desktop {
 
     fn toggle_shared_audio(&mut self, cx: &mut Context<Self>) {
         if let Some(call) = self.native_call.as_ref().filter(|call| call.stop.is_some()) {
-            let _ = call
-                .audio_requests
-                .try_send(audio::Request::Share(!call.sharing_audio));
-            cx.notify();
-        }
-    }
-
-    /// Volume choices for received shared audio, while some plays.
-    pub(crate) fn shared_audio_commands(&self, generation: u64) -> Vec<(f32, String, bool)> {
-        let Some(call) = self
-            .call_with_generation(generation)
-            .filter(|call| call.receiving_audio)
-        else {
-            return Vec::new();
-        };
-        [1., 0.5, 0.25, 0.]
-            .into_iter()
-            .map(|volume| {
-                let label = if volume == 0. {
-                    "Shared audio muted".into()
-                } else {
-                    format!("Shared audio {}%", (volume * 100.) as u32)
-                };
-                (volume, label, call.shared_volume == volume)
-            })
-            .collect()
-    }
-
-    pub(crate) fn set_shared_volume(
-        &mut self,
-        generation: u64,
-        volume: f32,
-        cx: &mut Context<Self>,
-    ) {
-        if self.native_call_generation == generation
-            && let Some(call) = &mut self.native_call
-            && call
-                .audio_requests
-                .try_send(audio::Request::Volume(volume))
-                .is_ok()
-        {
-            call.shared_volume = volume;
+            let _ = call.audio_requests.try_send(!call.sharing_audio);
             cx.notify();
         }
     }
@@ -1677,6 +1666,7 @@ async fn drive(
         source,
         source_requests,
         mut audio_requests,
+        mut volumes,
         updates,
         quality,
         mut stop,
@@ -1721,13 +1711,13 @@ async fn drive(
         display.updates.clone(),
         policy.relay_only,
     );
-    let mut audio = audio::Audio::new();
+    let mut audio = audio::Audio::new(display.updates.clone());
     let result = tokio::select! {
         biased;
         () = &mut cancel => Ok(Finish::Left),
         result = meeting(
             &mut media, &mut display, &mut publisher, &mut viewer,
-            (video_worker.as_path(), source), source_requests, (&mut audio, &mut audio_requests),
+            (video_worker.as_path(), source), source_requests, (&mut audio, &mut audio_requests, &mut volumes),
         ) => result,
     };
     let (closed, (), decoded, ()) =
@@ -1854,7 +1844,11 @@ async fn meeting(
     viewer: &mut viewer::Viewer,
     (worker, initial): (&Path, Option<Source>),
     mut source_requests: [mpsc::Receiver<SourceRequest>; 2],
-    (audio, audio_requests): (&mut audio::Audio, &mut mpsc::Receiver<audio::Request>),
+    (audio, audio_requests, volumes): (
+        &mut audio::Audio,
+        &mut mpsc::Receiver<bool>,
+        &mut watch::Receiver<audio::Volumes>,
+    ),
 ) -> Result<Finish, String> {
     let changes = display.source_changes;
     let mut selection = *display.quality.borrow_and_update();
@@ -1906,15 +1900,7 @@ async fn meeting(
                     Some(Err(error)) => return Err(text(error)),
                     None => return Ok(Finish::MediaEnded),
                 };
-                let event = match audio.event(event).await {
-                    Ok(event) => event,
-                    Err(change) => {
-                        if let Some(change) = change {
-                            changes.report(SourceChange::Audio(change)).await?;
-                        }
-                        continue;
-                    }
-                };
+                let Some(event) = audio.event(event).await else { continue };
                 let retune = matches!(event, MediaEvent::SourceLimits { .. } | MediaEvent::Route(_));
                 publisher.event(&event);
                 if retune {
@@ -1970,14 +1956,14 @@ async fn meeting(
                 }
                 continue;
             }
-            Some(request) = audio_requests.recv() => {
-                let request = match request {
-                    audio::Request::Share(true) if !publisher.enabled(Source::Screen) => audio::Request::Share(false),
-                    request => request,
-                };
-                if let Some(change) = audio.request(media, request).await? {
+            Some(share) = audio_requests.recv() => {
+                if let Some(change) = audio.share(media, share && publisher.enabled(Source::Screen)).await? {
                     changes.report(SourceChange::Audio(change)).await?;
                 }
+                continue;
+            }
+            Ok(()) = volumes.changed() => {
+                audio.set_volumes(&volumes.borrow_and_update());
                 continue;
             }
             Some(event) = audio.next() => {

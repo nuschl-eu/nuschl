@@ -5,7 +5,7 @@
 //! PipeWire node of this worker's (the [`policy`] picks the streams) and
 //! encodes it as 20 ms stereo Opus on its own 48 kHz clock. Shared audio
 //! received from others is mixed per publisher and plays as a stream of its
-//! own, "Shared audio", at the volume the call sets.
+//! own, "Shared audio", each publisher's at the volume this viewer chose.
 
 #[cfg(target_os = "linux")]
 mod pipewire;
@@ -49,8 +49,9 @@ const PAUSE: Duration = Duration::from_millis(100);
 /// Received audio queued ahead of the device, and the queue's size.
 const AHEAD: usize = 4 * FRAME;
 const RING: usize = 20 * FRAME;
-/// Publishers whose shared audio plays at once.
+/// Publishers whose shared audio plays at once, and whose volumes are kept.
 const MAX_PUBLISHERS: usize = 16;
+const MAX_VOLUMES: usize = 256;
 /// Opus timestamps tick at 48 kHz; the jitter buffer counts 10 ms frames.
 const TICKS_PER_FRAME: u64 = FRAME as u64;
 
@@ -117,7 +118,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 opus,
             })) => playback.push(publisher, timestamp, opus),
             Ok(Input::Request(Request::End { publisher })) => playback.end(publisher),
-            Ok(Input::Request(Request::Volume { volume })) => playback.volume = volume,
+            Ok(Input::Request(Request::Volume { publisher, volume })) => {
+                playback.volume(publisher, volume);
+            }
             Ok(Input::Stopped(number, reason)) => {
                 if share.as_ref().is_some_and(|share| share.number == number) {
                     share = None;
@@ -249,13 +252,17 @@ struct Output {
     _stream: cpal::Stream,
 }
 
-/// Received shared audio: one mixer stream per publisher.
-struct Playback {
+/// One publisher's received shared audio and its latest 10 ms sequence number.
+struct Publisher {
     mixer: Mixer,
-    /// Each publisher's mixer stream and latest 10 ms sequence number.
-    publishers: BTreeMap<u64, (u32, u64)>,
-    streams: u32,
-    volume: f32,
+    latest: u64,
+}
+
+/// Received shared audio, each publisher's at the volume this viewer chose.
+struct Playback {
+    publishers: BTreeMap<u64, Publisher>,
+    /// Kept for the rest of the call, also while a publisher's audio is off.
+    volumes: BTreeMap<u64, f32>,
     output: Option<Output>,
     /// An output that failed to open is tried again after a pause.
     retry: Instant,
@@ -264,10 +271,8 @@ struct Playback {
 impl Default for Playback {
     fn default() -> Self {
         Self {
-            mixer: Mixer::default(),
             publishers: BTreeMap::new(),
-            streams: 0,
-            volume: 1.,
+            volumes: BTreeMap::new(),
             output: None,
             retry: Instant::now(),
         }
@@ -277,30 +282,30 @@ impl Default for Playback {
 impl Playback {
     fn push(&mut self, publisher: u64, timestamp: u64, opus: Vec<u8>) {
         let sequence = timestamp / TICKS_PER_FRAME;
-        if !self.publishers.contains_key(&publisher) {
-            if self.publishers.len() == MAX_PUBLISHERS {
-                return;
-            }
-            self.streams = self.streams.wrapping_add(1);
-            self.publishers.insert(publisher, (self.streams, sequence));
-        }
-        let Some((stream, latest)) = self.publishers.get_mut(&publisher) else {
+        if !self.publishers.contains_key(&publisher) && self.publishers.len() == MAX_PUBLISHERS {
             return;
-        };
-        // A jump of more than a second (a new path or clock) starts afresh.
-        if latest.abs_diff(sequence) > 100 {
-            self.mixer.end_stream(*stream);
         }
-        *latest = sequence;
+        let received = self
+            .publishers
+            .entry(publisher)
+            .or_insert_with(|| Publisher {
+                mixer: Mixer::default(),
+                latest: sequence,
+            });
+        // A jump of more than a second (a new path or clock) starts afresh.
+        if received.latest.abs_diff(sequence) > 100 {
+            received.mixer.clear();
+        }
+        received.latest = sequence;
         let voice = Voice {
-            stream: *stream,
+            stream: 0,
             sender: 0,
             sequence,
             opus,
             end: false,
             volume: 1.,
         };
-        let _ = self.mixer.push(voice, Instant::now());
+        let _ = received.mixer.push(voice, Instant::now());
         if self.output.is_none() && Instant::now() >= self.retry {
             match open() {
                 Ok(output) => self.output = Some(output),
@@ -313,11 +318,16 @@ impl Playback {
     }
 
     fn end(&mut self, publisher: u64) {
-        if let Some((stream, _)) = self.publishers.remove(&publisher) {
-            self.mixer.end_stream(stream);
-        }
+        self.publishers.remove(&publisher);
         if self.publishers.is_empty() {
             self.output = None;
+        }
+    }
+
+    /// The volume takes effect with the next mixed frame.
+    fn volume(&mut self, publisher: u64, volume: f32) {
+        if self.volumes.len() < MAX_VOLUMES || self.volumes.contains_key(&publisher) {
+            self.volumes.insert(publisher, volume);
         }
     }
 
@@ -326,13 +336,21 @@ impl Playback {
         let Some(output) = &mut self.output else {
             return;
         };
-        self.mixer.cleanup(Instant::now());
+        let now = Instant::now();
         while RING - output.ring.slots() < AHEAD {
             let mut mix = [[0.; 2]; FRAME];
-            self.mixer.mix(&mut mix);
-            let gain = f64::from(self.volume);
+            for (publisher, received) in &mut self.publishers {
+                received.mixer.cleanup(now);
+                let mut own = [[0.; 2]; FRAME];
+                received.mixer.mix(&mut own);
+                let gain = f64::from(self.volumes.get(publisher).copied().unwrap_or(1.));
+                for (total, frame) in mix.iter_mut().zip(own) {
+                    total[0] += frame[0] * gain;
+                    total[1] += frame[1] * gain;
+                }
+            }
             for frame in mix {
-                let _ = output.ring.push(frame.map(|sample| sample * gain));
+                let _ = output.ring.push(frame);
             }
         }
     }

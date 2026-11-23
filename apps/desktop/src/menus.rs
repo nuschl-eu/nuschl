@@ -811,16 +811,6 @@ impl Desktop {
                     this.toggle_video_stats(generation, cx);
                 }));
             }
-            for (volume, label, selected) in self.shared_audio_commands(generation) {
-                let mut entry = local_item(label, "volume", move |this, _, _, cx| {
-                    this.set_shared_volume(generation, volume, cx);
-                })
-                .key(format!("shared-audio:{volume}"));
-                if let Entry::Item { choice, .. } = &mut entry {
-                    *choice = Some(selected);
-                }
-                entries.push(entry);
-            }
             return entries;
         }
         if let MenuTarget::VideoQuality(generation, feed) = menu.target {
