@@ -3,6 +3,9 @@
 //! a speaker that mutes and unmutes, and a volume slider while the pointer or
 //! the keyboard is on the control. It is greyed out while the share carries no
 //! audio. The choices are this viewer's, kept per publisher for the call.
+//! The call's host is the person whose invitation the viewer joined (only
+//! they hold the host key the SFU checks), so their choice is also kept by
+//! certificate hash, for their next calls.
 
 use super::{Surface, audio::Volumes};
 use crate::{
@@ -13,6 +16,7 @@ use crate::{
     theme::{ACCENT, MAIN, SELECTED, TEXT, TEXT_FAINT, color, tint},
 };
 use gpui_kit::{prelude::*, *};
+use nuschl_session::config::SharedAudio;
 use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
@@ -46,6 +50,15 @@ impl Level {
     }
 }
 
+impl From<SharedAudio> for Level {
+    fn from(SharedAudio { volume, muted }: SharedAudio) -> Self {
+        Self { volume, muted }
+    }
+}
+
+/// A choice to remember for the person with this certificate hash.
+pub struct Remember(pub String, pub SharedAudio);
+
 pub(super) struct Controls {
     /// Publishers whose screen share carries audio.
     pub(super) audio: BTreeSet<u64>,
@@ -54,16 +67,39 @@ pub(super) struct Controls {
     hovered: Option<u64>,
     /// Each control's focus: the speaker and the slider.
     focus: BTreeMap<u64, [FocusHandle; 2]>,
+    /// The inviting host's certificate hash and remembered choice.
+    remembered: Option<(String, Option<Level>)>,
+    host: Option<u64>,
 }
 
 impl Controls {
-    pub(super) fn new(volumes: watch::Sender<Volumes>) -> Self {
+    pub(super) fn new(
+        volumes: watch::Sender<Volumes>,
+        remembered: Option<(String, Option<SharedAudio>)>,
+    ) -> Self {
         Self {
             audio: BTreeSet::new(),
             levels: BTreeMap::new(),
             volumes,
             hovered: None,
             focus: BTreeMap::new(),
+            remembered: remembered.map(|(hash, choice)| (hash, choice.map(Level::from))),
+            host: None,
+        }
+    }
+
+    /// The host's publisher id: their remembered choice applies to it.
+    pub(super) fn set_host(&mut self, host: Option<u64>) {
+        if std::mem::replace(&mut self.host, host) == host {
+            return;
+        }
+        if let Some(host) = host
+            && !self.levels.contains_key(&host)
+            && let Some((_, Some(level))) = self.remembered
+        {
+            self.volumes.send_modify(|volumes| {
+                volumes.insert(host, level.heard());
+            });
         }
     }
 
@@ -77,7 +113,16 @@ impl Controls {
     }
 
     fn level(&self, publisher: u64) -> Level {
-        self.levels.get(&publisher).copied().unwrap_or_default()
+        self.levels
+            .get(&publisher)
+            .copied()
+            .or_else(|| {
+                self.remembered
+                    .as_ref()
+                    .filter(|_| self.host == Some(publisher))
+                    .and_then(|(_, level)| *level)
+            })
+            .unwrap_or_default()
     }
 
     fn set(&mut self, publisher: u64, level: Level) {
@@ -85,6 +130,21 @@ impl Controls {
         self.volumes.send_modify(|volumes| {
             volumes.insert(publisher, level.heard());
         });
+        if self.host == Some(publisher)
+            && let Some((_, remembered)) = &mut self.remembered
+        {
+            *remembered = Some(level);
+        }
+    }
+
+    /// What to remember of `publisher`'s level, when they are the host.
+    fn remember(&self, publisher: u64) -> Option<Remember> {
+        let (hash, _) = self
+            .remembered
+            .as_ref()
+            .filter(|_| self.host == Some(publisher))?;
+        let Level { volume, muted } = self.level(publisher);
+        Some(Remember(hash.clone(), SharedAudio { volume, muted }))
     }
 
     fn toggle(&mut self, publisher: u64) {
@@ -223,6 +283,14 @@ pub(super) fn control(
 
 fn toggle(surface: &mut Surface, publisher: u64, cx: &mut Context<Surface>) {
     surface.audio.toggle(publisher);
+    changed(surface, publisher, cx);
+}
+
+/// Show a changed level, and keep a host's choice beyond the call.
+fn changed(surface: &Surface, publisher: u64, cx: &mut Context<Surface>) {
+    if let Some(choice) = surface.audio.remember(publisher) {
+        cx.emit(choice);
+    }
     cx.notify();
 }
 
@@ -307,6 +375,12 @@ fn volume(
                 }
             }),
         )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this: &mut Surface, _: &MouseUpEvent, _, cx| {
+                changed(this, publisher, cx);
+            }),
+        )
         .on_key_down(
             cx.listener(move |this: &mut Surface, event: &KeyDownEvent, _, cx| {
                 let position = this.audio.position(publisher);
@@ -318,7 +392,7 @@ fn volume(
                     _ => return,
                 };
                 this.audio.slide(publisher, next);
-                cx.notify();
+                changed(this, publisher, cx);
                 cx.stop_propagation();
             }),
         );

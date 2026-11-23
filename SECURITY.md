@@ -312,7 +312,7 @@ folder of its own. Folders are created 0700, files 0600.
 | Local history (SQLite) | `$XDG_DATA_HOME/nuschl/history/` | the storage worker only |
 | Servers' security records (`nuschl-policy.json`) | `$XDG_DATA_HOME/nuschl/` | the main process only |
 | Settings, bookmarks with accepted certificate pins and access tokens, `managed.json` | `$XDG_CONFIG_HOME/nuschl/` | the main process only |
-| Last channels, update check state | `$XDG_STATE_HOME/nuschl/` | the main process only |
+| Last channels, update check state, shared-audio volumes by certificate hash | `$XDG_STATE_HOME/nuschl/` | the main process only |
 | Channel trees and server icons (server-controlled, bounded when read) | `$XDG_CACHE_HOME/nuschl/` | the main process only |
 | Music bot certificates, links, library keys, queues with playback history, cover cache, the import requester secret | `/var/lib/nuschl-musicbot/` under the NixOS module; each browser's link in a cookie | the bot only (private systemd state directory). Every valid link controls all queues, reads history, streams audio, sets the shared library account's ratings and, with an import service configured, requests albums from it ([links](docs/musicbot.md#links), [adding music](docs/musicbot.md#adding-music)). The public Mumble comment carries only the public address and instructions. |
 

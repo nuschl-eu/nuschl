@@ -17,6 +17,12 @@ without audio.
   that mutes and unmutes it, with a volume slider while the pointer or the
   keyboard is on it; it is greyed out ("No shared audio") while the share
   carries none. The web call page shows the same control on the tile.
+- **Remembered volume.** Mute and volume are this viewer's, per publisher. They
+  last for the call, except for the call's host when the viewer joined through
+  their invitation: the host key the SFU checks binds that publisher to the
+  inviting user, so the choice is kept by their certificate hash in the state
+  folder (`shared-audio.json`), apart from their voice volume. Other
+  participants, web guests and web call pages get per-call choices.
 - **Worker.** One call audio worker per call (`nuschl-media-worker
   --call-audio`, in the media role's sandbox) records, encodes and plays shared
   audio. It starts when the call first needs it and ends with the call. A

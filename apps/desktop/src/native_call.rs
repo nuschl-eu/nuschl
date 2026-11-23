@@ -147,6 +147,8 @@ struct Update {
     visible: bool,
     /// Publishers whose screen share carries audio.
     audio: BTreeSet<u64>,
+    /// The publisher id of the call's host, who invited this viewer.
+    host: Option<u64>,
 }
 
 #[derive(Default)]
@@ -202,6 +204,14 @@ impl Latest {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .audio = publishers;
+        self.ready.notify_one();
+    }
+
+    fn host(&self, host: Option<u64>) {
+        self.update
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .host = host;
         self.ready.notify_one();
     }
 
@@ -297,6 +307,8 @@ struct Surface {
     _updates: Task<()>,
 }
 
+impl EventEmitter<audio_control::Remember> for Surface {}
+
 impl Surface {
     fn new(
         updates: Arc<Latest>,
@@ -308,7 +320,7 @@ impl Surface {
         let observe = cx.spawn(async move |this, cx| {
             loop {
                 updates.ready.notified().await;
-                let (status, tiles, stats, sources, visible, audio) = {
+                let (status, tiles, stats, sources, visible, audio, host) = {
                     let mut update = updates
                         .update
                         .lock()
@@ -323,6 +335,7 @@ impl Surface {
                         update.sources,
                         update.visible,
                         update.audio.clone(),
+                        update.host,
                     )
                 };
                 if this
@@ -331,6 +344,7 @@ impl Surface {
                         this.stats = stats;
                         this.sources = sources;
                         this.audio.audio = audio;
+                        this.audio.set_host(host);
                         this.pictures = tiles.map(|(stream, frame, failed)| {
                             let stream = stream?;
                             let image = (visible && !failed)
@@ -555,6 +569,20 @@ impl Desktop {
             return;
         };
         let voice_generation = selected.generation;
+        // The inviter is the call's host: their shared audio keeps its volume.
+        let remembered = inviter
+            .and_then(|(session, instance)| {
+                selected
+                    .users
+                    .get(&session)
+                    .filter(|user| user.instance == instance)?
+                    .certificate_hash
+                    .clone()
+            })
+            .map(|hash| {
+                let choice = self.profile.shared_audio().get(&hash).copied();
+                (hash, choice)
+            });
         let owner = link.publisher().is_some();
         let room = link.url();
         if owner == inviter.is_some()
@@ -585,6 +613,7 @@ impl Desktop {
                 sources: Sources::default(),
                 visible: true,
                 audio: BTreeSet::new(),
+                host: None,
             }),
             ready: Notify::new(),
         });
@@ -597,9 +626,18 @@ impl Desktop {
         let (selection, quality) = watch::channel(Selection::default());
         let (request_audio, audio_requests) = mpsc::channel(4);
         let (set_volumes, volumes) = watch::channel(audio::Volumes::new());
-        let controls = audio_control::Controls::new(set_volumes);
+        let controls = audio_control::Controls::new(set_volumes, remembered);
         let surface =
             cx.new(|cx| Surface::new(updates.clone(), status, selection.clone(), controls, cx));
+        cx.subscribe(
+            &surface,
+            |this, _, audio_control::Remember(hash, choice), _| {
+                if let Err(error) = this.profile.remember_shared_audio(hash, *choice) {
+                    tracing::warn!(%error, "could not keep a shared audio volume");
+                }
+            },
+        )
+        .detach();
         let policy = PeerPolicy {
             relay_only: self.settings.relay_only,
         };
@@ -1695,7 +1733,7 @@ async fn drive(
         codecs: &[Codec::Av1],
         policy,
     };
-    let (mut media, video_worker) = tokio::select! {
+    let (mut media, video_worker, host) = tokio::select! {
         biased;
         () = &mut cancel => return Ok(Finish::Left),
         result = prepare(crypto, options) => result?,
@@ -1711,6 +1749,7 @@ async fn drive(
         display.updates.clone(),
         policy.relay_only,
     );
+    display.updates.host(host);
     let mut audio = audio::Audio::new(display.updates.clone());
     let result = tokio::select! {
         biased;
@@ -2020,12 +2059,21 @@ async fn meeting(
     }
 }
 
-async fn prepare(crypto: CryptoHandle, options: Connect<'_>) -> Result<(Media, PathBuf), String> {
+async fn prepare(
+    crypto: CryptoHandle,
+    options: Connect<'_>,
+) -> Result<(Media, PathBuf, Option<u64>), String> {
     let (executable, video_worker) = WORKERS
         .as_ref()
         .ok_or("The native video workers are unavailable.")?
         .clone();
     let connection = Connection::connect(crypto, options).await.map_err(text)?;
+    let welcome = connection.welcome();
+    let host = welcome
+        .peers
+        .iter()
+        .find(|peer| peer.role == nuschl_protocol::sfu::Role::Host && peer.id != welcome.peer)
+        .map(|peer| peer.id);
     let media = connection
         .into_media(MediaOptions {
             executable,
@@ -2034,7 +2082,7 @@ async fn prepare(crypto: CryptoHandle, options: Connect<'_>) -> Result<(Media, P
         })
         .await
         .map_err(text)?;
-    Ok((media, video_worker))
+    Ok((media, video_worker, host))
 }
 
 fn text(error: impl std::fmt::Display) -> String {
