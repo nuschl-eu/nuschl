@@ -145,6 +145,10 @@ channel, send, receive, edit, and load the server's history through the SDK alon
 `readme_screenshot.py` (`just readme-screenshot`) makes the picture at the top of
 README.md the same way: a loopback `nuschld`, scripted people, and the desktop in a
 private headless GNOME Shell, cropped to the window; check it before committing.
+`status_layout.py` (local-only: GNOME Shell on the real GPU) runs the same scene
+with AT-SPI and a sine-tone microphone: through muted, unmuted, speaking and typing,
+at 1078×782 and 860×520, the header, voice card and composer keep their extents and
+no label outside the timeline and channel tree shows an ellipsis.
 The terminal client: `with_local_nuschld.py <binaries> tui_loopback.py <binaries> --port
 PORT` (or `with_local_murmur.py <mumble-server> tui_loopback.py <binaries> --port PORT
 --stock`) drives `nuschl-tui` through pseudo-terminals, one person in the full screen

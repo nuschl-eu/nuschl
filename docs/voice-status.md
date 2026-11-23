@@ -12,9 +12,9 @@ that server and explicitly disconnects **voice and chat**. Selecting the destina
 line browses its current channel without moving microphone ownership.
 
 One pure classification supplies the rail, card, selected-server footer and current
-voice-channel heading. Microphone destination means routing intent, not speech or
-hardware readiness. An idle unmuted push-to-talk destination is not called Talking.
-Speaking requires current own-user activity and is suppressed immediately by local
+voice-channel heading. A server that receives your microphone says Muted, Unmuted or
+Speaking; the others say Listening or Deafened. Unmuted is routing intent: an idle
+unmuted push-to-talk destination says Unmuted. Speaking requires current own-user activity and is suppressed immediately by local
 mute/deafen/push-to-mute, server mute/deafen/suppression, missing acknowledgement,
 unsupported/unknown codec, E2EE voice unavailability or insufficient transmit budget.
 A listening server remains a listening context even when another destination is

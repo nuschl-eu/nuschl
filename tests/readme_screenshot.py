@@ -287,7 +287,7 @@ def main():
             window = shell.window("Nuschl")
             margin = (window["height"] - height) // 2
             for _ in range(2):  # the first click after mapping can be swallowed
-                shell.click(window["x"] + window["width"] // 2 + 90, window["y"] + margin + height - 62)
+                shell.click(window["x"] + window["width"] // 2 + 90, window["y"] + margin + height - 38)
                 time.sleep(0.4)
             reply = "I'll take the Windows build after dinner."
             shell.type(reply)

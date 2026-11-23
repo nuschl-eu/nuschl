@@ -32,6 +32,9 @@ use std::{
 const RAIL_WIDTH: f32 = 72. + layout::SCROLLBAR_GUTTER;
 const SPLITTER_WIDTH: f32 = 5.;
 const CONTROL_HEIGHT: f32 = 32.;
+/// The line height of the composer's status line, which keeps its height
+/// whatever it says.
+const STATUS_LINE: f32 = 20.;
 const CHANNELS_DIALOG: u8 = 1 << 6;
 const CHANNELS_SHEET_LIST: &str = "channels-sheet-list";
 
@@ -887,7 +890,11 @@ fn sidebar(
                                         .rounded_full()
                                         .bg(color(status_color(server.status))),
                                 )
-                                .child(layout::label("connection", server.status_label())),
+                                .child(layout::detailed_label(
+                                    "connection",
+                                    connection_line(server),
+                                    server.status_label(),
+                                )),
                         ),
                 )
                 .child(icon_button(
@@ -2367,23 +2374,23 @@ fn conversation(
                 }
             });
     let topic = if !is_channel {
-        "Private conversation".to_string()
+        "Private conversation"
+    } else if server.status == Status::Connecting {
+        "Connecting…"
+    } else if !connected {
+        "Offline"
     } else if !server.has_mumble_voice() {
-        "End-to-end voice is not available yet on this server.".into()
+        "Text only"
     } else if in_this_voice {
-        crate::voice::projected(&this.client, server, this.push_muted)
-            .label()
-            .to_string()
-    } else if connected {
-        "Double-click the channel or use Join voice to talk here".to_string()
+        crate::voice::projected(&this.client, server, this.push_muted).label()
     } else {
-        channel.topic.clone()
+        "Not joined"
     };
     let context = ConversationLayout {
         pane,
         index,
         channel,
-        topic: &topic,
+        topic,
         is_channel,
         in_this_voice,
     };
@@ -4084,14 +4091,23 @@ fn composer(
                 cx,
             ))
         })
+        // One line high: who is typing (or where the message goes) keeps at
+        // least half of it; the history state and the keyboard hint follow
+        // while they fit. What does not fit wraps below the line, out of
+        // sight, so a change of text moves nothing.
         .child(
             layout::row()
+                .flex_wrap()
+                .gap_x_4()
+                .h(px(STATUS_LINE))
+                .line_height(px(STATUS_LINE))
+                .overflow_hidden()
                 .px_1()
                 .text_xs()
                 .text_color(color(TEXT_FAINT))
                 .child(
                     layout::flexible()
-                        .flex_grow(2.)
+                        .min_w(relative(0.5))
                         .child(crate::typing::LiveStatus {
                             id: "typing-status".into(),
                             label: typing.clone().map(SharedString::from),
@@ -4116,22 +4132,31 @@ fn composer(
                             },
                         }),
                 )
-                .child(layout::label(
-                    "composer-hint",
-                    if this.settings.enter_sends {
-                        "Enter to send · Shift+Enter for a new line"
-                    } else {
-                        "Enter for a new line · Ctrl/Cmd+Enter to send"
-                    },
-                ))
-                .child(layout::label(
+                .child(layout::fixed().child(layout::label(
                     "history-default",
                     if this.history_enabled {
-                        "Local history on · no end-to-end encryption"
+                        "Local history on"
                     } else {
                         "Local history off"
                     },
-                )),
+                )))
+                .child(layout::fixed().child(if this.settings.enter_sends {
+                    layout::detailed_label(
+                        "composer-hint",
+                        "New line: Shift+Enter",
+                        "Enter to send · Shift+Enter for a new line",
+                    )
+                } else {
+                    layout::detailed_label(
+                        "composer-hint",
+                        if cfg!(target_os = "macos") {
+                            "Send: Cmd+Enter"
+                        } else {
+                            "Send: Ctrl+Enter"
+                        },
+                        "Enter for a new line · Ctrl/Cmd+Enter to send",
+                    )
+                })),
         );
     div()
         .min_w_0()
@@ -4548,6 +4573,20 @@ fn downgrade_card(reason: &str, index: usize, cx: &mut Context<Desktop>) -> AnyE
         )))
         .into_any_element();
     layout::notice("downgrade-banner", DANGER, "shield", body, None).into_any_element()
+}
+
+/// The sidebar's connection status and round trip; `status_label` adds the
+/// transport.
+fn connection_line(server: &ServerView) -> String {
+    match &server.transport {
+        Some(stats) if server.status == Status::Connected && stats.udp_active => {
+            format!("Connected · {:.0} ms", stats.udp.average_ms)
+        }
+        Some(stats) if server.status == Status::Connected && stats.tcp.packets > 0 => {
+            format!("Connected · {:.0} ms", stats.tcp.average_ms)
+        }
+        _ => server.status_label(),
+    }
 }
 
 fn status_color(status: Status) -> Token {
