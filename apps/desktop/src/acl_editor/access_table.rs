@@ -338,7 +338,9 @@ fn row(
     };
     let own = bits_of(&rows.own, who);
     let row_label = label(view, who);
-    let mut row = line().h(px(TABLE_ROW)).child(
+    // The list lays rows out at their content's width unless they fill it;
+    // filled, the cells line up under the header's columns.
+    let mut row = line().w_full().h(px(TABLE_ROW)).child(
         div()
             .id(SharedString::from(format!("acl-row-{token}-{number}")))
             .w(px(130.))
@@ -567,7 +569,12 @@ pub(super) fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Deskto
         .bg(color(ELEVATED))
         .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
-        .child(div().w(px(130.)).flex_shrink_0().child("Who"));
+        .child(
+            div()
+                .w(px(130.))
+                .flex_shrink_0()
+                .child(text!("Who").with_id("acl-column-who")),
+        );
     for (column, (heading, _, help)) in COLUMNS.iter().enumerate() {
         header = header.child(
             div()
@@ -575,9 +582,8 @@ pub(super) fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Deskto
                 .flex_1()
                 .min_w_0()
                 .pl_3()
-                .whitespace_nowrap()
                 .tooltip(move |_, cx| cx.new(|_| Tooltip((*help).into())).into())
-                .child(SharedString::from(*heading)),
+                .child(text!(*heading).with_id(("acl-column-label", column))),
         );
     }
     let mut grid = div()

@@ -221,9 +221,9 @@ pointer/keyboard endpoints, bounded instantiated rows, focus reveal and text
 editing keys at 1280×800, 900×600 and 900×800 at 200% zoom. `--pending-input`
 attempts a real edit during a naturally paced save and verifies the original
 field value is retained, then editable after confirmation. `--channel-types`
-reads a custom table as Custom, saves Members only, Password and Open and
-compares the server's rules, then creates a channel as Announcements and
-checks the rules saved for it.
+checks that each cell starts under its column header, reads a custom table as
+Custom, saves Members only, Password and Open and compares the server's rules,
+then creates a channel as Announcements and checks the rules saved for it.
 [acl_e2ee_bootstrap.py](../tests/acl_e2ee_bootstrap.py) separately starts nuschld
 in E2EE-only mode and uses the native SuperUser password form and group editor
 to promote an offline account, without changing security policy or using a raw

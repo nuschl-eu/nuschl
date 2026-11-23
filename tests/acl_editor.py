@@ -392,6 +392,28 @@ def actions(args, root, shell, application, bot, murmur):
             "a custom table showed a type",
         )
         assert not any(selected(kind) for kind in ("Open", "Members only", "Private"))
+        # Each cell sits in its header's column: the header's text and the
+        # cell's button both start at the column's start plus px_3 (12 px)
+        # and the button's own padding.
+        headings = ("See & join", "Speak", "Chat", "Moderate", "Manage channel")
+
+        def columns():
+            found = {}
+            for node, role, name, _ in items(application):
+                for heading in headings:
+                    if role == "label" and name == heading:
+                        found["header", heading] = node.extents()
+                    elif role == "push button" and name.startswith(
+                        f"Registered users · {heading}: "
+                    ):
+                        found["cell", heading] = node.extents()
+            return found if len(found) == 2 * len(headings) else None
+
+        found = eventually(columns, "the table's headers or cells are missing")
+        for heading in headings:
+            header, cell = found["header", heading], found["cell", heading]
+            assert abs(header[0] - 12 - cell[0]) <= 3, (heading, header, cell)
+        mark("table_cells_line_up_with_their_headers")
         choose("Members only")
         eventually(
             lambda: text_contains("Registered users may join, speak and write."),
