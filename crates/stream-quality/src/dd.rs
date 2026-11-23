@@ -367,6 +367,11 @@ impl Layers {
         Some(frame)
     }
 
+    /// Whether the source has sent a template structure.
+    pub fn layered(&self) -> bool {
+        self.structure.is_some()
+    }
+
     /// The active decode targets that fit tier `tier` of `kind`'s ladder, one per
     /// layer pair, lowest first; the lowest active target when none fits. A target
     /// fits when its spatial layer belongs to the tier or a lower one (when the
@@ -422,6 +427,8 @@ pub struct Selector {
     newest: Option<u16>,
     /// The RTP timestamp of the last temporal unit forwarded with the marker.
     ended: Option<u64>,
+    /// Whether the receiver lacks the wanted target's chain.
+    broken: bool,
 }
 
 impl Selector {
@@ -429,6 +436,9 @@ impl Selector {
     /// happens at the next frame that starts a temporal unit for the receiver,
     /// is a switch point for the target and whose chain the receiver holds.
     pub fn want(&mut self, target: Option<Wanted>) {
+        if target != self.wanted {
+            self.broken = false;
+        }
         self.wanted = target;
     }
 
@@ -436,10 +446,15 @@ impl Selector {
         self.current.map(|(target, _)| target)
     }
 
-    /// Whether a switch waits for a switch point; the caller asks the publisher
-    /// for a key frame.
+    /// Whether a switch waits for a switch point.
     pub fn waiting(&self) -> bool {
         self.wanted.is_some() && self.current != self.wanted
+    }
+
+    /// Whether the switch waits for a key picture: the receiver lacks a frame
+    /// of the wanted target's chain.
+    pub fn needs_keyframe(&self) -> bool {
+        self.waiting() && self.broken
     }
 
     /// Whether the receiver holds every earlier frame of the chain protecting
@@ -464,10 +479,9 @@ impl Selector {
             match self.wanted {
                 None => self.current = None,
                 Some((target, _)) => {
-                    if self.intact(frame, target)
-                        && frame.dti(target) == Dti::Switch
-                        && self.ended != Some(timestamp)
-                    {
+                    let intact = self.intact(frame, target);
+                    self.broken = !intact;
+                    if intact && frame.dti(target) == Dti::Switch && self.ended != Some(timestamp) {
                         self.current = self.wanted;
                     }
                 }
@@ -948,7 +962,7 @@ mod tests {
                     s.want(Some((3, 1)));
                 }
                 if (7..10).contains(&unit) {
-                    assert!(s.waiting(), "unit {unit}");
+                    assert!(s.needs_keyframe(), "unit {unit}");
                 }
             });
         assert_eq!(forwarded, [12, 14, 16, 18, 19, 21, 23]);
@@ -981,7 +995,7 @@ mod tests {
         });
         let (forwarded, _) = run_l2t2(&mut layers, &mut late, 8..10, &[0, 4], |_, _| {});
         assert_eq!(forwarded, [17, 19]);
-        assert!(late.waiting());
+        assert!(late.needs_keyframe());
     }
 
     #[test]
@@ -993,6 +1007,7 @@ mod tests {
             if unit == 3 {
                 s.want(Some((3, 1)));
             }
+            assert!(!s.needs_keyframe());
         });
         // S1T0 frames only, then from the next S1T0 frame (unit 4) all S1 frames.
         assert_eq!(forwarded, [0, 1, 5, 9, 11, 13, 15]);

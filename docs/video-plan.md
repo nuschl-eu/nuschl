@@ -236,7 +236,9 @@ and pacing use measured payload rates.
 - SFU queues hold about 300 ms at the leg's estimate, clamped to 32 KiB–2 MiB;
   RTX caches about 1 s.
 - Key-frame requests: one per receiver and source per 2 s, coalesced per
-  source; native senders repair loss with intra refresh.
+  source; native senders repair loss with intra refresh. For a layered source
+  the SFU asks only when a receiver lacks a chain of the decode target it
+  should get; lost packets come back from the SFU's retransmission buffer.
 - Per room: ≤150 Mbit/s egress, ≤25 Mbit/s per receiver, ≤70 % of the host's
   upload. Available capacity is shared max-min by dropping layers; a join
   fails when the base layers do not fit.
