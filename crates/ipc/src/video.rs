@@ -62,6 +62,27 @@ pub enum CaptureFailure {
     Permission = 45,
 }
 
+/// The longest pipeline message a capture worker reports with its failure.
+pub const CAPTURE_DETAIL_BYTES: usize = 200;
+
+/// Report why a capture stopped: the reason byte, then the start of the
+/// pipeline's message.
+pub fn write_capture_failure(
+    output: &mut impl io::Write,
+    reason: CaptureFailure,
+    detail: &str,
+) -> io::Result<()> {
+    let detail = &detail[..detail.floor_char_boundary(CAPTURE_DETAIL_BYTES)];
+    let header = Header {
+        bytes: 1 + detail.len() as u32,
+        ..Header::empty(Kind::CaptureFailed, 0)
+    };
+    output.write_all(&header.to_bytes())?;
+    output.write_all(&[reason as u8])?;
+    output.write_all(detail.as_bytes())?;
+    output.flush()
+}
+
 impl CaptureFailure {
     fn from_exit(code: i32) -> Option<Self> {
         [
@@ -234,6 +255,7 @@ pub enum Kind {
     SetCaptureLimits,
     SetCapturePreview,
     CapturePreview,
+    CaptureFailed,
 }
 
 /// Each reply carries the ID from its request.
@@ -294,6 +316,7 @@ impl Header {
             22 => Kind::SetCaptureLimits,
             23 => Kind::SetCapturePreview,
             24 => Kind::CapturePreview,
+            25 => Kind::CaptureFailed,
             _ => return Err(invalid()),
         };
         let key = flags == KEY;

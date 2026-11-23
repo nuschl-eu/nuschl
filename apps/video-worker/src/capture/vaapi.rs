@@ -7,7 +7,7 @@ use gstreamer::{self as gst, prelude::*};
 use gstreamer_app::AppSink;
 use nuschl_ipc::video::{
     CaptureFailure, CaptureLimits, Kind, PREVIEW_HEIGHT, PREVIEW_WIDTH, Settings, Source,
-    write_capture_preview,
+    write_capture_failure, write_capture_preview,
 };
 use std::{
     io,
@@ -475,8 +475,8 @@ fn write_frames(
                 bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
             {
                 return match message.view() {
-                    gst::MessageView::Error(error) => {
-                        let error = error.error();
+                    gst::MessageView::Error(message) => {
+                        let error = message.error();
                         let reason = if error.matches(gst::CoreError::Negotiation)
                             || error.matches(gst::StreamError::Format)
                         {
@@ -486,6 +486,19 @@ fn write_frames(
                         } else {
                             CaptureFailure::Hardware
                         };
+                        // Name the element and keep the last line of its
+                        // diagnostic, such as a flow error's return value.
+                        let element = message.src().map(|src| src.name());
+                        let debug = message.debug();
+                        let reason_line = debug.as_deref().and_then(|text| text.lines().last());
+                        let detail = format!(
+                            "{}: {error}{}",
+                            element.as_deref().unwrap_or("pipeline"),
+                            reason_line
+                                .map(|line| format!(" ({line})"))
+                                .unwrap_or_default(),
+                        );
+                        let _ = write_capture_failure(&mut stdout, reason, &detail);
                         Err(reason.into())
                     }
                     _ => Ok(()),

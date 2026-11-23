@@ -29,14 +29,31 @@ pub enum Error {
     Timeout,
     #[error("video encoder has stopped")]
     Stopped,
-    #[error(transparent)]
-    Capture(#[from] CaptureFailure),
+    /// The worker's reason, with the pipeline's message when it sent one.
+    #[error("{0}")]
+    Capture(CaptureFailure, Option<String>),
     #[error("The video capture connection closed.")]
     CaptureClosed,
     #[error("The video capture worker exited ({0}).")]
     CaptureExit(std::process::ExitStatus),
     #[error("a Tokio runtime is required to start a video source")]
     Runtime,
+}
+
+impl From<CaptureFailure> for Error {
+    fn from(reason: CaptureFailure) -> Self {
+        Self::Capture(reason, None)
+    }
+}
+
+impl Error {
+    /// The capture pipeline's message for a failed capture.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Capture(_, detail) => detail.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 pub enum Output {
