@@ -71,6 +71,8 @@ struct Download {
     id: u64,
     key: Key,
     path: PathBuf,
+    /// Where it is received, in Nuschl's cache folder, until it is at `path`.
+    staged: PathBuf,
     state: Receiving,
     commands: Option<mpsc::Sender<TransferRequest>>,
     stop: Option<tokio::task::AbortHandle>,
@@ -79,9 +81,15 @@ struct Download {
 
 enum Receiving {
     Connecting,
-    Progress { done: u64, total: u64 },
+    Progress {
+        done: u64,
+        total: u64,
+    },
+    Saving,
     Done,
     Failed(String),
+    /// Complete at `Download::staged`, and saving it at `path` failed.
+    Unsaved(String),
     Cancelled,
 }
 
@@ -112,6 +120,8 @@ enum Update {
     Event(TransferEvent),
     /// The worker has exited: for a download, whether the file is complete.
     Finished(Result<(), String>),
+    /// A download is complete in its staging file, and saving it failed.
+    Unsaved(String),
 }
 
 /// The servers from Settings. The test override pins both servers and keeps
@@ -300,13 +310,51 @@ impl Desktop {
 
     /// Ask where to save an offered file, then receive it.
     fn download(&mut self, key: Key, offer: Offer, cx: &mut Context<Self>) {
-        let directory = downloads();
-        let target = cx.prompt_for_new_path(&directory, Some(&save_name(&offer.name)));
+        let name = offer.name.clone();
+        self.ask_where(
+            &name,
+            move |this, path, cx| this.receive(key, offer, path, cx),
+            cx,
+        );
+    }
+
+    /// Ask again where to save a received file whose saving failed, and save
+    /// it there from its staging file.
+    fn save_received(&mut self, id: u64, name: &str, cx: &mut Context<Self>) {
+        self.ask_where(
+            name,
+            move |this, path, cx| {
+                let Some(download) = this.transfers.downloads.iter_mut().find(|download| {
+                    download.id == id && matches!(download.state, Receiving::Unsaved(_))
+                }) else {
+                    return;
+                };
+                download.state = Receiving::Saving;
+                download.path = path.clone();
+                let staged = download.staged.clone();
+                let (updates, receiver) = mpsc::channel(1);
+                this.driver.runtime().spawn(async move {
+                    let _ = updates.send(finish(staged, path).await).await;
+                });
+                follow(id, receiver, cx);
+            },
+            cx,
+        );
+    }
+
+    /// Ask where to save a file called `name`, then `then` with the path.
+    fn ask_where(
+        &mut self,
+        name: &str,
+        then: impl FnOnce(&mut Self, PathBuf, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let target = cx.prompt_for_new_path(&downloads(), Some(&save_name(name)));
         cx.spawn(async move |this, cx| {
             let chosen = target.await;
             let _ = this.update(cx, |this, cx| {
                 match chosen {
-                    Ok(Ok(Some(path))) => this.receive(key, offer, path, cx),
+                    Ok(Ok(Some(path))) => then(this, path, cx),
                     Ok(Err(error)) => {
                         this.error = Some(format!("Cannot ask where to save: {error}"))
                     }
@@ -338,16 +386,30 @@ impl Desktop {
             max_size: size_limit(offer.size),
             servers,
         };
-        let started = self.driver.runtime().block_on(Transfer::start(None));
-        self.transfers
-            .downloads
-            .retain(|download| download.key != key);
+        let folder = self.profile.layout().downloads();
+        let started = nuschl_session::layout::create_private_dir(&folder)
+            .map_err(|error| format!("Cannot write {}: {error}", folder.display()))
+            .and_then(|()| {
+                self.driver
+                    .runtime()
+                    .block_on(Transfer::start(None))
+                    .map_err(|error| format!("File transfer is unavailable: {error}"))
+            });
+        self.transfers.downloads.retain(|download| {
+            let replaced = download.key == key;
+            if replaced {
+                let _ = std::fs::remove_file(&download.staged);
+            }
+            !replaced
+        });
         self.transfers.next_id += 1;
         let id = self.transfers.next_id;
+        let staged = folder.join(format!("{}-{id}.part", std::process::id()));
         let mut download = Download {
             id,
             key,
             path: path.clone(),
+            staged: staged.clone(),
             state: Receiving::Connecting,
             commands: None,
             stop: None,
@@ -360,13 +422,11 @@ impl Desktop {
                 let (updates, receiver) = mpsc::channel(32);
                 self.driver
                     .runtime()
-                    .spawn(run_download(worker, path, updates));
+                    .spawn(run_download(worker, staged, path, updates));
                 follow(id, receiver, cx);
             }
             Ok(_) => download.state = Receiving::Failed("The transfer did not start.".into()),
-            Err(error) => {
-                download.state = Receiving::Failed(format!("File transfer is unavailable: {error}"))
-            }
+            Err(reason) => download.state = Receiving::Failed(reason),
         }
         self.transfers.downloads.push(download);
     }
@@ -416,7 +476,7 @@ impl Desktop {
                     }
                     offer.problem = Some(tidy(&reason));
                 }
-                Update::Event(_) => {}
+                Update::Event(_) | Update::Unsaved(_) => {}
                 Update::Finished(_) => {
                     announce = !offer.ended && offer.posted;
                     offer.ended = true;
@@ -443,8 +503,12 @@ impl Desktop {
                 Update::Event(_) => return,
                 Update::Finished(Ok(())) => Receiving::Done,
                 Update::Finished(Err(reason)) => Receiving::Failed(tidy(&reason)),
+                Update::Unsaved(reason) => Receiving::Unsaved(tidy(&reason)),
             };
-            if matches!(download.state, Receiving::Done | Receiving::Failed(_)) {
+            if matches!(
+                download.state,
+                Receiving::Done | Receiving::Failed(_) | Receiving::Unsaved(_)
+            ) {
                 download.commands = None;
                 download.stop = None;
             }
@@ -591,22 +655,64 @@ async fn run_offer(mut worker: Transfer, updates: mpsc::Sender<Update>) {
     let _ = updates.send(Update::Finished(Ok(()))).await;
 }
 
-/// Write what the worker receives to `<path>.part`, and only a complete file
-/// to `path`.
-async fn run_download(mut worker: Transfer, path: PathBuf, updates: mpsc::Sender<Update>) {
-    let mut part = path.clone().into_os_string();
-    part.push(".part");
-    let part = PathBuf::from(part);
-    let mut result = save(&mut worker.events, &part, &updates).await;
-    if result.is_ok() {
-        result = tokio::fs::rename(&part, &path)
-            .await
-            .map_err(|error| format!("Cannot save {}: {error}", path.display()));
+/// Write what the worker receives to `staged`, and only a complete file to
+/// `path`.
+async fn run_download(
+    mut worker: Transfer,
+    staged: PathBuf,
+    path: PathBuf,
+    updates: mpsc::Sender<Update>,
+) {
+    let update = match save(&mut worker.events, &staged, &updates).await {
+        Ok(()) => finish(staged, path).await,
+        Err(reason) => {
+            let _ = tokio::fs::remove_file(&staged).await;
+            Update::Finished(Err(reason))
+        }
+    };
+    let _ = updates.send(update).await;
+}
+
+/// [`place`] a complete download, and what that means for its card.
+async fn finish(staged: PathBuf, path: PathBuf) -> Update {
+    let target = path.clone();
+    match tokio::task::spawn_blocking(move || place(&staged, &target))
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+    {
+        Ok(()) => Update::Finished(Ok(())),
+        Err(error) => Update::Unsaved(save_error(&path, &error)),
     }
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&part).await;
+}
+
+/// Why a complete download could not be saved at `path`. A disconnected
+/// FUSE mount (a broken document portal) answers `ENOTCONN`.
+fn save_error(path: &Path, error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotConnected => {
+            format!("Cannot save {}: the folder is disconnected", path.display())
+        }
+        _ => format!("Cannot save {}: {error}", path.display()),
     }
-    let _ = updates.send(Update::Finished(result)).await;
+}
+
+/// Put the complete file `staged` at `target` in one step: a rename where
+/// both share a file system, otherwise a synced copy into `target`, which
+/// needs that one name only (a document portal folder holds nothing else).
+/// A failed copy removes `target` and keeps `staged` for another try.
+fn place(staged: &Path, target: &Path) -> std::io::Result<()> {
+    if std::fs::rename(staged, target).is_ok() {
+        return Ok(());
+    }
+    let mut source = std::fs::File::open(staged)?;
+    let mut file = std::fs::File::create(target)?;
+    if let Err(error) = std::io::copy(&mut source, &mut file).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(target);
+        return Err(error);
+    }
+    let _ = std::fs::remove_file(staged);
+    Ok(())
 }
 
 async fn save(
@@ -979,6 +1085,7 @@ fn receiver_status(
             progress: Some(percent(*done, *total) as f32 / 100.),
             buttons: vec![cancel(cx)],
         },
+        Receiving::Saving => Shown::status("Saving…"),
         Receiving::Done => {
             let (open, reveal) = (download.path.clone(), download.path.clone());
             let name = download
@@ -1004,6 +1111,22 @@ fn receiver_status(
                         cx,
                     ),
                 ],
+            )
+        }
+        Receiving::Unsaved(reason) => {
+            let name = download.key.name.clone();
+            with(
+                reason.clone(),
+                vec![styled_button(
+                    ("offer-save", position),
+                    "Save as…",
+                    Tone::Primary,
+                    move |this, _, cx| {
+                        this.save_received(id, &name, cx);
+                        cx.notify();
+                    },
+                    cx,
+                )],
             )
         }
         Receiving::Failed(reason) if available => with(
@@ -1040,8 +1163,8 @@ fn kind(name: &str) -> (&'static str, Token) {
 mod tests {
     // Not `super::*`: GPUI's prelude has its own `test` attribute.
     use super::{
-        ClientSettings, PUBLIC_RENDEZVOUS, TransferEvent, kind, mpsc, people, percent, save,
-        wormhole_servers,
+        ClientSettings, PUBLIC_RENDEZVOUS, TransferEvent, kind, mpsc, people, percent, place, save,
+        save_error, wormhole_servers,
     };
     use base64::Engine as _;
 
@@ -1105,6 +1228,97 @@ mod tests {
         assert!(saved(vec![started(6), garbage]).0.is_err());
     }
 
+    /// An empty folder of its own for one test.
+    fn folder(name: &str) -> std::path::PathBuf {
+        let folder = std::env::temp_dir().join(format!(
+            "nuschl-transfer-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(folder.join("staging")).unwrap();
+        folder
+    }
+
+    #[test]
+    fn a_download_on_the_same_file_system_is_renamed_into_place() {
+        let folder = folder("rename");
+        let (staged, target) = (folder.join("staging/1.part"), folder.join("file"));
+        std::fs::write(&staged, "complete").unwrap();
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&staged).unwrap());
+        place(&staged, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete");
+        assert!(!staged.exists());
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&target).unwrap()),
+            inode
+        );
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// A folder that holds only the chosen name and takes no new ones, as a
+    /// document portal's: the download is copied into that name.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_with_only_the_chosen_name_gets_the_complete_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = folder("one-name");
+        let (staged, document) = (folder.join("staging/1.part"), folder.join("document"));
+        std::fs::create_dir(&document).unwrap();
+        let target = document.join("file");
+        std::fs::write(&staged, "complete").unwrap();
+        std::fs::write(&target, "an older and longer file").unwrap();
+        let mode = |mode| std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(&document, mode(0o555)).unwrap();
+        let placed = place(&staged, &target);
+        std::fs::set_permissions(&document, mode(0o755)).unwrap();
+        placed.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete");
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_keeps_the_staged_file_for_another_try() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = folder("failed");
+        let (staged, locked) = (folder.join("staging/1.part"), folder.join("locked"));
+        std::fs::write(&staged, "complete").unwrap();
+        std::fs::create_dir(&locked).unwrap();
+        let mode = |mode| std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(&locked, mode(0o555)).unwrap();
+        let refused = place(&staged, &locked.join("file"));
+        std::fs::set_permissions(&locked, mode(0o755)).unwrap();
+        assert!(refused.is_err());
+        assert!(!locked.join("file").exists());
+        // Another try finds the staged file and needs no new download.
+        let target = folder.join("file");
+        place(&staged, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete");
+
+        // A copy that fails after opening the target removes what it wrote:
+        // a folder as the staged file makes reading fail, and it cannot be
+        // renamed over the existing file.
+        let unreadable = folder.join("staging/2.part");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(place(&unreadable, &target).is_err());
+        assert!(!target.exists());
+        assert!(unreadable.is_dir());
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn a_disconnected_folder_is_named_in_the_error() {
+        let path = std::path::Path::new("/run/user/1000/doc/1/file");
+        let disconnected = std::io::Error::from(std::io::ErrorKind::NotConnected);
+        assert_eq!(
+            save_error(path, &disconnected),
+            "Cannot save /run/user/1000/doc/1/file: the folder is disconnected"
+        );
+    }
+
     #[test]
     fn the_test_override_pins_servers_and_avoids_stun() {
         let settings = ClientSettings::default();
@@ -1149,6 +1363,7 @@ mod tests {
                     size: "1 MB".into(),
                 },
                 path: std::path::PathBuf::new(),
+                staged: std::path::PathBuf::new(),
                 state: Receiving::Connecting,
                 commands: Some(commands.clone()),
                 stop: Some(stop),

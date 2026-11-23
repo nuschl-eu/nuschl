@@ -11,7 +11,7 @@
 //! | `$XDG_CONFIG_HOME/nuschl` | `~/.config/nuschl` | what you edit or keep with your dotfiles: `settings.json`, `servers.json` (the bookmarks), `managed.json`. No keys, no caches. |
 //! | `$XDG_DATA_HOME/nuschl` | `~/.local/share/nuschl` | `identity/` (the Mumble certificate and its private key), `keys/` (the crypto worker's sealed keystore), `history/` (the storage worker's database), `nuschl-policy.json` (the servers' security records) |
 //! | `$XDG_STATE_HOME/nuschl` | `~/.local/state/nuschl` | `last-channels.json`, `update-state.json` |
-//! | `$XDG_CACHE_HOME/nuschl` | `~/.cache/nuschl` | `channels.json` (channel trees for browsing offline) and `icons.json` (server icons); safe to delete |
+//! | `$XDG_CACHE_HOME/nuschl` | `~/.cache/nuschl` | `channels.json` (channel trees for browsing offline), `icons.json` (server icons) and `downloads/` (files being received); safe to delete |
 //!
 //! macOS keeps configuration and data in `~/Library/Application
 //! Support/org.Nuschl.Nuschl` (state in its `state` folder) and the cache in
@@ -60,6 +60,8 @@ const APPLICATION: &str = "nuschl";
 const HISTORY: &str = "history";
 const IDENTITY: &str = "identity";
 const KEYS: &str = "keys";
+/// The folder under the cache folder.
+const DOWNLOADS: &str = "downloads";
 /// The crypto worker's folder in earlier versions, in the configuration folder.
 const OLD_KEYS: &str = "nuschel-identity";
 pub(crate) const HISTORY_FILE: &str = "history.sqlite3";
@@ -80,7 +82,8 @@ pub struct Layout {
     pub data: PathBuf,
     /// Where Nuschl resumes from: the last channels, the update check.
     pub state: PathBuf,
-    /// Channel trees and server icons: safe to delete at any time.
+    /// Channel trees, server icons and files being received: safe to delete
+    /// at any time.
     pub cache: PathBuf,
 }
 
@@ -166,6 +169,12 @@ impl Layout {
     /// The crypto worker's folder: the sealed keystore, its state and store key.
     pub fn keys(&self) -> PathBuf {
         self.data.join(KEYS)
+    }
+
+    /// Files being received, until they are complete and saved where the
+    /// user chose.
+    pub fn downloads(&self) -> PathBuf {
+        self.cache.join(DOWNLOADS)
     }
 
     /// A worker may write anywhere in its folder, so no other folder may lie
