@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 pub const MAX_SDP: usize = 32 * 1024;
 pub const MAX_DATAGRAM: usize = 2048;
-pub const MAX_VIDEO: usize = 1024 * 1024;
+pub const MAX_VIDEO: usize = crate::video::SCREEN_FRAME_BYTES;
 const MAX_METADATA: usize = MAX_SDP * 2 + 8192;
 pub const MAX_TRACKS: usize = 48;
 

@@ -230,9 +230,10 @@ and pacing use measured payload rates.
 
 ### 5.2 Bounds
 
-- Encoder caps: screen key frames ≤1 MiB from 1440p up, ≤512 KiB below; camera
-  key frames ≤256 KiB; deltas ≤ half the key-frame cap. An oversized frame is
-  dropped and a key frame requested.
+- Encoder caps: screen frames ≤8 MiB, key frames and deltas; camera key frames
+  ≤256 KiB, deltas ≤128 KiB. The largest measured screen key frame is 4.45 MB
+  (3840×2160 noise, VA-API QVBR). An oversized frame is dropped and a key frame
+  requested.
 - SFU queues hold about 300 ms at the leg's estimate, clamped to 32 KiB–2 MiB;
   RTX caches about 1 s.
 - Key-frame requests: one per receiver and source per 2 s, coalesced per
