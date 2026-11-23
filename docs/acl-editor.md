@@ -22,7 +22,8 @@ numeric account. Missing labels never discard membership.
 **Channel password** sets, changes or removes a password the way Mumble's channel
 dialog does: two local rules that apply in the channel only, `@all` denied and
 `#<password>` granted Enter, Speak, Whisper, Text message, Link channel and
-Traverse. People with the password as an access token may enter.
+Traverse. People with the password as an access token may enter; on nuschld only
+they see the channel, as for any channel that denies Traverse.
 
 **Channel type** sets who may join, speak and write in one step: Open, Members
 only, Password, Announcements or Private. A type is a template for the table's
@@ -44,12 +45,15 @@ here and in subchannels unless noted:
 
 Members only keeps Traverse, so a subchannel can admit everyone again. Private
 denies Traverse: only `@admin`, other holders of Write and the rows you add
-enter, listen, whisper or write here and in every subchannel. Stock Murmur and
-nuschld send every channel to every client, so others still see a private
-channel and the people in it, and its description says so. The description comes
-from `Kind::help`, which knows whether the server is nuschld, so it can change
-once nuschld hides channels. Password uses the typed password, or keeps the
-current one; the other types remove it. Mumble's password rules let `@admin`
+enter, listen, whisper or write here and in every subchannel. nuschld sends a
+client only the channels it may traverse and the people in them
+([server](server.md), "What each client sees"), so on nuschld nobody else sees a
+private channel, its subchannels or the people in them. Stock Murmur sends every
+channel to every client, so there others still see a private channel and the
+people in it. The description comes from `Kind::help`, which takes whether the
+connection negotiated `hidden-channels/1`: "Others don't see the channel" on
+nuschld, "Others see the channel" elsewhere. Password uses the typed password, or
+keeps the current one; the other types remove it. Mumble's password rules let `@admin`
 enter through Write; speaking there takes the password. Murmur checks Text
 message in the receiver's channel for private messages too, so Members only and
 Private also stop everyone else's private messages to people inside. Rules the

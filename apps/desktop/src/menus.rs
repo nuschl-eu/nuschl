@@ -2322,11 +2322,13 @@ fn channel_kind(this: &Desktop, prompt: &Prompt, cx: &mut Context<Desktop>) -> O
     let PromptAction::CreateChannel { kind, password, .. } = &prompt.action else {
         return None;
     };
-    let nuschl = prompt
+    let hidden = prompt
         .origin
         .as_ref()
         .and_then(|origin| origin.local_index(this))
-        .is_some_and(|index| !this.client.servers[index].capabilities.is_empty());
+        .is_some_and(|index| {
+            this.client.servers[index].has(nuschl_protocol::nuschl::capability::HIDDEN_CHANNELS)
+        });
     let options = Kind::ALL
         .into_iter()
         .map(|choice| {
@@ -2358,7 +2360,7 @@ fn channel_kind(this: &Desktop, prompt: &Prompt, cx: &mut Context<Desktop>) -> O
                 div()
                     .text_sm()
                     .text_color(color(TEXT_MUTED))
-                    .child(text!(kind.help(nuschl)).with_id("create-channel-kind-help")),
+                    .child(text!(kind.help(hidden)).with_id("create-channel-kind-help")),
             )
             .when(*kind == Kind::Password, |content| {
                 content.child(
