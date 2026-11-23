@@ -578,7 +578,6 @@ pub fn card(
                                     ))
                                 }),
                         )
-                        .child(layout::fixed().child(action))
                         .when_some(place.issue.as_ref(), |row, issue| {
                             row.child(layout::fixed().child(crate::dialogs::icon_button(
                                 (id.clone(), "audio-issue"),
@@ -595,7 +594,8 @@ pub fn card(
                                 },
                                 cx,
                             )))
-                        }),
+                        })
+                        .child(layout::fixed().child(action)),
                 )
                 .into_any_element()
         })
