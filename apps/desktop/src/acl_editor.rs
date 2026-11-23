@@ -90,6 +90,8 @@ pub struct Editor {
     close_after_save: bool,
     /// The type picked when creating this channel, applied once it loads.
     create: Option<Applied>,
+    /// How the unsaved changes alter who may do what, in a few lines.
+    preview: Vec<String>,
     member: Entity<InputState>,
     input_readonly: Cell<[bool; 4]>,
     rule_scroll: UniformListScrollHandle,
@@ -157,6 +159,7 @@ impl Editor {
             show_rules: false,
             close_after_save: false,
             create: None,
+            preview: Vec::new(),
             rule_scroll: UniformListScrollHandle::new(),
             table_scroll: UniformListScrollHandle::new(),
             group_scroll: UniformListScrollHandle::new(),
@@ -727,7 +730,39 @@ fn change(this: &mut Desktop, token: u64, action: impl FnOnce(&mut Editor)) {
         }
         action(editor);
         editor.dirty = editor.state.draft().is_some_and(|draft| draft.dirty());
+        refresh_preview(editor);
+        parents::next(this, token);
     }
+}
+
+/// Recomputes the effect preview after the draft or the rules read change.
+fn refresh_preview(editor: &mut Editor) {
+    editor.preview = editor
+        .state
+        .draft()
+        .map_or_else(Vec::new, |draft| parents::preview(&editor.parents, draft));
+}
+
+/// The effect preview: how saving changes who may do what, here and in the
+/// subchannels.
+fn effect_lines(editor: &Editor) -> AnyElement {
+    let (reading, more) = editor.parents.below_status();
+    let mut lines = div().flex().flex_col().gap_1();
+    for (number, line) in editor.preview.iter().enumerate() {
+        lines = lines.child(note(
+            SharedString::from(format!("acl-effect-{number}")),
+            line.clone(),
+        ));
+    }
+    if reading {
+        lines = lines.child(note("acl-effect-reading", "Checking subchannels…"));
+    } else if more {
+        lines = lines.child(note(
+            "acl-effect-more",
+            format!("Checked the first {} subchannels", parents::MAX_BELOW),
+        ));
+    }
+    lines.into_any_element()
 }
 fn change_rule(this: &mut Desktop, token: u64, id: RowId, action: impl FnOnce(&mut Editor)) {
     if !active_editor(this, token)
@@ -1262,6 +1297,7 @@ pub fn sync(this: &mut Desktop, cx: &mut Context<Desktop>) {
         }
         inputs_readonly(editor, write.is_some(), cx);
         editor.dirty = editor.state.draft().is_some_and(|draft| draft.dirty());
+        refresh_preview(editor);
         if write.is_none() && editor.close_after_save && !editor.dirty && !editor.state.error {
             let then = editor.then.take();
             this.panel = None;
@@ -1631,7 +1667,8 @@ pub fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Desktop>) -> 
                             .child(text!("Unsaved changes").with_id("acl-dirty")),
                     )
                 }),
-        );
+        )
+        .when(editor.dirty, |body| body.child(effect_lines(editor)));
     let Some(draft) = editor.state.draft() else {
         return body.into_any_element();
     };

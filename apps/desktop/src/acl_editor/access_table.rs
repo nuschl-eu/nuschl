@@ -166,7 +166,7 @@ fn evaluate(
 ) -> (u32, [Reason; 32], HashMap<u32, acl::Node>, bool) {
     let channel = snapshot.channel;
     let (tree, flat) = if parents.done {
-        (parents::tree(&parents.acls, snapshot, who), false)
+        (parents::tree(&parents.acls, snapshot, &[], who), false)
     } else {
         let mut node = base.clone();
         if let Who::Group(group) = who {

@@ -90,6 +90,17 @@ names that channel on hover, and its context menu (or Alt-click) offers
 which lights up and fades out (ease-out; at once with reduced motion). Unsaved
 changes ask Save or Discard first.
 
+**Effect** lines appear under the status line while the draft has unsaved
+changes: how saving changes what Everyone, Registered users and the groups
+visible in the channel may do, here and in the subchannels, such as
+"@guests may now speak here and in 3 subchannels". A row may do a column's
+work when it has all of the column's permissions. Three lines show, then
+"and N more". The parents' rules, the draft and the subchannels' rules are
+evaluated with `nuschl_core::acl` before and after the change. Once the draft
+first changes, the editor reads the subchannels' rules one query at a time,
+breadth first, at most 64 of them; a subchannel whose rules cannot be read is
+left out with its own subchannels. At most 32 groups are compared.
+
 Closing the editor with unsaved changes asks first: **Save** (closes once the
 save is confirmed), **Discard** or **Keep editing**.
 
@@ -224,6 +235,8 @@ field value is retained, then editable after confirmation. `--channel-types`
 checks that each cell starts under its column header, reads a custom table as
 Custom, saves Members only, Password and Open and compares the server's rules,
 then creates a channel as Announcements and checks the rules saved for it.
+`--change-preview` denies Registered users Speak in Music and waits for the
+effect line counting its subchannel, then reloads and checks the line goes.
 [acl_e2ee_bootstrap.py](../tests/acl_e2ee_bootstrap.py) separately starts nuschld
 in E2EE-only mode and uses the native SuperUser password form and group editor
 to promote an offline account, without changing security policy or using a raw

@@ -472,6 +472,28 @@ def actions(args, root, shell, application, bot, murmur):
         mark("channel_created_with_a_type")
         return {"channel_types": cases, "stage": stage, "server": args.server}
 
+    if args.change_preview:
+        # Before saving, the editor says how the change alters who may do what
+        # here and in the subchannels (Music has Listening party).
+        open_acl("Music", expand=False)
+        activate("Registered users · Speak: Yes, not set here")
+        activate("Registered users · Speak: Yes, set here")
+        eventually(
+            lambda: text_contains(
+                "Registered users may no longer speak here and in 1 subchannel"
+            ),
+            "the effect preview did not show",
+        )
+        shell.screenshot(args.output / "change-preview.png")
+        mark("change_preview_counts_subchannels")
+        activate("Reload and discard draft")
+        eventually(
+            lambda: not text_contains("may no longer speak"),
+            "the preview outlived the draft",
+        )
+        mark("change_preview_ends_with_the_draft")
+        return {"change_preview": cases, "server": args.server}
+
     if args.geometry:
         admin = operator(root, pin)
         try:
@@ -1067,6 +1089,7 @@ def main():
     parser.add_argument("--geometry", action="store_true")
     parser.add_argument("--pending-input", action="store_true")
     parser.add_argument("--channel-types", action="store_true")
+    parser.add_argument("--change-preview", action="store_true")
     parser.add_argument("--server", choices=("stock", "nuschld"), default="stock")
     parser.add_argument(
         "--high-admin-limit",
