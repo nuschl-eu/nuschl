@@ -944,6 +944,7 @@ pub struct Driver {
     pending: Pending,
     generation: std::sync::atomic::AtomicU64,
     settings: watch::Sender<ClientSettings>,
+    presences: watch::Sender<Presences>,
     voice_keys: watch::Sender<VoiceKeys>,
     /// Whether connections decode and report plugin data (off by default).
     plugin_data: watch::Sender<bool>,
@@ -1087,6 +1088,7 @@ impl Driver {
             pending: Default::default(),
             generation: Default::default(),
             settings,
+            presences: Default::default(),
             voice_keys,
             plugin_data: watch::Sender::new(false),
             media,
@@ -1144,6 +1146,7 @@ impl Driver {
             ),
             (
                 self.settings.subscribe(),
+                self.presences.subscribe(),
                 self.voice_keys.subscribe(),
                 self.plugin_data.subscribe(),
             ),
@@ -1435,6 +1438,10 @@ impl Driver {
     pub fn apply_settings(&self, settings: ClientSettings) {
         self.settings.send_replace(settings);
     }
+    /// Apply the volumes and mutes of users without a certificate.
+    pub fn apply_presences(&self, presences: Presences) {
+        self.presences.send_replace(presences);
+    }
     /// Play a sound effect for this server, unless it is deafened (see `connect_once`).
     pub fn play_sound(&self, server: &str, sound: Sound) {
         if let Some(connection) = self.connections().get(server) {
@@ -1657,8 +1664,9 @@ async fn connection_loop(
         mpsc::Sender<StorageCommand>,
         Pending,
     ),
-    (mut settings, mut voice_keys, mut plugin_data): (
+    (mut settings, presences, mut voice_keys, mut plugin_data): (
         watch::Receiver<ClientSettings>,
+        watch::Receiver<Presences>,
         watch::Receiver<VoiceKeys>,
         watch::Receiver<bool>,
     ),
@@ -1683,7 +1691,7 @@ async fn connection_loop(
             (&mut commands, &mut sounds, &mut self_state),
             (&events, &hub),
             (&content, &storage, &pending),
-            (&mut settings, &mut voice_keys, &mut plugin_data),
+            (&mut settings, &presences, &mut voice_keys, &mut plugin_data),
             &mut restore,
         )
         .await;
@@ -1834,8 +1842,9 @@ async fn connect_once(
         &mpsc::Sender<StorageCommand>,
         &Pending,
     ),
-    (settings, voice_keys, plugin_data): (
+    (settings, presences, voice_keys, plugin_data): (
         &mut watch::Receiver<ClientSettings>,
+        &watch::Receiver<Presences>,
         &mut watch::Receiver<VoiceKeys>,
         &mut watch::Receiver<bool>,
     ),
@@ -1924,7 +1933,8 @@ async fn connect_once(
     // Retry the latest visible conversation when the worker uploads its keys.
     let mut pending_encrypted_open = None;
     let mut mls_keys_ready = false;
-    let mut hashes = BTreeMap::<u32, Option<String>>::new();
+    // Whose volume and local mute each session's voice plays with.
+    let mut voices = BTreeMap::<u32, UserKey>::new();
     let mut loss_percent = 5_u8;
     // Our own voice is on the air (no terminator sent yet).
     let mut transmitting = false;
@@ -2151,10 +2161,11 @@ async fn connect_once(
                 },
                 SessionEvent::Audio(packet) => {
                     if !voice_allowed { continue; }
-                    let hash = hashes.get(&packet.sender).cloned().flatten();
                     let (muted_locally, volume) = {
                         let current = settings.borrow();
-                        (current.locally_muted(hash.as_deref()), current.volume_for(hash.as_deref()) * current.server_volume(&id))
+                        let (volume, muted) = voices.get(&packet.sender)
+                            .map_or((1., false), |user| user.playback(&current, &presences.borrow()));
+                        (muted, volume * current.server_volume(&id))
                     };
                     if muted_locally { continue; }
                     mark_talking(events, &id, generation, &mut speaking, packet.sender, !packet.end).await;
@@ -2163,7 +2174,7 @@ async fn connect_once(
                     }
                 },
                 SessionEvent::User(user) => {
-                    hashes.insert(user.session, user.certificate_hash.clone());
+                    voices.insert(user.session, UserKey::of(&user));
                     let restricts = user.suppressed || user.muted || user.deafened;
                     if restricts { restricted_users.insert(user.session); } else { restricted_users.remove(&user.session); }
                     if Some(user.session) == own_session {
@@ -2187,7 +2198,7 @@ async fn connect_once(
                     let _ = events.send(Event::Protocol { server: id.clone(), generation, event: SessionEvent::User(user) }).await;
                 },
                 SessionEvent::UserRemoved(session) => {
-                    hashes.remove(&session);
+                    voices.remove(&session);
                     restricted_users.remove(&session);
                     let _ = events.send(Event::Protocol { server: id.clone(), generation, event: SessionEvent::UserRemoved(session) }).await;
                 },
@@ -3967,6 +3978,68 @@ fn server_event(event: SessionEvent) -> Result<ServerEvent, Option<Unmodelled>> 
 
 const _: () =
     assert!(crate::client::MAX_PLUGIN_RECEIVERS == nuschl_session::connection::MAX_ACTION_TARGETS);
+
+/// Whose volume and local mute: a certificate hash, as in Mumble, so they
+/// follow a person across names and connections in the settings; or for a
+/// user without a certificate, their presence (`User::instance`), new on every
+/// join and reconnect, in [`Presences`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UserKey {
+    Certificate(String),
+    Presence(u64),
+}
+
+impl UserKey {
+    pub fn of(user: &nuschl_session::connection::User) -> Self {
+        match &user.certificate_hash {
+            Some(hash) => Self::Certificate(hash.clone()),
+            None => Self::Presence(user.instance),
+        }
+    }
+
+    /// This user's playback volume, and whether you muted them.
+    pub fn playback(&self, settings: &ClientSettings, presences: &Presences) -> (f32, bool) {
+        match self {
+            Self::Certificate(hash) => (
+                settings.volume_for(Some(hash)),
+                settings.locally_muted(Some(hash)),
+            ),
+            Self::Presence(instance) => (
+                presences.volume(*instance),
+                presences.mutes.contains(instance),
+            ),
+        }
+    }
+}
+
+/// The volumes and local mutes of users without a certificate, by presence:
+/// held in memory while they stay connected.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Presences {
+    pub volumes: BTreeMap<u64, f32>,
+    pub mutes: std::collections::BTreeSet<u64>,
+}
+
+impl Presences {
+    pub fn volume(&self, instance: u64) -> f32 {
+        self.volumes.get(&instance).copied().unwrap_or(1.)
+    }
+
+    /// Mute `instance` for you, or unmute it.
+    pub fn toggle_mute(&mut self, instance: u64) {
+        if !self.mutes.remove(&instance) {
+            self.mutes.insert(instance);
+        }
+    }
+
+    /// Keep the presences `present` names; true when any went.
+    pub fn retain(&mut self, present: impl Fn(u64) -> bool) -> bool {
+        let before = (self.volumes.len(), self.mutes.len());
+        self.volumes.retain(|instance, _| present(*instance));
+        self.mutes.retain(|instance| present(*instance));
+        before != (self.volumes.len(), self.mutes.len())
+    }
+}
 
 /// Your nicknames and friends as the settings keep them.
 impl crate::names::Names for ClientSettings {
