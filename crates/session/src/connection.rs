@@ -328,6 +328,13 @@ pub enum SessionEvent {
     },
 }
 
+/// How long after sending our self-mute and self-deafen the server's echo is
+/// checked, and how often they are sent again while it shows other values
+/// (see [`State::confirm_self`]).
+const SELF_CHECK: Duration = Duration::from_millis(1500);
+const SELF_RESENDS: u8 = 5;
+const SELF_NOT_CONFIRMED: &str =
+    "The server has not confirmed your mute state. Toggle mute to retry.";
 const RELAY_PRIVACY_UNAVAILABLE: &str = "Relay-only is enabled locally, but this server cannot promise to hide your IP address from other clients.";
 
 #[derive(Debug)]
@@ -1554,6 +1561,9 @@ pub async fn run(
                 },
                 _ = ping.tick() => {
                     ticks += 1;
+                    if let Some(notice) = state.confirm_self(Instant::now()) {
+                        emit(&events, SessionEvent::Notice(notice.into())).await?;
+                    }
                     let now = nuschl_core::now_ms() as u64;
                     if let Some(udp) = state.udp.as_mut() {
                         udp.maybe_ping(state.version, now).await;
@@ -1835,6 +1845,9 @@ struct State {
     opus: bool,
     local_muted: bool,
     local_deafened: bool,
+    /// When to compare the server's echo with our self-state, and the
+    /// resends left (see [`State::confirm_self`]).
+    self_check: Option<(Instant, u8)>,
     rejoin: Option<u32>,
     voice_target: u32,
     voice_revision: u64,
@@ -1891,6 +1904,7 @@ impl Default for State {
             opus: true,
             local_muted: true,
             local_deafened: false,
+            self_check: None,
             rejoin: None,
             voice_target: 0,
             voice_revision: 0,
@@ -2330,6 +2344,38 @@ impl State {
         }
     }
 
+    fn send_self(&mut self) {
+        self.queue(
+            kind::USER_STATE,
+            &proto::UserState {
+                self_mute: Some(self.local_muted),
+                self_deaf: Some(self.local_deafened),
+                ..Default::default()
+            },
+        );
+    }
+    /// Murmur and nuschld drop our own UserState beyond their rate limit and
+    /// answer nothing. Once the echo is due, a server that shows another
+    /// self-mute or self-deafen gets ours again, at most [`SELF_RESENDS`]
+    /// times; then the notice says it is not confirmed.
+    fn confirm_self(&mut self, now: Instant) -> Option<&'static str> {
+        let (_, left) = self.self_check.filter(|(due, _)| now >= *due)?;
+        let shown = self
+            .own_session
+            .and_then(|own| self.users.get(&own))
+            .map(|own| (own.self_muted, own.self_deafened));
+        if shown == Some((self.local_muted, self.local_deafened)) {
+            self.self_check = None;
+            return None;
+        }
+        if left == 0 {
+            self.self_check = None;
+            return Some(SELF_NOT_CONFIRMED);
+        }
+        self.self_check = Some((now + SELF_CHECK, left - 1));
+        self.send_self();
+        None
+    }
     fn queue<M: Message>(&mut self, kind: u16, message: &M) {
         // Murmur limits our own user state only; others' are counted too.
         if matches!(
@@ -3040,14 +3086,8 @@ impl State {
             Command::SetSelf { muted, deafened } => {
                 self.local_muted = muted || deafened;
                 self.local_deafened = deafened;
-                self.queue(
-                    kind::USER_STATE,
-                    &proto::UserState {
-                        self_mute: Some(muted || deafened),
-                        self_deaf: Some(deafened),
-                        ..Default::default()
-                    },
-                );
+                self.self_check = Some((Instant::now() + SELF_CHECK, SELF_RESENDS));
+                self.send_self();
             }
             Command::SetComment(comment) => {
                 if comment.len() > MAX_CONTENT_BYTES {
@@ -7422,6 +7462,50 @@ mod tests {
         state.users.get_mut(&7).unwrap().suppressed = true;
         assert_eq!(state.outgoing_voice(packet(false)), None);
         assert_eq!(state.outgoing_voice(packet(true)), Some(silent));
+    }
+
+    #[test]
+    fn a_self_state_the_server_does_not_show_is_sent_again_a_bounded_number_of_times() {
+        let mut state = State {
+            own_session: Some(7),
+            local_muted: false,
+            ..State::default()
+        };
+        state.users.insert(
+            7,
+            User {
+                session: 7,
+                self_muted: true,
+                ..User::default()
+            },
+        );
+        let sent = Instant::now();
+        state.self_check = Some((sent + SELF_CHECK, SELF_RESENDS));
+        assert_eq!(state.confirm_self(sent), None);
+        assert!(
+            state.outbound.is_empty(),
+            "sent again before the echo is due"
+        );
+        let mut now = sent;
+        for _ in 0..SELF_RESENDS {
+            now += SELF_CHECK;
+            assert_eq!(state.confirm_self(now), None);
+            let (kind, body) = state.outbound.pop().expect("sent again");
+            let message = proto::UserState::decode(body.as_slice()).unwrap();
+            assert_eq!(
+                (kind, message.self_mute, message.self_deaf),
+                (kind::USER_STATE, Some(false), Some(false))
+            );
+        }
+        now += SELF_CHECK;
+        assert_eq!(state.confirm_self(now), Some(SELF_NOT_CONFIRMED));
+        assert_eq!(state.confirm_self(now + SELF_CHECK), None);
+        assert!(state.outbound.is_empty());
+        // An echo that shows our state ends the check.
+        state.self_check = Some((now, SELF_RESENDS));
+        state.users.get_mut(&7).unwrap().self_muted = false;
+        assert_eq!(state.confirm_self(now), None);
+        assert!(state.outbound.is_empty() && state.self_check.is_none());
     }
 
     #[tokio::test]

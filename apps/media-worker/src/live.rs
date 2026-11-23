@@ -1633,10 +1633,12 @@ fn convertible(config: &cpal::StreamConfig) -> Result<(usize, u32), String> {
 /// Report errors that end a stream. A stream that follows the system default
 /// (`DeviceChanged`: the audio server moved it to the new default device, as
 /// when Bluetooth headphones connect) keeps running and needs no reopening.
-/// `microphone` numbers a microphone's errors.
+/// `microphone` numbers a microphone's errors; `stream` names the stream in
+/// the message.
 fn error_callback(
     tx: SyncSender<Event>,
     microphone: Option<u64>,
+    stream: &'static str,
 ) -> impl FnMut(cpal::Error) + Send + 'static {
     move |error| {
         if !matches!(
@@ -1646,7 +1648,7 @@ fn error_callback(
                 | cpal::ErrorKind::DeviceChanged
         ) {
             let _ = tx.try_send(Event::DeviceError {
-                message: error.to_string(),
+                message: format!("{stream}: {error}"),
                 microphone,
             });
         }
@@ -1683,7 +1685,7 @@ where
                 stamper.anchor(converter.capture_time(clock.now_shifted(latency, Duration::ZERO)));
                 stamper.advance(converter.push(data, &mut ring));
             },
-            error_callback(tx, Some(microphone)),
+            error_callback(tx, Some(microphone), "microphone"),
             None,
         )
         .map_err(|error| error.to_string())
@@ -1830,7 +1832,7 @@ where
             move |data: &[T], info: &cpal::InputCallbackInfo| {
                 callback(&mut data.iter().map(|value| f32::from_sample(*value)), info);
             },
-            error_callback(tx, Some(microphone)),
+            error_callback(tx, Some(microphone), "speaker recording"),
             None,
         )
         .map_err(|error| error.to_string())
@@ -1868,7 +1870,7 @@ where
                     underruns.fetch_add(1, Ordering::Relaxed);
                 }
             },
-            error_callback(tx, None),
+            error_callback(tx, None, "speakers"),
             None,
         )
         .map_err(|error| error.to_string())
@@ -2019,13 +2021,13 @@ mod tests {
     #[test]
     fn a_stream_moved_to_the_new_default_device_keeps_its_devices() {
         let (tx, rx) = super::mpsc::sync_channel(4);
-        let mut report = super::error_callback(tx, None);
+        let mut report = super::error_callback(tx, None, "speakers");
         report(cpal::ErrorKind::DeviceChanged.into());
         assert!(rx.try_recv().is_err());
         report(cpal::ErrorKind::DeviceNotAvailable.into());
         assert!(matches!(
             rx.try_recv(),
-            Ok(super::Event::DeviceError { .. })
+            Ok(super::Event::DeviceError { message, .. }) if message.starts_with("speakers: ")
         ));
     }
 

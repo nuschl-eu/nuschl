@@ -12,6 +12,7 @@ use std::{
 
 pub use tempfile::TempDir;
 
+pub mod murmur;
 pub mod sfu;
 pub mod turn;
 

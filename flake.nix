@@ -444,9 +444,11 @@
             pkgs.bubblewrap
             pkgs.util-linux
           ];
+          # tests/self_state.rs runs a stock Murmur on loopback.
           nuschl-session.testInputs = [
             pkgs.bubblewrap
             pkgs.util-linux
+            pkgs.murmur
             crates.project.workspaceMembers.nuschl-crypto-worker.build
             crates.project.workspaceMembers.nuschl-stream-sfu.build
           ]
