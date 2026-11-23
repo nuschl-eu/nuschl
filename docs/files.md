@@ -651,7 +651,7 @@ could later shrink by omitting levels the receiver already holds.
 | Party | Persisted | Where |
 | --- | --- | --- |
 | Owner | Each share, one row of the share index: the file key, the `FileRef`, both idempotency keys (`FileOpen`, `ChatSend`), object id once known, server, conversation and `seq` once acknowledged, path, size, modification time and file id at preparation; the piece layer (32 bytes per 64 KiB, 0.05 % of the file) | Local storage worker database (which already holds the plaintext of local history); the piece layer in a file beside it, read only when a request comes (§3.5) |
-| Recipient | Each download: object id, message, destination, done bitmap, and the hash of each verified piece; the partial file `name.part` beside the destination. A finished download that the user lets help share (§2.10) becomes a share index row like the owner's | Same database; bitmap and piece hashes written atomically after the data they cover is synced (every 8 MiB or 2 s) |
+| Recipient | Each download: object id, message, destination, done bitmap, and the hash of each verified piece; the partial file in Nuschl's cache folder. A finished download that the user lets help share (§2.10) becomes a share index row like the owner's | Same database; bitmap and piece hashes written atomically after the data they cover is synced (every 8 MiB or 2 s) |
 | Server | Object record (owner account, `R`, pieces root, key commitment, `object_len`, class, state), references to messages, the **sources** (the devices that hold the whole object: the owner's, and recipients' that help share), for kept objects the bitmap of stored pieces | Server database, the bitmap updated only after the pieces it covers are synced; blobs and the piece layer as files (§5.4) |
 | Server (transient) | Which devices are online, wants, pulls in flight, watchers, the piece cache (memory and disk tier) | Gone after a restart (the disk tier is emptied); recipients re-want; sources announce nothing (§3.5) |
 
@@ -1042,8 +1042,8 @@ owner's other devices show its live shares as "From your other device".
 | Saved | "Saved as name.mkv"; "Helping share it" while this device is a source | Open, Show in folder, Stop helping |
 | Ended | "No longer available" | |
 
-Cancel asks whether to keep the partial file for later. Downloads write `name.part` beside
-the chosen destination and rename it when every piece is verified. Images keep their
+Cancel asks whether to keep the partial file for later. Downloads write the partial file
+in Nuschl's cache folder and put it at the chosen destination when every piece is verified. Images keep their
 final size from the message's width and height while loading.
 
 Deleting a message with a live attachment says what it does: "Delete for everyone also

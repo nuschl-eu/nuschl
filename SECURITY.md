@@ -243,8 +243,8 @@ before serving it.
 **Transfer** ([files](docs/files.md)). The transfer worker (magic-wormhole) is the
 only sandboxed worker with network access: rendezvous, transit relay and peers,
 plus the offered file, read-only. Downloads stream to the desktop, which writes
-only the path the user chose (the offered name is a sanitized suggestion) and at
-most the announced size. With `relay_only`, the worker skips direct sockets,
+at most the announced size to a staging file in its cache folder and then only the
+path the user chose (the offered name is a sanitized suggestion). With `relay_only`, the worker skips direct sockets,
 interface enumeration, STUN and peer-address advertising and uses only the locally
 configured rendezvous and relay; peer-provided relay addresses are ignored, and a
 relay failure has no peer fallback. Enabling it revokes active direct-capable
