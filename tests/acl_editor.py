@@ -196,7 +196,14 @@ def actions(args, root, shell, application, bot, murmur):
                 "JSON.stringify((()=>{const w=global.get_window_actors().map(a=>a.meta_window).find(w=>w.get_title().startsWith('Nuschl'));const b=w.get_buffer_rect();return {x:b.x,y:b.y};})())"
             )
         )
-        x, y, width, height = node.extents()
+        # A focus reveal scrolls the dialog; click where the control settles.
+        extents = node.extents()
+        for _ in range(20):
+            time.sleep(0.1)
+            settled, extents = extents, node.extents()
+            if settled == extents:
+                break
+        x, y, width, height = extents
         return origin["x"] + x + width // 2, origin["y"] + y + height // 2
 
     def activate(name):
@@ -229,7 +236,7 @@ def actions(args, root, shell, application, bot, murmur):
     def text_contains(text):
         return any(text in label for _, _, label, _ in items(application))
 
-    def open_acl(channel="Root"):
+    def open_acl(channel="Root", expand=True):
         row = eventually(
             lambda: next(
                 (
@@ -250,7 +257,7 @@ def actions(args, root, shell, application, bot, murmur):
             "ACL draft did not load",
         )
         # The rule list is collapsed while the permission table shows the channel.
-        expand = next(
+        expand = expand and next(
             (
                 node
                 for node, role, name, _ in items(application)
@@ -258,7 +265,7 @@ def actions(args, root, shell, application, bot, murmur):
             ),
             None,
         )
-        if expand is not None:
+        if expand:
             assert expand.call("Component", "GrabFocus")[0]
             time.sleep(0.15)
             shell.click(*point(expand))
@@ -334,6 +341,65 @@ def actions(args, root, shell, application, bot, murmur):
             "during_state": during,
             "groups": groups,
         }
+
+    if args.channel_types:
+        # Channel types write standard Mumble rules and read back from them.
+        def selected(name):
+            node = named(name, "radio button")
+            # ATSPI_STATE_SELECTED and ATSPI_STATE_CHECKED, in the first word.
+            return bool(node and node.call("Accessible", "GetState")[0][0] & (1 << 23 | 1 << 4))
+
+        def choose(name):
+            node = wait(name, "radio button")
+            assert node.call("Component", "GrabFocus")[0]
+            time.sleep(0.15)
+            shell.click(*point(node))
+            eventually(lambda: selected(name), f"{name} not selected")
+
+        def rules_of(channel):
+            admin = operator(root, pin)
+            try:
+                return [
+                    (rule.get(5), rule.get(6, [0])[0], rule.get(7, [0])[0], rule.get(2, [1])[0])
+                    for rule in local_rules(query_channel(admin, channel))
+                ]
+            finally:
+                admin.close()
+
+        def saved(rules, what):
+            save()
+            eventually(lambda: rules_of(6) == rules, f"{what} saved other rules")
+            eventually(lambda: not text_contains("Unsaved changes"), "the save was not confirmed")
+
+        access = 0x2 | 0x4 | 0x800 | 0x8 | 0x100 | 0x200
+        locked = 0x4 | 0x8 | 0x100 | 0x200 | 0x80 | 0x2
+        open_acl("Music", expand=False)
+        assert selected("Open"), "a channel without rules is not Open"
+        # A row set outside the types' templates makes the table custom.
+        activate("Registered users · Speak: Yes, not set here")
+        eventually(
+            lambda: any(label == "Custom" for _, _, label, _ in items(application)),
+            "a custom table showed a type",
+        )
+        assert not any(selected(kind) for kind in ("Open", "Members only", "Hidden"))
+        choose("Members only")
+        eventually(
+            lambda: text_contains("Registered users may join, speak and write."),
+            "Members only did not apply",
+        )
+        shell.screenshot(args.output / "channel-type.png")
+        saved([([b"all"], 0, access & ~0x2, 1), ([b"auth"], access, 0, 1)], "Members only")
+        mark("channel_type_saves_its_rules_and_reads_back")
+        # Password takes the typed password and stores Mumble's two rules.
+        type_field("New channel password", "door-code")
+        choose("Password")
+        saved([([b"all"], 0, locked, 0), ([b"#door-code"], locked, 0, 0)], "Password")
+        assert text_contains("Channel password: door-code")
+        choose("Open")
+        saved([], "Open")
+        mark("password_type_uses_the_typed_password")
+        activate("Close dialog")
+        return {"channel_types": cases, "server": args.server}
 
     if args.geometry:
         admin = operator(root, pin)
@@ -929,6 +995,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--geometry", action="store_true")
     parser.add_argument("--pending-input", action="store_true")
+    parser.add_argument("--channel-types", action="store_true")
     parser.add_argument("--server", choices=("stock", "nuschld"), default="stock")
     parser.add_argument(
         "--high-admin-limit",
