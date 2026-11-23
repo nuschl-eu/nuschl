@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The core: one task owns every room, every peer's WebRTC state (str0m in RTP
 //! mode) and the one UDP socket. It forwards RTP packets from a publisher to
-//! each subscriber with their payload, timestamp and marker unchanged, in the
-//! codec the publisher negotiated (AV1, VP9 or Opus); it never decrypts,
-//! depacketizes or transcodes. A source whose packets carry the Dependency
-//! Descriptor reaches each receiver in the decode target chosen for it
-//! (`quality`). Each subscriber gets its own sequence numbers from zero: frames
-//! it skips leave no gap, and packets a budget drops leave one it sees.
+//! each subscriber with their payload and timestamp unchanged, in the codec the
+//! publisher negotiated (AV1, VP9 or Opus); it never decrypts, depacketizes or
+//! transcodes. A source whose packets carry the Dependency Descriptor reaches
+//! each receiver in the decode target chosen for it (`quality`), with the
+//! marker on the last packet of each temporal unit the receiver gets. Each
+//! subscriber gets its own sequence numbers from zero: frames it skips leave no
+//! gap.
 
 use crate::{
     config::Config,
@@ -1016,28 +1017,6 @@ impl Core {
             let Some(out_mid) = forward.mid else {
                 continue;
             };
-            let view = &mut forward.view;
-            if video && view.backlog.dropped(timestamp) {
-                view.rewrite.skip(*packet.seq_no);
-                dropped |= frame.is_some();
-                continue;
-            }
-            let keep = match &frame {
-                None => true,
-                Some(None) => false,
-                Some(Some(frame)) => view.selector.forward(frame),
-            };
-            dropped |= view.selector.waiting();
-            if !keep {
-                view.rewrite.skip(*packet.seq_no);
-                continue;
-            }
-            // The last packet of the highest spatial layer forwarded ends the
-            // receiver's picture.
-            let marker = packet.header.marker
-                || frame
-                    .flatten()
-                    .is_some_and(|frame| frame.end && Some(frame.layer.spatial) == view.spatial());
             let Some(pt) = peer
                 .subscribe
                 .media(out_mid)
@@ -1048,6 +1027,28 @@ impl Core {
             };
             let mut api = peer.subscribe.direct_api();
             let Some(stream) = api.stream_tx_by_mid(out_mid, None) else {
+                continue;
+            };
+            let view = &mut forward.view;
+            let layered = frame.flatten();
+            if video && view.backlog.dropped(timestamp) {
+                view.rewrite.skip(*packet.seq_no);
+                if let Some(frame) = &layered {
+                    view.selector.dropped(frame);
+                }
+                dropped |= frame.is_some();
+                continue;
+            }
+            let marker = match &frame {
+                None => Some(packet.header.marker),
+                Some(None) => None,
+                Some(Some(frame)) => view
+                    .selector
+                    .forward(frame, timestamp, packet.header.marker),
+            };
+            dropped |= view.selector.waiting();
+            let Some(marker) = marker else {
+                view.rewrite.skip(*packet.seq_no);
                 continue;
             };
             let full = if video {
@@ -1088,12 +1089,19 @@ impl Core {
             if let Some(limit) = limit {
                 if video {
                     view.rewrite.skip(*packet.seq_no);
-                    view.shed(timestamp, frame.is_none().then_some(now), limit);
+                    view.backlog
+                        .shed(timestamp, frame.is_none().then_some(now), limit);
+                    if let Some(frame) = &layered {
+                        view.selector.dropped(frame);
+                    }
                 }
                 dropped |= frame.is_some();
                 continue;
             }
             let Some(seq) = view.rewrite.forward(*packet.seq_no) else {
+                if let Some(frame) = &layered {
+                    view.selector.dropped(frame);
+                }
                 continue;
             };
             if video {
@@ -1351,7 +1359,8 @@ impl Core {
                 if limit == VideoLimit::WithinTarget && point < ceiling {
                     limit = VideoLimit::QualityRecovery;
                 }
-                planned.choices[point].target
+                let choice = &planned.choices[point];
+                (choice.target, choice.layer.spatial)
             });
             if peer.video_limits
                 && forward.open
@@ -1372,7 +1381,6 @@ impl Core {
                 view.reported_limit = Some(limit);
             }
             view.selector.want(target);
-            view.choices = planned.choices;
         }
         for (id, desired) in desired {
             let peer = self.peers.get_mut(&id).expect("listed");

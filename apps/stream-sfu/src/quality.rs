@@ -5,9 +5,10 @@
 //! extension on both legs, as the publisher wrote it.
 //!
 //! A receiver gets the frames of one decode target per layered source from
-//! Q1's `Selector`, which switches at switch points, with sequence numbers of
-//! its own ([`Rewrite`]) so intentional layer skips leave no gaps. The queue
-//! budget sheds pictures when a receiver falls behind.
+//! Q1's `Selector`, which switches at switch points whose chains the receiver
+//! holds and marks the end of each temporal unit it forwards, with sequence
+//! numbers of its own ([`Rewrite`]) so intentional layer skips leave no gaps.
+//! The queue budget sheds pictures when a receiver falls behind.
 //!
 //! A receiver asks for a tier per source (`QualityRequest`) and states the
 //! tiers it decodes (`DecodeCapacity`), each at most once a second. The tier it
@@ -18,7 +19,7 @@ use crate::protocol::VideoLimit;
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
     adapt::Stepper,
-    dd::{Choice, Layers, Selector},
+    dd::{Layers, Selector},
     receive,
 };
 use std::{
@@ -60,31 +61,10 @@ pub struct View {
     pub selector: Selector,
     /// Paces moves toward the receiver's share of the budgets.
     pub stepper: Option<Stepper>,
-    /// The decode targets that fit the receiver's tier, lowest first.
-    pub choices: Vec<Choice>,
     pub rewrite: Rewrite,
     pub backlog: Backlog,
     pub reported_limit: Option<VideoLimit>,
     pub limit_throttle: Throttle,
-}
-
-impl View {
-    /// The spatial layer of the decode target forwarded now.
-    pub fn spatial(&self) -> Option<u8> {
-        let current = self.selector.current()?;
-        self.choices
-            .iter()
-            .find(|c| c.target == current)
-            .map(|c| c.layer.spatial)
-    }
-
-    pub fn shed(&mut self, timestamp: u64, pause: Option<Instant>, limit: VideoLimit) {
-        self.backlog.shed(timestamp, pause, limit);
-        // Re-enter the decode target at a switch point after dropping a picture.
-        let target = self.selector.current();
-        self.selector = Selector::default();
-        self.selector.want(target);
-    }
 }
 
 /// The video admitted to one receiver's send queue and its temporary quality limit.
@@ -124,7 +104,7 @@ impl Backlog {
         self.dropped_through.is_some_and(|last| timestamp <= last)
     }
 
-    fn shed(&mut self, timestamp: u64, pause: Option<Instant>, limit: VideoLimit) {
+    pub fn shed(&mut self, timestamp: u64, pause: Option<Instant>, limit: VideoLimit) {
         self.dropped_through = Some(timestamp.max(self.dropped_through.unwrap_or(0)));
         self.overloaded(limit);
         self.recovery = pause.map_or(Recovery::Live, |now| {
