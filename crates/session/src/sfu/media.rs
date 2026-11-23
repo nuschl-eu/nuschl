@@ -43,6 +43,10 @@ const VIDEO: [Purpose; 2] = [Purpose::Camera, Purpose::ScreenVideo];
 const AUDIO_QUEUE: usize = 8;
 /// Direct admission counts the system-audio reservation of `nuschl_rtc`.
 const AUDIO_BITRATE: u64 = 256_000;
+/// The RTC transport admits one audio packet per track every 2.5 ms
+/// (`nuschl_rtc::Peer::write`, its bound on the packet rate). Packets that
+/// reach the publisher together wait in its queue and leave this far apart.
+const AUDIO_SPACING: Duration = Duration::from_micros(2500);
 
 pub struct MediaOptions {
     /// Path of the installed `nuschl-rtc-worker`.
@@ -1037,6 +1041,9 @@ async fn run(
     let mut sub_buffer = [0; rtc::MAX_DATAGRAM + 1];
     let mut sending = [None; 2];
     let mut audio_sending = None;
+    // The next packet to send, and when the transport admits it.
+    let mut held_audio: Option<Audio> = None;
+    let mut audio_turn = Instant::now();
     let mut send_gates = std::array::from_fn::<_, 2, _>(|_| FrameGate::new());
     let mut sequence = [0_u64; 2];
     loop {
@@ -1247,9 +1254,13 @@ async fn run(
                 }
                 None => return Ok(()),
             },
-            frame = inputs.audio.recv() => {
+            frame = inputs.audio.recv(), if held_audio.is_none() => {
                 let Some(frame) = frame else { return Ok(()); };
-                if Some(frame.revision) == inputs.changes.borrow().audio
+                held_audio = Some(frame);
+            }
+            () = wake(held_audio.as_ref().map(|_| audio_turn)) => {
+                if let Some(frame) = held_audio.take()
+                    && Some(frame.revision) == inputs.changes.borrow().audio
                     && Some(frame.revision) == audio_sending
                     && frame.queued.elapsed() <= MAX_PENDING_FRAME_AGE
                     && (sending_direct || publish.is_some())
@@ -1265,7 +1276,9 @@ async fn run(
                             } else if let Some(leg) = &mut publish {
                                 leg.wake = now;
                             }
+                            audio_turn = Instant::now() + AUDIO_SPACING;
                         }
+                        // Over the bandwidth budget: dropped, as video is.
                         Reply::Rejected => {}
                         _ => return Err(Error::Protocol("invalid RTC write reply")),
                     }

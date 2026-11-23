@@ -781,12 +781,17 @@ async fn shared_audio(late: bool) {
         .unwrap();
     let mut available = false;
     let mut received = Vec::new();
+    // Two packets at once every 40 ms, as an encoder fed by an audio graph's
+    // quantum delivers them.
+    let mut burst = tokio::time::interval(Duration::from_millis(40));
     timeout(HANDSHAKE, async {
-        while received.len() < 10 {
+        while received.len() < 30 {
             tokio::select! {
-                _ = tick.tick() => {
-                    sent += 1;
-                    alice.send_source_frame(Purpose::SystemAudio, sent * 960, false, packet(sent)).unwrap();
+                _ = burst.tick() => {
+                    for _ in 0..2 {
+                        sent += 1;
+                        alice.send_source_frame(Purpose::SystemAudio, sent * 960, false, packet(sent)).unwrap();
+                    }
                 }
                 event = alice.next() => {
                     event.expect("publisher remains live").expect("RTC publisher");
@@ -811,9 +816,15 @@ async fn shared_audio(late: bool) {
     .await
     .expect("shared audio reaches the viewer");
     assert!(available, "the viewer subscribes to the audio track");
-    // The receiver's clock advances 960 ticks per packet, as the sender's did.
+    // Every packet arrives, and the receiver's clock advances 960 ticks per
+    // packet, as the sender's did.
     let (first, start) = received[0];
-    for &(number, timestamp) in &received {
+    for (index, &(number, timestamp)) in received.iter().enumerate() {
+        assert_eq!(
+            number,
+            first + index as u64,
+            "a packet was dropped: {received:?}"
+        );
         assert_eq!(timestamp - start, (number - first) * 960);
     }
     alice.set_source(Purpose::SystemAudio, false).unwrap();
