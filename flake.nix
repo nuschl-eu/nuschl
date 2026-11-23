@@ -102,6 +102,8 @@
             || lib.hasSuffix ".json" path
             || lib.hasSuffix ".vp8" path
             || lib.hasSuffix "/apps/rtc-worker/tests/fixtures/screen.av1" path
+            # The SFU's replay tests read recorded Chromium streams.
+            || lib.hasInfix "/apps/stream-sfu/tests/fixtures/" path
             || lib.hasSuffix ".svg" path
             # The Windows icon and the resource script embed-resource compiles.
             || lib.hasSuffix ".ico" path
