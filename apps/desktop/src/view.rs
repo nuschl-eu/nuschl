@@ -2366,23 +2366,23 @@ fn conversation(
                 }
             });
     let topic = if !is_channel {
-        "Private conversation".to_string()
+        "Private conversation"
+    } else if server.status == Status::Connecting {
+        "Connecting…"
+    } else if !connected {
+        "Offline"
     } else if !server.has_mumble_voice() {
-        "End-to-end voice is not available yet on this server.".into()
+        "Text only"
     } else if in_this_voice {
-        crate::voice::projected(&this.client, server, this.push_muted)
-            .label()
-            .to_string()
-    } else if connected {
-        "Double-click the channel or use Join voice to talk here".to_string()
+        crate::voice::projected(&this.client, server, this.push_muted).label()
     } else {
-        channel.topic.clone()
+        "Not joined"
     };
     let context = ConversationLayout {
         pane,
         index,
         channel,
-        topic: &topic,
+        topic,
         is_channel,
         in_this_voice,
     };
