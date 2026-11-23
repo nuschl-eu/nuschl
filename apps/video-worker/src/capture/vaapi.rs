@@ -23,11 +23,6 @@ use std::{
 const QUEUE: &str = "max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream";
 
 const QVBR_QINDEX: u32 = 112;
-// Finest quantizers for a screen whose keyframes approach the frame limit, up
-// to 3440x1440 and above. Each keeps such a keyframe of a static screen full
-// of text below the 1 MiB limit and the encoder's coded buffer.
-const FLOOR_QINDEX: u32 = 128;
-const LARGE_FLOOR_QINDEX: u32 = 144;
 
 pub fn prepare(
     source: Source,
@@ -109,20 +104,15 @@ pub fn prepare(
         .find_property("rate-control")
         .and_then(|property| gst::glib::EnumClass::with_type(property.value_type()))
         .ok_or("missing video rate control")?;
-    let (mode, rate) = modes
+    let rate = modes
         .iter()
-        .find_map(|mode| Some((*mode, rates.to_value_by_nick(mode)?)))
+        .find_map(|mode| rates.to_value_by_nick(mode))
         .ok_or("the render node has no supported video rate control")?;
     // The target percentage makes the negotiated bitrate the codec's peak
     // rate budget. QVBR drivers can still overshoot it. Other modes ignore
     // the quality factor.
     encoder.set_property_from_value("rate-control", &rate);
     encoder.set_property("qp", QVBR_QINDEX);
-    // VBR keyframes of a static screen grow from one to the next until one
-    // overflows the coded buffer, so VBR and CBR screens start floored.
-    if source == Source::Screen && mode != "qvbr" {
-        encoder.set_property("min-qp", FLOOR_QINDEX);
-    }
     Ok(pipeline)
 }
 
@@ -452,7 +442,6 @@ fn write_frames(
     let mut previous = 0;
     let mut waiting_for_key = true;
     let mut requested_at: Option<Instant> = None;
-    let mut floored = false;
     loop {
         let limits = control.limits();
         if scale.update(source, limits)? {
@@ -534,24 +523,6 @@ fn write_frames(
         if size == 0 || buffer.flags().contains(gst::BufferFlags::CORRUPTED) || stale {
             waiting_for_key = true;
             continue;
-        }
-        // The next keyframe after one within an eighth of the limit can exceed
-        // the limit or the coded buffer. Setting the quality factor makes the
-        // encoder reconfigure with the floor, for the rest of the capture.
-        if keyframe
-            && source == Source::Screen
-            && !floored
-            && size > settings.packet_limit(true) / 8 * 7
-        {
-            floored = true;
-            let large = u32::from(width) * u32::from(height) > 3440 * 1440;
-            let floor = if large {
-                LARGE_FLOOR_QINDEX
-            } else {
-                FLOOR_QINDEX
-            };
-            encoder.set_property("min-qp", floor);
-            encoder.set_property("qp", QVBR_QINDEX);
         }
         if size > settings.packet_limit(keyframe) {
             waiting_for_key = true;
