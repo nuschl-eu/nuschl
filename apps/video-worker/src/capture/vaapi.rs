@@ -43,6 +43,12 @@ pub fn prepare(
 
     let target = node.map_or_else(String::new, |node| format!("path={node}"));
     let (width, height) = source.max_dimensions();
+    // Screens send keyframes when a receiver asks for one. 1024 frames is
+    // vaav1enc's longest keyframe interval.
+    let key_interval = match source {
+        Source::Screen => 1024,
+        Source::Camera => 60,
+    };
     // Fix square pixels before the branches negotiate their output dimensions.
     let tee = if preview {
         "video/x-raw(ANY),pixel-aspect-ratio=1/1 ! tee name=split split. ! "
@@ -71,7 +77,7 @@ pub fn prepare(
             "vapostproc name=scale ! capsfilter name=limit ",
             "caps=\"video/x-raw(memory:VAMemory),format=NV12,width=[16,{width}],height=[16,{height}]\" ! ",
             "vaav1enc name=encoder bitrate={bitrate} target-percentage=100 hierarchical-level=1 ",
-            "ref-frames=1 key-int-max=60 ! ",
+            "ref-frames=1 key-int-max={key_interval} ! ",
             "av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! ",
             "appsink name=encoded max-buffers=1 sync=false{preview_path}",
         ),
@@ -81,6 +87,7 @@ pub fn prepare(
         width = width,
         height = height,
         bitrate = bitrate / 1000,
+        key_interval = key_interval,
         preview_path = preview_path,
     );
     let pipeline = gst::parse::launch(&description)?
