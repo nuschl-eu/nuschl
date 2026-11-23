@@ -3,7 +3,8 @@
 //! appendix A) and per-receiver layer choice. [`Layers`] keeps a source's template
 //! structure and measures the rate of each decode target; a [`Selector`] per
 //! receiver forwards the frames of the decode target it was given and switches
-//! targets only at switch points.
+//! targets only at switch points the receiver can decode from: a frame with a
+//! switch indication whose chain the receiver holds (§A.4.2).
 
 use crate::Kind;
 use std::time::Duration;
@@ -13,6 +14,11 @@ pub const URI: &str =
 
 /// Templates per structure; the template id has six bits.
 const MAX_TEMPLATES: usize = 64;
+/// Decode targets per structure, and so chains; the count has five bits.
+const MAX_TARGETS: usize = 32;
+/// Frame numbers a receiver's [`Selector`] remembers; a chain's frame diff has
+/// eight bits.
+const HISTORY: usize = 256;
 /// The window over which [`Layers`] measures rates.
 const WINDOW: Duration = Duration::from_secs(1);
 
@@ -91,6 +97,8 @@ impl Bits<'_> {
 struct Template {
     layer: Target,
     dtis: Dtis,
+    /// Per chain, the frame diff to the previous frame of the chain.
+    chains: [u8; MAX_TARGETS],
 }
 
 /// A template dependency structure, sent with key frames.
@@ -98,6 +106,9 @@ struct Structure {
     offset: u32,
     templates: Vec<Template>,
     targets: Vec<Target>,
+    chains: usize,
+    /// The chain protecting each decode target; empty without chains.
+    protected_by: Vec<u8>,
     /// The shorter side of each spatial layer, when the publisher sent it.
     heights: Vec<u32>,
     active: u32,
@@ -116,6 +127,7 @@ impl Structure {
             templates.push(Template {
                 layer,
                 dtis: Dtis::default(),
+                chains: [0; MAX_TARGETS],
             });
             match bits.read(2)? {
                 0 => {}
@@ -132,19 +144,22 @@ impl Structure {
         for template in &mut templates {
             template.dtis = Dtis::read(bits, count)?;
         }
-        // Frame diffs and chains matter to decoders; this reads past them.
+        // Frame diffs matter to decoders; this reads past them.
         for _ in &templates {
             while bits.flag()? {
                 bits.read(4)?;
             }
         }
         let chains = bits.ns(count as u32 + 1)?;
+        let mut protected_by = Vec::new();
         if chains > 0 {
             for _ in 0..count {
-                bits.ns(chains)?;
+                protected_by.push(bits.ns(chains)? as u8);
             }
-            for _ in 0..templates.len() as u32 * chains {
-                bits.read(4)?;
+            for template in &mut templates {
+                for diff in &mut template.chains[..chains as usize] {
+                    *diff = bits.read(4)? as u8;
+                }
             }
         }
         let targets = (0..count)
@@ -171,6 +186,8 @@ impl Structure {
             offset,
             templates,
             targets,
+            chains: chains as usize,
+            protected_by,
             heights,
             active: u32::MAX >> (32 - count),
         })
@@ -185,11 +202,19 @@ pub struct Frame {
     pub number: u16,
     pub layer: Target,
     dtis: Dtis,
+    /// Per decode target, the frame diff to the previous frame of the chain
+    /// protecting it; `None` for a structure without chains.
+    chains: Option<[u8; MAX_TARGETS]>,
 }
 
 impl Frame {
     pub fn dti(&self, target: usize) -> Dti {
         self.dtis.get(target)
+    }
+
+    /// The frame diff to the previous frame of the chain protecting `target`.
+    pub fn chain_diff(&self, target: usize) -> Option<u8> {
+        Some(*self.chains?.get(target)?)
     }
 }
 
@@ -250,12 +275,14 @@ impl Layers {
         let end = bits.flag()?;
         let template_id = bits.read(6)?;
         let number = bits.read(16)? as u16;
-        let (mut new, mut active, mut custom_dtis) = (None, None, false);
+        let (mut new, mut active) = (None, None);
+        let (mut custom_dtis, mut custom_fdiffs, mut custom_chains) = (false, false, false);
         if descriptor.len() > 3 {
             let has_structure = bits.flag()?;
             let has_active = bits.flag()?;
             custom_dtis = bits.flag()?;
-            bits.read(2)?;
+            custom_fdiffs = bits.flag()?;
+            custom_chains = bits.flag()?;
             if has_structure {
                 new = Some(Structure::read(bits)?);
             }
@@ -273,12 +300,34 @@ impl Layers {
         } else {
             template.dtis
         };
+        if custom_fdiffs {
+            loop {
+                match bits.read(2)? {
+                    0 => break,
+                    size => bits.read(4 * size)?,
+                };
+            }
+        }
+        let mut diffs = template.chains;
+        if custom_chains {
+            for diff in &mut diffs[..structure.chains] {
+                *diff = bits.read(8)? as u8;
+            }
+        }
+        let chains = (!structure.protected_by.is_empty()).then(|| {
+            let mut targets = [0; MAX_TARGETS];
+            for (target, &chain) in targets.iter_mut().zip(&structure.protected_by) {
+                *target = diffs[usize::from(chain)];
+            }
+            targets
+        });
         let frame = Frame {
             start,
             end,
             number,
             layer: template.layer,
             dtis,
+            chains,
         };
         if new.is_some() {
             self.structure = new;
@@ -329,22 +378,33 @@ impl Layers {
     }
 }
 
-/// One receiver's view of one source: forwards the frames of its decode target.
-#[derive(Clone, Copy, Debug, Default)]
+/// A decode target and its spatial layer, the highest in the target.
+pub type Wanted = (usize, u8);
+
+/// One receiver's view of one source: forwards the frames of its decode target
+/// and ends each temporal unit it forwards with the marker.
+#[derive(Clone, Debug, Default)]
 pub struct Selector {
-    current: Option<usize>,
-    wanted: Option<usize>,
+    current: Option<Wanted>,
+    wanted: Option<Wanted>,
+    /// Per frame number modulo [`HISTORY`]: the number of a frame forwarded
+    /// whole and the decode targets whose chains it kept intact.
+    history: Vec<(u16, u32)>,
+    newest: Option<u16>,
+    /// The RTP timestamp of the last temporal unit forwarded with the marker.
+    ended: Option<u64>,
 }
 
 impl Selector {
     /// Sets the decode target to forward, `None` to forward nothing. The switch
-    /// happens at the start of the next frame that is a switch point for it.
-    pub fn want(&mut self, target: Option<usize>) {
+    /// happens at the next frame that starts a temporal unit for the receiver,
+    /// is a switch point for the target and whose chain the receiver holds.
+    pub fn want(&mut self, target: Option<Wanted>) {
         self.wanted = target;
     }
 
     pub fn current(&self) -> Option<usize> {
-        self.current
+        self.current.map(|(target, _)| target)
     }
 
     /// Whether a switch waits for a switch point; the caller asks the publisher
@@ -353,17 +413,87 @@ impl Selector {
         self.wanted.is_some() && self.current != self.wanted
     }
 
-    /// Whether to forward a packet of `frame`.
-    pub fn forward(&mut self, frame: &Frame) -> bool {
+    /// Whether the receiver holds every earlier frame of the chain protecting
+    /// `target`. Without chains the switch indications alone count.
+    fn intact(&self, frame: &Frame, target: usize) -> bool {
+        let Some(diff) = frame.chain_diff(target) else {
+            return true;
+        };
+        let number = frame.number.wrapping_sub(u16::from(diff));
+        diff == 0
+            || self
+                .history
+                .get(usize::from(number) % HISTORY)
+                .is_some_and(|&(n, targets)| n == number && targets >> target & 1 == 1)
+    }
+
+    /// Whether to forward a packet of `frame` in the temporal unit at
+    /// `timestamp`, and with which marker: `marker` is the publisher's, set at
+    /// the end of its temporal unit.
+    pub fn forward(&mut self, frame: &Frame, timestamp: u64, marker: bool) -> Option<bool> {
         if frame.start && self.current != self.wanted {
             match self.wanted {
                 None => self.current = None,
-                Some(target) if frame.dti(target) == Dti::Switch => self.current = Some(target),
-                Some(_) => {}
+                Some((target, _)) => {
+                    if self.intact(frame, target)
+                        && frame.dti(target) == Dti::Switch
+                        && self.ended != Some(timestamp)
+                    {
+                        self.current = self.wanted;
+                    }
+                }
             }
         }
-        self.current
-            .is_some_and(|target| frame.dti(target) != Dti::NotPresent)
+        let (target, spatial) = self.current?;
+        if frame.dti(target) == Dti::NotPresent {
+            return None;
+        }
+        if frame.start {
+            self.record(frame);
+        }
+        let marker = marker || frame.end && frame.layer.spatial == spatial;
+        if marker {
+            self.ended = Some(timestamp);
+        }
+        Some(marker)
+    }
+
+    fn record(&mut self, frame: &Frame) {
+        let targets = (0..MAX_TARGETS)
+            .filter(|&target| self.intact(frame, target))
+            .fold(0, |mask, target| mask | 1 << target);
+        if self.history.is_empty() {
+            self.history = vec![(0, 0); HISTORY];
+        }
+        // Numbers skipped since the newest frame lose their entries, so none
+        // outlives the history.
+        let skipped = self
+            .newest
+            .map_or(1, |newest| frame.number.wrapping_sub(newest));
+        if skipped < 0x8000 {
+            for n in 1..skipped.min(HISTORY as u16) {
+                let number = frame.number.wrapping_sub(n);
+                self.history[usize::from(number) % HISTORY] = (0, 0);
+            }
+            self.newest = Some(frame.number);
+        }
+        self.history[usize::from(frame.number) % HISTORY] = (frame.number, targets);
+    }
+
+    /// `frame` misses at least one packet at the receiver: the SFU did not send
+    /// it. Its chains break there, and when the current target needs the frame
+    /// the receiver gets nothing more until it can switch again.
+    pub fn dropped(&mut self, frame: &Frame) {
+        if let Some(entry) = self.history.get_mut(usize::from(frame.number) % HISTORY)
+            && entry.0 == frame.number
+        {
+            entry.1 = 0;
+        }
+        if let Some((target, _)) = self.current
+            && matches!(frame.dti(target), Dti::Switch | Dti::Required)
+        {
+            self.current = None;
+        }
     }
 }
 
@@ -436,6 +566,26 @@ mod tests {
             ]
         );
         assert_eq!(structure.heights, [67, 135, 270]);
+        // One chain per spatial layer.
+        assert_eq!(structure.protected_by, [0, 0, 0, 1, 1, 1, 2, 2, 2]);
+        // Each chain diff points at the latest T0 frame of its layer or below:
+        // 0x0172, 0x0173 and the inactive S2's 0x0174.
+        let chains: Vec<[u8; 3]> = frames
+            .iter()
+            .map(|f| [0, 3, 6].map(|t| f.chain_diff(t).expect("chains")))
+            .collect();
+        assert_eq!(
+            chains,
+            [
+                [0, 0, 0],
+                [1, 1, 1],
+                [1, 1, 1],
+                [3, 2, 1],
+                [4, 3, 2],
+                [4, 3, 2],
+                [6, 5, 4]
+            ]
+        );
         // The later packets turn the top spatial layer off.
         assert_eq!(structure.active, 0b111111);
         let summary: Vec<_> = frames
@@ -539,8 +689,8 @@ mod tests {
         let mut layers = Layers::default();
         let mut low = Selector::default();
         let mut full = Selector::default();
-        low.want(Some(0));
-        full.want(Some(2));
+        low.want(Some((0, 0)));
+        full.want(Some((2, 0)));
         // T0 T2 T1 T2 repeated, 30 frames a second.
         let pattern = [0, 2, 1, 2];
         let mut forwarded = (0, 0);
@@ -549,11 +699,14 @@ mod tests {
             let frame = layers
                 .packet(&l1t3(id, number, number == 0), 1, Duration::ZERO)
                 .expect("valid");
-            forwarded.0 += u32::from(low.forward(&frame));
-            forwarded.1 += u32::from(full.forward(&frame));
+            let at = u64::from(number);
+            // One packet per frame: each forwarded one ends its temporal unit.
+            forwarded.0 += u32::from(low.forward(&frame, at, true).is_some());
+            forwarded.1 += u32::from(full.forward(&frame, at, true) == Some(true));
             if number == 21 {
-                // Up at the next switch point, the T1 frame 22.
-                low.want(Some(2));
+                // Up at the next switch point, the T1 frame 22; without chains
+                // the switch indication suffices.
+                low.want(Some((2, 0)));
                 assert!(low.waiting());
             }
             if number == 22 {
@@ -567,9 +720,275 @@ mod tests {
         let frame = layers
             .packet(&l1t3(1, 41, false), 1, Duration::ZERO)
             .expect("valid");
-        assert!(!low.forward(&frame));
+        assert_eq!(low.forward(&frame, 41, true), None);
         assert_eq!(low.current(), None);
         assert!(!low.waiting());
+    }
+
+    /// libwebrtc's L2T2_KEY structure (scalability_structure_key_svc.cc): two
+    /// spatial layers that reference each other only in key pictures, two
+    /// temporal layers, one chain per spatial layer. Decode targets S0T0, S0T1,
+    /// S1T0, S1T1.
+    const L2T2_KEY: [(u8, u8, &str, [u8; 2]); 6] = [
+        (0, 0, "SSSS", [0, 0]),
+        (0, 0, "SS--", [4, 3]),
+        (0, 1, "-D--", [2, 1]),
+        (1, 0, "--SS", [1, 1]),
+        (1, 0, "--SS", [1, 4]),
+        (1, 1, "---D", [3, 2]),
+    ];
+
+    struct Writer(Vec<bool>);
+
+    impl Writer {
+        fn put(&mut self, value: u32, n: u32) {
+            for i in (0..n).rev() {
+                self.0.push((value >> i) & 1 == 1);
+            }
+        }
+
+        fn ns(&mut self, value: u32, n: u32) {
+            let width = u32::BITS - n.leading_zeros();
+            let m = (1 << width) - n;
+            if value < m {
+                self.put(value, width - 1);
+            } else {
+                self.put((value + m) >> 1, width - 1);
+                self.put((value + m) & 1, 1);
+            }
+        }
+
+        fn bytes(mut self) -> Vec<u8> {
+            while !self.0.len().is_multiple_of(8) {
+                self.0.push(false);
+            }
+            self.0
+                .chunks(8)
+                .map(|byte| byte.iter().fold(0, |a, &b| (a << 1) | u8::from(b)))
+                .collect()
+        }
+    }
+
+    /// The descriptor of one L2T2_KEY frame in one packet, with the structure
+    /// and layer sizes when `structure`.
+    fn l2t2_key(template: usize, number: u16, structure: bool) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        w.put(0b11, 2);
+        w.put(template as u32, 6);
+        w.put(u32::from(number), 16);
+        if structure {
+            w.put(0b10000, 5);
+            w.put(0, 6);
+            w.put(3, 5);
+            let mut previous = (0, 0);
+            for &(spatial, temporal, ..) in &L2T2_KEY[1..] {
+                w.put(
+                    match (spatial - previous.0, temporal) {
+                        (0, t) if t == previous.1 => 0,
+                        (0, _) => 1,
+                        _ => 2,
+                    },
+                    2,
+                );
+                previous = (spatial, temporal);
+            }
+            w.put(3, 2);
+            for &(_, _, dtis, _) in &L2T2_KEY {
+                for c in dtis.chars() {
+                    w.put("-DSR".find(c).expect("a DTI") as u32, 2);
+                }
+            }
+            for _ in &L2T2_KEY {
+                // Frame diffs, unused by the selector.
+                w.put(0, 1);
+            }
+            w.ns(2, 5);
+            for chain in [0, 0, 1, 1] {
+                w.ns(chain, 2);
+            }
+            for &(.., chains) in &L2T2_KEY {
+                for diff in chains {
+                    w.put(u32::from(diff), 4);
+                }
+            }
+            w.put(1, 1);
+            for (width, height) in [(960, 540), (1920, 1080)] {
+                w.put(width - 1, 16);
+                w.put(height - 1, 16);
+            }
+        }
+        w.bytes()
+    }
+
+    /// The templates of temporal unit `unit` after a key picture at unit 0:
+    /// key, then T1 and T0 alternating.
+    fn l2t2_unit(unit: u16) -> [usize; 2] {
+        match unit % 2 {
+            _ if unit == 0 => [0, 3],
+            1 => [2, 5],
+            _ => [1, 4],
+        }
+    }
+
+    /// Runs `units` temporal units of an L2T2_KEY stream with key pictures at
+    /// `keys` (every one since the stream began) through `selector`, calling
+    /// `step` at the start of each unit; returns the frame numbers forwarded and
+    /// those with the marker.
+    fn run_l2t2(
+        layers: &mut Layers,
+        selector: &mut Selector,
+        units: std::ops::Range<u16>,
+        keys: &[u16],
+        mut step: impl FnMut(u16, &mut Selector),
+    ) -> (Vec<u16>, Vec<u16>) {
+        let (mut forwarded, mut marked) = (Vec::new(), Vec::new());
+        for unit in units {
+            step(unit, selector);
+            let since_key = unit - keys.iter().filter(|&&k| k <= unit).max().expect("a key");
+            for (spatial, template) in l2t2_unit(since_key).into_iter().enumerate() {
+                let number = unit * 2 + spatial as u16;
+                let descriptor = l2t2_key(template, number, template == 0);
+                let frame = layers
+                    .packet(&descriptor, 1, Duration::ZERO)
+                    .expect("valid");
+                if let Some(marker) = selector.forward(&frame, u64::from(unit), spatial == 1) {
+                    forwarded.push(number);
+                    if marker {
+                        marked.push(number);
+                    }
+                }
+            }
+        }
+        (forwarded, marked)
+    }
+
+    #[test]
+    fn reads_chains_per_decode_target() {
+        let mut layers = Layers::default();
+        let key = layers
+            .packet(&l2t2_key(0, 0, true), 1, Duration::ZERO)
+            .expect("valid");
+        assert_eq!(
+            layers.structure.as_ref().expect("structure").protected_by,
+            [0, 0, 1, 1]
+        );
+        assert_eq!(
+            (0..4).map(|t| key.chain_diff(t)).collect::<Vec<_>>(),
+            [Some(0); 4]
+        );
+        let delta = layers
+            .packet(&l2t2_key(4, 5, false), 1, Duration::ZERO)
+            .expect("valid");
+        let diffs: Vec<_> = (0..4)
+            .map(|t| delta.chain_diff(t).expect("chains"))
+            .collect();
+        assert_eq!(diffs, [1, 1, 4, 4]);
+        // Custom chains replace the template's: fdiffs 3 and 18, chains 7 and 9.
+        let mut w = Writer(Vec::new());
+        w.put(0b11, 2);
+        w.put(4, 6);
+        w.put(5, 16);
+        w.put(0b00011, 5);
+        w.put(1, 2);
+        w.put(2, 4);
+        w.put(2, 2);
+        w.put(17, 8);
+        w.put(0, 2);
+        w.put(7, 8);
+        w.put(9, 8);
+        let custom = layers.packet(&w.bytes(), 1, Duration::ZERO).expect("valid");
+        assert_eq!(custom.chain_diff(0), Some(7));
+        assert_eq!(custom.chain_diff(3), Some(9));
+    }
+
+    #[test]
+    fn an_upswitch_across_spatial_layers_waits_for_the_key_picture() {
+        let mut layers = Layers::default();
+        let mut selector = Selector::default();
+        selector.want(Some((1, 0)));
+        // S0T1: the key picture's base, then every S0 frame, each one marked.
+        let (forwarded, marked) = run_l2t2(&mut layers, &mut selector, 0..6, &[0], |_, _| {});
+        assert_eq!(forwarded, [0, 2, 4, 6, 8, 10]);
+        assert_eq!(marked, forwarded);
+        // Up to S1T1: the S1T0 frames are switch points without the receiver's
+        // chain, so the switch waits for the next key picture at unit 9.
+        let (forwarded, marked) =
+            run_l2t2(&mut layers, &mut selector, 6..12, &[0, 9], |unit, s| {
+                if unit == 6 {
+                    s.want(Some((3, 1)));
+                }
+                if (7..10).contains(&unit) {
+                    assert!(s.waiting(), "unit {unit}");
+                }
+            });
+        assert_eq!(forwarded, [12, 14, 16, 18, 19, 21, 23]);
+        // The key picture's base is part of the receiver's temporal unit.
+        assert_eq!(marked, [12, 14, 16, 19, 21, 23]);
+        assert!(!selector.waiting());
+    }
+
+    #[test]
+    fn a_downswitch_needs_the_lower_chain() {
+        let mut layers = Layers::default();
+        let mut selector = Selector::default();
+        selector.want(Some((3, 1)));
+        // From the key picture the receiver holds the S0 chain until the first
+        // S0T0 delta frame (unit 2), which it can still switch down at.
+        let (forwarded, _) = run_l2t2(&mut layers, &mut selector, 0..4, &[0], |unit, s| {
+            if unit == 2 {
+                s.want(Some((0, 0)));
+            }
+        });
+        assert_eq!(forwarded, [0, 1, 3, 4]);
+        // Later the S0 chain is broken for an S1 receiver: it stays at S1 and
+        // needs a key picture.
+        let mut late = Selector::default();
+        late.want(Some((3, 1)));
+        run_l2t2(&mut layers, &mut late, 4..8, &[0, 4], |unit, s| {
+            if unit == 7 {
+                s.want(Some((0, 0)));
+            }
+        });
+        let (forwarded, _) = run_l2t2(&mut layers, &mut late, 8..10, &[0, 4], |_, _| {});
+        assert_eq!(forwarded, [17, 19]);
+        assert!(late.waiting());
+    }
+
+    #[test]
+    fn a_temporal_switch_needs_no_key_picture() {
+        let mut layers = Layers::default();
+        let mut selector = Selector::default();
+        selector.want(Some((2, 0)));
+        let (forwarded, _) = run_l2t2(&mut layers, &mut selector, 0..8, &[0], |unit, s| {
+            if unit == 3 {
+                s.want(Some((3, 1)));
+            }
+        });
+        // S1T0 frames only, then from the next S1T0 frame (unit 4) all S1 frames.
+        assert_eq!(forwarded, [0, 1, 5, 9, 11, 13, 15]);
+    }
+
+    #[test]
+    fn a_dropped_frame_breaks_its_chain_and_a_discardable_one_nothing() {
+        let mut layers = Layers::default();
+        let mut selector = Selector::default();
+        selector.want(Some((3, 1)));
+        run_l2t2(&mut layers, &mut selector, 0..3, &[0], |_, _| {});
+        // Unit 3 is T1: its S1 frame is discardable for S1T1.
+        let t1 = layers
+            .packet(&l2t2_key(5, 7, false), 1, Duration::ZERO)
+            .expect("valid");
+        selector.dropped(&t1);
+        assert_eq!(selector.current(), Some(3));
+        // Unit 4's S1T0 frame is required: nothing more until a key picture.
+        let (forwarded, _) = run_l2t2(&mut layers, &mut selector, 4..5, &[0], |_, _| {});
+        assert_eq!(forwarded, [9]);
+        let t0 = layers
+            .packet(&l2t2_key(4, 9, false), 1, Duration::ZERO)
+            .expect("valid");
+        selector.dropped(&t0);
+        let (forwarded, _) = run_l2t2(&mut layers, &mut selector, 5..8, &[0, 7], |_, _| {});
+        assert_eq!(forwarded, [14, 15]);
     }
 
     #[test]
