@@ -2418,6 +2418,19 @@ impl Desktop {
         for event in events {
             match event.into_input() {
                 Ok(input) => {
+                    // What the audio did, for reports of a microphone that
+                    // stopped: the status after a stop names its cause.
+                    match &input {
+                        nuschl_client::input::Input::AudioStatus {
+                            server, message, ..
+                        } => {
+                            tracing::info!(server, message, "audio status");
+                        }
+                        nuschl_client::input::Input::MicrophoneStopped { server, .. } => {
+                            tracing::warn!(server, "microphone stopped");
+                        }
+                        _ => {}
+                    }
                     #[cfg(feature = "frame-timing")]
                     {
                         use nuschl_client::input::{Input, ServerEvent};
