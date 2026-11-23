@@ -8,10 +8,11 @@
 //! recording exists, the output callback records what it hands to the device.
 //!
 //! Device callbacks stamp their samples on one clock (the worker's `Instant`
-//! epoch, corrected by the latency cpal reports), and the worker feeds the
-//! canceller each reference frame once it has sounded, up to the microphone
-//! frame being processed. The canceller then always sees the far end before
-//! its echo, at a steady offset, whatever the callbacks' burst sizes.
+//! epoch: the device's own instants, corrected by the latency cpal reports,
+//! see `StreamClock`), and the worker feeds the canceller each reference
+//! frame once it has sounded, up to the microphone frame being processed.
+//! The canceller then always sees the far end before its echo, at a steady
+//! offset, whatever the callbacks' burst sizes.
 
 use crate::dsp::{FRAME, RATE};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -49,6 +50,35 @@ impl Clock {
     pub fn now_shifted(&self, earlier: Duration, later: Duration) -> u64 {
         let elapsed = self.epoch.elapsed() + later;
         elapsed.saturating_sub(earlier).as_nanos() as u64
+    }
+}
+
+/// One stream's device instants (cpal's callback and capture or playback
+/// times) on the worker's clock. A callback runs some time after the device
+/// instant it reports, so the smallest difference seen is the offset between
+/// the two clocks: a late callback keeps the stamps of its audio.
+pub struct StreamClock {
+    clock: Clock,
+    offset: Option<i128>,
+}
+
+impl StreamClock {
+    pub fn new(clock: Clock) -> Self {
+        Self {
+            clock,
+            offset: None,
+        }
+    }
+
+    /// The device instant `callback` (in nanoseconds), moved `earlier` or
+    /// `later` as in `Clock::now_shifted`. No allocation.
+    pub fn now_shifted(&mut self, callback: u128, earlier: Duration, later: Duration) -> u64 {
+        let device = callback as i128;
+        let seen = i128::from(self.clock.now_shifted(Duration::ZERO, Duration::ZERO)) - device;
+        let offset = *self
+            .offset
+            .insert(self.offset.map_or(seen, |offset| offset.min(seen)));
+        (device + offset + later.as_nanos() as i128 - earlier.as_nanos() as i128).max(0) as u64
     }
 }
 
@@ -329,6 +359,18 @@ mod tests {
         // The second stamp corrects the clock (11 ms, not 10 ms).
         assert_eq!(timeline.time_of(480), Some(11_000_000));
         assert_eq!(timeline.time_of(960), Some(21_000_000));
+    }
+
+    #[test]
+    fn a_late_callback_keeps_the_stamp_of_its_device_instant() {
+        let mut clock = StreamClock::new(Clock::new());
+        let first = clock.now_shifted(1_000_000_000, Duration::ZERO, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(20));
+        // 10 ms of device time later, reported 20 ms later: the stamp moves 10 ms.
+        let second = clock.now_shifted(1_010_000_000, Duration::ZERO, Duration::ZERO);
+        assert_eq!(second - first, 10_000_000);
+        let captured = clock.now_shifted(1_015_000_000, Duration::from_millis(3), Duration::ZERO);
+        assert_eq!(captured - first, 12_000_000);
     }
 
     #[test]

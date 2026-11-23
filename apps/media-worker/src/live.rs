@@ -1671,6 +1671,7 @@ where
 {
     let (channels, rate) = convertible(&config)?;
     let mut converter = CaptureConverter::new(channels, rate);
+    let mut clock = reference::StreamClock::new(clock);
     device
         .build_input_stream(
             config,
@@ -1682,7 +1683,11 @@ where
                 let latency = timestamp
                     .callback
                     .saturating_duration_since(timestamp.capture);
-                stamper.anchor(converter.capture_time(clock.now_shifted(latency, Duration::ZERO)));
+                stamper.anchor(converter.capture_time(clock.now_shifted(
+                    timestamp.callback.as_nanos(),
+                    latency,
+                    Duration::ZERO,
+                )));
                 stamper.advance(converter.push(data, &mut ring));
             },
             error_callback(tx, Some(microphone), "microphone"),
@@ -1789,6 +1794,7 @@ fn record_output(
     let outputs = converter.outputs();
     let (mut ring, samples) = RingBuffer::<f32>::new(reference::RING_FRAMES * outputs);
     let (mut stamper, timeline) = reference::stamped();
+    let mut clock = reference::StreamClock::new(clock);
     let callback = move |values: &mut dyn Iterator<Item = f32>, info: &cpal::InputCallbackInfo| {
         let timestamp = info.timestamp();
         let latency = timestamp
@@ -1796,7 +1802,11 @@ fn record_output(
             .saturating_duration_since(timestamp.capture);
         // Filtered reference samples describe earlier capture instants;
         // unlike playback delay, compensate toward the past.
-        stamper.anchor(clock.now_shifted(latency + converter.timestamp_delay(), Duration::ZERO));
+        stamper.anchor(clock.now_shifted(
+            timestamp.callback.as_nanos(),
+            latency + converter.timestamp_delay(),
+            Duration::ZERO,
+        ));
         stamper.advance(converter.push(values, &mut ring));
     };
     let stream = by_format!(
@@ -1852,6 +1862,7 @@ where
 {
     let (channels, rate) = convertible(&config)?;
     let mut converter = PlaybackConverter::new(channels, rate);
+    let mut clock = reference::StreamClock::new(clock);
     device
         .build_output_stream(
             config,
@@ -1862,7 +1873,11 @@ where
                     .saturating_duration_since(timestamp.callback);
                 played
                     .stamper
-                    .anchor(converter.reference_time(clock.now_shifted(Duration::ZERO, ahead)));
+                    .anchor(converter.reference_time(clock.now_shifted(
+                        timestamp.callback.as_nanos(),
+                        Duration::ZERO,
+                        ahead,
+                    )));
                 let (dry, handed) = converter.pull(data, &mut ring, &mut played.samples);
                 played.stamper.advance(handed);
                 if dry {
