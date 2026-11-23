@@ -533,62 +533,70 @@ pub fn card(
                 },
                 cx,
             );
-            layout::row()
+            // The place takes the row's full width; the status lines share
+            // theirs with the controls. Each line is one line high, so a
+            // status change moves nothing.
+            div()
                 .id(id.clone())
                 .role(Role_::Group)
                 .aria_label(format!("{}: {}", place.label, status))
-                // The controls sit at the row's bottom edge. Scrolled to the
-                // end, the last row's bottom meets the region's, so its
-                // hang-up is in view even when a narrow, zoomed row (wrapped
-                // status lines) is taller than the region.
-                .items_end()
+                .w_full()
+                .min_w_0()
                 .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(place_link(place, cx))
                 .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .flex_basis(px(0.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(place_link(place, cx))
+                    // The controls sit at the row's bottom edge. Scrolled to
+                    // the end, the last row's bottom meets the region's, so
+                    // its hang-up is in view even when a zoomed row is taller
+                    // than the region.
+                    layout::row()
+                        .items_end()
                         .child(
-                            div()
+                            layout::flexible()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
                                 .text_xs()
-                                .text_color(color(if place.state.speaking() {
-                                    SUCCESS
-                                } else {
-                                    TEXT_MUTED
-                                }))
-                                .child(layout::text((id.clone(), "status"), status)),
+                                .child(
+                                    div()
+                                        .text_color(color(if place.state.speaking() {
+                                            SUCCESS
+                                        } else {
+                                            TEXT_MUTED
+                                        }))
+                                        .child(layout::label((id.clone(), "status"), status)),
+                                )
+                                .when_some(place.bitrate.as_ref(), |column, bitrate| {
+                                    column.child(div().text_color(color(TEXT_MUTED)).child(
+                                        layout::label(
+                                            (id.clone(), "bitrate"),
+                                            crate::bitrate::place_line(bitrate),
+                                        ),
+                                    ))
+                                }),
                         )
-                        .when_some(place.bitrate.as_ref(), |column, bitrate| {
-                            column.child(div().text_xs().text_color(color(TEXT_MUTED)).child(
-                                layout::label(
-                                    (id.clone(), "bitrate"),
-                                    crate::bitrate::place_line(bitrate),
-                                ),
-                            ))
+                        .child(layout::fixed().child(action))
+                        .when_some(place.issue.as_ref(), |row, issue| {
+                            row.child(layout::fixed().child(crate::dialogs::icon_button(
+                                (id.clone(), "audio-issue"),
+                                "alert",
+                                format!("{}: {issue}; open audio settings", place.name),
+                                WARNING,
+                                None,
+                                move |this, window, cx| {
+                                    if issue_target.resolve(&this.client).is_some() {
+                                        issue_target.browse(this, window, cx);
+                                        this.open_settings();
+                                        cx.notify();
+                                    }
+                                },
+                                cx,
+                            )))
                         }),
                 )
-                .child(layout::fixed().child(action))
-                .when_some(place.issue.as_ref(), |row, issue| {
-                    row.child(layout::fixed().child(crate::dialogs::icon_button(
-                        (id.clone(), "audio-issue"),
-                        "alert",
-                        format!("{}: {issue}; open audio settings", place.name),
-                        WARNING,
-                        None,
-                        move |this, window, cx| {
-                            if issue_target.resolve(&this.client).is_some() {
-                                issue_target.browse(this, window, cx);
-                                this.open_settings();
-                                cx.notify();
-                            }
-                        },
-                        cx,
-                    )))
-                })
                 .into_any_element()
         })
         .collect::<Vec<_>>();
