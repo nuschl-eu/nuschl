@@ -232,7 +232,13 @@ impl Media {
         key_frame: bool,
         data: Vec<u8>,
     ) -> Result<bool, Error> {
-        let sources = self.sources.borrow().active();
+        let sources: Vec<_> = self
+            .sources
+            .borrow()
+            .active()
+            .into_iter()
+            .filter(|purpose| video_kind(*purpose).is_some())
+            .collect();
         let [purpose] = sources.as_slice() else {
             return Err(Error::Protocol("select an active video source"));
         };

@@ -304,7 +304,16 @@ async fn native_publisher_in_call_page_vm() {
         .await
         .unwrap();
     media.switch_source(Purpose::ScreenVideo).unwrap();
+    media.set_source(Purpose::SystemAudio, true).unwrap();
     fs::write(state.join("peer"), peer.to_string()).unwrap();
+    // One 20 ms stereo Opus frame (CELT, 64 kbit/s) of a 600 Hz tone from
+    // reference libopus: twelve whole periods, so repeating it is the tone.
+    let tone = hex::decode(
+        "fcb02ec29c587f554c71d4da56bde304b19e281c4870e38338338336be766ac8d8d843ccccaee6fcf87d9eff298e3ec5df9dc65de5de2294b8e178be8d4ce429148fe1c94d254f7d4cf3f15d622c14da8f987df3d395cf6491d4bbebcdb68cc125b05f232c2c15f6e63bb40d79e2b1d03f2344879f2f6ad1fb899fffe16a57f50b07326e2afadfb5a5c43c4d7c93b7fc0001c60aaa007afe664467bb54efffd1",
+    )
+    .unwrap();
+    let mut audio = tokio::time::interval(Duration::from_millis(20));
+    let mut played = 0;
 
     let mut tick = tokio::time::interval(Duration::from_millis(34));
     let mut timestamp = 0;
@@ -327,6 +336,10 @@ async fn native_publisher_in_call_page_vm() {
                         timestamp += 3_060;
                         media.send_keyframe(timestamp, red.clone()).unwrap();
                     }
+                }
+                _ = audio.tick() => {
+                    played += 960;
+                    let _ = media.send_source_frame(Purpose::SystemAudio, played, false, tone.clone());
                 }
                 event = media.next() => {
                     ready |= matches!(event.expect("publisher remains live").expect("RTC publisher"), MediaEvent::SourceReady { .. });

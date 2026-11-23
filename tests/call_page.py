@@ -10,10 +10,13 @@ roster. The creator and first Chromium subscriber move from the SFU to direct
 video and back as the publisher's bandwidth estimate changes. The screen exposes
 receiver video statistics. A pinned camera takes
 the large view; a publisher leaving takes its tile
-and roster row along. A page user then publishes Chromium's fake camera and
-screen with Start camera and Share screen. Captures start at the buttons.
-An explicit audio opt-in shares a synthetic tab tone over the SFU. The subscribers
-show both videos, a participant without
+and roster row along. A native publisher shares its screen and a tone as shared
+audio before Chromium joins: the screen tile's speaker plays the tone, and muting
+it silences the player while the track goes on. A page user then publishes
+Chromium's fake camera and screen with Start camera and Share screen. Captures
+start at the buttons. The subscribers' tile of that screen shows "No shared
+audio" until an explicit audio opt-in shares a synthetic tab tone over the SFU,
+which then plays and mutes as the native one. The subscribers show both videos, a participant without
 AV1 switches the call to VP9 and back while the streams keep going, and Stop
 ends the captures and the tiles. A Chromium without encoded transforms and a
 broken link get their refusals. Screenshots land in the directory given as the
@@ -35,6 +38,7 @@ import time
 from pathlib import Path
 
 from selenium import webdriver
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
 
@@ -250,6 +254,112 @@ def direct_video(publisher, viewer, peer):
     showing(viewer, tracks, "SFU video decoded after fallback")
 
 
+RECORDED_TONE = """
+const [selector, done] = arguments;
+const stream = document.querySelector(selector).srcObject;
+const recorder = new MediaRecorder(stream);
+const chunks = [];
+const stop = () => { if (recorder.state === 'recording') recorder.stop(); };
+const deadline = setTimeout(stop, 20000);
+recorder.ondataavailable = ({ data }) => {
+  if (data.size) chunks.push(data);
+  if (chunks.length >= 2) stop();
+};
+recorder.onerror = event => {
+  clearTimeout(deadline);
+  done({error: String(event.error)});
+};
+recorder.onstop = async () => {
+  clearTimeout(deadline);
+  const recording = new Blob(chunks, {type: recorder.mimeType});
+  try {
+    const data = await recording.arrayBuffer();
+    const context = new OfflineAudioContext(1, 48000, 48000);
+    const decoded = await context.decodeAudioData(data);
+    const samples = decoded.getChannelData(0);
+    if (samples.length < decoded.sampleRate) throw new Error('recorded less than a second of audio');
+    const middle = samples.subarray(samples.length / 4, 3 * samples.length / 4);
+    let power = 0;
+    let crossings = 0;
+    let positive = false;
+    for (const sample of middle) {
+      power += sample * sample;
+      if (sample > 0.1 && !positive) {
+        positive = true;
+        crossings++;
+      }
+      if (sample < -0.1) positive = false;
+    }
+    done({hertz: crossings * decoded.sampleRate / middle.length, rms: Math.sqrt(power / middle.length)});
+  } catch (error) {
+    done({error: String(error), bytes: recording.size, type: recording.type, chunks: chunks.length});
+  }
+};
+recorder.start(1000);
+"""
+
+
+def speaker(peer):
+    return f'.tile[data-peer="{peer}"][data-screen] .shared-audio button'
+
+
+def player(peer):
+    return f'#shared-audio audio[data-peer="{peer}"]'
+
+
+def label(driver, peer):
+    return driver.execute_script(f"return document.querySelector('{speaker(peer)}')?.getAttribute('aria-label')")
+
+
+def without_audio(driver, peer, what):
+    wait(driver, f"""const button = document.querySelector('{speaker(peer)}');
+                     return button?.disabled && button.getAttribute('aria-label') === 'No shared audio'""",
+         f"{what}: the screen tile shows no shared audio")
+
+
+def tone_of(driver, peer, hertz, minimum, what):
+    # Wait for actual recorder output. A negotiated track can precede its
+    # first packets, and under VM load the recorder can begin late.
+    tone = driver.execute_async_script(RECORDED_TONE, player(peer))
+    assert "error" not in tone and abs(tone["hertz"] - hertz) < 25 and tone["rms"] > minimum, (driver.name, what, tone)
+    return tone
+
+
+def shared_audio(driver, peer, hertz, minimum, what, screenshot=None):
+    """`peer`'s screen tile plays their shared audio from its speaker, which mutes
+    only this page's player: the track goes on."""
+    wait(driver, f"return document.querySelector('{speaker(peer)}')?.disabled === false",
+         f"{what}: the screen tile's speaker")
+    # A browser that waits for a click before playing shows the audio muted.
+    if label(driver, peer) == "Unmute shared audio":
+        driver.find_element(By.CSS_SELECTOR, speaker(peer)).click()
+    wait(driver, f"""const audio = document.querySelector('{player(peer)}');
+                     return audio && !audio.paused && !audio.muted && audio.srcObject.getAudioTracks()[0]?.readyState === 'live'
+                       && document.querySelector('{speaker(peer)}').getAttribute('aria-label') === 'Mute shared audio'""",
+         f"{what}: shared audio playing")
+    tone = tone_of(driver, peer, hertz, minimum, what)
+    print(f"{driver.name}: {what}: received the encrypted tone {tone}", flush=True)
+    if screenshot:
+        ActionChains(driver).move_to_element(driver.find_element(By.CSS_SELECTOR, speaker(peer))).perform()
+        # On every tile, the speaker and its volume stay clear of the name.
+        wait(driver, f"""const apart = (a, b) => a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top;
+                         const clear = [...document.querySelectorAll('.tile .shared-audio')].every(control => {{
+                           const name = control.closest('.tile').querySelector('figcaption').getBoundingClientRect();
+                           return [...control.children].every(part => apart(part.getBoundingClientRect(), name));
+                         }});
+                         const volume = document.querySelector('{speaker(peer)}').nextElementSibling;
+                         return clear && getComputedStyle(volume).opacity === '1'""",
+             f"{what}: the volume opens on hover, clear of the names")
+        driver.save_screenshot(str(OUT / screenshot))
+    driver.find_element(By.CSS_SELECTOR, speaker(peer)).click()
+    wait(driver, f"""return document.querySelector('{player(peer)}').muted
+                     && document.querySelector('{speaker(peer)}').getAttribute('aria-label') === 'Unmute shared audio'""",
+         f"{what}: muted")
+    tone_of(driver, peer, hertz, minimum, f"{what}, muted here")
+    driver.find_element(By.CSS_SELECTOR, speaker(peer)).click()
+    wait(driver, f"return !document.querySelector('{player(peer)}').muted", f"{what}: unmuted")
+
+
 def native_video(viewer):
     secret, publisher = secrets.token_bytes(32), secrets.token_bytes(32)
     posted = fragment(secret, publisher)
@@ -274,6 +384,8 @@ def native_video(viewer):
                 raise AssertionError(f"native publisher did not join: {log.read_text()}")
             viewer.get(f"{ORIGIN}/call{posted}")
             showing(viewer, {(int(peer), True): ((255, 0, 0), True)}, "native screen decoded in Chromium")
+            shared_audio(viewer, int(peer), 600, 0.05, "native shared audio, joined late",
+                         screenshot="native-shared-audio.png")
             (state / "switch").touch()
             showing(viewer, {(int(peer), False): ((255, 0, 0), None)}, "native camera replaced screen in Chromium")
         finally:
@@ -398,6 +510,9 @@ try:
     showing(user, {(a, False): (COLOURS["a"], False), (c, True): (COLOURS["c"], True),
                    (u, False): (green, False), (u, True): (green, False)}, "the page user's own view")
 
+    for driver in [chrome, fox]:
+        without_audio(driver, u, "a page user's screen")
+    chrome.save_screenshot(str(OUT / "screen-without-audio.png"))
     user.find_element(By.ID, "screen").click()
     wait(user, "return document.getElementById('screen').textContent === 'Share screen'", "screen stopped")
     user.find_element(By.ID, "screen-audio").click()
@@ -405,59 +520,9 @@ try:
     wait(user, "return document.getElementById('notice').textContent.includes('Sharing tab audio')",
          "tab audio announced")
     assert user.execute_script("return window.captures.at(-1)") == ["getDisplayMedia", True, "browser"]
-    selector = "#shared-audio audio"
+    selector = player(u)
     for driver in [chrome, fox]:
-        wait(driver, f"return Boolean(document.querySelector('{selector}')?.srcObject)", "shared audio track")
-        assert driver.execute_script(f"return document.querySelector('{selector}').paused"), "audio autoplayed"
-        wait(driver, f"""const track = document.querySelector('{selector}')?.srcObject?.getAudioTracks()[0];
-                         return track?.readyState === 'live' && !track.muted""", "shared audio receiving")
-        # Wait for actual recorder output. A negotiated track can precede its
-        # first packets, and under VM load the recorder can begin late.
-        tone = driver.execute_async_script("""
-          const [selector, done] = arguments;
-          const stream = document.querySelector(selector).srcObject;
-          const recorder = new MediaRecorder(stream);
-          const chunks = [];
-          const stop = () => { if (recorder.state === 'recording') recorder.stop(); };
-          const deadline = setTimeout(stop, 20000);
-          recorder.ondataavailable = ({ data }) => {
-            if (data.size) chunks.push(data);
-            if (chunks.length >= 2) stop();
-          };
-          recorder.onerror = event => {
-            clearTimeout(deadline);
-            done({error: String(event.error)});
-          };
-          recorder.onstop = async () => {
-            clearTimeout(deadline);
-            const recording = new Blob(chunks, {type: recorder.mimeType});
-            try {
-              const data = await recording.arrayBuffer();
-              const context = new OfflineAudioContext(1, 48000, 48000);
-              const decoded = await context.decodeAudioData(data);
-              const samples = decoded.getChannelData(0);
-              if (samples.length < decoded.sampleRate) throw new Error('recorded less than a second of audio');
-              const middle = samples.subarray(samples.length / 4, 3 * samples.length / 4);
-              let power = 0;
-              let crossings = 0;
-              let positive = false;
-              for (const sample of middle) {
-                power += sample * sample;
-                if (sample > 0.1 && !positive) {
-                  positive = true;
-                  crossings++;
-                }
-                if (sample < -0.1) positive = false;
-              }
-              done({hertz: crossings * decoded.sampleRate / middle.length, rms: Math.sqrt(power / middle.length)});
-            } catch (error) {
-              done({error: String(error), bytes: recording.size, type: recording.type, chunks: chunks.length});
-            }
-          };
-          recorder.start(1000);
-        """, selector)
-        assert "error" not in tone and abs(tone["hertz"] - 660) < 25 and tone["rms"] > 0.2, (driver.name, tone)
-        print(f"{driver.name}: received the encrypted tab audio tone {tone}", flush=True)
+        shared_audio(driver, u, 660, 0.2, "tab audio", screenshot="shared-audio-tile.png" if driver is chrome else None)
 
     user.save_screenshot(str(OUT / "publishing.png"))
     chrome.save_screenshot(str(OUT / "publishing-subscriber.png"))
