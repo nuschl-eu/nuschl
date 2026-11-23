@@ -7,6 +7,7 @@ a stand-in that hands out only this test's files, against a loopback Murmur, a
 scripted peer and a private magic-wormhole mailbox and relay. No host
 clipboard, audio, profile or file chooser is used. Checks that:
 
+- an attached image brings no link preview note to the composer;
 - with Strip metadata ticked (the default), an image over 8 MB and a PNG the
   content worker cannot decode leave a note and nothing in the tray, and the
   peer receives no file offer;
@@ -25,11 +26,13 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from accessibility import items, start_registry  # noqa: E402
@@ -70,6 +73,17 @@ PORTAL = '''(() => {
     Gio.BusNameOwnerFlags.NONE, null, null);
   return 'ready';
 })()'''
+
+
+def png(path, width, height):
+    """A synthetic RGB PNG."""
+    rows = b"".join(b"\0" + bytes((x * 7 + y * 3) % 256 for x in range(width * 3)) for y in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+    return path
 
 
 def main():
@@ -150,6 +164,27 @@ def main():
             file.truncate(8 * 1024 * 1024 + 1)
         broken = root / "broken.png"
         broken.write_bytes(b"\x89PNG\r\n\x1a\nnot an image")
+
+        # An image in the tray, with text typed after it, brings no link
+        # preview note.
+        shot = png(root / "shot.png", 64, 48)
+        attach(shot)
+        find(lambda _, role, name, __: role == "list item" and name == f"Image {shot.name}",
+             "the image was not prepared")
+        find(lambda _, role, name, __: role in ("text", "entry") and name == "Message",
+             "no composer")[0].call("Component", "GrabFocus")
+        time.sleep(0.5)
+        shell.type("Look")
+        time.sleep(1.0)
+        notes = [name for _, _, name, _ in items(nuschl)
+                 if name == "Link preview" or name.startswith(("Text only", "No link preview"))]
+        assert not notes, notes
+        shell.chord("Control_L", "a")
+        shell.key("BackSpace")
+        find(lambda _, role, name, __: name == f"Remove {shot.name}", "no Remove button")[0].press()
+        eventually(lambda: not present(lambda _, role, name, __: name.startswith(f"Image {shot.name}")),
+                   "the image stayed in the tray")
+        print("An attached image brought no link preview note.", flush=True)
 
         # On: refused with a note, nothing in the tray, nothing offered.
         attach(photo)
