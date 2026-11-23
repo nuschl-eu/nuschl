@@ -51,9 +51,10 @@ decisions (§11).
   Each fresh portal grant supplies one PipeWire FD to a capture worker.
   VA-API handles encoding and decoding where available. The software fallbacks
   are rav1e and rav1d. The decoder returns bounded BGRA to GPUI.
-- A native desktop handles one encrypted peer pair. Two native peers can
-  upgrade from the SFU to a direct connection and fall back to the SFU. Relay-only
-  native connections use UDP TURN with the SFU as their only media peer.
+- A native publisher whose video flows one way can move it from the SFU to
+  direct connections with one or two native viewers and fall back to the SFU.
+  Relay-only native connections use UDP TURN with the SFU as their only media
+  peer.
 - The companion browser page handles group calls, captures camera and screen,
   and can share the selected browser tab's audio in supported browsers. It
   sets receive quality per tile and switches two-person video between the SFU

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! One optional native peer leg. The SFU transports sealed signaling.
+//! Optional native peer legs: a publisher sends to up to two viewers, a viewer
+//! receives from one publisher. The SFU transports sealed signaling.
 
 use super::{
     Command, Connection, Description, Error, Instant, Leg, LegRole, Network, Purpose, Track,
@@ -9,15 +10,17 @@ use crate::sfu::turn::turn_address;
 use futures_util::{FutureExt, future::BoxFuture};
 use nuschl_ipc::{
     crypto::call::Action,
-    rtc::{Codec, FIRST_DIRECT_LEG},
+    rtc::{Codec, FIRST_DIRECT_LEG, MAX_DIRECT_SEND_LEGS},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    future::pending,
+    future::{pending, poll_fn},
     net::{IpAddr, SocketAddr},
+    task::Poll,
     time::Duration,
 };
 use tokio::{
+    io::ReadBuf,
     net::{UdpSocket, lookup_host},
     time::timeout,
 };
@@ -62,6 +65,7 @@ pub(super) enum Setup {
 }
 
 pub(super) struct Prepared {
+    peer: u64,
     socket: UdpSocket,
     local: Candidates,
     setup: Setup,
@@ -96,17 +100,44 @@ pub(super) enum Signal {
     },
 }
 
+/// The direct legs an endpoint may use. Video in both directions keeps the SFU.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Role {
+    /// Every other participant receives this publisher's video.
+    Send(Vec<u64>),
+    /// This viewer receives video from one publisher.
+    Receive(u64),
+}
+
+pub(super) fn role(peers: &[u64], publishing: bool, subscribed: &[Track]) -> Option<Role> {
+    match (publishing, subscribed) {
+        (true, []) if (1..=MAX_DIRECT_SEND_LEGS).contains(&peers.len()) => {
+            Some(Role::Send(peers.to_vec()))
+        }
+        (false, [first, rest @ ..]) => {
+            let publisher = first.publisher?;
+            rest.iter()
+                .all(|track| track.publisher == Some(publisher))
+                .then_some(Role::Receive(publisher))
+        }
+        _ => None,
+    }
+}
+
 pub(super) struct Direct {
     interface: IpAddr,
     stun: Option<(String, u16)>,
     next_leg: u32,
-    pub(super) ready: bool,
+    /// Viewers that decoded this publisher's video through the SFU.
+    pub(super) ready: Vec<u64>,
     pub(super) asked: bool,
-    pub(super) leg: Option<Attempt>,
+    /// All legs of one role; a publisher selects them together.
+    pub(super) legs: Vec<Attempt>,
     retry: Instant,
 }
 
 pub(super) struct Attempt {
+    pub(super) peer: u64,
     pub(super) transport: Leg,
     pub(super) id: [u8; 16],
     deadline: Instant,
@@ -125,34 +156,50 @@ impl Direct {
                 .find_map(|url| turn_address(url))
                 .map(|(host, port)| (host.to_owned(), port)),
             next_leg: FIRST_DIRECT_LEG,
-            ready: false,
+            ready: Vec::new(),
             asked: false,
-            leg: None,
+            legs: Vec::new(),
             retry: Instant::now(),
         }
     }
 
     pub(super) fn can_offer(&self) -> bool {
-        self.ready && self.leg.is_none() && Instant::now() >= self.retry
+        Instant::now() >= self.retry
     }
 
+    /// The publisher's cooldown paces retries.
     pub(super) fn can_accept(&self) -> bool {
-        self.asked && self.leg.is_none() && Instant::now() >= self.retry
+        self.asked && self.legs.is_empty()
+    }
+
+    pub(super) fn selected(&self) -> bool {
+        self.legs.iter().any(|leg| leg.transport.selected)
     }
 
     pub(super) fn deadline(&self) -> Option<Instant> {
-        self.leg.as_ref().map(|leg| {
-            if leg.transport.selected {
-                leg.transport
-                    .last_packet
-                    .map_or(leg.deadline, |last| last + SILENCE)
-            } else {
-                leg.deadline
-            }
-        })
+        self.legs
+            .iter()
+            .map(|leg| {
+                if leg.transport.selected {
+                    leg.transport
+                        .last_packet
+                        .map_or(leg.deadline, |last| last + SILENCE)
+                } else {
+                    leg.deadline
+                }
+            })
+            .min()
     }
 
-    pub(super) fn discover(&self, setup: Setup) -> Discovery {
+    pub(super) fn wake(&self) -> Option<Instant> {
+        self.legs
+            .iter()
+            .filter(|leg| leg.answered)
+            .filter_map(|leg| leg.transport.wake)
+            .min()
+    }
+
+    pub(super) fn discover(&self, peer: u64, setup: Setup) -> Discovery {
         let interface = self.interface;
         let stun = self.stun.clone();
         async move {
@@ -169,6 +216,7 @@ impl Direct {
                 None => None,
             };
             Ok(Prepared {
+                peer,
                 socket,
                 local: Candidates { host, reflexive },
                 setup,
@@ -198,10 +246,13 @@ impl Direct {
         for track in &mut description.tracks {
             track.publisher = Some(peer);
         }
-        Some(self.discover(Setup::Answer {
-            description,
-            remote: candidates,
-        }))
+        Some(self.discover(
+            peer,
+            Setup::Answer {
+                description,
+                remote: candidates,
+            },
+        ))
     }
 
     pub(super) async fn complete(
@@ -209,11 +260,12 @@ impl Direct {
         worker: &mut Worker,
         codec: Codec,
         Prepared {
+            peer,
             socket,
             mut local,
             setup,
         }: Prepared,
-    ) -> Result<Signal, Error> {
+    ) -> Result<(u64, Signal), Error> {
         let leg = self.next_leg;
         self.next_leg = leg
             .checked_add(1)
@@ -233,7 +285,8 @@ impl Direct {
             LegRole::Direct,
         )
         .await?;
-        let attempt = self.leg.insert(Attempt {
+        self.legs.push(Attempt {
+            peer,
             transport,
             id,
             deadline: Instant::now() + SETUP,
@@ -241,6 +294,7 @@ impl Direct {
             answered: false,
             confirmed: false,
         });
+        let attempt = self.legs.last_mut().ok_or(Error::Protocol("direct leg"))?;
         if let Some(address) = local.reflexive
             && !matches!(
                 worker
@@ -256,10 +310,13 @@ impl Direct {
             Setup::Offer(purposes) => {
                 let description = describe(worker, Command::Offer { leg, id, purposes }).await?;
                 attempt.tracks = description.tracks.clone();
-                Ok(Signal::Offer {
-                    candidates: local,
-                    description,
-                })
+                Ok((
+                    peer,
+                    Signal::Offer {
+                        candidates: local,
+                        description,
+                    },
+                ))
             }
             Setup::Answer {
                 description,
@@ -269,10 +326,13 @@ impl Direct {
                 let description =
                     describe(worker, Command::AcceptOffer { leg, description }).await?;
                 attempt.connect(remote);
-                Ok(Signal::Answer {
-                    candidates: local,
-                    description,
-                })
+                Ok((
+                    peer,
+                    Signal::Answer {
+                        candidates: local,
+                        description,
+                    },
+                ))
             }
         }
     }
@@ -285,9 +345,9 @@ impl Direct {
         mut description: Description,
     ) -> Result<(), Error> {
         let Some(attempt) = self
-            .leg
-            .as_mut()
-            .filter(|leg| leg.id == description.id && !leg.answered)
+            .legs
+            .iter_mut()
+            .find(|leg| leg.peer == peer && leg.id == description.id && !leg.answered)
         else {
             return Ok(());
         };
@@ -311,20 +371,34 @@ impl Direct {
         Ok(())
     }
 
+    /// Close every leg and return each peer with its attempt.
     pub(super) async fn close(
         &mut self,
         worker: &mut Worker,
         publish: Option<&mut Leg>,
-    ) -> Result<Option<[u8; 16]>, Error> {
+    ) -> Result<Vec<(u64, [u8; 16])>, Error> {
         self.retry = Instant::now() + COOLDOWN;
-        let Some(attempt) = self.leg.take() else {
-            return Ok(None);
+        let legs = std::mem::take(&mut self.legs);
+        let retired = match publish.filter(|_| legs.iter().any(|leg| leg.transport.selected)) {
+            Some(publish) => {
+                // Switching retires the selected direct send legs in the worker.
+                done(
+                    worker,
+                    Command::SetSendLegs {
+                        legs: vec![publish.id],
+                    },
+                )
+                .await?;
+                publish.bandwidth = None;
+                publish.wake = Some(Instant::now());
+                true
+            }
+            None => false,
         };
-        if let Some(publish) = publish.filter(|_| attempt.transport.selected) {
-            // Switching retires the direct send leg in the worker.
-            done(worker, Command::SetSendLeg { leg: publish.id }).await?;
-            publish.wake = Some(Instant::now());
-        } else {
+        for attempt in legs
+            .iter()
+            .filter(|attempt| !(retired && attempt.transport.selected))
+        {
             done(
                 worker,
                 Command::CloseLeg {
@@ -333,8 +407,33 @@ impl Direct {
             )
             .await?;
         }
-        Ok(Some(attempt.id))
+        Ok(legs
+            .into_iter()
+            .map(|attempt| (attempt.peer, attempt.id))
+            .collect())
     }
+}
+
+/// The next datagram on an answered leg, with the leg's index.
+pub(super) async fn receive(
+    legs: &[Attempt],
+    buffer: &mut [u8],
+) -> (usize, std::io::Result<(usize, SocketAddr)>) {
+    poll_fn(|context| {
+        for (index, attempt) in legs.iter().enumerate() {
+            if let (true, Network::Direct { socket, .. }) =
+                (attempt.answered, &attempt.transport.network)
+            {
+                let mut read = ReadBuf::new(&mut *buffer);
+                if let Poll::Ready(result) = socket.poll_recv_from(context, &mut read) {
+                    let size = read.filled().len();
+                    return Poll::Ready((index, result.map(|source| (size, source))));
+                }
+            }
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 impl Attempt {
@@ -364,10 +463,17 @@ pub(super) async fn send(
     Ok(())
 }
 
-pub(super) fn enough(sample: Option<(Instant, u64)>, desired: u64) -> bool {
-    sample.is_some_and(|(observed, rate)| {
-        observed.elapsed() <= SAMPLE_AGE && rate.saturating_mul(4) / 5 >= desired
-    })
+/// 80 % of a probed rate carries `desired`.
+pub(super) fn sustains(rate: u64, desired: u64) -> bool {
+    rate.saturating_mul(4) / 5 >= desired
+}
+
+/// Whether a fresh probe of the upload sustains the stream for every viewer;
+/// `None` without a fresh probe.
+pub(super) fn upload(sample: Option<(Instant, u64)>, desired: u64, viewers: usize) -> Option<bool> {
+    sample
+        .filter(|(observed, _)| observed.elapsed() <= SAMPLE_AGE)
+        .map(|(_, rate)| sustains(rate, desired.saturating_mul(viewers as u64)))
 }
 
 async fn binding(
@@ -469,6 +575,38 @@ fn allowed(interface: IpAddr, endpoint: SocketAddr) -> bool {
 mod tests {
     use super::*;
     use turn_client_proto::stun::types::message::MessageWriteExt;
+
+    #[test]
+    fn a_publisher_sends_one_way_to_at_most_two_viewers() {
+        let screen = |publisher| Track {
+            mid: format!("{publisher}"),
+            purpose: Purpose::ScreenVideo,
+            publisher: Some(publisher),
+        };
+        assert_eq!(role(&[2], true, &[]), Some(Role::Send(vec![2])));
+        assert_eq!(role(&[2, 3], true, &[]), Some(Role::Send(vec![2, 3])));
+        assert_eq!(role(&[2, 3, 4], true, &[]), None);
+        assert_eq!(role(&[], true, &[]), None);
+        assert_eq!(role(&[2], true, &[screen(2)]), None);
+        assert_eq!(role(&[2, 3], false, &[screen(2)]), Some(Role::Receive(2)));
+        assert_eq!(role(&[2, 3], false, &[screen(2), screen(3)]), None);
+        assert_eq!(role(&[2], false, &[]), None);
+    }
+
+    #[test]
+    fn eighty_percent_of_a_fresh_upload_probe_covers_every_viewer() {
+        let now = Instant::now();
+        let screen = 8_000_000;
+        assert_eq!(upload(Some((now, 10_000_000)), screen, 1), Some(true));
+        assert_eq!(upload(Some((now, 9_999_999)), screen, 1), Some(false));
+        assert_eq!(upload(Some((now, 10_000_000)), screen, 2), Some(false));
+        assert_eq!(upload(Some((now, 20_000_000)), screen, 2), Some(true));
+        assert_eq!(upload(None, screen, 1), None);
+        let stale = now.checked_sub(SAMPLE_AGE + Duration::from_millis(1));
+        assert!(stale.is_some_and(|at| upload(Some((at, 20_000_000)), screen, 1).is_none()));
+        assert!(!sustains(u64::MAX, u64::MAX));
+        assert!(!sustains(9_999_999, screen));
+    }
 
     #[tokio::test]
     async fn binding_observes_the_mapping_on_the_same_socket() {

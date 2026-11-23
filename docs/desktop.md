@@ -234,9 +234,10 @@ budget and encoder target for the selected source. The stats overlay leaves
 the video size unchanged. Viewer Auto fits the video tile and requests at
 least the 1080p tier for screen shares to keep text readable.
 
-Native media uses one encrypted peer pair per desktop. Two native clients can
-switch to a direct connection when it can carry their video and return to the
-call server if needed. **Relay-only connections** routes native video through
+A native presenter can send its video directly to one or two native viewers
+when 80 % of its upload carries the video to each of them, and returns to the
+call server when a direct connection slows down or fails. Calls with video in
+both directions, more viewers or browser participants use the call server. **Relay-only connections** routes native video through
 the call host's UDP TURN relay. Browser guests can use the link for group
 calls. The desktop keeps its meeting open for browser guests if native
 playback ends. Voice stays in Mumble.

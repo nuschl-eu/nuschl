@@ -163,7 +163,7 @@ struct Call {
     opened_subscribe: bool,
     sending: Option<Sending>,
     receiving: BTreeMap<u64, FrameDecryptor>,
-    active: Option<u32>,
+    active: Vec<u32>,
     keyframe: [bool; MAX_ENCODINGS as usize],
 }
 
@@ -178,7 +178,7 @@ impl Call {
             opened_subscribe: false,
             sending: None,
             receiving: BTreeMap::new(),
-            active: None,
+            active: Vec::new(),
             keyframe: [false; MAX_ENCODINGS as usize],
         }
     }
@@ -270,9 +270,7 @@ impl Call {
             }
             Command::CloseLeg { leg } => {
                 self.legs.remove(&leg).ok_or(())?;
-                if self.active == Some(leg) {
-                    self.active = None;
-                }
+                self.active.retain(|active| *active != leg);
                 Reply::Done
             }
             Command::AddReflexive { leg, address } => {
@@ -349,16 +347,27 @@ impl Call {
                 Reply::Done
             }
             Command::Poll { leg } => return self.poll(leg, now),
-            Command::SetSendLeg { leg } => {
-                let live = self.legs.get(&leg).ok_or(())?;
-                if self.sending.is_none()
-                    || live.role == LegRole::SfuSubscribe
-                    || !live.peer.is_connected()
+            Command::SetSendLegs { legs } => {
+                let usable = |index: usize, leg: &u32| {
+                    !legs[..index].contains(leg)
+                        && self.legs.get(leg).is_some_and(|live| {
+                            live.peer.is_connected()
+                                && match live.role {
+                                    LegRole::Direct => true,
+                                    LegRole::SfuPublish => legs.len() == 1,
+                                    LegRole::SfuSubscribe => false,
+                                }
+                        })
+                };
+                if self.sending.is_none() || !legs.iter().enumerate().all(|(i, leg)| usable(i, leg))
                 {
                     return Err(());
                 }
-                if self.active != Some(leg) {
-                    if let Some(previous) = self.active.replace(leg) {
+                if self.active != legs {
+                    for previous in std::mem::replace(&mut self.active, legs) {
+                        if self.active.contains(&previous) {
+                            continue;
+                        }
                         match self.legs.get_mut(&previous) {
                             Some(old) if old.role == LegRole::SfuPublish => {
                                 old.peer.clear_call_send()
@@ -410,24 +419,31 @@ impl Call {
         now: Instant,
         data: &[u8],
     ) -> Result<(), ()> {
-        let leg = self.legs.get_mut(&self.active.ok_or(())?).ok_or(())?;
-        let track = leg.peer.track_for(to_purpose(purpose)).ok_or(())?;
         let index = usize::from(encoding(purpose));
-        if matches!(purpose, Purpose::Camera | Purpose::ScreenVideo)
-            && !self.keyframe[index]
-            && !key_frame
+        if self.active.is_empty()
+            || matches!(purpose, Purpose::Camera | Purpose::ScreenVideo)
+                && !self.keyframe[index]
+                && !key_frame
         {
             return Err(());
         }
         let sender = self.sending.as_mut().ok_or(())?;
-        let encrypted = sender.keys[index]
+        let encrypted: std::sync::Arc<[u8]> = sender.keys[index]
             .encrypt(key_frame, data)
-            .map_err(|_| ())?;
-        if leg
-            .peer
-            .write(track, timestamp, now, encrypted.into())
-            .is_err()
-        {
+            .map_err(|_| ())?
+            .into();
+        // Every direct receiver gets the same ciphertext. A leg that refuses the
+        // frame needs a key frame, which the other legs receive too.
+        let mut written = true;
+        for leg in &self.active {
+            let live = self.legs.get_mut(leg).ok_or(())?;
+            let track = live.peer.track_for(to_purpose(purpose)).ok_or(())?;
+            written &= live
+                .peer
+                .write(track, timestamp, now, encrypted.clone())
+                .is_ok();
+        }
+        if !written {
             self.keyframe[index] = false;
             return Err(());
         }

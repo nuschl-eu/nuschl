@@ -262,14 +262,17 @@ synthetic AV1 through the SFU and through real coturn. They check authenticated
 frame bytes, source identity, simultaneous publishing and receiving, the relay
 address and worker shutdown. Run the Nix `nuschl-session-unit` check, which supplies coturn
 and the crypto worker, RTC worker, video worker and SFU executables.
-The standalone `nuschl-rtc-worker-unit` check exercises SFrame and two UDP legs
-using a synthetic AV1 frame in the worker's confined role.
+The standalone `nuschl-rtc-worker-unit` check exercises SFrame, switching and
+simultaneous direct UDP legs using a synthetic AV1 frame in the worker's
+confined role.
 
 The native media API accepts local camera and screen frames while it receives
 video from the call's other publishers. A publisher and purpose identify each
 remote video source. Both media directions use the authenticated WSS peer
-address and the SFU's configured UDP port, which defaults to 3479. Two native
-peers with video flowing one way can switch to a direct route and keep the SFU
-leg available. The direct leg tests its host address and can obtain a reflexive
-address from the WSS-advertised UDP TURN service with STUN. In relay-only mode,
+address and the SFU's configured UDP port, which defaults to 3479. A native
+publisher whose video flows one way can switch to direct routes with one or two
+native viewers and keep the SFU leg available; the RTC worker writes each
+encrypted frame on every selected direct leg. Each direct leg tests its host
+address and can obtain a reflexive address from the WSS-advertised UDP TURN
+service with STUN. In relay-only mode,
 the broker forwards the SFU legs through allocations on that service.

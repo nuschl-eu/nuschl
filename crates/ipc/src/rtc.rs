@@ -23,6 +23,8 @@ pub const MAX_TRACKS: usize = 48;
 pub const SFU_SUBSCRIBE_LEG: u32 = 1;
 pub const SFU_PUBLISH_LEG: u32 = 2;
 pub const FIRST_DIRECT_LEG: u32 = 3;
+/// A publisher sends each frame on the SFU leg or on up to this many direct legs.
+pub const MAX_DIRECT_SEND_LEGS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -141,8 +143,10 @@ pub enum Command {
     Poll {
         leg: u32,
     },
-    SetSendLeg {
-        leg: u32,
+    /// Move media in one step to these legs: the SFU publish leg alone, or
+    /// direct legs.
+    SetSendLegs {
+        legs: Vec<u32>,
     },
     Write {
         purpose: Purpose,
@@ -189,7 +193,10 @@ impl Command {
             Self::AcceptOffer { leg, description } | Self::AcceptAnswer { leg, description } => {
                 *leg != 0 && description.valid()
             }
-            Self::CloseLeg { leg } | Self::Poll { leg } | Self::SetSendLeg { leg } => *leg != 0,
+            Self::CloseLeg { leg } | Self::Poll { leg } => *leg != 0,
+            Self::SetSendLegs { legs } => {
+                (1..=MAX_DIRECT_SEND_LEGS).contains(&legs.len()) && !legs.contains(&0)
+            }
             Self::RequestKeyframe { leg, publisher, .. } => *leg != 0 && *publisher != 0,
             Self::Datagram { .. } | Self::Write { .. } => false,
         }
