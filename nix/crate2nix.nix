@@ -36,6 +36,7 @@ let
     CARGO_ENCODED_RUSTFLAGS = "";
   };
   gst = pkgs.gst_all_1;
+  gstVa = import ./gst-va { inherit pkgs; };
   gstLibraries = [
     pkgs.glib
     gst.gstreamer
@@ -102,7 +103,7 @@ let
       NUSCHL_VIDEO_GST_PLUGINS = lib.concatStringsSep ":" [
         "${lib.getLib gst.gstreamer}/lib/gstreamer-1.0/libgstcoreelements.so"
         "${gst.gst-plugins-base}/lib/gstreamer-1.0/libgstapp.so"
-        "${gst.gst-plugins-bad}/lib/gstreamer-1.0/libgstva.so"
+        "${gstVa}/lib/gstreamer-1.0/libgstva.so"
         "${gst.gst-plugins-bad}/lib/gstreamer-1.0/libgstvideoparsersbad.so"
         "${pkgs.pipewire}/lib/gstreamer-1.0/libgstpipewire.so"
       ];

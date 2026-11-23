@@ -1,0 +1,17 @@
+--- a/sys/va/gstvaav1enc.c
++++ b/sys/va/gstvaav1enc.c
+@@ -2508,9 +2508,11 @@
+   un_compressed_size =
+       ((base->width * base->height * pic_size_profile_factor) >> 3);
+ 
+-  /* FIXME: Using only a rough approximation for bitstream headers.
+-     We do not calculate SpeedAdj and do not consider still_picture. */
+-  base->codedbuf_size = un_compressed_size / self->cr;
++  /* Hardware rate control can exceed the level's minimum compression ratio,
++     for example with keyframes of detailed screen content, and a frame larger
++     than the coded buffer fails the stream. Reserve the uncompressed size: a
++     coded buffer exists only while its frame is encoded. */
++  base->codedbuf_size = un_compressed_size;
+ 
+   base->codedbuf_size = gst_va_base_enc_adjust_coded_buffer_size (base,
+       base->codedbuf_size, self->rc.rc_ctrl_mode, self->rc.target_bitrate_bits);
