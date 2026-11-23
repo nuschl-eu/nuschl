@@ -155,6 +155,188 @@ fn a_password_is_stored_as_mumble_stores_it() {
     assert_eq!(draft.entries().len(), 3);
 }
 
+/// A channel as Murmur creates it under the root: its own `admin` group
+/// holds the creator, account 7.
+fn new_channel() -> Acl {
+    Acl {
+        channel: 5,
+        inherit_acls: true,
+        entries: Vec::new(),
+        groups: vec![AclGroup {
+            name: "admin".into(),
+            inherited: false,
+            inherit: true,
+            inheritable: true,
+            add: vec![7],
+            remove: vec![],
+            inherited_members: vec![],
+        }],
+    }
+}
+
+fn rule(group: &str, grant: u32, deny: u32, subs: bool) -> AclEntry {
+    AclEntry {
+        apply_here: true,
+        apply_subs: subs,
+        inherited: false,
+        user_id: None,
+        group: Some(group.into()),
+        grant,
+        deny,
+    }
+}
+
+#[test]
+fn channel_types_compile_to_mumble_rules_and_read_back() {
+    use crate::access::Kind;
+    use permission::*;
+    let access = TRAVERSE | ENTER | LISTEN | SPEAK | WHISPER | TEXT_MESSAGE;
+    let expected = |kind| match kind {
+        Kind::Open => vec![],
+        Kind::Members => vec![
+            rule("all", 0, access & !TRAVERSE, true),
+            rule("auth", access, 0, true),
+        ],
+        Kind::Password => vec![
+            rule("all", 0, PASSWORD, false),
+            rule("#door", PASSWORD, 0, false),
+        ],
+        Kind::Announcements => vec![
+            rule("all", 0, SPEAK | WHISPER, true),
+            rule("admin", SPEAK | WHISPER, 0, true),
+        ],
+        Kind::Hidden => vec![rule("all", 0, access, true), rule("admin", access, 0, true)],
+    };
+    let mut switched = AclDraft::new(new_channel());
+    assert_eq!(switched.kind(), Some(Kind::Open));
+    for kind in Kind::ALL {
+        let mut draft = AclDraft::new(new_channel());
+        draft.set_kind(kind, "door").unwrap();
+        assert_eq!(draft.snapshot().entries, expected(kind), "{kind:?}");
+        assert_eq!(draft.kind(), Some(kind));
+        // From any other type, too.
+        switched.set_kind(kind, "door").unwrap();
+        assert_eq!(switched.snapshot().entries, expected(kind), "{kind:?}");
+    }
+    // Password keeps the current password when none is typed.
+    switched.set_kind(Kind::Password, "door").unwrap();
+    switched.set_kind(Kind::Password, "").unwrap();
+    assert_eq!(switched.password(), Some("door"));
+    switched.set_kind(Kind::Open, "").unwrap();
+    assert_eq!(
+        AclDraft::new(new_channel()).set_kind(Kind::Password, ""),
+        Err("Type a password first.")
+    );
+}
+
+#[test]
+fn channel_types_keep_other_permissions_and_read_other_setups_as_custom() {
+    use crate::access::{Cell, Kind, Who};
+    let mut draft = AclDraft::new(new_channel());
+    let mut table = crate::access::Table::default();
+    table.row(Who::Group("admin".into())).set(4, Cell::Allow);
+    table.row(Who::Person(3)).set(1, Cell::Allow);
+    draft.set_table(&table).unwrap();
+    assert_eq!(draft.kind(), None, "a person row in Speak is custom");
+    draft.set_kind(Kind::Hidden, "").unwrap();
+    let table = draft.table().unwrap();
+    let admin = table
+        .rows
+        .iter()
+        .find(|(who, _)| *who == Who::Group("admin".into()));
+    let admin = admin.unwrap().1;
+    assert_eq!((admin.cell(0), admin.cell(4)), (Cell::Allow, Cell::Allow));
+    assert_eq!(draft.kind(), Some(Kind::Hidden));
+    // Rules the table cannot show stay as they are.
+    let mut advanced = new_channel();
+    advanced
+        .entries
+        .push(rule("~sub", permission::SPEAK, 0, true));
+    let mut draft = AclDraft::new(advanced);
+    assert_eq!(draft.kind(), None);
+    assert!(draft.set_kind(Kind::Open, "").is_err());
+    assert_eq!(draft.entries().len(), 1);
+}
+
+#[test]
+fn channel_types_give_everyone_members_and_moderators_their_access() {
+    use crate::access::Kind;
+    use crate::acl::{Node, Subject, effective_permissions, token_digest};
+    use permission::*;
+    // Murmur's default root: @admin (account 7) may write, registered users
+    // may make temporary channels.
+    let mut root = new_channel();
+    root.channel = 0;
+    root.entries = vec![
+        rule("admin", WRITE, 0, true),
+        rule("auth", MAKE_TEMP_CHANNEL, 0, true),
+        rule("all", SELF_REGISTER, 0, false),
+    ];
+    let root = node(&root, None);
+    fn who(user_id: Option<u32>, tokens: &[[u8; 32]]) -> Subject<'_> {
+        Subject {
+            user_id,
+            channel: 0,
+            hash: None,
+            tokens,
+            strong: false,
+        }
+    }
+    let tokens = [token_digest("door")];
+    let everyone = who(None, &[]);
+    let member = who(Some(3), &[]);
+    let moderator = who(Some(7), &[]);
+    let holder = who(None, &tokens);
+    // What each may do in the channel (5) and its subchannel (6).
+    let check = |kind: Kind, subject: &Subject<'_>| {
+        let mut draft = AclDraft::new(new_channel());
+        draft.set_kind(kind, "door").unwrap();
+        let sub = Node {
+            parent: Some(5),
+            inherit_acl: true,
+            ..Default::default()
+        };
+        let tree = std::collections::HashMap::from([
+            (0, root.clone()),
+            (5, node(&draft.snapshot(), Some(0))),
+            (6, sub),
+        ]);
+        let wanted = ENTER | SPEAK | TEXT_MESSAGE;
+        (
+            effective_permissions(&tree, subject, 5) & wanted,
+            effective_permissions(&tree, subject, 6) & ENTER,
+        )
+    };
+    let all = ENTER | SPEAK | TEXT_MESSAGE;
+    let listen = ENTER | TEXT_MESSAGE;
+    for (kind, subject, here, below) in [
+        (Kind::Open, &everyone, all, ENTER),
+        (Kind::Open, &member, all, ENTER),
+        (Kind::Members, &everyone, 0, 0),
+        (Kind::Members, &member, all, ENTER),
+        (Kind::Members, &moderator, all, ENTER),
+        // Mumble's password rules apply here only; Traverse still guards
+        // the subchannels. Write lets a moderator in, without Speak.
+        (Kind::Password, &everyone, 0, 0),
+        (Kind::Password, &member, 0, 0),
+        (Kind::Password, &moderator, listen, ENTER),
+        (Kind::Password, &holder, all, ENTER),
+        (Kind::Announcements, &everyone, listen, ENTER),
+        (Kind::Announcements, &member, listen, ENTER),
+        (Kind::Announcements, &moderator, all, ENTER),
+        (Kind::Hidden, &everyone, 0, 0),
+        (Kind::Hidden, &member, 0, 0),
+        (Kind::Hidden, &moderator, all, ENTER),
+    ] {
+        assert_eq!(
+            check(kind, subject),
+            (here, below),
+            "{kind:?} for {:?}",
+            subject.user_id
+        );
+    }
+}
+
 #[test]
 fn changes_are_private_and_preserve_unedited_bits_and_fields() {
     let remote = acl();

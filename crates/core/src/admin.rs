@@ -361,6 +361,32 @@ impl AclDraft {
         Ok(())
     }
 
+    /// The channel's type, if its own rules match one.
+    pub fn kind(&self) -> Option<crate::access::Kind> {
+        crate::access::kind(&self.table()?, self.password().is_some())
+    }
+
+    /// Gives the channel `kind`'s rules. Password sets `password`, or keeps
+    /// the current password when it is empty; other types remove it.
+    pub fn set_kind(
+        &mut self,
+        kind: crate::access::Kind,
+        password: &str,
+    ) -> Result<(), &'static str> {
+        let mut table = self
+            .table()
+            .ok_or("This channel uses advanced rules. Edit them below.")?;
+        if kind != crate::access::Kind::Password {
+            self.set_password("")?;
+        } else if !password.is_empty() {
+            self.set_password(password)?;
+        } else if self.password().is_none() {
+            return Err("Type a password first.");
+        }
+        crate::access::apply(&mut table, kind);
+        self.set_table(&table)
+    }
+
     /// An inherited group cannot be deleted at its parent. Removing its local
     /// definition restores the inherited defaults, exactly as stock Mumble does.
     pub fn remove_group(&mut self, id: RowId) -> bool {
