@@ -251,13 +251,16 @@ impl Kind {
     }
 
     /// What the type does, on a server that sends clients only the channels
-    /// they may traverse (`hidden`, nuschld's `hidden-channels/1`) or on one
-    /// that sends every channel to everyone, as Murmur does.
+    /// they may traverse or an access token would open (`hidden`, nuschld's
+    /// `hidden-channels/1`) or on one that sends every channel to everyone,
+    /// as Murmur does.
     pub fn help(self, hidden: bool) -> &'static str {
         match self {
             Kind::Open => "Anyone may join, speak and write.",
             Kind::Members => "Registered users may join, speak and write.",
-            Kind::Password => "People with the password may join, speak and write.",
+            Kind::Password => {
+                "People with the password may join, speak and write. Others see the channel."
+            }
             Kind::Announcements => "Only @admin may speak. Everyone may listen and write.",
             Kind::Private if hidden => {
                 "Only @admin and people you add may join. Others don't see the channel."
@@ -455,6 +458,11 @@ mod tests {
             Kind::Private
                 .help(true)
                 .ends_with("Others don't see the channel.")
+        );
+        assert!(
+            Kind::Password
+                .help(true)
+                .ends_with("Others see the channel.")
         );
     }
 

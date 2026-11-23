@@ -48,9 +48,9 @@ pub mod capability {
     pub const SHARE: &str = "share/1";
     pub const PRIVACY: &str = "privacy/1";
     pub const KNOCK: &str = "knock/1";
-    /// The server sends a client only the channels it may traverse and the
-    /// people in them (#341). No messages; it tells the client what the
-    /// server does.
+    /// The server sends a client only the channels it may traverse or an
+    /// access token would open, and the people in them (#341). No messages;
+    /// it tells the client what the server does.
     pub const HIDDEN_CHANNELS: &str = "hidden-channels/1";
     pub const ALL: [&str; 11] = [
         HISTORY,

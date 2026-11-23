@@ -40,6 +40,8 @@ const TEMP: u32 = i32::MAX as u32;
 /// A Private channel ([`Fixture::add_secret`]) and its subchannel.
 const SECRET: u32 = 5;
 const INNER: u32 = 6;
+/// A channel with Mumble's password `letmein` ([`Fixture::add_door`]).
+const DOOR: u32 = 7;
 
 const ADMIN: u32 = 2;
 const OWNER: u32 = 3;
@@ -1925,6 +1927,33 @@ impl Fixture {
         self.state.channel_added(INNER);
     }
 
+    /// A channel below the root with Mumble's channel password rules: `@all`
+    /// denied and `#letmein` granted Traverse, Enter, Speak, Whisper, Text
+    /// message and Link channel, in the channel only.
+    fn add_door(&mut self) {
+        let password = perm::TRAVERSE
+            | perm::ENTER
+            | perm::SPEAK
+            | perm::WHISPER
+            | perm::TEXT_MESSAGE
+            | perm::LINK_CHANNEL;
+        let here = |group: &str, grant, deny| AclEntry {
+            apply_subs: false,
+            ..entry(group, None, grant, deny)
+        };
+        let mut door = Channel::new(DOOR, Some(0), "Door".into());
+        door.node.acls = vec![here("all", 0, password), here("#letmein", password, 0)];
+        self.state
+            .conversations
+            .add_channel(door.conversation_id, DOOR);
+        self.state.channels.0.insert(DOOR, door);
+        if let Some(root) = self.state.channels.get_mut(0) {
+            root.children.push(DOOR);
+        }
+        self.state.invalidate();
+        self.state.channel_added(DOOR);
+    }
+
     fn hidden(&self, kind: &str) -> Vec<u32> {
         self.state.users[&self.actor(kind)]
             .hidden
@@ -2012,6 +2041,48 @@ fn a_private_channel_and_its_subtree_reach_only_those_who_may_traverse_it() {
     f.state.invalidate();
     f.state.finish();
     assert_eq!(f.hidden("admin"), [] as [u32; 0]);
+}
+
+#[test]
+fn a_channel_a_password_opens_stays_listed_and_only_the_password_enters() {
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    for session in f.actors {
+        f.received(session);
+    }
+    f.add_door();
+    let registered = f.actor("registered");
+    // Everyone sees it; the Private channel without a token rule stays hidden.
+    for kind in KINDS {
+        let session = f.actor(kind);
+        assert_eq!(Heard::of(&f.received(session)).channels, [DOOR], "{kind}");
+        assert!(!f.state.users[&session].hidden.contains(&DOOR), "{kind}");
+    }
+    for kind in ["registered", "guest", "anonymous"] {
+        assert_eq!(f.hidden(kind), [SECRET, INNER], "{kind}");
+    }
+    // Seeing it is not entering it.
+    assert_eq!(
+        f.state
+            .authorize(registered, Action::Enter { channel: DOOR }),
+        Err(Denial::Permission {
+            session: registered,
+            channel: DOOR,
+            permission: perm::ENTER
+        })
+    );
+    // With the password, as a temporary access token, it enters.
+    f.handle(
+        registered,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(DOOR),
+            temporary_access_tokens: vec!["letmein".into()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.state.users[&registered].channel, DOOR);
+    assert_eq!(f.hidden("registered"), [SECRET, INNER]);
 }
 
 #[test]

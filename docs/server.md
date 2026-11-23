@@ -627,8 +627,12 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
 - **What each client sees** (visibility.rs, #341). A client receives the
   channels it may traverse and the people in them: `effective_permissions`
   with Traverse, so a channel where a rule denies Traverse on the way down is
-  hidden from everyone who holds no Write there. Its own channel, the channels
-  it listens to and the channels above one it sees are always shown; Write at
+  hidden from everyone who holds no Write there. A channel that an access
+  token named on the way down (a `#token` rule, as Mumble's channel password
+  stores it) would let the client traverse is shown as well, so a password
+  channel stays listed and its password can be entered; the client's
+  permissions stay what its own tokens give. Its own channel, the channels it
+  listens to and the channels above one it sees are always shown; Write at
   the root shows every channel, as it may edit every channel's ACL. Only
   channels at or below a rule that denies Traverse are evaluated
   (`State::guarded_channels`); everywhere else everybody sees everything, as
@@ -747,9 +751,8 @@ Deliberate differences:
   channel and everyone in it to every client; nuschld sends a channel only to
   those who may traverse it. Stock clients show what they receive: someone
   entering a hidden channel leaves as if disconnected, and arrives as if
-  connected when back in view. Mumble's channel password denies Traverse
-  too, so a password channel shows once its password is among the client's
-  access tokens.
+  connected when back in view. A channel an access token opens (Mumble's
+  channel password, any `#token` rule) stays listed for everyone.
 - **Ghost takeover.** An unregistered name in use is only taken over by the same
   certificate (or, both without certificates, the same address). Murmur lets any
   connection from the same address take it.

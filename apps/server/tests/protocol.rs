@@ -1650,6 +1650,30 @@ fn private_acl(channel: u32, members: &[u32]) -> proto::Acl {
     }
 }
 
+/// Mumble's channel password rules: `@all` denied and `#<password>`
+/// granted Traverse, Enter, Speak, Whisper, Text message and Link channel, in
+/// the channel only.
+fn password_acl(channel: u32, password: &str) -> proto::Acl {
+    let bits = 0x2 | 0x4 | 0x8 | 0x80 | 0x100 | 0x200;
+    let rule = |group: String, grant, deny| proto::acl::ChanAcl {
+        apply_here: Some(true),
+        apply_subs: Some(false),
+        group: Some(group),
+        grant: Some(grant),
+        deny: Some(deny),
+        ..Default::default()
+    };
+    proto::Acl {
+        channel_id: channel,
+        inherit_acls: Some(true),
+        acls: vec![
+            rule("all".into(), 0, bits),
+            rule(format!("#{password}"), bits, 0),
+        ],
+        ..Default::default()
+    }
+}
+
 /// Channels and sessions named in `frames` (channel and user states and
 /// removals).
 fn named(frames: &[ControlFrame]) -> (Vec<u32>, Vec<u32>) {
@@ -1732,6 +1756,13 @@ async fn private_channels_and_the_people_in_them_reach_only_those_who_may_enter(
         .await
         .channel_id
         .unwrap();
+    admin.send(kind::CHANNEL_STATE, &create(0, "Door")).await;
+    let door = admin
+        .expect::<proto::ChannelState>(kind::CHANNEL_STATE, |c| c.name.as_deref() == Some("Door"))
+        .await
+        .channel_id
+        .unwrap();
+    admin.send(kind::ACL, &password_acl(door, "letmein")).await;
     let into = |channel: u32| proto::UserState {
         channel_id: Some(channel),
         ..Default::default()
@@ -1746,12 +1777,13 @@ async fn private_channels_and_the_people_in_them_reach_only_those_who_may_enter(
             .await;
     }
 
-    // A guest connecting now gets neither channel nor the member in them.
+    // A guest connecting now gets neither channel nor the member in them,
+    // and gets the channel its password would open.
     let mut guest = Client::connect(fixture.address(), Options::new("Guest", &guest_key))
         .await
         .unwrap();
     let (channels, sessions) = named(&guest.seen);
-    assert!(channels.contains(&0));
+    assert!(channels.contains(&0) && channels.contains(&door));
     assert!(!channels.contains(&private) && !channels.contains(&inner));
     assert!(sessions.contains(&admin.session) && !sessions.contains(&member.session));
 
@@ -1831,6 +1863,35 @@ async fn private_channels_and_the_people_in_them_reach_only_those_who_may_enter(
             .await
             .is_none()
     );
+
+    // The guest may not enter the password channel without the password,
+    // and enters with it.
+    guest.send(kind::USER_STATE, &into(door)).await;
+    let denied = guest
+        .expect::<proto::PermissionDenied>(kind::PERMISSION_DENIED, |_| true)
+        .await;
+    assert_eq!(
+        (denied.permission, denied.channel_id),
+        (Some(0x4), Some(door))
+    );
+    guest
+        .send(
+            kind::USER_STATE,
+            &proto::UserState {
+                channel_id: Some(door),
+                temporary_access_tokens: vec!["letmein".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+    {
+        let me = guest.session;
+        guest
+            .expect::<proto::UserState>(kind::USER_STATE, move |s| {
+                s.session == Some(me) && s.channel_id == Some(door)
+            })
+            .await;
+    }
     fixture.running.shutdown().await;
 }
 

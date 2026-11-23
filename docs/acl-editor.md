@@ -22,8 +22,9 @@ numeric account. Missing labels never discard membership.
 **Channel password** sets, changes or removes a password the way Mumble's channel
 dialog does: two local rules that apply in the channel only, `@all` denied and
 `#<password>` granted Enter, Speak, Whisper, Text message, Link channel and
-Traverse. People with the password as an access token may enter; on nuschld only
-they see the channel, as for any channel that denies Traverse.
+Traverse. People with the password as an access token may enter. Everyone sees
+the channel: nuschld lists a channel that an access token would open, so the
+password can be entered.
 
 **Channel type** sets who may join, speak and write in one step: Open, Members
 only, Password, Announcements or Private. A type is a template for the table's
@@ -46,9 +47,10 @@ here and in subchannels unless noted:
 Members only keeps Traverse, so a subchannel can admit everyone again. Private
 denies Traverse: only `@admin`, other holders of Write and the rows you add
 enter, listen, whisper or write here and in every subchannel. nuschld sends a
-client only the channels it may traverse and the people in them
-([server](server.md), "What each client sees"), so on nuschld nobody else sees a
-private channel, its subchannels or the people in them. Stock Murmur sends every
+client only the channels it may traverse or an access token would open, and the
+people in them ([server](server.md), "What each client sees"), so on nuschld
+nobody else sees a private channel, its subchannels or the people in them, as
+long as no rule there grants an access token (`#token`). Stock Murmur sends every
 channel to every client, so there others still see a private channel and the
 people in it. The description comes from `Kind::help`, which takes whether the
 connection negotiated `hidden-channels/1`: "Others don't see the channel" on

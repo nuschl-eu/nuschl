@@ -925,10 +925,12 @@ impl State {
 
     /// The channels `session` does not see: of `guarded`
     /// ([`State::guarded_channels`]), those it may not traverse (a rule
-    /// denies Traverse on the way down and it holds no Write there), except
-    /// its own channel, the channels it listens to and the channels above one
-    /// it sees. Write at the root sees every channel, as it may edit every
-    /// channel's ACL.
+    /// denies Traverse on the way down and it holds no Write there) and no
+    /// access token named on the way down would let it traverse, except its
+    /// own channel, the channels it listens to and the channels above one it
+    /// sees. A channel with a password thus stays listed, so it can be entered
+    /// with the password. Write at the root sees every channel, as it may edit
+    /// every channel's ACL.
     pub fn hidden_channels(&self, session: u32, guarded: &[u32]) -> BTreeSet<u32> {
         let Some(user) = self.users.get(&session) else {
             return BTreeSet::new();
@@ -936,10 +938,9 @@ impl State {
         if guarded.is_empty() || self.has(session, 0, perm::WRITE) {
             return BTreeSet::new();
         }
-        let reached = guarded
-            .iter()
-            .copied()
-            .filter(|&channel| self.has(session, channel, perm::TRAVERSE));
+        let reached = guarded.iter().copied().filter(|&channel| {
+            self.has(session, channel, perm::TRAVERSE) || self.token_opens(user, channel)
+        });
         let mut seen = BTreeSet::new();
         for channel in reached
             .chain([user.channel])
@@ -957,6 +958,22 @@ impl State {
             .copied()
             .filter(|channel| !seen.contains(channel))
             .collect()
+    }
+
+    /// Whether `user` could traverse `channel` holding every access token the
+    /// rules on the way down name; its permissions stay what its own tokens
+    /// give.
+    fn token_opens(&self, user: &User, channel: u32) -> bool {
+        let named = acl::path_tokens(&self.channels, channel);
+        if named.is_empty() {
+            return false;
+        }
+        let tokens: Vec<[u8; 32]> = user.tokens.iter().copied().chain(named).collect();
+        let subject = Subject {
+            tokens: &tokens,
+            ..subject(user)
+        };
+        acl::effective_permissions(&self.channels, &subject, channel) & perm::TRAVERSE != 0
     }
 
     /// The channels at or below one with a rule that denies Traverse, parents
