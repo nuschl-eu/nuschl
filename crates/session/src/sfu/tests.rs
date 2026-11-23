@@ -664,6 +664,17 @@ async fn native_video_for_policy(relay_only: bool) {
 #[tokio::test]
 async fn shared_audio_crosses_the_sfu_as_its_own_track() {
     let _media = MEDIA_TEST.lock().await;
+    shared_audio(false).await;
+}
+
+/// A viewer that joins while screen and audio are already shared gets both.
+#[tokio::test]
+async fn a_late_viewer_receives_shared_audio() {
+    let _media = MEDIA_TEST.lock().await;
+    shared_audio(true).await;
+}
+
+async fn shared_audio(late: bool) {
     nuschl_testkit::sandbox();
     let crypto = fixture("nuschl-crypto-worker");
     let rtc = fixture("nuschl-rtc-worker");
@@ -686,20 +697,25 @@ async fn shared_audio_crosses_the_sfu_as_its_own_track() {
     )
     .await
     .unwrap();
-    let bob = Connection::connect_with_roots(
-        CryptoHandle::start(crypto, directory.path().join("bob")),
-        connect(&posted),
-        roots,
-    )
-    .await
-    .unwrap();
-    timeout(HANDSHAKE, async {
-        while alice.welcome().peers.is_empty() {
-            alice.poll_idle().await.unwrap();
-        }
-    })
-    .await
-    .unwrap();
+    let join = async || {
+        Connection::connect_with_roots(
+            CryptoHandle::start(crypto.clone(), directory.path().join("bob")),
+            connect(&posted),
+            roots.clone(),
+        )
+        .await
+        .unwrap()
+    };
+    let early = if late { None } else { Some(join().await) };
+    if !late {
+        timeout(HANDSHAKE, async {
+            while alice.welcome().peers.is_empty() {
+                alice.poll_idle().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
     let publisher = alice.welcome().peer;
     let mut alice = alice
         .into_media(MediaOptions {
@@ -716,6 +732,32 @@ async fn shared_audio_crosses_the_sfu_as_its_own_track() {
         "shared audio is off until the publisher turns it on"
     );
     alice.set_source(Purpose::SystemAudio, true).unwrap();
+    // Distinct packets: the n-th carries n, as 20 ms frames on a 48 kHz clock.
+    let packet = |n: u64| [nuschl_core::audio::SILENT_OPUS.as_slice(), &n.to_be_bytes()].concat();
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut sent = 0_u64;
+    if late {
+        // The publisher sends for a second before anyone else is in the room.
+        timeout(HANDSHAKE, async {
+            while sent < 50 {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        sent += 1;
+                        let _ = alice.send_source_frame(Purpose::SystemAudio, sent * 960, false, packet(sent));
+                    }
+                    event = alice.next() => {
+                        event.expect("publisher remains live").expect("RTC publisher");
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let bob = match early {
+        Some(bob) => bob,
+        None => join().await,
+    };
     let mut bob = bob
         .into_media(MediaOptions {
             executable: rtc.clone(),
@@ -724,10 +766,6 @@ async fn shared_audio_crosses_the_sfu_as_its_own_track() {
         })
         .await
         .unwrap();
-    // Distinct packets: the n-th carries n, as 20 ms frames on a 48 kHz clock.
-    let packet = |n: u64| [nuschl_core::audio::SILENT_OPUS.as_slice(), &n.to_be_bytes()].concat();
-    let mut tick = tokio::time::interval(Duration::from_millis(20));
-    let mut sent = 0_u64;
     let mut available = false;
     let mut received = Vec::new();
     timeout(HANDSHAKE, async {
