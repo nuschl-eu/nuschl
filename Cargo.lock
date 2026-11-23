@@ -7354,6 +7354,7 @@ dependencies = [
  "nuschl-sandbox",
  "nuschl-session",
  "nuschl-stream",
+ "nuschl-testkit",
  "nuschl-update",
  "serde_json",
  "tokio",
