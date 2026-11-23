@@ -28,7 +28,7 @@ change alone is no reason to change a cryptographic protocol.
 | --- | --- | --- |
 | GPUI and its graphics, font and window backends | Desktop rendering and accessibility | Desktop shell only; message content arrives from workers as typed documents and validated pixels. Its SVG renderer draws only compiled-in icons and pinned Twemoji ([emoji](docs/emoji.md)). |
 | Terminal graphics and clipboard adapters | Terminal output, OS clipboard | TUI only; draws bounded, validated worker bitmaps. Clipboard helpers get fixed argv, byte and time bounds, and run only on explicit local paste; SSH sessions skip the host clipboard. |
-| CPAL and OS audio bindings | PipeWire, PulseAudio, CoreAudio, WASAPI | Media worker; device handles and audio only. |
+| CPAL and OS audio bindings | PipeWire, PulseAudio, CoreAudio, WASAPI | Media and call audio workers; device handles, audio and the worker's own PipeWire objects only. |
 | Codec and DSP crates with SIMD internals | Voice processing | Native media worker or browser codec Worker. The browser Worker shares fixed PCM rings with AudioWorklets. Capture and playback authorization stay in separate page-to-worklet buffers. |
 | SQLx SQLite | Local history, server state | Storage worker; one database directory, fixed parameterized statements, extension loading and deserialization disabled. `nuschld --import-murmur` reads the untrusted Murmur file read-only, immutable and query-only ([server](docs/server.md)). |
 | SQLx PostgreSQL | Server persistence | `nuschld`'s storage worker; it holds the database credential and one scoped connection. |
@@ -82,6 +82,7 @@ add only:
 | storage | its history directory, writable | 1 GiB |
 | crypto | its `keys/` directory, writable | 1 GiB |
 | media | PipeWire and PulseAudio sockets, ALSA devices, sound sysfs and procfs, `/usr/share/pipewire`, `/usr/share/alsa` | 1 GiB |
+| call audio, Linux only | the media role's grants | 1 GiB |
 | transfer | network and resolver files; the offered file, read-only | 1 GiB |
 | music-bot codec, Linux only | none | 1 GiB |
 | video encode, Linux only | none | 1 GiB, 120 s CPU over its life, 5 s wall time per exchange |
@@ -99,7 +100,10 @@ Rules for every platform:
   tested. A worker executable started directly (for development) is unconfined.
   Native Windows, macOS and mobile each need their own capability review.
 - An audio service socket grants that service's whole API. Nuschl code creates
-  and changes only its own streams.
+  and changes only its own streams and links. While the user shares audio in a
+  call, the call audio worker links other applications' playback streams into
+  its own capture node ([screen-share audio](docs/screen-share-audio.md)); the
+  links belong to its connection and end with the share.
 - A link-preview worker's slot is released only after the whole worker has
   exited: on Linux the namespace init named by bwrap's receipt, on Windows when
   the supervisor's job lists no process, on macOS when the worker is reaped

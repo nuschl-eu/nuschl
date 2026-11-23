@@ -43,6 +43,7 @@ pub(crate) fn command(executable: &Path, role: Role) -> Result<Command, Error> {
         role,
         Role::Preview { .. }
             | Role::Media
+            | Role::CallAudio
             | Role::VideoEncode
             | Role::VideoCapture { .. }
             | Role::VideoDecode { .. }
@@ -254,7 +255,7 @@ mod tests {
             arguments: &[],
         });
         assert!(!ordinary.iter().any(|arg| arg == "--json-status-fd"));
-        for role in [Role::Media, Role::Rtc] {
+        for role in [Role::Media, Role::CallAudio, Role::Rtc] {
             assert!(
                 arguments(role)
                     .windows(2)
@@ -283,6 +284,7 @@ mod tests {
             directory: &directory,
         });
         let media = arguments(Role::Media);
+        let call_audio = arguments(Role::CallAudio);
         let rtc = arguments(Role::Rtc);
         let offer = arguments(Role::Transfer {
             file: Some(&executable),
@@ -292,7 +294,15 @@ mod tests {
         assert_eq!(math[..3], ["--as=536870912", "--cpu=120", "--"]);
         assert_eq!(update[..3], ["--as=268435456", "--cpu=5", "--"]);
         assert_eq!(rtc[..3], ["--as=1073741824", "--cpu=3600", "--"]);
-        for persistent in [&codec, &storage, &media, &crypto, &offer, &receive] {
+        for persistent in [
+            &codec,
+            &storage,
+            &media,
+            &call_audio,
+            &crypto,
+            &offer,
+            &receive,
+        ] {
             assert_eq!(persistent[..2], ["--as=1073741824", "--"]);
         }
         let all = [
@@ -305,6 +315,7 @@ mod tests {
                 &["/worker", "--database", "/data/history.sqlite3"],
             ),
             (&media, &["/worker", "--live"]),
+            (&call_audio, &["/worker", "--call-audio"]),
             (&rtc, &["/worker", "--call"]),
             (&crypto, &["/worker", "--data", "/data"]),
             (&offer, &["/worker", "--file", "/input"]),
@@ -351,13 +362,17 @@ mod tests {
                 "/lib64",
                 "/worker",
             ];
-            if !network && !std::ptr::eq(command, &media) {
+            let audio = std::ptr::eq(command, &media) || std::ptr::eq(command, &call_audio);
+            if !network && !audio {
                 let read_only = command.windows(3).filter(|option| option[0] == "--ro-bind");
                 for option in read_only {
                     assert!(system.contains(&option[2].as_str()), "{option:?}");
                 }
             }
         }
+        // Shared call audio has exactly the media role's grants.
+        let grants = |command: &[String]| command[..command.len() - 1].to_vec();
+        assert_eq!(grants(&call_audio), grants(&media));
         // The offered file is the only path bound from outside the system.
         let input = offer.iter().position(|a| a == "/input").unwrap();
         assert_eq!(offer[input - 2], "--ro-bind");

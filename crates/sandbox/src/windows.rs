@@ -113,6 +113,7 @@ mod tests {
             assert_eq!(arguments.join(" "), format!("--nuschl-sandbox --profile {expected}"));
         }
         assert!(policy(Role::VideoDecode { vaapi: true }).is_none());
+        assert!(policy(Role::CallAudio).is_none());
     }
 
     #[test]

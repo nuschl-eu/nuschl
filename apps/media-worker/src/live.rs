@@ -971,7 +971,7 @@ fn open_devices(
 }
 
 /// Connect to an audio server as Nuschl, the application mixers show.
-fn connect(id: cpal::HostId) -> Result<cpal::Host, String> {
+pub(crate) fn connect(id: cpal::HostId) -> Result<cpal::Host, String> {
     #[cfg(target_os = "linux")]
     let host = {
         let application = || cpal::ApplicationInfo {
@@ -1592,7 +1592,7 @@ fn resolve_pulse_default(input: bool) -> Option<(String, String)> {
 }
 
 /// The channel count and rate of a device format the converters handle.
-fn convertible(config: &cpal::StreamConfig) -> Result<(usize, u32), String> {
+pub(crate) fn convertible(config: &cpal::StreamConfig) -> Result<(usize, u32), String> {
     let channels = usize::from(config.channels);
     let rate = config.sample_rate;
     if channels == 0 || channels > 32 || !(8000..=384_000).contains(&rate) {
@@ -1855,7 +1855,10 @@ where
         .map_err(|error| error.to_string())
 }
 
-fn stream_config(host: &cpal::Host, supported: cpal::SupportedStreamConfig) -> cpal::StreamConfig {
+pub(crate) fn stream_config(
+    host: &cpal::Host,
+    supported: cpal::SupportedStreamConfig,
+) -> cpal::StreamConfig {
     #[cfg(target_os = "linux")]
     let buffer = device_buffer(supported.buffer_size());
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
