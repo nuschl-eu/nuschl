@@ -61,7 +61,8 @@ impl CaptureMode {
             Error::Capture(
                 CaptureFailure::Hardware
                     | CaptureFailure::HardwareFormat
-                    | CaptureFailure::HardwareResource
+                    | CaptureFailure::HardwareResource,
+                _
             )
         ) || matches!(
             error,
@@ -227,7 +228,7 @@ impl Publisher {
         let Some(mut track) = self.slots[index(source)].take() else {
             return false;
         };
-        tracing::warn!(target: "nuschl_capture", ?source, mode = ?track.attempt.mode, hardware = ?track.encoding.hardware, %error, "capture stopped");
+        tracing::warn!(target: "nuschl_capture", ?source, mode = ?track.attempt.mode, hardware = ?track.encoding.hardware, %error, detail = error.detail().unwrap_or_default(), "capture stopped");
         if allowed
             && recoverable(error)
             && let Some(delay) = REOPEN_DELAYS.get(track.attempt.number).copied()
@@ -272,7 +273,7 @@ impl Publisher {
 
     #[cfg(not(target_os = "linux"))]
     pub fn recover(&mut self, source: Source, _: bool, error: &Error) -> bool {
-        tracing::warn!(target: "nuschl_capture", ?source, %error, "capture stopped");
+        tracing::warn!(target: "nuschl_capture", ?source, %error, detail = error.detail().unwrap_or_default(), "capture stopped");
         self.retire(source);
         false
     }
@@ -490,7 +491,7 @@ pub(super) async fn next_reopen(
 fn recoverable(error: &Error) -> bool {
     match error {
         Error::CaptureClosed
-        | Error::Capture(_)
+        | Error::Capture(..)
         | Error::CaptureExit(_)
         | Error::Timeout
         | Error::Stopped => true,
@@ -658,7 +659,7 @@ mod tests {
         let segfault = Error::CaptureExit(ExitStatus::from_raw(139 << 8));
         mode = mode.after_failure(&segfault, Some(true));
         assert_eq!(mode, CaptureMode::Hardware);
-        mode = mode.after_failure(&Error::Capture(CaptureFailure::HardwareFormat), None);
+        mode = mode.after_failure(&CaptureFailure::HardwareFormat.into(), None);
         assert_eq!(mode, CaptureMode::Software);
         assert_eq!(
             CaptureMode::HardwareWithPreview.after_failure(&segfault, Some(false)),

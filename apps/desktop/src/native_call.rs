@@ -1881,7 +1881,7 @@ async fn meeting(
                 media.set_source(purpose(source), false).map_err(text)?;
                 let change = if matches!(
                     error,
-                    nuschl_ipc::video::Error::Capture(CaptureFailure::Cancelled)
+                    nuschl_ipc::video::Error::Capture(CaptureFailure::Cancelled, _)
                 ) {
                     publisher.retire(source);
                     SourceChange::Cancelled(source)

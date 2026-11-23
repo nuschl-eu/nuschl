@@ -3,8 +3,8 @@
 #[cfg(target_os = "linux")]
 use super::preview::{read_capture_preview, send_capture_start};
 use super::{
-    CaptureFailure, CaptureLimits, DecodedFrame, Error, HEADER_BYTES, Header, Kind, Settings,
-    Source, invalid,
+    CAPTURE_DETAIL_BYTES, CaptureFailure, CaptureLimits, DecodedFrame, Error, HEADER_BYTES, Header,
+    Kind, Settings, Source, invalid,
     preview::read_preview_pixels,
     supervisor::{DEADLINE, SOURCES},
 };
@@ -407,7 +407,7 @@ async fn capture_exit(child: &mut Child) -> Error {
         Ok(Ok(status)) if !status.success() => status
             .code()
             .and_then(CaptureFailure::from_exit)
-            .map_or(Error::CaptureExit(status), Error::Capture),
+            .map_or(Error::CaptureExit(status), Error::from),
         _ => Error::CaptureClosed,
     }
 }
@@ -515,6 +515,18 @@ async fn read_frame(
                 let _ = preview.try_send(picture);
                 return Ok(None);
             }
+            if header.kind == Kind::CaptureFailed {
+                let size = header.bytes as usize;
+                if !(1..=1 + CAPTURE_DETAIL_BYTES).contains(&size) {
+                    return Err(invalid().into());
+                }
+                let mut failure = vec![0; size];
+                input.read_exact(&mut failure).await?;
+                let reason = CaptureFailure::from_exit(failure[0].into()).ok_or_else(invalid)?;
+                // The desktop logs this text from the confined worker on one line.
+                let detail = String::from_utf8_lossy(&failure[1..]).replace(char::is_control, " ");
+                return Err(Error::Capture(reason, Some(detail)));
+            }
             if !matches!(header.kind, Kind::CaptureFrame | Kind::HardwareFrame)
                 || header.id <= previous
             {
@@ -545,6 +557,42 @@ async fn read_frame(
         .unwrap_or(Err(Error::Timeout))?;
         if let Some(frame) = frame {
             return Ok(frame);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_capture_reports_its_reason_and_the_pipeline_message() {
+        let detail = "capture: Internal data stream error.\n".repeat(10);
+        let mut bytes = Vec::new();
+        super::super::write_capture_failure(&mut bytes, CaptureFailure::Hardware, &detail).unwrap();
+        assert_eq!(bytes.len(), HEADER_BYTES + 1 + CAPTURE_DETAIL_BYTES);
+        let error = read_frame(&mut bytes.as_slice(), Source::Screen, 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::Capture(CaptureFailure::Hardware, _)));
+        let logged = detail[..CAPTURE_DETAIL_BYTES].replace('\n', " ");
+        assert_eq!(error.detail(), Some(logged.as_str()));
+        assert_eq!(error.to_string(), CaptureFailure::Hardware.to_string());
+
+        for (reason, size) in [(0, 2), (40, 2 + CAPTURE_DETAIL_BYTES), (40, 0)] {
+            let header = Header {
+                bytes: size as u32,
+                ..Header::empty(Kind::CaptureFailed, 0)
+            };
+            let mut bytes = header.to_bytes().to_vec();
+            bytes.push(reason);
+            bytes.resize(HEADER_BYTES + size.max(1), b'x');
+            let error = read_frame(&mut bytes.as_slice(), Source::Screen, 0, None)
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(error, Error::Io(_)), "{error}");
         }
     }
 }

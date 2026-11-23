@@ -50,11 +50,13 @@ pub fn run() -> Result<(), Failure> {
             vaapi::prepare(source, target, control.limits().bitrate, preview.is_some())
     {
         return vaapi::run(pipeline, source, control, preview).map_err(|error| {
-            use nuschl_ipc::video::CaptureFailure;
+            use nuschl_ipc::video::{CaptureFailure, write_capture_failure};
             if error.is::<CaptureFailure>() {
                 error
             } else {
-                CaptureFailure::Hardware.into()
+                let reason = CaptureFailure::Hardware;
+                let _ = write_capture_failure(&mut io::stdout().lock(), reason, &error.to_string());
+                reason.into()
             }
         });
     }
