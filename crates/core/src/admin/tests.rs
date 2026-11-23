@@ -205,7 +205,7 @@ fn channel_types_compile_to_mumble_rules_and_read_back() {
             rule("all", 0, SPEAK | WHISPER, true),
             rule("admin", SPEAK | WHISPER, 0, true),
         ],
-        Kind::Hidden => vec![rule("all", 0, access, true), rule("admin", access, 0, true)],
+        Kind::Private => vec![rule("all", 0, access, true), rule("admin", access, 0, true)],
     };
     let mut switched = AclDraft::new(new_channel());
     assert_eq!(switched.kind(), Some(Kind::Open));
@@ -238,7 +238,7 @@ fn channel_types_keep_other_permissions_and_read_other_setups_as_custom() {
     table.row(Who::Person(3)).set(1, Cell::Allow);
     draft.set_table(&table).unwrap();
     assert_eq!(draft.kind(), None, "a person row in Speak is custom");
-    draft.set_kind(Kind::Hidden, "").unwrap();
+    draft.set_kind(Kind::Private, "").unwrap();
     let table = draft.table().unwrap();
     let admin = table
         .rows
@@ -246,7 +246,7 @@ fn channel_types_keep_other_permissions_and_read_other_setups_as_custom() {
         .find(|(who, _)| *who == Who::Group("admin".into()));
     let admin = admin.unwrap().1;
     assert_eq!((admin.cell(0), admin.cell(4)), (Cell::Allow, Cell::Allow));
-    assert_eq!(draft.kind(), Some(Kind::Hidden));
+    assert_eq!(draft.kind(), Some(Kind::Private));
     // Rules the table cannot show stay as they are.
     let mut advanced = new_channel();
     advanced
@@ -324,9 +324,9 @@ fn channel_types_give_everyone_members_and_moderators_their_access() {
         (Kind::Announcements, &everyone, listen, ENTER),
         (Kind::Announcements, &member, listen, ENTER),
         (Kind::Announcements, &moderator, all, ENTER),
-        (Kind::Hidden, &everyone, 0, 0),
-        (Kind::Hidden, &member, 0, 0),
-        (Kind::Hidden, &moderator, all, ENTER),
+        (Kind::Private, &everyone, 0, 0),
+        (Kind::Private, &member, 0, 0),
+        (Kind::Private, &moderator, all, ENTER),
     ] {
         assert_eq!(
             check(kind, subject),

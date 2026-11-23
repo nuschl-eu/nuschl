@@ -75,9 +75,9 @@ fn pick(this: &mut Desktop, token: u64, kind: Kind, cx: &mut Context<Desktop>) {
     });
 }
 
-/// The channel type: Open, Members only, Password, Announcements or Hidden,
+/// The channel type: Open, Members only, Password, Announcements or Private,
 /// or none for a custom table. Left out when the table cannot show the rules.
-pub(super) fn kinds(editor: &Editor, cx: &mut Context<Desktop>) -> AnyElement {
+pub(super) fn kinds(view: &ServerView, editor: &Editor, cx: &mut Context<Desktop>) -> AnyElement {
     let token = editor.token;
     let Some(draft) = editor.state.draft().filter(|draft| draft.table().is_some()) else {
         return div().into_any_element();
@@ -102,7 +102,10 @@ pub(super) fn kinds(editor: &Editor, cx: &mut Context<Desktop>) -> AnyElement {
         options,
         cx,
     ))
-    .child(note("acl-kind-help", current.map_or("Custom", Kind::help)))
+    .child(note(
+        "acl-kind-help",
+        current.map_or("Custom", |kind| kind.help(!view.capabilities.is_empty())),
+    ))
     .into_any_element()
 }
 

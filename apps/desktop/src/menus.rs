@@ -2317,11 +2317,16 @@ pub fn menu(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
 
 /// The channel type to create a channel with (#341), and the password for
 /// the Password type.
-fn channel_kind(prompt: &Prompt, cx: &mut Context<Desktop>) -> Option<AnyElement> {
+fn channel_kind(this: &Desktop, prompt: &Prompt, cx: &mut Context<Desktop>) -> Option<AnyElement> {
     use nuschl_core::access::Kind;
     let PromptAction::CreateChannel { kind, password, .. } = &prompt.action else {
         return None;
     };
+    let nuschl = prompt
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.local_index(this))
+        .is_some_and(|index| !this.client.servers[index].capabilities.is_empty());
     let options = Kind::ALL
         .into_iter()
         .map(|choice| {
@@ -2353,7 +2358,7 @@ fn channel_kind(prompt: &Prompt, cx: &mut Context<Desktop>) -> Option<AnyElement
                 div()
                     .text_sm()
                     .text_color(color(TEXT_MUTED))
-                    .child(text!(kind.help()).with_id("create-channel-kind-help")),
+                    .child(text!(kind.help(nuschl)).with_id("create-channel-kind-help")),
             )
             .when(*kind == Kind::Password, |content| {
                 content.child(
@@ -2411,7 +2416,7 @@ pub fn prompt(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                             .child(Input::new(&prompt.input)),
                     )
                 })
-                .when_some(channel_kind(prompt, cx), |content, kind| {
+                .when_some(channel_kind(this, prompt, cx), |content, kind| {
                     content.child(kind)
                 }),
         )

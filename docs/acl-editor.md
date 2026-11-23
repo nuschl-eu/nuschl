@@ -25,7 +25,7 @@ dialog does: two local rules that apply in the channel only, `@all` denied and
 Traverse. People with the password as an access token may enter.
 
 **Channel type** sets who may join, speak and write in one step: Open, Members
-only, Password, Announcements or Hidden. A type is a template for the table's
+only, Password, Announcements or Private. A type is a template for the table's
 first three columns (See & join, Speak, Chat); the other columns and
 permissions stay as they are. A channel whose table matches a type shows it;
 otherwise none is selected and the editor says **Custom**. Moderators are
@@ -40,18 +40,20 @@ here and in subchannels unless noted:
 | Members only | `@all` deny Enter, Listen, Speak, Whisper, Text message; `@auth` allow Traverse, Enter, Listen, Speak, Whisper, Text message |
 | Password | the channel password's two rules below (here only) |
 | Announcements | `@all` deny Speak, Whisper; `@admin` allow Speak, Whisper |
-| Hidden | `@all` deny Traverse, Enter, Listen, Speak, Whisper, Text message; `@admin` allow the same |
+| Private | `@all` deny Traverse, Enter, Listen, Speak, Whisper, Text message; `@admin` allow the same |
 
-Members only keeps Traverse, so a subchannel can admit everyone again. Hidden
-denies Traverse: only `@admin` and other holders of Write enter, listen, whisper
-or write here and in every subchannel. Stock Murmur and nuschld send every
-channel to every client, so a hidden channel and the people in it stay listed.
-Password uses the typed password, or keeps the current one; the other types
-remove it. Mumble's password rules let `@admin` enter through Write; speaking
-there takes the password. Murmur checks Text message in the receiver's channel
-for private messages too, so Members only and Hidden also stop everyone else's
-private messages to people inside. Rules the table cannot show leave the type
-unset.
+Members only keeps Traverse, so a subchannel can admit everyone again. Private
+denies Traverse: only `@admin`, other holders of Write and the rows you add
+enter, listen, whisper or write here and in every subchannel. Stock Murmur and
+nuschld send every channel to every client, so others still see a private
+channel and the people in it, and its description says so. The description comes
+from `Kind::help`, which knows whether the server is nuschld, so it can change
+once nuschld hides channels. Password uses the typed password, or keeps the
+current one; the other types remove it. Mumble's password rules let `@admin`
+enter through Write; speaking there takes the password. Murmur checks Text
+message in the receiver's channel for private messages too, so Members only and
+Private also stop everyone else's private messages to people inside. Rules the
+table cannot show leave the type unset.
 
 **Create sub-channel…** offers the same types. Once the server shows the new
 channel on the same connection, its permissions open, take the type and save.

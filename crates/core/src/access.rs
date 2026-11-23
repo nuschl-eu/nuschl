@@ -228,7 +228,7 @@ pub enum Kind {
     Members,
     Password,
     Announcements,
-    Hidden,
+    Private,
 }
 
 impl Kind {
@@ -237,7 +237,7 @@ impl Kind {
         Kind::Members,
         Kind::Password,
         Kind::Announcements,
-        Kind::Hidden,
+        Kind::Private,
     ];
 
     pub fn label(self) -> &'static str {
@@ -246,17 +246,20 @@ impl Kind {
             Kind::Members => "Members only",
             Kind::Password => "Password",
             Kind::Announcements => "Announcements",
-            Kind::Hidden => "Hidden",
+            Kind::Private => "Private",
         }
     }
 
-    pub fn help(self) -> &'static str {
+    /// What the type does, on a Nuschl server (`nuschl`) or a Mumble server.
+    /// nuschld lists every channel to everyone, as Murmur does, so Private
+    /// reads the same on both until nuschld hides channels.
+    pub fn help(self, _nuschl: bool) -> &'static str {
         match self {
             Kind::Open => "Anyone may join, speak and write.",
             Kind::Members => "Registered users may join, speak and write.",
             Kind::Password => "People with the password may join, speak and write.",
             Kind::Announcements => "Only @admin may speak. Everyone may listen and write.",
-            Kind::Hidden => "Only @admin may enter, here and in subchannels.",
+            Kind::Private => "Only @admin and people you add may join. Others see the channel.",
         }
     }
 
@@ -274,7 +277,7 @@ impl Kind {
                 (Who::Group("auth".into()), grant(ACCESS)),
             ],
             Kind::Announcements => vec![(Who::Everyone, deny(speak)), (admin, grant(speak))],
-            Kind::Hidden => vec![(Who::Everyone, deny(ACCESS)), (admin, grant(ACCESS))],
+            Kind::Private => vec![(Who::Everyone, deny(ACCESS)), (admin, grant(ACCESS))],
         }
     }
 }

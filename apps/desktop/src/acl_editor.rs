@@ -1688,7 +1688,7 @@ pub fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Desktop>) -> 
         ));
     }
     body = body
-        .child(access_table::kinds(editor, cx))
+        .child(access_table::kinds(view, editor, cx))
         .child(password_section)
         .child(access_table::render(view, editor, cx));
     let count = draft.entries().len();

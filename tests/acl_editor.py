@@ -391,7 +391,7 @@ def actions(args, root, shell, application, bot, murmur):
             lambda: any(label == "Custom" for _, _, label, _ in items(application)),
             "a custom table showed a type",
         )
-        assert not any(selected(kind) for kind in ("Open", "Members only", "Hidden"))
+        assert not any(selected(kind) for kind in ("Open", "Members only", "Private"))
         choose("Members only")
         eventually(
             lambda: text_contains("Registered users may join, speak and write."),
