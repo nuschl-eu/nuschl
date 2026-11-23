@@ -257,7 +257,7 @@ impl Direct {
         mut description: Description,
         subscribed: &[Track],
     ) -> Option<Discovery> {
-        if !(1..=2).contains(&description.tracks.len())
+        if !(1..=3).contains(&description.tracks.len())
             || description.tracks.iter().any(|track| {
                 track.publisher.is_some()
                     || !subscribed.iter().any(|known| {

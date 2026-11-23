@@ -67,7 +67,7 @@ impl Leg {
                 Command::Offer {
                     leg: id,
                     id: [id as u8; 16],
-                    purposes: vec![Purpose::ScreenVideo],
+                    purposes: vec![Purpose::ScreenVideo, Purpose::SystemAudio],
                 },
             )
             .await,
@@ -401,6 +401,29 @@ async fn confined_worker_sends_each_frame_once_on_every_direct_leg() {
             }
         );
         assert_eq!(data, VIDEO);
+    }
+    // Shared audio takes the same legs.
+    let opus = [0xf8, 0xff, 0xfe];
+    let audio = Command::Write {
+        purpose: Purpose::SystemAudio,
+        timestamp: 960,
+        key_frame: false,
+    };
+    assert!(matches!(
+        workers[0]
+            .exchange(audio, opus.to_vec())
+            .await
+            .unwrap()
+            .kind,
+        Reply::Done
+    ));
+    for (leg, sender) in legs.iter_mut().zip([1, 3]) {
+        let (event, data) = leg.frame(&mut workers).await;
+        assert!(
+            matches!(event, Event::Frame { publisher, purpose: Purpose::SystemAudio, timestamp: 960, .. } if publisher == sender),
+            "{event:?}"
+        );
+        assert_eq!(data, opus);
     }
 
     // Narrowing the set retires the dropped direct leg in the same step.

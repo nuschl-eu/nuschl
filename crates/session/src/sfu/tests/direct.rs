@@ -558,3 +558,106 @@ async fn native_video_follows_the_upload_and_relay_only_stays_relayed() {
     call.publisher.stop().await.unwrap();
     call.viewer.stop().await.unwrap();
 }
+
+/// Shared audio takes the direct leg with the screen: the viewer receives
+/// every audio packet in order while both endpoints are direct. A process runs
+/// two RTC workers, so the second viewer's leg is the RTC worker's own test.
+#[tokio::test]
+async fn shared_audio_follows_the_screen_onto_the_direct_leg() {
+    let _media = MEDIA_TEST.lock().await;
+    nuschl_testkit::sandbox();
+    let crypto = fixture("nuschl-crypto-worker");
+    let rtc = fixture("nuschl-rtc-worker");
+    let sfu = nuschl_testkit::sfu::start(fixture("nuschl-stream-sfu"), "");
+    let (host, roots) = tls_proxy(&sfu).await;
+    let directory = nuschl_testkit::temp_dir();
+    let posted = format!("https://{host}/call#{LINK}");
+    let owner = format!("{posted}&p={OWNER}");
+    let join = async |name: &str, link: &str| {
+        let mut connection = Connection::connect_with_roots(
+            CryptoHandle::start(crypto.clone(), directory.path().join(name)),
+            Connect {
+                generation: 1,
+                host: &host,
+                link,
+                codecs: &[Codec::Av1],
+                policy: PeerPolicy::default(),
+            },
+            roots.clone(),
+        )
+        .await
+        .unwrap();
+        connection.welcome.turn = None;
+        connection
+    };
+    let options = |publish| MediaOptions {
+        executable: rtc.clone(),
+        sfu_port: sfu.media.port(),
+        publish,
+    };
+    let publisher = join("publisher", &owner).await;
+    let from = publisher.welcome().peer;
+    let mut publisher = publisher
+        .into_media(options(Some(Purpose::ScreenVideo)))
+        .await
+        .unwrap();
+    publisher.set_source(Purpose::SystemAudio, true).unwrap();
+    let mut viewer = join("viewer", &posted).await;
+    // Version 1, the first camera and screen tier, as in the tests above.
+    write(
+        &mut viewer.socket,
+        &ClientMessage::Capacity {
+            decode: "010000".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut viewer = viewer.into_media(options(None)).await.unwrap();
+    let picture = picture();
+    let packet = |n: u64| [nuschl_core::audio::SILENT_OPUS.as_slice(), &n.to_be_bytes()].concat();
+    let mut video = tokio::time::interval(Duration::from_millis(33));
+    let mut audio = tokio::time::interval(Duration::from_millis(20));
+    let (mut ready, mut timestamp, mut sent) = (false, 0, 0_u64);
+    let mut routes = [None; 2];
+    // The packet numbers the viewer received while both endpoints were direct.
+    let mut direct = Vec::new();
+    timeout(Duration::from_secs(30), async {
+        while direct.len() < 25 {
+            let both_direct = routes == [Some(Route::Direct); 2];
+            let (index, event) = tokio::select! {
+                _ = video.tick(), if ready => {
+                    timestamp += 2970;
+                    publisher.send_source_frame(Purpose::ScreenVideo, timestamp, true, picture.clone()).unwrap();
+                    continue;
+                }
+                _ = audio.tick() => {
+                    sent += 1;
+                    let _ = publisher.send_source_frame(Purpose::SystemAudio, sent * 960, false, packet(sent));
+                    continue;
+                }
+                event = publisher.next() => (0, event),
+                event = viewer.next() => (1, event),
+            };
+            match event.unwrap().unwrap() {
+                MediaEvent::SourceReady { purpose: Purpose::ScreenVideo } => ready = true,
+                MediaEvent::Route(route) => {
+                    assert!(!both_direct || route == Route::Direct, "endpoint {index} left the direct path: {route:?}");
+                    routes[index] = Some(route);
+                }
+                MediaEvent::Frame { publisher: sender, purpose: Purpose::SystemAudio, data, .. } if both_direct => {
+                    assert_eq!(sender, from);
+                    direct.push(u64::from_be_bytes(data[data.len() - 8..].try_into().unwrap()));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("routes {routes:?}, {} audio packets over the direct leg", direct.len()));
+    assert!(
+        direct.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "a packet was dropped: {direct:?}"
+    );
+    publisher.stop().await.unwrap();
+    viewer.stop().await.unwrap();
+}
