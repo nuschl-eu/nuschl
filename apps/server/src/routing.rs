@@ -147,6 +147,7 @@ impl State {
         let Some(user) = self.users.get_mut(&speaker) else {
             return;
         };
+        let channel = user.channel;
         if user.mute
             || user.suppress
             || user.self_mute
@@ -203,7 +204,13 @@ impl State {
             let Some(user) = self.users.get_mut(&receiver.session) else {
                 continue;
             };
-            if !loopback && (receiver.session == speaker || user.deaf || user.self_deaf) {
+            // Nobody hears someone they do not see.
+            if !loopback
+                && (receiver.session == speaker
+                    || user.deaf
+                    || user.self_deaf
+                    || user.hidden.contains(&channel))
+            {
                 continue;
             }
             if registered_only && user.account.is_none() {

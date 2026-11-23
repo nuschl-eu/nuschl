@@ -653,7 +653,13 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   descriptions, comments, statistics, kicks, channel edits, links, ACLs,
   knocks and share links; no `PermissionDenied` names them, the registration
   list leaves out a last channel the reader does not see, and a hidden
-  channel's name does not count as taken among its siblings.
+  channel's name does not count as taken among its siblings. Voice (speech
+  into linked channels, whispers and shouts), stock text, typing indicators
+  and plugin data reach only those who see the sender, and a stock text
+  names only the channels and people its receiver sees. Knock notices and
+  admissions name only people their recipient sees. Stored channel messages
+  reach Nuschl readers of the channel with the author's name, as history
+  pages show them.
 - **Output.** Each connection has a queue bounded in bytes (`max_queued_bytes`).
   Control frames are never dropped: a client that lets the limit fill is
   disconnected. Voice frames are dropped once 64 KiB are waiting. Broadcasts

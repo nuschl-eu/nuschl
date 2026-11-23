@@ -16,6 +16,7 @@
 //! client at most the channel tree it sees, as at login, through its bounded
 //! queue.
 use crate::state::{State, User};
+use bytes::Bytes;
 use nuschl_protocol::{control as proto, encode_control, kind, nuschl};
 use std::{cmp::Reverse, collections::BTreeSet};
 
@@ -47,7 +48,8 @@ impl State {
     }
 
     /// A `UserState` about `message.session` to everyone who sees that user,
-    /// except `except`, without listeners in channels a client does not see.
+    /// except `except`, without listeners in channels a client does not see
+    /// and without an actor it does not see.
     pub fn broadcast_user(&self, message: &proto::UserState, except: Option<u32>) {
         let Some(channel) = message
             .session
@@ -65,22 +67,29 @@ impl State {
                 continue;
             }
             let hides = |id: &u32| user.hidden.contains(id);
+            let unseen_actor = message
+                .actor
+                .is_some_and(|actor| !self.sees_user(user.session, actor));
             let volumes = message
                 .listening_volume_adjustment
                 .iter()
                 .filter_map(|adjustment| adjustment.listening_channel);
-            if !message
-                .listening_channel_add
-                .iter()
-                .chain(&message.listening_channel_remove)
-                .copied()
-                .chain(volumes)
-                .any(|id| hides(&id))
+            if !unseen_actor
+                && !message
+                    .listening_channel_add
+                    .iter()
+                    .chain(&message.listening_channel_remove)
+                    .copied()
+                    .chain(volumes)
+                    .any(|id| hides(&id))
             {
                 user.link.send(frame.clone());
                 continue;
             }
             let mut seen = message.clone();
+            if unseen_actor {
+                seen.actor = None;
+            }
             seen.listening_channel_add.retain(|id| !hides(id));
             seen.listening_channel_remove.retain(|id| !hides(id));
             seen.listening_volume_adjustment
@@ -96,14 +105,57 @@ impl State {
         }
     }
 
+    /// A stock `TextMessage` to `to` if it sees the sender (or the sender is
+    /// gone), without the channels and people it does not see; `frame` is
+    /// `message` encoded.
+    pub fn send_text(&self, to: u32, message: &proto::TextMessage, frame: &Bytes) {
+        let Some(user) = self.users.get(&to) else {
+            return;
+        };
+        if message
+            .actor
+            .is_some_and(|actor| self.users.contains_key(&actor) && !self.sees_user(to, actor))
+        {
+            return;
+        }
+        let hides = |id: &u32| user.hidden.contains(id);
+        let unseen = |session: &u32| !self.sees_user(to, *session);
+        if !message.channel_id.iter().chain(&message.tree_id).any(hides)
+            && !message.session.iter().any(unseen)
+        {
+            user.link.send(frame.clone());
+            return;
+        }
+        let mut seen = message.clone();
+        seen.channel_id.retain(|id| !hides(id));
+        seen.tree_id.retain(|id| !hides(id));
+        seen.session.retain(|session| !unseen(session));
+        user.link.message(kind::TEXT_MESSAGE, &seen);
+    }
+
     /// Tell everyone who knows `channel` that the user it held is gone
-    /// (`message` says why); the user may already be removed.
+    /// (`message` says why, without an actor the client does not see); the
+    /// user may already be removed.
     pub fn broadcast_user_remove(&self, channel: u32, message: &proto::UserRemove) {
         let Some(frame) = encode_control(kind::USER_REMOVE, message) else {
             return;
         };
         for user in self.users.values() {
-            if !user.hidden.contains(&channel) {
+            if user.hidden.contains(&channel) {
+                continue;
+            }
+            if message
+                .actor
+                .is_some_and(|actor| !self.sees_user(user.session, actor))
+            {
+                user.link.message(
+                    kind::USER_REMOVE,
+                    &proto::UserRemove {
+                        actor: None,
+                        ..message.clone()
+                    },
+                );
+            } else {
                 user.link.send(frame.clone());
             }
         }

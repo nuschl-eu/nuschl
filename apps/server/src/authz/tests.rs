@@ -362,14 +362,10 @@ fn admission_fences_pending_pages_and_live_edits_of_old_messages() {
             source: moderator,
             conversation,
             message: old,
-            fallback: nuschl_protocol::encode_control(
-                kind::TEXT_MESSAGE,
-                &proto::TextMessage {
-                    message: "secret".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            fallback: proto::TextMessage {
+                message: "secret".into(),
+                ..Default::default()
+            },
         },
         None,
     );
@@ -2488,6 +2484,165 @@ fn requests_naming_a_hidden_channel_or_person_are_answered_as_for_missing_ones()
     };
     assert_eq!(last_channel(&mut f, admin), Some(SECRET));
     assert_eq!(last_channel(&mut f, registered), None);
+}
+
+#[test]
+fn nobody_hears_or_reads_someone_they_do_not_see() {
+    use prost::Message as _;
+    // Packets microseconds apart stay within the bandwidth limit.
+    let mut f = Fixture::new(Config::from_toml("max_bandwidth = 1000000000\n").unwrap());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, anonymous] = f.actors;
+    let into = |channel: u32| proto::UserState {
+        channel_id: Some(channel),
+        ..Default::default()
+    };
+    f.handle(member, kind::USER_STATE, &into(SECRET));
+    f.handle(admin, kind::USER_STATE, &into(LOBBY));
+    for channel in [(SECRET, LOBBY), (LOBBY, SECRET)] {
+        f.state
+            .channels
+            .get_mut(channel.0)
+            .unwrap()
+            .links
+            .insert(channel.1);
+    }
+    f.state.invalidate();
+    let heard = |f: &mut Fixture, session: u32, wanted: u16| {
+        f.received(session)
+            .into_iter()
+            .filter(|(kind, _)| *kind == wanted)
+            .map(|(_, body)| body)
+            .collect::<Vec<_>>()
+    };
+    for session in f.actors {
+        f.received(session);
+    }
+
+    // Voice into a linked channel, and a whisper by name, reach only those
+    // who see the speaker.
+    let voice = Bytes::from_static(&[0, 4 << 3, 1, (5 << 3) | 2, 3, 1, 2, 3]);
+    let speak = |f: &mut Fixture, voice: &Bytes| {
+        f.state.handle(
+            member,
+            ControlFrame {
+                kind: kind::UDP_TUNNEL,
+                payload: voice.clone(),
+            },
+            &mut Datagrams::default(),
+        );
+    };
+    speak(&mut f, &voice);
+    assert_eq!(heard(&mut f, admin, kind::UDP_TUNNEL).len(), 1);
+    assert!(heard(&mut f, anonymous, kind::UDP_TUNNEL).is_empty());
+    assert!(heard(&mut f, registered, kind::UDP_TUNNEL).is_empty());
+    f.handle(
+        member,
+        kind::VOICE_TARGET,
+        &proto::VoiceTarget {
+            id: Some(1),
+            targets: vec![proto::voice_target::Target {
+                session: vec![anonymous, admin],
+                ..Default::default()
+            }],
+        },
+    );
+    speak(
+        &mut f,
+        &Bytes::from_static(&[0, 1 << 3, 1, 4 << 3, 2, (5 << 3) | 2, 1, 9]),
+    );
+    assert_eq!(heard(&mut f, admin, kind::UDP_TUNNEL).len(), 1);
+    assert!(heard(&mut f, anonymous, kind::UDP_TUNNEL).is_empty());
+
+    // Typing in the lobby's conversation.
+    let lobby = f.conversation(LOBBY);
+    f.handle(
+        member,
+        nuschl::kind::TYPING,
+        &v1::Typing {
+            conversation: lobby.to_vec(),
+            session: 0,
+        },
+    );
+    assert_eq!(heard(&mut f, admin, nuschl::kind::TYPING).len(), 1);
+    assert!(heard(&mut f, registered, nuschl::kind::TYPING).is_empty());
+
+    // Plugin data.
+    f.handle(
+        member,
+        kind::PLUGIN_DATA_TRANSMISSION,
+        &proto::PluginDataTransmission {
+            receiver_sessions: vec![anonymous, admin],
+            data: Some(b"x".to_vec()),
+            data_id: Some("game".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        heard(&mut f, admin, kind::PLUGIN_DATA_TRANSMISSION).len(),
+        1
+    );
+    assert!(heard(&mut f, anonymous, kind::PLUGIN_DATA_TRANSMISSION).is_empty());
+
+    // Stock text: from someone hidden, to people seen, and naming a hidden
+    // channel.
+    for session in [admin, anonymous] {
+        f.state.users.get_mut(&session).unwrap().extension = None;
+    }
+    let text = |channel_id: Vec<u32>, session: Vec<u32>| proto::TextMessage {
+        channel_id,
+        session,
+        message: "hello".into(),
+        ..Default::default()
+    };
+    f.handle(
+        member,
+        kind::TEXT_MESSAGE,
+        &text(vec![LOBBY], vec![anonymous]),
+    );
+    assert_eq!(heard(&mut f, admin, kind::TEXT_MESSAGE).len(), 1);
+    assert!(heard(&mut f, anonymous, kind::TEXT_MESSAGE).is_empty());
+    f.handle(
+        admin,
+        kind::TEXT_MESSAGE,
+        &text(vec![LOBBY, SECRET], vec![]),
+    );
+    let seen = heard(&mut f, anonymous, kind::TEXT_MESSAGE);
+    assert_eq!(seen.len(), 1);
+    let seen = proto::TextMessage::decode(seen[0].clone()).unwrap();
+    assert_eq!(
+        (seen.actor, seen.channel_id),
+        (Some(admin), vec![LOBBY]),
+        "the hidden channel is left out"
+    );
+
+    // Someone hidden who mutes someone seen is not named.
+    f.state
+        .channels
+        .get_mut(LOBBY)
+        .unwrap()
+        .node
+        .acls
+        .push(entry("", Some(MEMBER), perm::MUTE_DEAFEN, 0));
+    f.state.invalidate();
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            session: Some(registered),
+            mute: Some(true),
+            ..Default::default()
+        },
+    );
+    let muted = |f: &mut Fixture, session: u32| {
+        heard(f, session, kind::USER_STATE)
+            .into_iter()
+            .map(|body| proto::UserState::decode(body).unwrap())
+            .find(|state| state.session == Some(registered))
+            .map(|state| (state.mute, state.actor))
+    };
+    assert_eq!(muted(&mut f, admin), Some((Some(true), Some(member))));
+    assert_eq!(muted(&mut f, anonymous), Some((Some(true), None)));
 }
 
 // ---- nothing else decides ----

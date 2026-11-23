@@ -586,6 +586,12 @@ impl State {
                 ),
                 // Not stored: Nuschl users in the channel still see it live.
                 _ => {
+                    let Some(frame) = nuschl_protocol::encode_control(
+                        nuschl_protocol::kind::TEXT_MESSAGE,
+                        &fallback,
+                    ) else {
+                        return;
+                    };
                     for session in self.readers(&conversation) {
                         if session != source
                             && self.allowed(
@@ -595,9 +601,8 @@ impl State {
                                     seq: message.seq,
                                 },
                             )
-                            && let Some(user) = self.users.get(&session)
                         {
-                            user.link.send(fallback.clone());
+                            self.send_text(session, &fallback, &frame);
                         }
                     }
                 }
@@ -674,16 +679,15 @@ impl State {
             nuschl_protocol::encode_control(nuschl_protocol::kind::TEXT_MESSAGE, &text)
         {
             for session in audience {
-                if let Some(user) = self.users.get(&session) {
-                    user.link.send(frame.clone());
-                }
+                self.send_text(session, &text, &frame);
             }
         }
     }
 
     /// Store a stock client's message in a channel's conversation; Nuschl
     /// readers get it once stored (docs/extension.md §4).
-    pub fn store_stock(&mut self, source: u32, id: Id, html: &str, fallback: &bytes::Bytes) {
+    pub fn store_stock(&mut self, source: u32, id: Id, fallback: &proto::TextMessage) {
+        let html = fallback.message.as_str();
         if html.len() > nuschl::MAX_LEGACY_CONTENT_BYTES {
             // Too large to keep: Nuschl users in the channel see it live only.
             self.stored(
@@ -1047,6 +1051,7 @@ impl State {
         };
         for reader in self.readers(&id) {
             if reader != session
+                && self.sees_user(reader, session)
                 && self.users.get(&reader).is_some_and(|user| {
                     user.extension
                         .as_ref()

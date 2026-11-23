@@ -167,7 +167,9 @@ impl State {
             .map(|c| c.name.as_str())
             .unwrap_or("");
         for &recipient in self.users.keys() {
-            if !self.allowed(recipient, Action::ModerateKnock { channel }) {
+            if !self.allowed(recipient, Action::ModerateKnock { channel })
+                || !self.sees_user(recipient, session)
+            {
                 continue;
             }
             if self.knock_capable(recipient) {
@@ -190,6 +192,30 @@ impl State {
         Ok(id)
     }
 
+    /// A `KnockAdmission` to its requester and the moderators of its channel
+    /// who see the requester; a moderator the recipient does not see is not
+    /// named.
+    fn send_admission(&self, message: &v1::KnockAdmission) {
+        for &recipient in self.users.keys() {
+            if !self.knock_capable(recipient)
+                || (recipient != message.session
+                    && !(self.allowed(
+                        recipient,
+                        Action::ModerateKnock {
+                            channel: message.channel,
+                        },
+                    ) && self.sees_user(recipient, message.session)))
+            {
+                continue;
+            }
+            let mut seen = *message;
+            if !self.sees_user(recipient, seen.admitted_by) {
+                seen.admitted_by = 0;
+            }
+            self.send(recipient, kind::KNOCK_ADMISSION, &seen);
+        }
+    }
+
     fn resolve_knock(&mut self, id: u64, grant: Option<Grant>) {
         let Some(p) = self.knocks.pending.remove(&id) else {
             return;
@@ -202,14 +228,7 @@ impl State {
             first_seq: grant.as_ref().map_or(0, |g| g.first_seq),
             active: grant.is_some(),
         };
-        for &recipient in self.users.keys() {
-            if (recipient == p.session
-                || self.allowed(recipient, Action::ModerateKnock { channel: p.channel }))
-                && self.knock_capable(recipient)
-            {
-                self.send(recipient, kind::KNOCK_ADMISSION, &message);
-            }
-        }
+        self.send_admission(&message);
         if !self.knock_capable(p.session) && grant.is_none() {
             self.knock_notice(p.session, "Your knock was closed.".into());
         }
@@ -329,19 +348,7 @@ impl State {
                 first_seq: grant.first_seq,
                 active: false,
             };
-            for &recipient in self.users.keys() {
-                if self.knock_capable(recipient)
-                    && (recipient == session
-                        || self.allowed(
-                            recipient,
-                            Action::ModerateKnock {
-                                channel: grant.channel,
-                            },
-                        ))
-                {
-                    self.send(recipient, kind::KNOCK_ADMISSION, &message);
-                }
-            }
+            self.send_admission(&message);
         }
         if destination.is_none() {
             let ids: Vec<_> = self

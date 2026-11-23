@@ -7,7 +7,6 @@
 //! to a reader task with a bounded queue (another worker); their result is
 //! re-checked against the current authorisation state before it is sent.
 use crate::{conversations::Id, server::Server, storage::StorageHandle};
-use bytes::Bytes;
 use nuschl_ipc::server::{
     PageQuery, ServerStorageRequest as Request, ServerStorageResponse as Response,
 };
@@ -33,13 +32,13 @@ pub enum Done {
     /// `MlsAck`, deliver, and for a commit tell the delivery service.
     Mls(Box<crate::mls::Stored>),
     /// A stock client's channel message: deliver to Nuschl readers, or the
-    /// stock frame if storing failed.
+    /// stock message if storing failed.
     Stock {
         /// The sender, who has its own copy.
         source: u32,
         conversation: Id,
         message: v1::Message,
-        fallback: Bytes,
+        fallback: nuschl_protocol::control::TextMessage,
     },
 }
 

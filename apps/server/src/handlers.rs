@@ -1435,9 +1435,13 @@ impl State {
         else {
             return;
         };
-        // Users exist only once authenticated; unknown receivers are skipped.
+        // Users exist only once authenticated; unknown receivers are skipped,
+        // as are those the sender does not see or who do not see it.
         for receiver in receivers {
-            if let Some(user) = self.users.get(&receiver) {
+            if self.sees_user(source, receiver)
+                && self.sees_user(receiver, source)
+                && let Some(user) = self.users.get(&receiver)
+            {
                 user.link.send(frame.clone());
             }
         }
@@ -1667,22 +1671,19 @@ impl State {
             }
         }
         for session in recipients {
-            if readers.contains(&session) {
-                continue;
-            }
-            if let Some(user) = self.users.get(&session) {
-                user.link.send(frame.clone());
+            if !readers.contains(&session) {
+                self.send_text(session, &message, &frame);
             }
         }
         for channel in reached {
             if let Some(id) = self.conversation_of_channel(channel) {
-                self.store_stock(source, id, &message.message, &frame);
+                self.store_stock(source, id, &message);
             }
         }
         if let Some(sender) = self.users.get(&source).and_then(|user| user.account) {
             for peer in directs {
                 let id = self.direct_conversation(sender, peer);
-                self.store_stock(source, id, &message.message, &frame);
+                self.store_stock(source, id, &message);
             }
         }
     }
