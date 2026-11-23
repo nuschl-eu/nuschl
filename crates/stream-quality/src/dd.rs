@@ -533,6 +533,12 @@ impl Selector {
         self.history[usize::from(frame.number) % HISTORY] = (frame.number, targets);
     }
 
+    /// Whether the decode target forwarded now can do without `frame`.
+    pub fn discardable(&self, frame: &Frame) -> bool {
+        self.current
+            .is_some_and(|(target, _)| frame.dti(target) == Dti::Discardable)
+    }
+
     /// `frame` misses at least one packet at the receiver: the SFU did not send
     /// it. Its chains break there, and when the current target needs the frame
     /// the receiver gets nothing more until it can switch again.

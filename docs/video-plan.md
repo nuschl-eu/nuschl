@@ -237,7 +237,11 @@ and pacing use measured payload rates.
   key frames ≤256 KiB; deltas ≤ half the key-frame cap. An oversized frame is
   dropped and a key frame requested.
 - SFU queues hold about 300 ms at the leg's estimate, clamped to 32 KiB–2 MiB;
-  RTX caches about 1 s.
+  RTX caches about 1 s. A layered source's queue measures how long a frame
+  starting now waits, less the time the last key picture takes: past 300 ms it
+  lowers the receiver's target and leaves out whole frames the target can do
+  without, past 600 ms every frame but a key picture until the next switch
+  point. A key picture's temporal unit goes out whole up to 8 MiB.
 - Key-frame requests: one per receiver and source per 2 s, coalesced per
   source; native senders repair loss with intra refresh. For a layered source
   the SFU asks only when a receiver lacks a chain of the decode target it

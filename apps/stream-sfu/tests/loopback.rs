@@ -76,6 +76,40 @@ struct Leg {
     events: Vec<Event>,
     /// Drops every nth incoming AV1 media packet; retransmissions pass.
     loss: Option<(u64, u64)>,
+    link: Option<Link>,
+}
+
+/// A downlink in front of a test peer: `rate` bits per second, a drop-tail
+/// buffer of `buffer` and `delay` one way.
+struct Link {
+    rate: f64,
+    delay: Duration,
+    buffer: Duration,
+    free: Instant,
+    queue: std::collections::VecDeque<(Instant, std::net::SocketAddr, Vec<u8>)>,
+}
+
+impl Link {
+    fn new(rate: u64, delay: Duration, buffer: Duration) -> Self {
+        Self {
+            rate: rate as f64,
+            delay,
+            buffer,
+            free: Instant::now(),
+            queue: Default::default(),
+        }
+    }
+
+    fn arrive(&mut self, now: Instant, source: std::net::SocketAddr, datagram: &[u8]) {
+        let start = self.free.max(now);
+        if start.saturating_duration_since(now) > self.buffer {
+            return;
+        }
+        // With the IPv4 and UDP headers.
+        self.free = start + Duration::from_secs_f64((datagram.len() + 28) as f64 * 8.0 / self.rate);
+        self.queue
+            .push_back((self.free + self.delay, source, datagram.to_vec()));
+    }
 }
 
 impl Leg {
@@ -95,6 +129,7 @@ impl Leg {
             socket,
             events: Vec::new(),
             loss: None,
+            link: None,
         }
     }
 
@@ -137,6 +172,10 @@ impl Leg {
             if self.lost(&buffer[..length]) {
                 continue;
             }
+            if let Some(link) = &mut self.link {
+                link.arrive(Instant::now(), source, &buffer[..length]);
+                continue;
+            }
             let input = Input::Receive(
                 Instant::now(),
                 Receive {
@@ -144,6 +183,23 @@ impl Leg {
                     source,
                     destination: local,
                     contents: buffer[..length].try_into().expect("datagram"),
+                },
+            );
+            self.rtc.handle_input(input).expect("input");
+            self.poll();
+        }
+        let now = Instant::now();
+        while let Some(link) = &mut self.link
+            && link.queue.front().is_some_and(|(due, ..)| *due <= now)
+        {
+            let (_, source, datagram) = link.queue.pop_front().expect("a datagram");
+            let input = Input::Receive(
+                now,
+                Receive {
+                    proto: Protocol::Udp,
+                    source,
+                    destination: local,
+                    contents: datagram.as_slice().try_into().expect("datagram"),
                 },
             );
             self.rtc.handle_input(input).expect("input");
@@ -1447,4 +1503,55 @@ async fn lost_packets_return_through_nack() {
         "{} key frame requests",
         host.keyframe_requests
     );
+}
+
+/// A camera viewer behind a 700 kbit/s downlink, about a third of the camera's
+/// rate, with a buffer deep enough that the link loses nothing: the SFU lowers
+/// its layers and leaves out whole frames it can do without. Every frame it
+/// gets stays decodable and it keeps decoding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_throttled_viewer_gets_decodable_frames() {
+    let sfu = start("");
+    let url = sfu.url.as_str();
+    let (mut host, _) = join(url, &ADMIT, true, true).await;
+    host.replay = Some(Replay::new(fixture(include_str!(
+        "fixtures/chrome-l3t3-key.txt"
+    ))));
+    host.publish_source(Codec::Av1, false);
+    replay_alone(&mut host).await;
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
+        host.step();
+        viewer.step();
+        host.send_replay();
+        if let Some(leg) = &mut viewer.subscribe {
+            leg.link.get_or_insert_with(|| {
+                Link::new(700_000, Duration::from_millis(20), Duration::from_secs(10))
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let late = viewer.received[&host.id].len();
+    let repaired = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < repaired {
+        host.step();
+        viewer.step();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let packets = &viewer.received[&host.id];
+    let (decoded, broken) = decodable(packets);
+    assert!(broken.is_empty(), "undecodable frames {broken:?}");
+    // Still decoding in the last five seconds.
+    let numbers: std::collections::HashSet<u16> = packets[late * 3 / 4..]
+        .iter()
+        .filter_map(|p| {
+            Some(u16::from_be_bytes(
+                p.descriptor.as_ref()?.0[1..3].try_into().ok()?,
+            ))
+        })
+        .collect();
+    let recent = decoded.iter().filter(|f| numbers.contains(&f.0)).count();
+    let spatial: Vec<u8> = decoded.iter().map(|f| f.1).collect();
+    assert!(recent >= 20, "{recent} recent frames, layers {spatial:?}");
 }

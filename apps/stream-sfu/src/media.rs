@@ -15,7 +15,7 @@ use crate::{
         self, ClientMessage, Decoders, MAX_SCREEN_BITRATE, PeerInfo, ServerMessage, Track,
         TurnCredentials, VideoLimit, Welcome,
     },
-    quality::{self, VideoAdmission},
+    quality::{self, Layered, VideoAdmission},
     rooms::{self, Bucket, Join, Nonce, PeerId, Refusal, RoomId, Rooms},
     routing::Routing,
     traffic::Traffic,
@@ -1061,13 +1061,31 @@ impl Core {
             };
             let full = if video {
                 let queue = stream.queue_info();
+                let bitrate = peer.estimate.min(self.config.receiver_bitrate);
                 match view.backlog.admission(timestamp, queue, can_request, now) {
-                    VideoAdmission::Regular => view.backlog.full(
-                        queue,
-                        peer.estimate.min(self.config.receiver_bitrate),
-                        payload,
-                        now,
-                    ),
+                    VideoAdmission::Regular => match &layered {
+                        None => view.backlog.full(queue, bitrate, payload, now),
+                        Some(frame) => {
+                            let discardable = view.selector.discardable(frame);
+                            let bound = quality::QUEUE_BOUND;
+                            match view.backlog.layered(
+                                frame,
+                                discardable,
+                                queue,
+                                bitrate,
+                                bound,
+                                now,
+                            ) {
+                                Layered::Send => view.backlog.capped(queue, payload),
+                                Layered::Skip => {
+                                    view.rewrite.skip(*packet.seq_no);
+                                    view.selector.dropped(frame);
+                                    keyframe |= view.selector.needs_keyframe();
+                                    continue;
+                                }
+                            }
+                        }
+                    },
                     VideoAdmission::Burst(bytes) => {
                         view.backlog.burst_full(queue, bytes + cost, recovery_burst)
                     }
