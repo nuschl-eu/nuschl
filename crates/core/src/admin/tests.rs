@@ -338,6 +338,28 @@ fn channel_types_give_everyone_members_and_moderators_their_access() {
 }
 
 #[test]
+fn a_new_channel_names_its_creator() {
+    let acl = new_channel();
+    assert!(created_by(&acl, Some(7), None));
+    assert!(!created_by(&acl, Some(8), None));
+    assert!(!created_by(&acl, None, Some("abc")));
+    // A creator without Write gets a rule of their own.
+    let mut acl = new_channel();
+    acl.groups.clear();
+    acl.entries.push(AclEntry {
+        apply_subs: false,
+        ..rule("$abc", permission::WRITE | permission::TRAVERSE, 0, false)
+    });
+    assert!(created_by(&acl, None, Some("abc")));
+    assert!(!created_by(&acl, None, Some("abd")));
+    acl.entries[0].group = None;
+    acl.entries[0].user_id = Some(8);
+    assert!(created_by(&acl, Some(8), None));
+    acl.entries[0].inherited = true;
+    assert!(!created_by(&acl, Some(8), None));
+}
+
+#[test]
 fn changes_are_private_and_preserve_unedited_bits_and_fields() {
     let remote = acl();
     let mut draft = AclDraft::new(remote.clone());

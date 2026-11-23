@@ -53,6 +53,13 @@ for private messages too, so Members only and Hidden also stop everyone else's
 private messages to people inside. Rules the table cannot show leave the type
 unset.
 
+**Create sub-channel…** offers the same types. Once the server shows the new
+channel on the same connection, its permissions open, take the type and save.
+The type applies only when the channel's rules name this account or certificate
+as its creator: its own `admin` group, or Murmur's Write rule for a creator
+without Write. A refusal, a reconnect or 15 seconds without the channel drop the
+request. Murmur and nuschld refuse a name a sibling already has.
+
 **Channel permissions** shows the channel's permissions as a table: rows for
 Everyone, groups and people, columns See & join (Traverse, Enter, Listen),
 Speak (Speak, Whisper), Chat (Text message), Moderate (Mute/deafen, Move) and
@@ -213,7 +220,8 @@ editing keys at 1280×800, 900×600 and 900×800 at 200% zoom. `--pending-input`
 attempts a real edit during a naturally paced save and verifies the original
 field value is retained, then editable after confirmation. `--channel-types`
 reads a custom table as Custom, saves Members only, Password and Open and
-compares the server's rules.
+compares the server's rules, then creates a channel as Announcements and
+checks the rules saved for it.
 [acl_e2ee_bootstrap.py](../tests/acl_e2ee_bootstrap.py) separately starts nuschld
 in E2EE-only mode and uses the native SuperUser password form and group editor
 to promote an offline account, without changing security policy or using a raw

@@ -416,6 +416,24 @@ pub fn group_has_local_definition(group: &AclGroup) -> bool {
         || !group.remove.is_empty()
 }
 
+/// Whether a new channel's `acl` names this account or certificate as its
+/// creator: Murmur and nuschld add a registered creator to the channel's own
+/// `admin` group, and give a creator without Write a rule granting it.
+pub fn created_by(acl: &Acl, user_id: Option<u32>, hash: Option<&str>) -> bool {
+    let admin = acl
+        .groups
+        .iter()
+        .any(|group| group.name == "admin" && user_id.is_some_and(|id| group.add.contains(&id)));
+    let hash = hash.map(|hash| format!("${hash}"));
+    admin
+        || acl.entries.iter().any(|entry| {
+            !entry.inherited
+                && entry.grant & permission::WRITE != 0
+                && ((entry.user_id.is_some() && entry.user_id == user_id)
+                    || (hash.is_some() && entry.group == hash))
+        })
+}
+
 /// What `acl`'s own channel defines, as the permission model reads it: the
 /// channel's own rules and groups. Inherited copies in a query reply come from
 /// the parents' nodes instead.

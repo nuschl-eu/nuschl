@@ -61,7 +61,17 @@ class OwnedNuschld(Nuschld):
         )
 
 
-def operator(root, pin):
+class Listing(Operator):
+    """An operator that also keeps the channel IDs by name from its sync."""
+
+    def receive(self):
+        kind, value = super().receive()
+        if kind == 7 and 3 in value:
+            self.__dict__.setdefault("channels", {})[value[3][0].decode()] = value.get(1, [0])[0]
+        return kind, value
+
+
+def operator(root, pin, kind=Operator):
     certificate, key = root / "operator.pem", root / "operator-key.pem"
     if not certificate.exists():
         subprocess.run(
@@ -88,7 +98,7 @@ def operator(root, pin):
             stderr=subprocess.DEVNULL,
             timeout=30,
         )
-    return Operator(SERVER.port, pin, SERVER.SUPERUSER_PASSWORD, certificate, key)
+    return kind(SERVER.port, pin, SERVER.SUPERUSER_PASSWORD, certificate, key)
 
 
 def configure(_shell, root, output):
@@ -399,7 +409,46 @@ def actions(args, root, shell, application, bot, murmur):
         saved([], "Open")
         mark("password_type_uses_the_typed_password")
         activate("Close dialog")
-        return {"channel_types": cases, "server": args.server}
+        # A type picked when creating a channel is saved once the server shows it.
+        row = eventually(
+            lambda: next(
+                (
+                    node
+                    for node, role, name, _ in items(application)
+                    if role == "tree item" and name.startswith("Music")
+                ),
+                None,
+            ),
+            "missing channel Music",
+        )
+        assert row.call("Component", "GrabFocus")[0]
+        time.sleep(0.2)
+        shell.click(*point(row), button=3)
+        wait("Create sub-channel…", "menu item").press()
+        type_field("Create a channel", "Stage")
+        choose("Announcements")
+        eventually(
+            lambda: text_contains("Only @admin may speak."), "the prompt kept its type"
+        )
+        shell.screenshot(args.output / "create-channel-type.png")
+        activate("Create")
+        eventually(lambda: text_contains("Permissions · Stage"), "the new channel did not open")
+        eventually(
+            lambda: text_contains("Permissions saved and confirmed"),
+            "the new channel's type was not saved",
+        )
+        assert selected("Announcements")
+        shell.screenshot(args.output / "created-channel.png")
+        lister = operator(root, pin, Listing)
+        try:
+            stage = lister.channels["Stage"]
+        finally:
+            lister.close()
+        announcements = [([b"all"], 0, 0x8 | 0x100, 1), ([b"admin"], 0x8 | 0x100, 0, 1)]
+        assert rules_of(stage) == announcements, rules_of(stage)
+        activate("Close dialog")
+        mark("channel_created_with_a_type")
+        return {"channel_types": cases, "stage": stage, "server": args.server}
 
     if args.geometry:
         admin = operator(root, pin)
