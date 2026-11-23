@@ -1947,7 +1947,7 @@ impl Desktop {
         })
         .detach();
     }
-    fn selected_key(&self) -> Option<(String, u32)> {
+    pub fn selected_key(&self) -> Option<(String, u32)> {
         let selected = self.client.navigation.selection()?;
         Some((selected.server.clone(), selected.channel))
     }
@@ -2301,7 +2301,7 @@ impl Desktop {
                 continue;
             }
             if !files.is_empty() {
-                self.offer_files(files, cx);
+                self.offer_files(&batch.key, files, cx);
             }
         }
     }

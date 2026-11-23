@@ -182,9 +182,18 @@ impl Transfers {
 }
 
 impl Desktop {
-    /// Offer each file in the selected conversation.
-    pub fn offer_files(&mut self, files: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let Some((index, channel)) = self.selected_indices() else {
+    /// Offer each file in conversation `key` (server id and channel).
+    pub fn offer_files(
+        &mut self,
+        key: &(String, u32),
+        files: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.client.servers.iter().position(|s| s.id == key.0) else {
+            return;
+        };
+        let channels = &self.client.servers[index].channels;
+        let Some(channel) = channels.iter().position(|c| c.id == key.1) else {
             return;
         };
         let servers = wormhole_servers(&self.settings);
@@ -281,7 +290,11 @@ impl Desktop {
                     Err(_) => return,
                 }
             }
-            let _ = this.update(cx, |this, cx| this.offer_files(files, cx));
+            let _ = this.update(cx, |this, cx| {
+                if let Some(key) = this.selected_key() {
+                    this.offer_files(&key, files, cx);
+                }
+            });
         })
         .detach();
     }
