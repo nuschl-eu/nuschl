@@ -437,7 +437,8 @@ class AccessibilityTest:
 
         def attached():
             nodes = snapshot(nuschl)
-            return nodes if any(role == "list item" and name == "Image Pasted image 1"
+            return nodes if any(role == "list item" and name.startswith("Image Pasted image 1, ")
+                                and not name.endswith("being prepared")
                                 for _, _, role, name in nodes) else None
         nodes = eventually(attached, "the pasted image is not in the composer's tray")
         self.write_tree(nodes, "tree-attached.txt")

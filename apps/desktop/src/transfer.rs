@@ -23,6 +23,7 @@ use nuschl_session::{config::ClientSettings, connection::Command, workers::Trans
 use tokio::{io::AsyncWriteExt as _, sync::mpsc};
 
 use crate::{
+    attachments::Offered,
     dialogs::{Tone, styled_button},
     state::{ChannelView, Desktop, ServerView, Status},
     theme::*,
@@ -181,12 +182,19 @@ impl Transfers {
     }
 }
 
+/// Whether files can be offered: the transfer worker is there.
+pub fn available() -> bool {
+    static AVAILABLE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| nuschl_sandbox::sibling("nuschl-transfer-worker").is_ok());
+    *AVAILABLE
+}
+
 impl Desktop {
     /// Offer each file in conversation `key` (server id and channel).
     pub fn offer_files(
         &mut self,
         key: &(String, u32),
-        files: Vec<PathBuf>,
+        files: Vec<Offered>,
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self.client.servers.iter().position(|s| s.id == key.0) else {
@@ -211,8 +219,9 @@ impl Desktop {
             return;
         }
         let (server_id, channel) = (server.id.clone(), server.channels[channel].id);
-        for path in files {
-            let size = match std::fs::metadata(&path) {
+        for file in files {
+            let path = &file.path;
+            let size = match std::fs::metadata(path) {
                 Ok(metadata) if metadata.is_file() => metadata.len(),
                 Ok(_) => {
                     server.set_notice("Only files can be offered, not folders.".into());
@@ -223,8 +232,8 @@ impl Desktop {
                     continue;
                 }
             };
-            let name = display_name(&path.file_name().unwrap_or_default().to_string_lossy());
-            let started = self.driver.runtime().block_on(Transfer::start(Some(&path)));
+            let name = display_name(&file.name);
+            let started = self.driver.runtime().block_on(Transfer::start(Some(path)));
             let request = TransferRequest::Offer {
                 name: name.clone(),
                 servers: servers.clone(),
@@ -260,7 +269,9 @@ impl Desktop {
                 direct: servers.direct,
             });
             let (updates, receiver) = mpsc::channel(32);
-            self.driver.runtime().spawn(run_offer(worker, updates));
+            self.driver
+                .runtime()
+                .spawn(run_offer(worker, file, updates));
             follow(id, receiver, cx);
         }
         cx.notify();
@@ -290,6 +301,13 @@ impl Desktop {
                     Err(_) => return,
                 }
             }
+            let files = files
+                .into_iter()
+                .map(|path| {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    Offered::file(name.into_owned(), path)
+                })
+                .collect();
             let _ = this.update(cx, |this, cx| {
                 if let Some(key) = this.selected_key() {
                     this.offer_files(&key, files, cx);
@@ -643,7 +661,8 @@ fn follow(id: u64, mut updates: mpsc::Receiver<Update>, cx: &mut Context<Desktop
 }
 
 /// Relay an offer's events until its worker exits; end it after [`OFFER_LIFETIME`].
-async fn run_offer(mut worker: Transfer, updates: mpsc::Sender<Update>) {
+/// Then let go of `file`: a staged copy is deleted.
+async fn run_offer(mut worker: Transfer, file: Offered, updates: mpsc::Sender<Update>) {
     let expiry = tokio::time::sleep(OFFER_LIFETIME);
     tokio::pin!(expiry);
     let mut expired = false;
@@ -665,6 +684,8 @@ async fn run_offer(mut worker: Transfer, updates: mpsc::Sender<Update>) {
             },
         }
     }
+    drop(worker);
+    drop(file);
     let _ = updates.send(Update::Finished(Ok(()))).await;
 }
 

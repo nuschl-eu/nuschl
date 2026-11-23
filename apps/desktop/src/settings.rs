@@ -77,14 +77,36 @@ pub fn segmented(
     options: Vec<(&'static str, bool, Action)>,
     cx: &mut Context<Desktop>,
 ) -> AnyElement {
+    segmented_sized(id, label, options, false, cx)
+}
+
+/// [`segmented`] as small as the composer's other controls, each option as
+/// wide as its label.
+pub fn compact_segmented(
+    id: &'static str,
+    label: &'static str,
+    options: Vec<(&'static str, bool, Action)>,
+    cx: &mut Context<Desktop>,
+) -> AnyElement {
+    segmented_sized(id, label, options, true, cx)
+}
+
+fn segmented_sized(
+    id: &'static str,
+    label: &'static str,
+    options: Vec<(&'static str, bool, Action)>,
+    compact: bool,
+    cx: &mut Context<Desktop>,
+) -> AnyElement {
+    let inset = if compact { 2. } else { 3. };
     div()
         .id(id)
         .role(Role::RadioGroup)
         .aria_label(label)
         .flex()
-        .p(px(3.))
-        .gap(px(3.))
-        .rounded(px(8.))
+        .p(px(inset))
+        .gap(px(inset))
+        .rounded(px(inset + 5.))
         .bg(color(APP))
         .border_1()
         .border_color(color(BORDER))
@@ -100,14 +122,13 @@ pub fn segmented(
                         .aria_label(text)
                         .aria_selected(selected)
                         .tab_index(0)
-                        .flex_1()
+                        .when(!compact, |option| option.flex_1().py(px(6.)).text_sm())
+                        .when(compact, |option| option.px(px(8.)).py(px(1.)).text_xs())
                         .min_w_0()
                         .whitespace_normal()
-                        .py(px(6.))
-                        .rounded(px(6.))
+                        .rounded(px(inset + 3.))
                         .flex()
                         .justify_center()
-                        .text_sm()
                         .cursor_pointer()
                         .text_color(color(if selected { TEXT } else { TEXT_MUTED }))
                         .when(selected, |option| option.bg(color(SELECTED)))
@@ -766,6 +787,40 @@ fn device_list(
         .into_any_element()
 }
 
+/// The quality each new message's images start with.
+fn image_rows(this: &Desktop, cx: &mut Context<Desktop>) -> Vec<AnyElement> {
+    use nuschl_core::ImageQuality;
+    let quality = this.settings.image_quality;
+    let options = [
+        ("Low", ImageQuality::Low),
+        ("High", ImageQuality::High),
+        ("Original", ImageQuality::Original),
+    ]
+    .into_iter()
+    .map(|(label, chosen)| {
+        let choose: Action = Rc::new(move |this, _, _| {
+            this.update_settings(|settings| settings.image_quality = chosen)
+        });
+        (label, quality == chosen, choose)
+    })
+    .collect();
+    vec![
+        managed(
+            this,
+            "image_quality",
+            segmented("image-quality-default", "Image quality", options, cx),
+        ),
+        div()
+            .text_xs()
+            .text_color(color(TEXT_MUTED))
+            .child(
+                text!("Each new message starts with this. Original sends the file.")
+                    .with_id("image-quality-hint"),
+            )
+            .into_any_element(),
+    ]
+}
+
 pub fn dialog(
     this: &Desktop,
     server: Option<&ServerView>,
@@ -1421,6 +1476,7 @@ pub fn dialog(
                 .child(section("APPEARANCE", crate::appearance::settings(this, cx)))
                 .child(section("GENERAL", general))
                 .child(section("PRIVACY", privacy))
+                .child(section("IMAGES", image_rows(this, cx)))
                 .child(section(
                     "LINK PREVIEWS",
                     vec![crate::link_preview::settings(this, cx)],

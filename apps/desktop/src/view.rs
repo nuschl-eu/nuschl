@@ -3957,13 +3957,9 @@ fn composer(
     let attachments = this.attachments();
     // Beside images in the tray, and beside a note on one that was refused.
     let image_options = note.is_some()
-        || attachments.iter().any(|attachment| {
-            matches!(
-                attachment,
-                crate::attachments::Attachment::Image { .. }
-                    | crate::attachments::Attachment::File { image: true, .. }
-            )
-        });
+        || attachments
+            .iter()
+            .any(|attachment| matches!(attachment, crate::attachments::Attachment::Image { .. }));
     let details = div()
         .w_full()
         .min_w_0()
@@ -4058,8 +4054,8 @@ fn composer(
             )
         })
         .when(image_options, |composer| {
-            composer.child(strip_metadata(
-                this.strips_metadata(&(server.id.clone(), channel.id)),
+            composer.child(image_options_row(
+                this.choice(&(server.id.clone(), channel.id)),
                 cx,
             ))
         })
@@ -4284,8 +4280,11 @@ fn composer(
         .into_any_element()
 }
 
-/// The Strip metadata checkbox, with what it does on an (i) beside it.
-fn strip_metadata(on: bool, cx: &mut Context<Desktop>) -> AnyElement {
+/// The message's image choice: the Strip metadata checkbox, with what it
+/// does on an (i) beside it, and the quality.
+fn image_options_row(choice: crate::attachments::Choice, cx: &mut Context<Desktop>) -> AnyElement {
+    use nuschl_core::ImageQuality;
+    let on = choice.strip_metadata;
     const HELP: &str =
         "Remove image metadata such as GPS coordinates, capture time, device model, etc.";
     let control = div()
@@ -4300,12 +4299,12 @@ fn strip_metadata(on: bool, cx: &mut Context<Desktop>) -> AnyElement {
         .gap_2()
         .cursor_pointer()
         .on_click(cx.listener(|this, _, _, cx| {
-            this.toggle_strip_metadata();
+            this.choose_images(|choice| choice.strip_metadata = !choice.strip_metadata);
             cx.notify();
         }))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
             if activation_key(event) {
-                this.toggle_strip_metadata();
+                this.choose_images(|choice| choice.strip_metadata = !choice.strip_metadata);
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -4344,6 +4343,28 @@ fn strip_metadata(on: bool, cx: &mut Context<Desktop>) -> AnyElement {
                 .tooltip(|_, cx| cx.new(|_| Tooltip(HELP.into())).into())
                 .child(icon("info", 14., color(TEXT_FAINT))),
         )
+        .child(
+            div().ml_3().child(crate::settings::compact_segmented(
+                "image-quality",
+                "Image quality",
+                [
+                    ("Low", ImageQuality::Low),
+                    ("High", ImageQuality::High),
+                    ("Original", ImageQuality::Original),
+                ]
+                .into_iter()
+                .map(|(label, quality)| {
+                    let choose = Rc::new(
+                        move |this: &mut Desktop, _: &mut Window, _: &mut Context<Desktop>| {
+                            this.choose_images(|choice| choice.quality = quality)
+                        },
+                    ) as crate::settings::Action;
+                    (label, choice.quality == quality, choose)
+                })
+                .collect(),
+                cx,
+            )),
+        )
         .into_any_element()
 }
 
@@ -4353,36 +4374,40 @@ fn attachment_chip(
     attachment: &crate::attachments::Attachment,
     cx: &mut Context<Desktop>,
 ) -> AnyElement {
-    use crate::attachments::Attachment;
+    use crate::attachments::{Attachment, Prepared};
     let id = attachment.id();
     let name = attachment.name().to_owned();
-    let (preview, detail, label) = match attachment {
+    // What is sent, and its size: the image element, or the file.
+    let file = || icon("file", 20., color(TEXT_MUTED)).into_any_element();
+    let (preview, size, label) = match attachment {
         Attachment::Image {
-            prepared: Some((_, image)),
+            prepared: Some(prepared @ Prepared::Inline(_, image)),
             ..
         } => (
             img(image.clone())
                 .size_full()
                 .object_fit(ObjectFit::Cover)
                 .into_any_element(),
-            None,
-            format!("Image {name}"),
+            Some(prepared.size()),
+            "Image",
         ),
+        Attachment::Image {
+            prepared: Some(prepared @ Prepared::File(..)),
+            ..
+        } => (file(), Some(prepared.size()), "File"),
         Attachment::Image { .. } => (
             text!("…")
                 .with_id("attachment-preparing")
                 .into_any_element(),
             None,
-            format!("Image {name}, being prepared"),
+            "Image",
         ),
-        Attachment::File { size, .. } => {
-            let size = nuschl_core::transfer::format_size(*size);
-            (
-                icon("file", 20., color(TEXT_MUTED)).into_any_element(),
-                Some(size.clone()),
-                format!("File {name}, {size}"),
-            )
-        }
+        Attachment::File { size, .. } => (file(), Some(*size), "File"),
+    };
+    let detail = size.map(nuschl_core::transfer::format_size);
+    let label = match &detail {
+        Some(size) => format!("{label} {name}, {size}"),
+        None => format!("{label} {name}, being prepared"),
     };
     div()
         .id(("attachment", id as usize))

@@ -320,6 +320,11 @@ pub struct ClientSettings {
     /// managed.json (and, once, from a settings.json written by hand).
     #[serde(skip_serializing)]
     pub voice_bitrate: u32,
+    /// The image quality each new message starts with. Written only when it
+    /// is not High, so released versions keep reading settings.json
+    /// otherwise.
+    #[serde(skip_serializing_if = "is_high")]
+    pub image_quality: nuschl_core::ImageQuality,
 }
 
 /// Light or dark, or as the desktop prefers.
@@ -392,6 +397,10 @@ where
         .map_err(|_| serde::de::Error::custom("invalid link preview settings"))
 }
 
+fn is_high(quality: &nuschl_core::ImageQuality) -> bool {
+    *quality == nuschl_core::ImageQuality::High
+}
+
 fn preview_settings_default(settings: &nuschl_link_preview::policy::Settings) -> bool {
     *settings == nuschl_link_preview::policy::Settings::default()
 }
@@ -430,6 +439,7 @@ impl Default for ClientSettings {
             share_web_host: String::new(),
             call_host: String::new(),
             voice_bitrate: nuschl_core::audio::DEFAULT_VOICE_BITRATE,
+            image_quality: nuschl_core::ImageQuality::High,
         }
     }
 }
@@ -3277,6 +3287,29 @@ mod tests {
     }
     fn sidecar(profile: &Profile) -> Option<String> {
         fs::read_to_string(profile.config_dir.join("voice-quality.json")).ok()
+    }
+
+    #[test]
+    fn image_quality_is_written_only_when_not_high() {
+        let (root, profile) = temporary_profile("image-quality");
+        let loaded = profile.load();
+        assert_eq!(
+            loaded.settings.image_quality,
+            nuschl_core::ImageQuality::High
+        );
+        let mut settings = loaded.settings.clone();
+        settings.image_quality = nuschl_core::ImageQuality::Original;
+        profile.save_settings(&settings, &loaded.managed).unwrap();
+        let saved: Value = serde_json::from_str(&read(&profile, "settings.json")).unwrap();
+        assert_eq!(saved["image_quality"], "original");
+        assert_eq!(
+            profile.load().settings.image_quality,
+            nuschl_core::ImageQuality::Original
+        );
+        settings.image_quality = nuschl_core::ImageQuality::High;
+        profile.save_settings(&settings, &loaded.managed).unwrap();
+        assert!(settings_keys(&profile).is_subset(&released_keys()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
