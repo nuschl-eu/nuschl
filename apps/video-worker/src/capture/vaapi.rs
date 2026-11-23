@@ -358,7 +358,7 @@ fn cadence_caps(source: &gst::Caps, fps: u16) -> gst::Caps {
 struct Scale {
     input: gst::Pad,
     filter: gst::Element,
-    encoder_caps: gst::Caps,
+    encoder: gst::Pad,
     size: Option<(u16, u16)>,
 }
 
@@ -371,15 +371,13 @@ impl Scale {
         let filter = pipeline
             .by_name("limit")
             .ok_or("missing video caps filter")?;
-        let encoder_caps = encoder
-            .pad_template("sink")
-            .ok_or("missing video encoder input template")?
-            .caps()
-            .to_owned();
+        let encoder = encoder
+            .static_pad("sink")
+            .ok_or("missing video encoder input")?;
         Ok(Self {
             input,
             filter,
-            encoder_caps,
+            encoder,
             size: None,
         })
     }
@@ -401,12 +399,17 @@ impl Scale {
         let caps =
             format!("video/x-raw(memory:VAMemory),format=NV12,width={width},height={height}")
                 .parse::<gst::Caps>()?;
-        if !caps.can_intersect(&self.encoder_caps) {
+        if !caps.can_intersect(&self.encoder.pad_template_caps()) {
             return Ok(self.size.take().is_some());
         }
         self.filter.set_property("caps", caps);
         self.size = Some((width, height));
-        Ok(true)
+        // Request a keyframe when the encoder's input size changes.
+        let encoding = self
+            .encoder
+            .current_caps()
+            .and_then(|caps| caps.structure(0).and_then(|format| dimensions(format).ok()));
+        Ok(encoding != self.size)
     }
 }
 
