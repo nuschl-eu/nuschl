@@ -23,58 +23,13 @@ use std::{
 const QUEUE: &str = "max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream";
 
 const QVBR_QINDEX: u32 = 112;
-// Match the call sender's video pacing window.
-const VIDEO_BURST: Duration = Duration::from_millis(300);
-
-pub struct Prepared {
-    pipeline: gst::Pipeline,
-    quality: Option<QualityRate>,
-}
-
-struct QualityRate {
-    qvbr: gst::glib::Value,
-    fallback: gst::glib::Value,
-    retry_at: Option<u32>,
-    debt: f64,
-    updated: Instant,
-}
-
-impl QualityRate {
-    fn enable(&mut self, encoder: &gst::Element) {
-        encoder.set_property("qp", QVBR_QINDEX);
-        encoder.set_property_from_value("rate-control", &self.qvbr);
-        self.retry_at = None;
-        self.debt = 0.;
-        self.updated = Instant::now();
-    }
-
-    /// A burst borrows up to one send window. Sustained excess exhausts it.
-    fn admit(&mut self, bytes: usize, bitrate: u32, now: Instant) -> bool {
-        let rate = f64::from(bitrate);
-        self.debt = (self.debt - rate * now.saturating_duration_since(self.updated).as_secs_f64())
-            .max(0.)
-            + bytes as f64 * 8.;
-        self.updated = now;
-        self.debt <= rate * VIDEO_BURST.as_secs_f64()
-    }
-
-    fn fall_back(&mut self, bitrate: u32, oversized: bool) {
-        // A higher budget can absorb the measured burst. Require a material
-        // increase to avoid switching in response to small estimate changes.
-        self.retry_at = Some(if oversized {
-            u32::MAX
-        } else {
-            ((self.debt / VIDEO_BURST.as_secs_f64()).ceil() as u32).max(bitrate * 3 / 2)
-        });
-    }
-}
 
 pub fn prepare(
     source: Source,
     node: Option<u32>,
     bitrate: u32,
     preview: bool,
-) -> Result<Prepared, Failure> {
+) -> Result<gst::Pipeline, Failure> {
     let plugins = option_env!("NUSCHL_VIDEO_GST_PLUGINS")
         .ok_or("the VA-API GStreamer plugin list is missing")?;
     gst::init()?;
@@ -115,7 +70,7 @@ pub fn prepare(
             "{tee}queue name=encode_queue {queue} ! ",
             "vapostproc name=scale ! capsfilter name=limit ",
             "caps=\"video/x-raw(memory:VAMemory),format=NV12,width=[16,{width}],height=[16,{height}]\" ! ",
-            "valve name=encoder_gate ! vaav1enc name=encoder bitrate={bitrate} target-percentage=100 hierarchical-level=1 ",
+            "vaav1enc name=encoder bitrate={bitrate} target-percentage=100 hierarchical-level=1 ",
             "ref-frames=1 key-int-max=60 ! ",
             "av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! ",
             "appsink name=encoded max-buffers=1 sync=false{preview_path}",
@@ -132,8 +87,10 @@ pub fn prepare(
         .downcast::<gst::Pipeline>()
         .map_err(|_| "invalid video pipeline")?;
     let encoder = pipeline.by_name("encoder").ok_or("missing video encoder")?;
+    // Screens use quality-defined VBR where the driver offers it. The mode is
+    // fixed for the life of the encoder.
     let modes: &[&str] = match source {
-        Source::Screen => &["vbr", "cbr"],
+        Source::Screen => &["qvbr", "vbr", "cbr"],
         Source::Camera => &["cbr"],
     };
     let rates = encoder
@@ -145,28 +102,15 @@ pub fn prepare(
         .find_map(|mode| rates.to_value_by_nick(mode))
         .ok_or("the render node has no supported video rate control")?;
     // The target percentage makes the negotiated bitrate the codec's peak
-    // rate budget. QVBR drivers can still overshoot it.
-    let quality = if source == Source::Screen
-        && let Some(qvbr) = rates.to_value_by_nick("qvbr")
-    {
-        let mut quality = QualityRate {
-            qvbr,
-            fallback: rate,
-            retry_at: None,
-            debt: 0.,
-            updated: Instant::now(),
-        };
-        quality.enable(&encoder);
-        Some(quality)
-    } else {
-        encoder.set_property_from_value("rate-control", &rate);
-        None
-    };
-    Ok(Prepared { pipeline, quality })
+    // rate budget. QVBR drivers can still overshoot it. Other modes ignore
+    // the quality factor.
+    encoder.set_property_from_value("rate-control", &rate);
+    encoder.set_property("qp", QVBR_QINDEX);
+    Ok(pipeline)
 }
 
 pub fn run(
-    Prepared { pipeline, quality }: Prepared,
+    pipeline: gst::Pipeline,
     source: Source,
     control: Arc<Control>,
     preview: Option<UnixStream>,
@@ -217,9 +161,7 @@ pub fn run(
             scope.spawn(move || write_previews(stream, &sink, control, running));
             shutdown
         });
-        let result = write_frames(
-            &pipeline, &sink, &encoder, &mut scale, source, &control, quality,
-        );
+        let result = write_frames(&pipeline, &sink, &encoder, &mut scale, source, &control);
         preview_running.store(false, Ordering::Relaxed);
         if let Some(stream) = stop_preview {
             let _ = stream.shutdown(Shutdown::Write);
@@ -482,7 +424,6 @@ fn write_frames(
     scale: &mut Scale,
     source: Source,
     control: &Control,
-    mut quality: Option<QualityRate>,
 ) -> Result<(), Failure> {
     let bus = pipeline.bus().ok_or("missing pipeline bus")?;
     let clock = Instant::now();
@@ -501,13 +442,6 @@ fn write_frames(
         if wanted != bitrate {
             encoder.set_property("bitrate", wanted);
             bitrate = encoder.property::<u32>("bitrate");
-        }
-        if let Some(rate) = &mut quality
-            && rate.retry_at.is_some_and(|retry| limits.bitrate >= retry)
-        {
-            restart_encoder(pipeline, sink, encoder, || rate.enable(encoder))?;
-            waiting_for_key = true;
-            requested_at = None;
         }
         if requested_at.is_none_or(|time| time.elapsed() >= Duration::from_millis(150))
             && (control.keyframe.swap(false, Ordering::Relaxed) || waiting_for_key)
@@ -580,20 +514,7 @@ fn write_frames(
             waiting_for_key = true;
             continue;
         }
-        let oversized = size > settings.packet_limit(keyframe);
-        if let Some(rate) = &mut quality
-            && rate.retry_at.is_none()
-            && (oversized || !rate.admit(size, settings.bitrate, Instant::now()))
-        {
-            rate.fall_back(settings.bitrate, oversized);
-            restart_encoder(pipeline, sink, encoder, || {
-                encoder.set_property_from_value("rate-control", &rate.fallback);
-            })?;
-            waiting_for_key = true;
-            requested_at = None;
-            continue;
-        }
-        if oversized {
+        if size > settings.packet_limit(keyframe) {
             waiting_for_key = true;
             continue;
         }
@@ -618,26 +539,6 @@ fn write_frames(
             bytes.as_slice(),
         )?;
     }
-}
-
-fn restart_encoder(
-    pipeline: &gst::Pipeline,
-    sink: &AppSink,
-    encoder: &gst::Element,
-    configure: impl FnOnce(),
-) -> Result<(), Failure> {
-    // The valve keeps the authorized capture and preview running while READY
-    // releases the encoder's VA context.
-    let gate = pipeline
-        .by_name("encoder_gate")
-        .ok_or("missing encoder gate")?;
-    gate.set_property("drop", true);
-    encoder.set_state(gst::State::Ready)?;
-    let _ = sink.try_pull_sample(gst::ClockTime::ZERO);
-    configure();
-    encoder.sync_state_with_parent()?;
-    gate.set_property("drop", false);
-    Ok(())
 }
 
 fn force_keyframe(encoder: &gst::Element) -> Result<(), Failure> {
