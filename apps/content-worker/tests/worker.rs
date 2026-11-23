@@ -3,7 +3,7 @@
 #![cfg(target_os = "linux")]
 use std::{path::Path, time::Instant};
 
-use nuschl_core::ContentBlock;
+use nuschl_core::{ContentBlock, ImageQuality};
 
 fn worker() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_nuschl-content-worker"))
@@ -98,7 +98,7 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x02\x08\x02\0
 
 #[tokio::test]
 async fn a_pasted_image_becomes_a_stock_mumble_image_message() {
-    let encoded = nuschl_ipc::host::encode_image(worker(), PNG, 131_072)
+    let encoded = nuschl_ipc::host::encode_image(worker(), PNG, 131_072, ImageQuality::Low)
         .await
         .unwrap();
     let html = encoded.html;
@@ -123,7 +123,13 @@ async fn a_pasted_image_becomes_a_stock_mumble_image_message() {
         }]
     ));
     assert!(matches!(
-        nuschl_ipc::host::encode_image(worker(), b"GIF89a, but not really", 131_072).await,
+        nuschl_ipc::host::encode_image(
+            worker(),
+            b"GIF89a, but not really",
+            131_072,
+            ImageQuality::High
+        )
+        .await,
         Err(nuschl_ipc::host::Error::Rejected(_))
     ));
 }

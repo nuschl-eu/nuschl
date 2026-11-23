@@ -10,9 +10,12 @@ use image::{
     DynamicImage, ExtendedColorType, ImageDecoder as _, ImageEncoder as _, ImageFormat,
     ImageReader, Limits, metadata::Orientation,
 };
-#[cfg(feature = "images")]
-use nuschl_core::preview::{ImageMime, img_element};
 use nuschl_core::{CodeRun, ContentBlock, MAX_CONTENT_BYTES, MessageDocument};
+#[cfg(feature = "images")]
+use nuschl_core::{
+    ImageQuality,
+    preview::{ImageMime, img_element},
+};
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, Theme, ThemeSet},
@@ -195,13 +198,23 @@ pub const ATTACHMENT_THUMBNAIL: u32 = 128;
 
 /// Re-encode a pasted image as a Mumble image message (an `<img>` element of
 /// at most `limit` bytes), as stock Mumble does (`Log::imageToImg`): upright
-/// as its EXIF orientation says, at most 1600×1000 pixels, as JPEG at the
-/// highest quality that fits, or as PNG when that is smaller. When even low
-/// quality does not fit, the image shrinks.
+/// as its EXIF orientation says, within the `quality`'s size, as JPEG at the
+/// highest of its qualities that fits, or as PNG when that is smaller. When
+/// even its lowest quality does not fit, the image shrinks until it does.
 /// Also returns a thumbnail of at most [`ATTACHMENT_THUMBNAIL`] pixels.
 #[cfg(feature = "images")]
-pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, ContentBlock), Error> {
+pub fn encode_image_message(
+    bytes: &[u8],
+    limit: usize,
+    quality: ImageQuality,
+) -> Result<(String, ContentBlock), Error> {
     let limit = limit.min(MAX_CONTENT_BYTES);
+    // The largest size, and the JPEG qualities tried in turn. Original is
+    // re-encoded only where it cannot go as its file: as High.
+    let ((view_width, view_height), qualities) = match quality {
+        ImageQuality::Low => ((800, 500), [70, 55, 40]),
+        ImageQuality::High | ImageQuality::Original => ((VIEW_WIDTH, VIEW_HEIGHT), [85, 70, 55]),
+    };
     let formats = [
         ImageFormat::Png,
         ImageFormat::Jpeg,
@@ -220,8 +233,8 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
         Orientation::Rotate90
         | Orientation::Rotate270
         | Orientation::Rotate90FlipH
-        | Orientation::Rotate270FlipH => (VIEW_HEIGHT, VIEW_WIDTH),
-        _ => (VIEW_WIDTH, VIEW_HEIGHT),
+        | Orientation::Rotate270FlipH => (view_height, view_width),
+        _ => (view_width, view_height),
     };
     if image.width() > width || image.height() > height {
         image = fit(image, width, height);
@@ -245,7 +258,7 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
         // JPEG has no transparency: blend it onto white.
         let opaque = flatten(&image);
         let mut smallest = png.len();
-        for quality in [85, 70, 55] {
+        for quality in qualities {
             let jpeg = encode_jpeg(&opaque, quality)?;
             let (mime, bytes) = if png.len() <= jpeg.len() {
                 (ImageMime::Png, &png)
@@ -265,7 +278,7 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
             (image.width() as f64 * scale) as u32,
             (image.height() as f64 * scale) as u32,
         );
-        if width < 16 || height < 16 {
+        if width == 0 || height == 0 {
             return Err(Error::ImageTooLarge(limit));
         }
         image = fit(image, width, height);
@@ -566,7 +579,7 @@ mod tests {
             panic!("the WebP image did not decode");
         };
         assert_eq!((width, height), (40, 30));
-        let (html, _) = encode_image_message(&webp, 128 * 1024).unwrap();
+        let (html, _) = encode_image_message(&webp, 128 * 1024, ImageQuality::High).unwrap();
         assert!(
             html.contains("data:image/jpeg") || html.contains("data:image/png"),
             "{}",
@@ -823,7 +836,8 @@ mod tests {
     fn pasted_images_are_encoded_as_stock_mumble_does_within_the_limit() {
         let limit = 131_072;
         // A large, detailed picture: shrunk to 1600×1000, then by quality or size.
-        let (element, thumbnail) = encode_image_message(&picture(2400, 1350, true), limit).unwrap();
+        let (element, thumbnail) =
+            encode_image_message(&picture(2400, 1350, true), limit, ImageQuality::High).unwrap();
         assert!(element.len() <= limit, "{}", element.len());
         // With a thumbnail for the composer.
         let ContentBlock::Image {
@@ -861,7 +875,8 @@ mod tests {
         );
 
         // Flat screenshots stay lossless: PNG is smaller than JPEG there.
-        let (element, _) = encode_image_message(&picture(800, 500, false), limit).unwrap();
+        let (element, _) =
+            encode_image_message(&picture(800, 500, false), limit, ImageQuality::High).unwrap();
         assert!(
             element.starts_with("<img src=\"data:image/png;base64,"),
             "{}",
@@ -870,10 +885,43 @@ mod tests {
         assert_eq!(received(&element), (800, 500));
 
         // A small limit shrinks the picture until it fits.
-        let (element, _) = encode_image_message(&picture(1600, 1000, true), 20_000).unwrap();
+        let (element, _) =
+            encode_image_message(&picture(1600, 1000, true), 20_000, ImageQuality::High).unwrap();
         assert!(element.len() <= 20_000);
         let (width, _) = received(&element);
         assert!(width < 1600, "{width}");
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn low_and_high_fit_any_server_limit() {
+        // Smooth, like a photo: both levels fit stock Murmur's limit as they are.
+        let smooth = image::RgbImage::from_fn(2000, 1125, |x, y| {
+            image::Rgb([(x / 10) as u8, (y / 6) as u8, ((x + y) / 15) as u8])
+        });
+        let smooth = encoded_jpeg(&smooth);
+        let high = encode_image_message(&smooth, 131_072, ImageQuality::High)
+            .unwrap()
+            .0;
+        let low = encode_image_message(&smooth, 131_072, ImageQuality::Low)
+            .unwrap()
+            .0;
+        assert_eq!(received(&high), (1600, 900));
+        assert_eq!(received(&low), (800, 450));
+        assert!(low.len() < high.len(), "{} {}", low.len(), high.len());
+        // Noise, and smaller server limits: smaller, never refused.
+        let noisy = picture(640, 360, true);
+        for quality in [ImageQuality::Low, ImageQuality::High] {
+            for limit in [131_072, 16_384, 2_048, 600] {
+                let element = encode_image_message(&noisy, limit, quality).unwrap().0;
+                assert!(
+                    element.len() <= limit,
+                    "{quality:?} {limit}: {}",
+                    element.len()
+                );
+                received(&element);
+            }
+        }
     }
 
     #[test]
@@ -980,9 +1028,26 @@ mod tests {
         let comment = [&[0x21, 0xfe, 14][..], b"NUSCHL-COMMENT", &[0]].concat();
         let gif = [&source[..13 + table], &comment, &source[13 + table..]].concat();
 
-        for (format, input) in [("JPEG", jpeg), ("PNG", png), ("WebP", webp), ("GIF", gif)] {
+        // A photo's EXIF: camera model, capture time and GPS position.
+        let photo = jpeg_with_exif(
+            &DynamicImage::ImageRgba8(pixels.clone()).to_rgb8(),
+            &exif(1),
+        );
+        let inputs = [
+            ("JPEG", jpeg),
+            ("EXIF", photo),
+            ("PNG", png),
+            ("WebP", webp),
+            ("GIF", gif),
+        ];
+        let qualities = [ImageQuality::Low, ImageQuality::High];
+        for ((format, input), quality) in inputs
+            .iter()
+            .flat_map(|input| qualities.map(|quality| (input, quality)))
+        {
+            let format = format!("{format} {quality:?}");
             assert!(input.windows(6).any(|window| window == b"NUSCHL"));
-            let (element, _) = encode_image_message(&input, 131_072)
+            let (element, _) = encode_image_message(input, 131_072, quality)
                 .unwrap_or_else(|error| panic!("{format}: {error}"));
             let source = element
                 .strip_prefix("<img src=\"")
@@ -992,6 +1057,10 @@ mod tests {
             let (sent, _) = nuschl_core::data_uri_image(source).unwrap();
             assert!(
                 !sent.windows(6).any(|window| window == b"NUSCHL"),
+                "{format}"
+            );
+            assert!(
+                !sent.windows(10).any(|window| window == b"2026:11:03"),
                 "{format}"
             );
             if sent.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -1046,7 +1115,7 @@ mod tests {
             })
         };
 
-        let (element, _) = encode_image_message(&png, 131_072).unwrap();
+        let (element, _) = encode_image_message(&png, 131_072, ImageQuality::High).unwrap();
         assert!(element.starts_with("<img src=\"data:image/png;base64,"));
         let source = element
             .strip_prefix("<img src=\"")
@@ -1199,8 +1268,12 @@ mod tests {
                 image::Rgb([0, 0, 255])
             }
         });
-        let (element, _) =
-            encode_image_message(&jpeg_with_exif(&pixels, &exif(6)), 131_072).unwrap();
+        let (element, _) = encode_image_message(
+            &jpeg_with_exif(&pixels, &exif(6)),
+            131_072,
+            ImageQuality::High,
+        )
+        .unwrap();
         let sent = sent_pixels(&element);
         assert_eq!(sent.dimensions(), (32, 64));
         // Red above, blue below.
@@ -1209,15 +1282,19 @@ mod tests {
 
         // Upright already (1), or without EXIF: as stored.
         for input in [jpeg_with_exif(&pixels, &exif(1)), encoded_jpeg(&pixels)] {
-            let (element, _) = encode_image_message(&input, 131_072).unwrap();
+            let (element, _) = encode_image_message(&input, 131_072, ImageQuality::High).unwrap();
             assert_eq!(sent_pixels(&element).dimensions(), (64, 32));
         }
 
         // A large one shrinks into the upright 1600×1000 box: 2400×1350
         // stored, 1350×2400 upright, sent at 563×1000.
         let large = image::RgbImage::from_fn(2400, 1350, |x, y| image::Rgb([x as u8, y as u8, 0]));
-        let (element, _) =
-            encode_image_message(&jpeg_with_exif(&large, &exif(8)), 1_000_000).unwrap();
+        let (element, _) = encode_image_message(
+            &jpeg_with_exif(&large, &exif(8)),
+            1_000_000,
+            ImageQuality::High,
+        )
+        .unwrap();
         assert_eq!(sent_pixels(&element).dimensions(), (563, 1000));
     }
 
@@ -1234,19 +1311,23 @@ mod tests {
     #[cfg(feature = "images")]
     fn pasted_images_that_cannot_fit_or_decode_are_rejected() {
         assert!(matches!(
-            encode_image_message(&picture(64, 64, true), 40),
+            encode_image_message(&picture(64, 64, true), 40, ImageQuality::High),
             Err(Error::ImageTooLarge(40))
         ));
         assert!(matches!(
-            encode_image_message(b"not an image", 131_072),
+            encode_image_message(b"not an image", 131_072, ImageQuality::High),
             Err(Error::InvalidImage)
         ));
         assert!(matches!(
-            encode_image_message(&picture(64, 64, false)[..40], 131_072),
+            encode_image_message(&picture(64, 64, false)[..40], 131_072, ImageQuality::High),
             Err(Error::InvalidImage)
         ));
         assert!(matches!(
-            encode_image_message(b"<svg xmlns='http://www.w3.org/2000/svg'/>", 131_072),
+            encode_image_message(
+                b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+                131_072,
+                ImageQuality::High
+            ),
             Err(Error::InvalidImage)
         ));
     }
@@ -1292,7 +1373,7 @@ mod tests {
         );
         assert!(decode_view(&uri).is_none());
         assert!(matches!(
-            encode_image_message(&gif, 131_072),
+            encode_image_message(&gif, 131_072, ImageQuality::High),
             Err(Error::InvalidImage)
         ));
     }

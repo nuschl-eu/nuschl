@@ -351,16 +351,22 @@ pub async fn decode_view(executable: &Path, uri: &str) -> Result<MessageDocument
     rendered(one(executable, ContentRequest::View { uri }).await?)
 }
 
-/// Re-encode a pasted image as a Mumble `<img>` element of at most `limit`
-/// bytes, with a thumbnail for the composer.
+/// Re-encode a pasted image at `quality` as a Mumble `<img>` element of at
+/// most `limit` bytes, with a thumbnail for the composer.
 pub async fn encode_image(
     executable: &Path,
     image: &[u8],
     limit: u32,
+    quality: nuschl_core::ImageQuality,
 ) -> Result<EncodedImage, Error> {
     use base64::Engine as _;
     let image = base64::engine::general_purpose::STANDARD.encode(image);
-    match one(executable, ContentRequest::EncodeImage { image, limit }).await? {
+    let request = ContentRequest::EncodeImage {
+        image,
+        limit,
+        quality,
+    };
+    match one(executable, request).await? {
         ContentResponse::Encoded(encoded) => Ok(encoded),
         _ => Err(Error::InvalidResponse),
     }

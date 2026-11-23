@@ -101,11 +101,13 @@ fn answer(renderer: &ContentRenderer, request: ContentRequest) -> Result<Content
             image(nuschl_content::decode_icon(&base64(&encoded)?))
         }
         ContentRequest::View { uri } => image(nuschl_content::decode_view(&uri)),
-        ContentRequest::EncodeImage { image, limit } => {
-            nuschl_content::encode_image_message(&base64(&image)?, limit as usize)
-                .map(|(html, thumbnail)| ContentResponse::Encoded(EncodedImage { html, thumbnail }))
-                .map_err(|error| error.to_string())
-        }
+        ContentRequest::EncodeImage {
+            image,
+            limit,
+            quality,
+        } => nuschl_content::encode_image_message(&base64(&image)?, limit as usize, quality)
+            .map(|(html, thumbnail)| ContentResponse::Encoded(EncodedImage { html, thumbnail }))
+            .map_err(|error| error.to_string()),
     }
 }
 

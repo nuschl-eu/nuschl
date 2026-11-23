@@ -270,7 +270,8 @@ impl Services {
                 if image.len() as u64 > crate::attachments::MAX_IMAGE_BYTES {
                     return Err("it is larger than 8 MB".to_owned());
                 }
-                match nuschl_ipc::host::encode_image(worker, &image, limit as u32).await {
+                let high = nuschl_core::ImageQuality::High;
+                match nuschl_ipc::host::encode_image(worker, &image, limit as u32, high).await {
                     Ok(encoded) => Ok(encoded),
                     Err(nuschl_ipc::host::Error::Rejected(reason)) => Err(reason),
                     Err(error) => Err(error.to_string()),

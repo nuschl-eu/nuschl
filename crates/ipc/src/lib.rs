@@ -77,9 +77,14 @@ pub enum ContentRequest {
     Icon { image: String },
     /// An inline `data:` image; answered with a `Rendered` image at the viewer's size.
     View { uri: String },
-    /// A base64-encoded pasted image, re-encoded as a Mumble `<img>` element
-    /// of at most `limit` bytes; answered with `Encoded`.
-    EncodeImage { image: String, limit: u32 },
+    /// A base64-encoded pasted image, re-encoded at `quality` as a Mumble
+    /// `<img>` element of at most `limit` bytes; answered with `Encoded`.
+    EncodeImage {
+        image: String,
+        limit: u32,
+        #[serde(default)]
+        quality: nuschl_core::ImageQuality,
+    },
 }
 
 /// An image ready to send, and its thumbnail (an `Image` block) for the composer.

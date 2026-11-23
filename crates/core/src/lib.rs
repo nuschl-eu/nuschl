@@ -31,6 +31,17 @@ pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
 /// The marker is stripped from all other text before embeds are inserted.
 pub const EMBED: char = '\u{FFFC}';
 
+/// How an attached image is sent: re-encoded small or large, or as the file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageQuality {
+    Low,
+    #[default]
+    High,
+    /// The file itself, offered for transfer.
+    Original,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
