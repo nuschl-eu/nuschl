@@ -85,6 +85,9 @@ pub enum ContentRequest {
         #[serde(default)]
         quality: nuschl_core::ImageQuality,
     },
+    /// A base64-encoded original image to send as its file, without its
+    /// metadata and otherwise unchanged; answered with `Stripped`.
+    StripImage { image: String },
 }
 
 /// An image ready to send, and its thumbnail (an `Image` block) for the composer.
@@ -114,6 +117,8 @@ pub enum ContentResponse {
     Prepared(PreparedContent),
     /// Mumble rich text to send as it is.
     Encoded(EncodedImage),
+    /// The original image without its metadata, base64-encoded.
+    Stripped(String),
     Preview(preview::Response),
     /// A re-encoded artwork thumbnail.
     Thumbnail(ThumbnailPng),

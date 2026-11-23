@@ -28,7 +28,11 @@ pub mod markdown;
 mod markup;
 pub mod math;
 pub mod preview;
+#[cfg(feature = "images")]
+mod strip;
 pub use markup::{MAX_LINKS, MAX_URL_BYTES, bare_urls};
+#[cfg(feature = "images")]
+pub use strip::strip_metadata;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -565,6 +569,8 @@ mod tests {
     }
 
     use super::*;
+    #[cfg(feature = "images")]
+    use strip::png_chunk;
 
     #[test]
     #[cfg(feature = "images")]
@@ -644,23 +650,6 @@ mod tests {
             at += 12 + length;
         }
         types
-    }
-
-    /// A PNG chunk of `kind` holding `data`.
-    #[cfg(feature = "images")]
-    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let typed = [kind.as_slice(), data].concat();
-        let crc = !typed.iter().fold(!0u32, |crc, &byte| {
-            (0..8).fold(crc ^ byte as u32, |crc, _| {
-                (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg())
-            })
-        });
-        [
-            &(data.len() as u32).to_be_bytes(),
-            &typed[..],
-            &crc.to_be_bytes(),
-        ]
-        .concat()
     }
 
     #[test]
@@ -1305,6 +1294,204 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)
             .unwrap();
         jpeg
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn originals_keep_their_pixels_and_lose_their_metadata() {
+        let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
+            image::Rgba([(x * 5) as u8, ((y * 7) ^ (x * 13)) as u8, 90, 255])
+        });
+        let encoded = |format| {
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgba8(pixels.clone())
+                .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+                .unwrap();
+            bytes
+        };
+        let segment = |marker: u8, body: &[u8]| {
+            [
+                &[0xff, marker][..],
+                &(body.len() as u16 + 2).to_be_bytes(),
+                body,
+            ]
+            .concat()
+        };
+        // Turned (EXIF orientation 6), with a camera model, capture time and
+        // GPS position.
+        let turned = exif(6);
+
+        // JPEG: EXIF, XMP, a comment and a second picture's index (MPF),
+        // an ICC profile, and data after the end of the image.
+        let photo = jpeg_with_exif(&DynamicImage::ImageRgba8(pixels.clone()).to_rgb8(), &turned);
+        let jpeg = [
+            &photo[..2],
+            &segment(
+                0xe1,
+                b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>NUSCHL-XMP</x:xmpmeta>",
+            ),
+            &segment(0xe2, b"MPF\0NUSCHL-MPF"),
+            &segment(0xe2, b"ICC_PROFILE\0\x01\x01KEEP-ICC"),
+            &segment(0xfe, b"NUSCHL-COMMENT"),
+            &photo[2..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // PNG: EXIF, text, XMP and time chunks, and data after IEND.
+        let source = encoded(ImageFormat::Png);
+        let png = [
+            &source[..33],
+            &png_chunk(b"eXIf", &turned),
+            &png_chunk(b"tEXt", b"Comment\0NUSCHL-COMMENT"),
+            &png_chunk(b"iTXt", b"XML:com.adobe.xmp\0\0\0\0\0NUSCHL-XMP"),
+            &png_chunk(b"tIME", &[0x07, 0xea, 11, 3, 14, 30, 12]),
+            &source[33..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // WebP: the extended format with an ICC profile, EXIF and XMP, and
+        // data after the RIFF container.
+        let lossless = encoded(ImageFormat::WebP);
+        let riff = |kind: &[u8; 4], data: &[u8]| {
+            let pad = vec![0; data.len() % 2];
+            [
+                kind.as_slice(),
+                &(data.len() as u32).to_le_bytes(),
+                data,
+                &pad,
+            ]
+            .concat()
+        };
+        // ICC, alpha, EXIF and XMP; then the canvas size, less one, in 24 bits each.
+        let header = [
+            &[0x3c, 0, 0, 0][..],
+            &47u32.to_le_bytes()[..3],
+            &31u32.to_le_bytes()[..3],
+        ]
+        .concat();
+        let body = [
+            &b"WEBP"[..],
+            &riff(b"VP8X", &header),
+            &riff(b"ICCP", b"KEEP-ICC"),
+            &lossless[12..],
+            &riff(b"EXIF", &turned),
+            &riff(b"XMP ", b"<x:xmpmeta>NUSCHL-XMP</x:xmpmeta>"),
+        ]
+        .concat();
+        let webp = [
+            &b"RIFF"[..],
+            &(body.len() as u32).to_le_bytes(),
+            &body,
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // GIF: looping, a comment and XMP, and data after the trailer.
+        let source = encoded(ImageFormat::Gif);
+        let table = if source[10] & 0x80 != 0 {
+            3 << ((source[10] & 7) + 1)
+        } else {
+            0
+        };
+        let looping = [&[0x21, 0xff, 11][..], b"NETSCAPE2.0", &[3, 1, 0, 0, 0]].concat();
+        let comment = [&[0x21, 0xfe, 14][..], b"NUSCHL-COMMENT", &[0]].concat();
+        let xmp = [
+            &[0x21, 0xff, 11][..],
+            b"XMP DataXMP",
+            &[10],
+            b"NUSCHL-XMP",
+            &[0],
+        ]
+        .concat();
+        let gif = [
+            &source[..13 + table],
+            &looping,
+            &comment,
+            &xmp,
+            &source[13 + table..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // BMP: data after the size its header gives.
+        let bmp = [&encoded(ImageFormat::Bmp)[..], b"NUSCHL-TRAILER"].concat();
+
+        let decoder = |bytes: &[u8]| {
+            ImageReader::new(std::io::Cursor::new(bytes.to_vec()))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap()
+        };
+        let contains = |bytes: &[u8], text: &[u8]| bytes.windows(text.len()).any(|w| w == text);
+        for (format, input, upright) in [
+            (ImageFormat::Jpeg, &jpeg, false),
+            (ImageFormat::Png, &png, false),
+            (ImageFormat::WebP, &webp, false),
+            (ImageFormat::Gif, &gif, true),
+            (ImageFormat::Bmp, &bmp, true),
+        ] {
+            assert!(contains(input, b"NUSCHL"), "{format:?}");
+            let stripped = strip_metadata(input).unwrap_or_else(|| panic!("{format:?}"));
+            for gone in [&b"NUSCHL"[..], b"2026:11:03"] {
+                assert!(!contains(&stripped, gone), "{format:?}");
+            }
+            // The same format and pixels, as stored.
+            assert_eq!(image::guess_format(&stripped).unwrap(), format);
+            assert_eq!(
+                image::load_from_memory(&stripped).unwrap().to_rgba8(),
+                image::load_from_memory(input).unwrap().to_rgba8(),
+                "{format:?}"
+            );
+            // Turned as before, by EXIF that holds only that.
+            let mut decoder = decoder(&stripped);
+            if upright {
+                assert_eq!(decoder.exif_metadata().unwrap(), None, "{format:?}");
+            } else {
+                assert_eq!(
+                    decoder.orientation().unwrap(),
+                    Orientation::Rotate90,
+                    "{format:?}"
+                );
+                let exif = decoder.exif_metadata().unwrap().unwrap();
+                assert_eq!(
+                    exif,
+                    b"MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0"
+                );
+            }
+        }
+        // The colour profile and the looping stay.
+        assert!(contains(
+            &strip_metadata(&jpeg).unwrap(),
+            b"ICC_PROFILE\0\x01\x01KEEP-ICC"
+        ));
+        assert!(contains(
+            &strip_metadata(&webp).unwrap(),
+            b"ICCP\x08\0\0\0KEEP-ICC"
+        ));
+        assert!(contains(&strip_metadata(&gif).unwrap(), b"NETSCAPE2.0"));
+
+        // Upright already: no EXIF at all.
+        let upright = jpeg_with_exif(
+            &DynamicImage::ImageRgba8(pixels.clone()).to_rgb8(),
+            &exif(1),
+        );
+        let stripped = strip_metadata(&upright).unwrap();
+        assert_eq!(decoder(&stripped).exif_metadata().unwrap(), None);
+        assert!(!contains(&stripped, b"Exif"));
+
+        // Other formats, and broken files, are not stripped; no cut-off
+        // file panics.
+        for input in [&jpeg, &png, &webp, &gif, &bmp] {
+            for end in 0..input.len() {
+                strip_metadata(&input[..end]);
+            }
+        }
+        assert_eq!(strip_metadata(b"II*\0\x08\0\0\0"), None);
+        assert_eq!(strip_metadata(&encoded(ImageFormat::Png)[..60]), None);
+        assert_eq!(strip_metadata(&photo[..photo.len() - 2]), None);
     }
 
     #[test]

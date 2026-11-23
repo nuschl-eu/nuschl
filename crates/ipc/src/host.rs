@@ -372,6 +372,23 @@ pub async fn encode_image(
     }
 }
 
+/// An original image without its metadata, from the sandboxed content worker:
+/// no larger than `image`.
+pub async fn strip_image(executable: &Path, image: &[u8]) -> Result<Vec<u8>, Error> {
+    use base64::Engine as _;
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let request = ContentRequest::StripImage {
+        image: base64.encode(image),
+    };
+    match one(executable, request).await? {
+        // Its length is checked before it is decoded.
+        ContentResponse::Stripped(stripped) if stripped.len() <= image.len().div_ceil(3) * 4 => {
+            base64.decode(stripped).map_err(|_| Error::InvalidResponse)
+        }
+        _ => Err(Error::InvalidResponse),
+    }
+}
+
 /// Literal text, or (`legacy_html`) Mumble rich text made inert, with its plain source.
 pub async fn prepare_content(
     executable: &Path,

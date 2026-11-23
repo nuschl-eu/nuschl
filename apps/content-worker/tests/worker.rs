@@ -134,6 +134,21 @@ async fn a_pasted_image_becomes_a_stock_mumble_image_message() {
     ));
 }
 
+#[tokio::test]
+async fn an_original_loses_its_metadata_and_keeps_its_bytes_otherwise() {
+    // The PNG with a text chunk after its header.
+    let text = b"\0\0\0\x0etEXtComment\0NUSCHL\xa0\xc5\xfc\xab";
+    let tagged = [&PNG[..33], text, &PNG[33..]].concat();
+    let stripped = nuschl_ipc::host::strip_image(worker(), &tagged)
+        .await
+        .unwrap();
+    assert_eq!(stripped, PNG);
+    assert!(matches!(
+        nuschl_ipc::host::strip_image(worker(), b"II*\0\x08\0\0\0").await,
+        Err(nuschl_ipc::host::Error::Rejected(_))
+    ));
+}
+
 /// The music bot's covers, through the thumbnail supervisor.
 #[tokio::test]
 async fn a_cover_becomes_a_png_thumbnail_and_unreadable_art_is_refused() {
