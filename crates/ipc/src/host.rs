@@ -351,17 +351,40 @@ pub async fn decode_view(executable: &Path, uri: &str) -> Result<MessageDocument
     rendered(one(executable, ContentRequest::View { uri }).await?)
 }
 
-/// Re-encode a pasted image as a Mumble `<img>` element of at most `limit`
-/// bytes, with a thumbnail for the composer.
+/// Re-encode a pasted image at `quality` as a Mumble `<img>` element of at
+/// most `limit` bytes, with a thumbnail for the composer.
 pub async fn encode_image(
     executable: &Path,
     image: &[u8],
     limit: u32,
+    quality: nuschl_core::ImageQuality,
 ) -> Result<EncodedImage, Error> {
     use base64::Engine as _;
     let image = base64::engine::general_purpose::STANDARD.encode(image);
-    match one(executable, ContentRequest::EncodeImage { image, limit }).await? {
+    let request = ContentRequest::EncodeImage {
+        image,
+        limit,
+        quality,
+    };
+    match one(executable, request).await? {
         ContentResponse::Encoded(encoded) => Ok(encoded),
+        _ => Err(Error::InvalidResponse),
+    }
+}
+
+/// An original image without its metadata, from the sandboxed content worker:
+/// no larger than `image`.
+pub async fn strip_image(executable: &Path, image: &[u8]) -> Result<Vec<u8>, Error> {
+    use base64::Engine as _;
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let request = ContentRequest::StripImage {
+        image: base64.encode(image),
+    };
+    match one(executable, request).await? {
+        // Its length is checked before it is decoded.
+        ContentResponse::Stripped(stripped) if stripped.len() <= image.len().div_ceil(3) * 4 => {
+            base64.decode(stripped).map_err(|_| Error::InvalidResponse)
+        }
         _ => Err(Error::InvalidResponse),
     }
 }

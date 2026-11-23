@@ -3,7 +3,7 @@
 #![cfg(target_os = "linux")]
 use std::{path::Path, time::Instant};
 
-use nuschl_core::ContentBlock;
+use nuschl_core::{ContentBlock, ImageQuality};
 
 fn worker() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_nuschl-content-worker"))
@@ -98,7 +98,7 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x02\x08\x02\0
 
 #[tokio::test]
 async fn a_pasted_image_becomes_a_stock_mumble_image_message() {
-    let encoded = nuschl_ipc::host::encode_image(worker(), PNG, 131_072)
+    let encoded = nuschl_ipc::host::encode_image(worker(), PNG, 131_072, ImageQuality::Low)
         .await
         .unwrap();
     let html = encoded.html;
@@ -123,7 +123,28 @@ async fn a_pasted_image_becomes_a_stock_mumble_image_message() {
         }]
     ));
     assert!(matches!(
-        nuschl_ipc::host::encode_image(worker(), b"GIF89a, but not really", 131_072).await,
+        nuschl_ipc::host::encode_image(
+            worker(),
+            b"GIF89a, but not really",
+            131_072,
+            ImageQuality::High
+        )
+        .await,
+        Err(nuschl_ipc::host::Error::Rejected(_))
+    ));
+}
+
+#[tokio::test]
+async fn an_original_loses_its_metadata_and_keeps_its_bytes_otherwise() {
+    // The PNG with a text chunk after its header.
+    let text = b"\0\0\0\x0etEXtComment\0NUSCHL\xa0\xc5\xfc\xab";
+    let tagged = [&PNG[..33], text, &PNG[33..]].concat();
+    let stripped = nuschl_ipc::host::strip_image(worker(), &tagged)
+        .await
+        .unwrap();
+    assert_eq!(stripped, PNG);
+    assert!(matches!(
+        nuschl_ipc::host::strip_image(worker(), b"II*\0\x08\0\0\0").await,
         Err(nuschl_ipc::host::Error::Rejected(_))
     ));
 }

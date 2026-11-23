@@ -187,9 +187,11 @@ impl App {
                 let worker = nuschl_client::native::content_worker()
                     .ok_or("The content worker is missing; the image was not attached.")?;
                 let clipboard = crate::clipboard_backend::read().await?;
-                let image = nuschl_ipc::host::encode_image(worker, &clipboard.bytes, budget as u32)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let high = nuschl_core::ImageQuality::High;
+                let image =
+                    nuschl_ipc::host::encode_image(worker, &clipboard.bytes, budget as u32, high)
+                        .await
+                        .map_err(|error| error.to_string())?;
                 Ok((image, clipboard.provider))
             }
             .await;

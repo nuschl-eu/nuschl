@@ -78,7 +78,8 @@ impl ContentProcessor {
             return Err("Invalid image message limit.".into());
         }
         let (html, mut thumbnail) =
-            nuschl_content::encode_image_message(bytes, limit).map_err(error)?;
+            nuschl_content::encode_image_message(bytes, limit, nuschl_core::ImageQuality::High)
+                .map_err(error)?;
         let mut pixels = 0;
         constrain_image(&mut thumbnail, &mut pixels)?;
         json(&EncodedImage { html, thumbnail })

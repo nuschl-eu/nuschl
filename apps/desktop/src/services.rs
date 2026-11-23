@@ -29,10 +29,10 @@ pub enum ServiceEvent {
         request: u64,
         document: Option<MessageDocument>,
     },
-    /// An attached image re-encoded for sending, or why it cannot be sent.
+    /// An attached image prepared for sending, or why it cannot be sent.
     Prepared {
         id: u64,
-        result: Result<nuschl_ipc::EncodedImage, String>,
+        result: Result<crate::attachments::Ready, String>,
     },
     /// Our call's lease `id` is over (`call`).
     CallLeaseEnded {
@@ -248,10 +248,20 @@ impl Services {
                 .await;
         });
     }
-    /// Re-encode an attached image as stock Mumble sends one: in the
-    /// sandboxed content worker, into an `<img>` of at most `limit` bytes.
+    /// Prepare attached image `id` as `plan` says, in the sandboxed content
+    /// worker: re-encoded as stock Mumble sends one, into an `<img>` of at
+    /// most `limit` bytes; or a copy (without its metadata, or a pasted one
+    /// as it is) written to `staged` for the transfer worker to offer.
     /// Two at a time; a file is read only when its turn comes.
-    pub fn prepare_image(&self, id: u64, source: crate::attachments::Source, limit: usize) {
+    pub fn prepare_image(
+        &self,
+        id: u64,
+        source: crate::attachments::Source,
+        plan: crate::attachments::Plan,
+        limit: usize,
+        staged: std::path::PathBuf,
+    ) {
+        use crate::attachments::{Plan, Ready, Source};
         let events = self.sender.clone();
         let permits = self.image_permits.clone();
         self.handle.spawn(async move {
@@ -260,20 +270,43 @@ impl Services {
                 let worker =
                     content_worker().ok_or("images need the content worker, which is missing")?;
                 let image = match source {
-                    crate::attachments::Source::Bytes(bytes) => bytes,
-                    crate::attachments::Source::File(path) => {
+                    Source::Bytes(bytes) => bytes,
+                    Source::File { path, .. } => std::sync::Arc::new(
                         tokio::task::spawn_blocking(move || crate::attachments::read(&path))
                             .await
-                            .map_err(|error| error.to_string())??
-                    }
+                            .map_err(|error| error.to_string())??,
+                    ),
                 };
-                if image.len() as u64 > crate::attachments::MAX_IMAGE_BYTES {
+                if plan != Plan::AsIs && image.len() as u64 > crate::attachments::MAX_IMAGE_BYTES {
                     return Err("it is larger than 8 MB".to_owned());
                 }
-                match nuschl_ipc::host::encode_image(worker, &image, limit as u32).await {
-                    Ok(encoded) => Ok(encoded),
-                    Err(nuschl_ipc::host::Error::Rejected(reason)) => Err(reason),
-                    Err(error) => Err(error.to_string()),
+                let rejected = |error| match error {
+                    nuschl_ipc::host::Error::Rejected(reason) => reason,
+                    error => error.to_string(),
+                };
+                let staged_copy = |bytes: Vec<u8>| async move {
+                    let size = bytes.len() as u64;
+                    tokio::task::spawn_blocking(move || {
+                        crate::attachments::stage(&staged, &bytes)
+                            .map(|()| Ready::Staged(staged, size))
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                };
+                match plan {
+                    Plan::Encode(quality) => {
+                        nuschl_ipc::host::encode_image(worker, &image, limit as u32, quality)
+                            .await
+                            .map(Ready::Encoded)
+                            .map_err(rejected)
+                    }
+                    Plan::Strip => {
+                        let stripped = nuschl_ipc::host::strip_image(worker, &image)
+                            .await
+                            .map_err(rejected)?;
+                        staged_copy(stripped).await
+                    }
+                    Plan::AsIs => staged_copy(image.to_vec()).await,
                 }
             }
             .await;

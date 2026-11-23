@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 use crate::document::Document;
 use crate::{
-    attachments::{Attachment, Kind, Source},
+    attachments::{Attachment, Kind, Prepared, Source},
     scrolling::{self, Anchor, Nested, Scroller, SmoothScroll},
     services::{ServiceEvent, Services},
 };
@@ -181,6 +181,8 @@ struct Outgoing {
     attachments: Vec<Attachment>,
     /// The server's image and text limits.
     limits: (usize, usize),
+    /// Its images' choice, as it was when the message was sent.
+    choice: crate::attachments::Choice,
 }
 
 pub struct Desktop {
@@ -337,6 +339,9 @@ pub struct Desktop {
     /// What each conversation's composer has attached, and a line about it.
     attachments: BTreeMap<(String, u32), Vec<Attachment>>,
     pub attach_note: Option<((String, u32), String)>,
+    /// The image choice of each conversation's message being composed,
+    /// from its first image until it is sent or cleared.
+    choices: BTreeMap<(String, u32), crate::attachments::Choice>,
     attachment_ids: u64,
     /// Files being dragged over the conversation (see view::file_drop).
     pub dragged_files: std::rc::Rc<std::cell::RefCell<Option<Vec<std::path::PathBuf>>>>,
@@ -618,6 +623,7 @@ impl Desktop {
             drafts: BTreeMap::new(),
             attachments: BTreeMap::new(),
             attach_note: None,
+            choices: BTreeMap::new(),
             attachment_ids: 0,
             dragged_files: Default::default(),
             outgoing: std::collections::VecDeque::new(),
@@ -1808,6 +1814,9 @@ impl Desktop {
         if let Err(nuschl_client::SendError::TooLong) = self.client.send_text(body) {
             self.error = Some("Message exceeds 256 KiB.".into());
         }
+        if let Some(key) = self.selected_key() {
+            self.choices.remove(&key);
+        }
         self.expire_typing(cx);
         cx.notify();
     }
@@ -1855,7 +1864,8 @@ impl Desktop {
         self.attach_note = None;
         let name =
             crate::attachments::pasted_name(self.attachments.get(&key).map_or(&[], Vec::as_slice));
-        if let Err(note) = self.attach_image(&key, name, Source::Bytes(image), None) {
+        let source = Ok(Source::Bytes(std::sync::Arc::new(image)));
+        if let Some(note) = self.attach_image(&key, name, source) {
             self.attach_note = Some((key, note));
         }
         cx.notify();
@@ -1915,13 +1925,21 @@ impl Desktop {
                         |name| name.to_string_lossy().into_owned(),
                     );
                     match checked {
-                        // An image this server or the tray cannot take goes as a file.
                         Ok(Kind::Image { size }) => {
-                            let source = Source::File(path.clone());
-                            let file = Some((path, size));
-                            if let Err(note) = this.attach_image(&key, name.clone(), source, file) {
-                                notes.push(note);
-                            }
+                            let source = Source::File {
+                                path,
+                                size,
+                                unsupported: None,
+                            };
+                            notes.extend(this.attach_image(&key, name, Ok(source)));
+                        }
+                        Ok(Kind::Unsupported { size, format }) => {
+                            let source = Source::File {
+                                path,
+                                size,
+                                unsupported: Some(format),
+                            };
+                            notes.extend(this.attach_image(&key, name, Ok(source)));
                         }
                         Ok(Kind::File { size }) => this.attach_file(&key, name, path, size),
                         Err(refusal) => refused.push((name, refusal)),
@@ -1937,7 +1955,7 @@ impl Desktop {
         })
         .detach();
     }
-    fn selected_key(&self) -> Option<(String, u32)> {
+    pub fn selected_key(&self) -> Option<(String, u32)> {
         let selected = self.client.navigation.selection()?;
         Some((selected.server.clone(), selected.channel))
     }
@@ -1945,59 +1963,97 @@ impl Desktop {
         self.attachment_ids += 1;
         self.attachment_ids
     }
-    /// Add an image to a conversation's tray and have the worker prepare it
-    /// for that server's image limit, keeping room for the text. One from a
-    /// file goes as a file where it cannot go as an image.
+    /// Add an image to a conversation's tray and prepare it as the message's
+    /// choice has it (see `prepare`). Returns a note when it cannot go as an
+    /// image; a `source` that is an error cannot.
     fn attach_image(
         &mut self,
         key: &(String, u32),
         name: String,
-        source: Source,
-        file: Option<(std::path::PathBuf, u64)>,
-    ) -> Result<(), String> {
-        let server = self.client.servers.iter().find(|server| server.id == key.0);
-        let limits = server
-            .and_then(|server| server.limits.clone())
-            .unwrap_or_default();
-        let allow_html = limits.allow_html;
-        let limit = limits.inline_image_byte_budget();
+        source: Result<Source, String>,
+    ) -> Option<String> {
         let images = self.attachments.get(key).map_or(0, |tray| {
             tray.iter()
                 .filter(|attachment| matches!(attachment, Attachment::Image { .. }))
                 .count()
         });
-        let refusal = if !allow_html {
-            "This server does not accept images.".to_owned()
-        } else if images >= crate::attachments::MAX_IMAGES {
-            format!(
-                "A message can carry up to {} images; send these first.",
-                crate::attachments::MAX_IMAGES
-            )
-        } else {
-            let id = self.next_attachment();
-            self.attachments
-                .entry(key.clone())
-                .or_default()
-                .push(Attachment::Image {
-                    id,
-                    name,
-                    file,
-                    prepared: None,
-                });
-            let limit = limit.min(MAX_CONTENT_BYTES);
-            let budget = limit
-                .saturating_sub(crate::attachments::CAPTION_ROOM)
-                .max(limit / 2);
-            self.services.prepare_image(id, source, budget);
-            return Ok(());
-        };
-        match file {
-            Some((path, size)) => {
-                self.attach_file(key, name, path, size);
-                Ok(())
+        let source = source.and_then(|source| {
+            if images >= crate::attachments::MAX_IMAGES {
+                Err(format!(
+                    "a message can carry up to {} images; send these first",
+                    crate::attachments::MAX_IMAGES
+                ))
+            } else {
+                Ok(source)
             }
-            None => Err(refusal),
-        }
+        });
+        let source = match source {
+            Ok(source) => source,
+            Err(reason) => return Some(format!("Could not attach {name}: {reason}.")),
+        };
+        // The message's choice from its first image on.
+        self.choices.insert(key.clone(), self.choice(key));
+        let id = self.next_attachment();
+        self.attachments
+            .entry(key.clone())
+            .or_default()
+            .push(Attachment::Image {
+                id,
+                name,
+                source,
+                prepared: None,
+            });
+        self.prepare(key, id)
+    }
+    /// Prepare image `id` in `key`'s tray as the message's choice has it:
+    /// re-encoded for the server's image limit, keeping room for the text, or
+    /// as a file to offer. Returns a note when it cannot go as chosen (see
+    /// `attachments::settle`).
+    fn prepare(&mut self, key: &(String, u32), id: u64) -> Option<String> {
+        let choice = self.choice(key);
+        let limits = self
+            .client
+            .servers
+            .iter()
+            .find(|server| server.id == key.0)
+            .and_then(|server| server.limits.clone())
+            .unwrap_or_default();
+        let tray = self.attachments.get_mut(key)?;
+        let source = tray.iter().find_map(|attachment| match attachment {
+            Attachment::Image {
+                id: image, source, ..
+            } if *image == id => Some(source.clone()),
+            _ => None,
+        })?;
+        let planned = crate::attachments::plan(
+            &source,
+            choice,
+            crate::transfer::available(),
+            limits.allow_html,
+        );
+        let ready = match planned {
+            Ok(crate::attachments::Plan::AsIs) if matches!(source, Source::File { .. }) => {
+                Ok(crate::attachments::Ready::Original)
+            }
+            Ok(plan) => {
+                let limit = limits.inline_image_byte_budget().min(MAX_CONTENT_BYTES);
+                let budget = limit
+                    .saturating_sub(crate::attachments::CAPTION_ROOM)
+                    .max(limit / 2);
+                let staged = self
+                    .profile
+                    .layout()
+                    .offers()
+                    .join(format!("{}-{id}", std::process::id()));
+                self.services
+                    .prepare_image(id, source, plan, budget, staged);
+                return None;
+            }
+            Err(reason) => Err(reason),
+        };
+        let note = crate::attachments::settle(tray, id, ready, choice.strip_metadata);
+        self.attachments.retain(|_, tray| !tray.is_empty());
+        note
     }
     fn attach_file(
         &mut self,
@@ -2017,6 +2073,51 @@ impl Desktop {
                 size,
             });
     }
+    /// The image choice of the message being composed in `key`: its own
+    /// once it has an image, or else Strip metadata ticked and the quality
+    /// from Settings.
+    pub fn choice(&self, key: &(String, u32)) -> crate::attachments::Choice {
+        self.choices
+            .get(key)
+            .copied()
+            .unwrap_or(crate::attachments::Choice {
+                strip_metadata: true,
+                quality: self.settings.image_quality,
+            })
+    }
+    /// Change the open conversation's image choice, and prepare its images
+    /// again for it.
+    pub fn choose_images(&mut self, change: impl FnOnce(&mut crate::attachments::Choice)) {
+        let Some(key) = self.selected_key() else {
+            return;
+        };
+        let mut choice = self.choice(&key);
+        change(&mut choice);
+        self.choices.insert(key.clone(), choice);
+        let images: Vec<u64> = self.attachments.get_mut(&key).map_or(Vec::new(), |tray| {
+            tray.iter()
+                .filter(|attachment| matches!(attachment, Attachment::Image { .. }))
+                .map(Attachment::id)
+                .collect()
+        });
+        let mut notes = Vec::new();
+        for old in images {
+            // A new id: a result for the old choice finds nothing to settle.
+            let new = self.next_attachment();
+            if let Some(Attachment::Image { id, prepared, .. }) = self
+                .attachments
+                .get_mut(&key)
+                .and_then(|tray| tray.iter_mut().find(|attachment| attachment.id() == old))
+            {
+                *id = new;
+                *prepared = None;
+            }
+            notes.extend(self.prepare(&key, new));
+        }
+        if !notes.is_empty() {
+            self.attach_note = Some((key, notes.join(" ")));
+        }
+    }
     pub fn remove_attachment(&mut self, id: u64) {
         for tray in self.attachments.values_mut() {
             tray.retain(|attachment| attachment.id() != id);
@@ -2030,77 +2131,35 @@ impl Desktop {
             return false;
         };
         self.attach_note = None;
+        self.choices.remove(&key);
         self.attachments.remove(&key).is_some()
     }
     /// The content worker prepared an attached image, or could not.
     fn prepared(
         &mut self,
         id: u64,
-        result: Result<nuschl_ipc::EncodedImage, String>,
+        result: Result<crate::attachments::Ready, String>,
         cx: &mut Context<Self>,
     ) {
         // In a composer's tray, or in a sent message waiting for it.
-        let trays = self.attachments.iter_mut();
-        let batches = self
-            .outgoing
-            .iter_mut()
-            .map(|batch| (&batch.key, &mut batch.attachments));
-        let Some((key, attachment)) = trays.chain(batches).find_map(|(key, tray)| {
-            let attachment = tray.iter_mut().find(|attachment| attachment.id() == id)?;
-            Some((key.clone(), attachment))
-        }) else {
-            return;
-        };
-        let Attachment::Image {
-            name,
-            file,
-            prepared,
-            ..
-        } = attachment
-        else {
-            return;
-        };
-        let thumbnail = result.and_then(|encoded| match encoded.thumbnail {
-            nuschl_core::ContentBlock::Image {
-                width,
-                height,
-                rgba,
-                ..
-            } => crate::document::render_image(width, height, &rgba)
-                .map(|thumbnail| (encoded.html, thumbnail))
-                .ok_or_else(|| "the thumbnail is invalid".to_owned()),
-            _ => Err("the thumbnail is missing".to_owned()),
+        let choices = &self.choices;
+        let trays = self.attachments.iter_mut().map(|(key, tray)| {
+            let strip = choices.get(key).is_none_or(|choice| choice.strip_metadata);
+            (key, tray, strip)
         });
-        let note = match (thumbnail, file.take()) {
-            (Ok(thumbnail), _) => {
-                *prepared = Some(thumbnail);
-                None
-            }
-            // A file the worker cannot encode is offered as a file instead.
-            (Err(reason), Some((path, size))) => {
-                let note = format!("{name} goes as a file: {reason}.");
-                *attachment = Attachment::File {
-                    id,
-                    name: std::mem::take(name),
-                    path,
-                    size,
-                };
-                Some(note)
-            }
-            (Err(reason), None) => {
-                let note = format!("Could not attach {name}: {reason}.");
-                let id = attachment.id();
-                for tray in self.attachments.values_mut() {
-                    tray.retain(|attachment| attachment.id() != id);
-                }
-                for batch in &mut self.outgoing {
-                    batch.attachments.retain(|attachment| attachment.id() != id);
-                }
-                Some(note)
-            }
-        };
-        if let Some(note) = note {
-            self.attach_note = Some((key, note));
+        let batches = self.outgoing.iter_mut().map(|batch| {
+            let strip = batch.choice.strip_metadata;
+            (&batch.key, &mut batch.attachments, strip)
+        });
+        let note = trays
+            .chain(batches)
+            .find(|(_, tray, _)| tray.iter().any(|attachment| attachment.id() == id))
+            .and_then(|(key, tray, strip_metadata)| {
+                let note = crate::attachments::settle(tray, id, result, strip_metadata)?;
+                Some((key.clone(), note))
+            });
+        if note.is_some() {
+            self.attach_note = note;
         }
         self.attachments.retain(|_, tray| !tray.is_empty());
         self.flush_outgoing(cx);
@@ -2124,9 +2183,12 @@ impl Desktop {
             return;
         }
         let limits = server.limits.clone().unwrap_or_default();
+        // Images that go inline, not as files.
         let images = self.attachments.get(&key).is_some_and(|tray| {
-            tray.iter()
-                .any(|attachment| matches!(attachment, Attachment::Image { .. }))
+            tray.iter().any(|attachment| {
+                matches!(attachment, Attachment::Image { prepared, .. }
+                    if !matches!(prepared, Some(Prepared::File(..))))
+            })
         });
         let wire = nuschl_session::connection::legacy_body(&text, limits.allow_html);
         let note = if server.status != Status::Connected {
@@ -2174,6 +2236,10 @@ impl Desktop {
                     limits.message_length
                 },
             ),
+            choice: self
+                .choices
+                .remove(&key)
+                .unwrap_or_else(|| self.choice(&key)),
         });
         self.attach_note = None;
         self.drafts.remove(&key);
@@ -2262,11 +2328,17 @@ impl Desktop {
             for attachment in batch.attachments {
                 match attachment {
                     Attachment::Image {
-                        prepared: Some((html, _)),
+                        prepared: Some(Prepared::Inline(html, _)),
                         ..
                     } => images.push(html),
-                    Attachment::Image { .. } => {}
-                    Attachment::File { path, .. } => files.push(path),
+                    Attachment::Image {
+                        prepared: Some(Prepared::File(offered, _)),
+                        ..
+                    } => files.push(offered),
+                    Attachment::Image { prepared: None, .. } => {}
+                    Attachment::File { name, path, .. } => {
+                        files.push(crate::attachments::Offered::file(name, path))
+                    }
                 }
             }
             let text = (!batch.text.trim().is_empty()).then_some(batch.text);
@@ -2294,7 +2366,7 @@ impl Desktop {
                 continue;
             }
             if !files.is_empty() {
-                self.offer_files(files, cx);
+                self.offer_files(&batch.key, files, cx);
             }
         }
     }

@@ -106,6 +106,23 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
   sends it. Other files go through the paperclip or a drop: Nuschl offers them
   peer to peer, with a magic-wormhole code in the message that stock Mumble users
   can use with any wormhole client, and shows offers as file cards.
+- Attached images go at the message's quality, chosen beside them:
+  - **Low** and **High** re-encode the image upright, without the original's
+    metadata (GPS coordinates, capture time, device model) or file name: Low
+    at most 800×500 pixels, High at most 1600×1000. Each is reduced further,
+    down to what fits the server's image limit, and is never refused for its
+    size.
+  - **Original** offers the file itself, as other files go. With **Strip
+    metadata** ticked, the file loses its metadata and keeps its format,
+    pixels, orientation and colour profile (JPEG, PNG, WebP, GIF, BMP up to
+    8 MB); without the file transfer, it goes as High.
+
+  With Strip metadata ticked, an image that cannot go so, such as one over
+  8 MB or a HEIC, AVIF, TIFF, JPEG XL or SVG file, stays unsent with a note.
+  Unticked, it goes as its original file. The tray shows the size each
+  attachment sends. Each new message starts with the box ticked and the
+  quality from **Settings → Images** (High unless changed); a message keeps
+  its choice until it is sent or cleared.
 
 - Links in welcome cards, channel descriptions and user comments support clicking,
   Tab/Shift+Tab and Enter, and screen-reader activation. They use the same URL

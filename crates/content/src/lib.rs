@@ -6,10 +6,16 @@ use std::cell::OnceCell;
 #[cfg(feature = "images")]
 use base64::Engine as _;
 #[cfg(feature = "images")]
-use image::{DynamicImage, ExtendedColorType, ImageEncoder as _, ImageFormat, ImageReader, Limits};
-#[cfg(feature = "images")]
-use nuschl_core::preview::{ImageMime, img_element};
+use image::{
+    DynamicImage, ExtendedColorType, ImageDecoder as _, ImageEncoder as _, ImageFormat,
+    ImageReader, Limits, metadata::Orientation,
+};
 use nuschl_core::{CodeRun, ContentBlock, MAX_CONTENT_BYTES, MessageDocument};
+#[cfg(feature = "images")]
+use nuschl_core::{
+    ImageQuality,
+    preview::{ImageMime, img_element},
+};
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, Theme, ThemeSet},
@@ -22,7 +28,11 @@ pub mod markdown;
 mod markup;
 pub mod math;
 pub mod preview;
+#[cfg(feature = "images")]
+mod strip;
 pub use markup::{MAX_LINKS, MAX_URL_BYTES, bare_urls};
+#[cfg(feature = "images")]
+pub use strip::strip_metadata;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -136,6 +146,17 @@ fn decode(
     max_dimension: u32,
     max_alloc: u64,
 ) -> Option<DynamicImage> {
+    decode_oriented(bytes, formats, max_dimension, max_alloc).map(|(image, _)| image)
+}
+
+/// [`decode`], and the EXIF orientation, which is not applied.
+#[cfg(feature = "images")]
+fn decode_oriented(
+    bytes: &[u8],
+    formats: &[ImageFormat],
+    max_dimension: u32,
+    max_alloc: u64,
+) -> Option<(DynamicImage, Orientation)> {
     let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -149,13 +170,18 @@ fn decode(
     limits.max_image_width = Some(max_dimension);
     limits.max_image_height = Some(max_dimension);
     limits.max_alloc = Some(max_alloc);
-    reader.limits(limits);
+    reader.limits(limits.clone());
+    // As `ImageReader::decode`: the pixels count against the allocation limit.
+    let mut decoder = reader.into_decoder().ok()?;
+    limits.reserve(decoder.total_bytes()).ok()?;
+    decoder.set_limits(limits).ok()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     // A GIF's screen may be 0 pixels high, and the decoder accepts it: an
     // image without pixels is no image.
-    reader
-        .decode()
+    DynamicImage::from_decoder(decoder)
         .ok()
         .filter(|image| image.width() > 0 && image.height() > 0)
+        .map(|image| (image, orientation))
 }
 
 /// Shrink only: `thumbnail` would also enlarge a small image.
@@ -175,13 +201,24 @@ const MAX_PASTE_DIMENSION: u32 = 8192;
 pub const ATTACHMENT_THUMBNAIL: u32 = 128;
 
 /// Re-encode a pasted image as a Mumble image message (an `<img>` element of
-/// at most `limit` bytes), as stock Mumble does (`Log::imageToImg`): at most
-/// 1600×1000 pixels, as JPEG at the highest quality that fits, or as PNG when
-/// that is smaller. When even low quality does not fit, the image shrinks.
+/// at most `limit` bytes), as stock Mumble does (`Log::imageToImg`): upright
+/// as its EXIF orientation says, within the `quality`'s size, as JPEG at the
+/// highest of its qualities that fits, or as PNG when that is smaller. When
+/// even its lowest quality does not fit, the image shrinks until it does.
 /// Also returns a thumbnail of at most [`ATTACHMENT_THUMBNAIL`] pixels.
 #[cfg(feature = "images")]
-pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, ContentBlock), Error> {
+pub fn encode_image_message(
+    bytes: &[u8],
+    limit: usize,
+    quality: ImageQuality,
+) -> Result<(String, ContentBlock), Error> {
     let limit = limit.min(MAX_CONTENT_BYTES);
+    // The largest size, and the JPEG qualities tried in turn. Original is
+    // re-encoded only where it cannot go as its file: as High.
+    let ((view_width, view_height), qualities) = match quality {
+        ImageQuality::Low => ((800, 500), [70, 55, 40]),
+        ImageQuality::High | ImageQuality::Original => ((VIEW_WIDTH, VIEW_HEIGHT), [85, 70, 55]),
+    };
     let formats = [
         ImageFormat::Png,
         ImageFormat::Jpeg,
@@ -191,18 +228,25 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
         // Sent re-encoded as JPEG or PNG, which every Mumble client shows.
         ImageFormat::WebP,
     ];
-    let mut image = decode(bytes, &formats, MAX_PASTE_DIMENSION, 256 * 1024 * 1024)
-        .ok_or(Error::InvalidImage)?;
-    if image.width() > VIEW_WIDTH || image.height() > VIEW_HEIGHT {
-        image = image.resize(
-            VIEW_WIDTH,
-            VIEW_HEIGHT,
-            image::imageops::FilterType::Triangle,
-        );
+    let (image, orientation) =
+        decode_oriented(bytes, &formats, MAX_PASTE_DIMENSION, 256 * 1024 * 1024)
+            .ok_or(Error::InvalidImage)?;
+    let mut image = visible(image);
+    // Shrunk before it is turned upright, into the box turned with it.
+    let (width, height) = match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (view_height, view_width),
+        _ => (view_width, view_height),
+    };
+    if image.width() > width || image.height() > height {
+        image = fit(image, width, height);
     }
+    image.apply_orientation(orientation);
     let thumbnail =
         if image.width() > ATTACHMENT_THUMBNAIL || image.height() > ATTACHMENT_THUMBNAIL {
-            image.thumbnail(ATTACHMENT_THUMBNAIL, ATTACHMENT_THUMBNAIL)
+            fit(image.clone(), ATTACHMENT_THUMBNAIL, ATTACHMENT_THUMBNAIL)
         } else {
             image.clone()
         }
@@ -218,7 +262,7 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
         // JPEG has no transparency: blend it onto white.
         let opaque = flatten(&image);
         let mut smallest = png.len();
-        for quality in [85, 70, 55] {
+        for quality in qualities {
             let jpeg = encode_jpeg(&opaque, quality)?;
             let (mime, bytes) = if png.len() <= jpeg.len() {
                 (ImageMime::Png, &png)
@@ -238,10 +282,64 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
             (image.width() as f64 * scale) as u32,
             (image.height() as f64 * scale) as u32,
         );
-        if width < 16 || height < 16 {
+        if width == 0 || height == 0 {
             return Err(Error::ImageTooLarge(limit));
         }
-        image = image.resize(width, height, image::imageops::FilterType::Triangle);
+        image = fit(image, width, height);
+    }
+}
+
+/// `image` with only the colour that can be seen: a transparent image goes
+/// through premultiplied 8-bit alpha and back, so a fully transparent pixel
+/// carries no colour and a nearly transparent one only what it shows.
+#[cfg(feature = "images")]
+fn visible(image: DynamicImage) -> DynamicImage {
+    if !image.color().has_alpha() {
+        return image;
+    }
+    let mut pixels = image.into_rgba8();
+    premultiply(&mut pixels);
+    unpremultiply(&mut pixels);
+    pixels.into()
+}
+
+/// Resize to fit `width` × `height`, keeping the aspect ratio, filtering a
+/// transparent image premultiplied, so transparent pixels lend visible ones
+/// none of their colour.
+#[cfg(feature = "images")]
+fn fit(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
+    let filter = image::imageops::FilterType::Triangle;
+    let DynamicImage::ImageRgba8(mut pixels) = image else {
+        return image.resize(width, height, filter);
+    };
+    premultiply(&mut pixels);
+    let mut resized = DynamicImage::ImageRgba8(pixels)
+        .resize(width, height, filter)
+        .into_rgba8();
+    unpremultiply(&mut resized);
+    resized.into()
+}
+
+#[cfg(feature = "images")]
+fn premultiply(pixels: &mut image::RgbaImage) {
+    for pixel in pixels.pixels_mut() {
+        let alpha = u16::from(pixel[3]);
+        for channel in &mut pixel.0[..3] {
+            *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+        }
+    }
+}
+
+#[cfg(feature = "images")]
+fn unpremultiply(pixels: &mut image::RgbaImage) {
+    for pixel in pixels.pixels_mut() {
+        let alpha = u16::from(pixel[3]);
+        for channel in &mut pixel.0[..3] {
+            *channel = match alpha {
+                0 => 0,
+                _ => ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8,
+            };
+        }
     }
 }
 
@@ -471,6 +569,8 @@ mod tests {
     }
 
     use super::*;
+    #[cfg(feature = "images")]
+    use strip::png_chunk;
 
     #[test]
     #[cfg(feature = "images")]
@@ -485,7 +585,7 @@ mod tests {
             panic!("the WebP image did not decode");
         };
         assert_eq!((width, height), (40, 30));
-        let (html, _) = encode_image_message(&webp, 128 * 1024).unwrap();
+        let (html, _) = encode_image_message(&webp, 128 * 1024, ImageQuality::High).unwrap();
         assert!(
             html.contains("data:image/jpeg") || html.contains("data:image/png"),
             "{}",
@@ -557,18 +657,8 @@ mod tests {
     fn artwork_thumbnails_are_bare_rgba_pngs_with_the_source_pixels() {
         // A source PNG with a text chunk after its header.
         let source = png(8, 6);
-        let crc = |bytes: &[u8]| {
-            !bytes.iter().fold(!0u32, |crc, &byte| {
-                (0..8).fold(crc ^ byte as u32, |crc, _| {
-                    (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg())
-                })
-            })
-        };
-        let text = b"tEXtComment\0tracking id 1234";
         let mut tagged = source[..33].to_vec();
-        tagged.extend_from_slice(&((text.len() - 4) as u32).to_be_bytes());
-        tagged.extend_from_slice(text);
-        tagged.extend_from_slice(&crc(text).to_be_bytes());
+        tagged.extend(png_chunk(b"tEXt", b"Comment\0tracking id 1234"));
         tagged.extend_from_slice(&source[33..]);
         assert!(chunk_types(&tagged).contains(&"tEXt".to_owned()));
 
@@ -735,7 +825,8 @@ mod tests {
     fn pasted_images_are_encoded_as_stock_mumble_does_within_the_limit() {
         let limit = 131_072;
         // A large, detailed picture: shrunk to 1600×1000, then by quality or size.
-        let (element, thumbnail) = encode_image_message(&picture(2400, 1350, true), limit).unwrap();
+        let (element, thumbnail) =
+            encode_image_message(&picture(2400, 1350, true), limit, ImageQuality::High).unwrap();
         assert!(element.len() <= limit, "{}", element.len());
         // With a thumbnail for the composer.
         let ContentBlock::Image {
@@ -773,7 +864,8 @@ mod tests {
         );
 
         // Flat screenshots stay lossless: PNG is smaller than JPEG there.
-        let (element, _) = encode_image_message(&picture(800, 500, false), limit).unwrap();
+        let (element, _) =
+            encode_image_message(&picture(800, 500, false), limit, ImageQuality::High).unwrap();
         assert!(
             element.starts_with("<img src=\"data:image/png;base64,"),
             "{}",
@@ -782,7 +874,8 @@ mod tests {
         assert_eq!(received(&element), (800, 500));
 
         // A small limit shrinks the picture until it fits.
-        let (element, _) = encode_image_message(&picture(1600, 1000, true), 20_000).unwrap();
+        let (element, _) =
+            encode_image_message(&picture(1600, 1000, true), 20_000, ImageQuality::High).unwrap();
         assert!(element.len() <= 20_000);
         let (width, _) = received(&element);
         assert!(width < 1600, "{width}");
@@ -790,21 +883,638 @@ mod tests {
 
     #[test]
     #[cfg(feature = "images")]
+    fn low_and_high_fit_any_server_limit() {
+        // Smooth, like a photo: both levels fit stock Murmur's limit as they are.
+        let smooth = image::RgbImage::from_fn(2000, 1125, |x, y| {
+            image::Rgb([(x / 10) as u8, (y / 6) as u8, ((x + y) / 15) as u8])
+        });
+        let smooth = encoded_jpeg(&smooth);
+        let high = encode_image_message(&smooth, 131_072, ImageQuality::High)
+            .unwrap()
+            .0;
+        let low = encode_image_message(&smooth, 131_072, ImageQuality::Low)
+            .unwrap()
+            .0;
+        assert_eq!(received(&high), (1600, 900));
+        assert_eq!(received(&low), (800, 450));
+        assert!(low.len() < high.len(), "{} {}", low.len(), high.len());
+        // Noise, and smaller server limits: smaller, never refused.
+        let noisy = picture(640, 360, true);
+        for quality in [ImageQuality::Low, ImageQuality::High] {
+            for limit in [131_072, 16_384, 2_048, 600] {
+                let element = encode_image_message(&noisy, limit, quality).unwrap().0;
+                assert!(
+                    element.len() <= limit,
+                    "{quality:?} {limit}: {}",
+                    element.len()
+                );
+                received(&element);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn sent_images_carry_none_of_the_original_metadata() {
+        let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
+            image::Rgba([(x * 5) as u8, ((y * 7) ^ (x * 13)) as u8, 90, 255])
+        });
+        let encoded = |format| {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(pixels.clone())
+                .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+                .unwrap();
+            bytes
+        };
+
+        // JPEG: EXIF with GPS, XMP, an ICC profile and a comment, and data
+        // after the end of the image.
+        let segment = |marker: u8, body: &[u8]| {
+            [
+                &[0xff, marker][..],
+                &(body.len() as u16 + 2).to_be_bytes(),
+                body,
+            ]
+            .concat()
+        };
+        let mut rgb = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut rgb, 90)
+            .write_image(
+                image::DynamicImage::ImageRgba8(pixels.clone())
+                    .to_rgb8()
+                    .as_raw(),
+                48,
+                32,
+                ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let jpeg = [
+            &rgb[..2],
+            &segment(
+                0xe1,
+                b"Exif\0\0MM\0*\0\0\0\x08NUSCHL-GPS 48.2082N 16.3738E Pixel 9",
+            ),
+            &segment(
+                0xe1,
+                b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>NUSCHL-XMP</x:xmpmeta>",
+            ),
+            &segment(0xe2, b"ICC_PROFILE\0\x01\x01NUSCHL-ICC"),
+            &segment(0xfe, b"NUSCHL-COMMENT"),
+            &rgb[2..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // PNG: text, XMP, EXIF and time chunks, and data after IEND.
+        let source = encoded(ImageFormat::Png);
+        let png = [
+            &source[..33],
+            &png_chunk(b"tEXt", b"Comment\0NUSCHL-COMMENT"),
+            &png_chunk(b"iTXt", b"XML:com.adobe.xmp\0\0\0\0\0NUSCHL-XMP"),
+            &png_chunk(b"eXIf", b"MM\0*\0\0\0\x08NUSCHL-GPS"),
+            &png_chunk(b"tIME", &[0x07, 0xea, 11, 3, 14, 30, 12]),
+            &source[33..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // WebP: the extended format with EXIF and XMP chunks.
+        let lossless = encoded(ImageFormat::WebP);
+        let riff = |kind: &[u8; 4], data: &[u8]| {
+            let pad = vec![0; data.len() % 2];
+            [
+                kind.as_slice(),
+                &(data.len() as u32).to_le_bytes(),
+                data,
+                &pad,
+            ]
+            .concat()
+        };
+        // Alpha, EXIF and XMP; then the canvas size, less one, in 24 bits each.
+        let header = [
+            &[0x1c, 0, 0, 0][..],
+            &47u32.to_le_bytes()[..3],
+            &31u32.to_le_bytes()[..3],
+        ]
+        .concat();
+        let body = [
+            &b"WEBP"[..],
+            &riff(b"VP8X", &header),
+            &lossless[12..],
+            &riff(b"EXIF", b"MM\0*\0\0\0\x08NUSCHL-GPS"),
+            &riff(b"XMP ", b"<x:xmpmeta>NUSCHL-XMP</x:xmpmeta>"),
+        ]
+        .concat();
+        let webp = [&b"RIFF"[..], &(body.len() as u32).to_le_bytes(), &body].concat();
+
+        // GIF: a comment extension after the global colour table.
+        let source = encoded(ImageFormat::Gif);
+        let table = if source[10] & 0x80 != 0 {
+            3 << ((source[10] & 7) + 1)
+        } else {
+            0
+        };
+        let comment = [&[0x21, 0xfe, 14][..], b"NUSCHL-COMMENT", &[0]].concat();
+        let gif = [&source[..13 + table], &comment, &source[13 + table..]].concat();
+
+        // A photo's EXIF: camera model, capture time and GPS position.
+        let photo = jpeg_with_exif(
+            &DynamicImage::ImageRgba8(pixels.clone()).to_rgb8(),
+            &exif(1),
+        );
+        let inputs = [
+            ("JPEG", jpeg),
+            ("EXIF", photo),
+            ("PNG", png),
+            ("WebP", webp),
+            ("GIF", gif),
+        ];
+        let qualities = [ImageQuality::Low, ImageQuality::High];
+        for ((format, input), quality) in inputs
+            .iter()
+            .flat_map(|input| qualities.map(|quality| (input, quality)))
+        {
+            let format = format!("{format} {quality:?}");
+            assert!(input.windows(6).any(|window| window == b"NUSCHL"));
+            let (element, _) = encode_image_message(input, 131_072, quality)
+                .unwrap_or_else(|error| panic!("{format}: {error}"));
+            let source = element
+                .strip_prefix("<img src=\"")
+                .unwrap()
+                .strip_suffix("\" />")
+                .unwrap();
+            let (sent, _) = nuschl_core::data_uri_image(source).unwrap();
+            assert!(
+                !sent.windows(6).any(|window| window == b"NUSCHL"),
+                "{format}"
+            );
+            assert!(
+                !sent.windows(10).any(|window| window == b"2026:11:03"),
+                "{format}"
+            );
+            if sent.starts_with(b"\x89PNG\r\n\x1a\n") {
+                let chunks = chunk_types(&sent);
+                assert!(
+                    chunks
+                        .iter()
+                        .all(|kind| ["IHDR", "IDAT", "IEND"].contains(&kind.as_str())),
+                    "{format}: {chunks:?}"
+                );
+                assert!(sent.ends_with(&png_chunk(b"IEND", b"")), "{format}");
+            } else {
+                assert!(sent.starts_with(&[0xff, 0xd8]), "{format}");
+                // The segments up to the scan: no APP1–APP15 and no comment.
+                let mut at = 2;
+                while sent[at + 1] != 0xda {
+                    let marker = sent[at + 1];
+                    assert!(
+                        !(0xe1..=0xef).contains(&marker) && marker != 0xfe,
+                        "{format}: {marker:#x}"
+                    );
+                    at += 2 + u16::from_be_bytes([sent[at + 2], sent[at + 3]]) as usize;
+                }
+                assert!(sent.ends_with(&[0xff, 0xd9]), "{format}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn transparent_pixels_carry_no_colour_after_re_encoding() {
+        // Left half: a pattern hidden under alpha 0; right half: opaque blue.
+        // Wider than 1600 pixels, so it is resized on the way.
+        let hidden = |x: u32, y: u32| image::Rgba([200, (x * 7) as u8, (y * 13) as u8, 0]);
+        let pixels = image::RgbaImage::from_fn(2000, 400, |x, y| {
+            if x < 1000 {
+                hidden(x, y)
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(pixels.clone())
+            .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        // Only blue is visible: no red or green anywhere a pixel shows, and
+        // no colour at all where none does.
+        let blue_only = |image: &image::RgbaImage| {
+            image.pixels().all(|pixel| match pixel.0 {
+                [_, _, _, 0] => pixel.0 == [0; 4],
+                [red, green, _, _] => red == 0 && green == 0,
+            })
+        };
+
+        let (element, _) = encode_image_message(&png, 131_072, ImageQuality::High).unwrap();
+        assert!(element.starts_with("<img src=\"data:image/png;base64,"));
+        let source = element
+            .strip_prefix("<img src=\"")
+            .unwrap()
+            .strip_suffix("\" />")
+            .unwrap();
+        let sent = image::load_from_memory(&nuschl_core::data_uri_image(source).unwrap().0)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(sent.dimensions(), (1600, 320));
+        assert!(blue_only(&sent));
+
+        // Unresized, resized and as a thumbnail.
+        let clean = visible(DynamicImage::ImageRgba8(pixels));
+        assert!(blue_only(&clean.to_rgba8()));
+        for (width, height) in [(500, 100), (128, 128)] {
+            let resized = fit(clean.clone(), width, height).to_rgba8();
+            assert!(blue_only(&resized), "{width}×{height}");
+            // The edge shows blue fading out, not the hidden colour.
+            let edge = resized.get_pixel(resized.width() / 2 - 1, 1).0;
+            assert!(edge[3] > 0 && edge[3] < 255 && edge[2] == 255, "{edge:?}");
+        }
+
+        // JPEG blends onto white: the transparent half is white, the rest
+        // white, blue or between them.
+        let jpeg = encode_jpeg(&flatten(&clean), 85).unwrap();
+        let sent = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert!(sent.pixels().all(|pixel| {
+            let [red, green, blue] = pixel.0.map(i16::from);
+            (red - green).abs() <= 12 && blue >= red.max(green) - 12
+        }));
+        assert!(
+            sent.get_pixel(10, 10)
+                .0
+                .iter()
+                .all(|&channel| channel >= 250)
+        );
+    }
+
+    /// EXIF as a phone writes it (TIFF, big-endian): the camera model, the
+    /// capture time, the GPS position and `orientation`.
+    #[cfg(feature = "images")]
+    fn exif(orientation: u16) -> Vec<u8> {
+        let entry = |tag: u16, kind: u16, count: u32, value: u32| {
+            [
+                &tag.to_be_bytes()[..],
+                &kind.to_be_bytes(),
+                &count.to_be_bytes(),
+                &value.to_be_bytes(),
+            ]
+            .concat()
+        };
+        let (ascii, short, long, rational) = (2, 3, 4, 5);
+        let ifd = |entries: &[Vec<u8>]| {
+            [
+                &(entries.len() as u16).to_be_bytes()[..],
+                &entries.concat(),
+                &[0; 4],
+            ]
+            .concat()
+        };
+        let rationals = |values: [(u32, u32); 3]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|(numerator, denominator)| {
+                    [numerator.to_be_bytes(), denominator.to_be_bytes()].concat()
+                })
+                .collect()
+        };
+        let model = b"NUSCHL-MODEL Pixel 9\0";
+        let time = b"2026:11:03 14:30:12\0";
+        // IFD0 at 8, then its strings, the Exif IFD, its string, the GPS IFD
+        // and its coordinates.
+        let model_at = 8 + 2 + 5 * 12 + 4;
+        let time_at = model_at + model.len() as u32;
+        let exif_at = time_at + time.len() as u32;
+        let original_at = exif_at + 2 + 12 + 4;
+        let gps_at = original_at + time.len() as u32;
+        let latitude_at = gps_at + 2 + 4 * 12 + 4;
+        let longitude_at = latitude_at + 24;
+        [
+            &b"MM\0*\0\0\0\x08"[..],
+            &ifd(&[
+                entry(0x0110, ascii, model.len() as u32, model_at),
+                entry(0x0112, short, 1, u32::from(orientation) << 16),
+                entry(0x0132, ascii, time.len() as u32, time_at),
+                entry(0x8769, long, 1, exif_at),
+                entry(0x8825, long, 1, gps_at),
+            ]),
+            model,
+            time,
+            &ifd(&[entry(0x9003, ascii, time.len() as u32, original_at)]),
+            time,
+            &ifd(&[
+                entry(0x0001, ascii, 2, u32::from_be_bytes(*b"N\0\0\0")),
+                entry(0x0002, rational, 3, latitude_at),
+                entry(0x0003, ascii, 2, u32::from_be_bytes(*b"E\0\0\0")),
+                entry(0x0004, rational, 3, longitude_at),
+            ]),
+            &rationals([(48, 1), (12, 1), (2952, 100)]),
+            &rationals([(16, 1), (22, 1), (2568, 100)]),
+        ]
+        .concat()
+    }
+
+    /// A JPEG of `pixels` with `exif` in its APP1 segment.
+    #[cfg(feature = "images")]
+    fn jpeg_with_exif(pixels: &image::RgbImage, exif: &[u8]) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .write_image(
+                pixels.as_raw(),
+                pixels.width(),
+                pixels.height(),
+                ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let app1 = [&b"Exif\0\0"[..], exif].concat();
+        [
+            &jpeg[..2],
+            &[0xff, 0xe1],
+            &(app1.len() as u16 + 2).to_be_bytes(),
+            &app1,
+            &jpeg[2..],
+        ]
+        .concat()
+    }
+
+    /// The pixels a sent `<img>` element carries.
+    #[cfg(feature = "images")]
+    fn sent_pixels(element: &str) -> image::RgbImage {
+        let source = element
+            .strip_prefix("<img src=\"")
+            .and_then(|element| element.strip_suffix("\" />"))
+            .unwrap();
+        let (bytes, _) = nuschl_core::data_uri_image(source).unwrap();
+        image::load_from_memory(&bytes).unwrap().to_rgb8()
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn photos_are_sent_upright() {
+        // A landscape picture, red on the left and blue on the right, that a
+        // phone held upright stored turned: EXIF orientation 6 (turn it 90°
+        // clockwise to show it).
+        let pixels = image::RgbImage::from_fn(64, 32, |x, _| {
+            if x < 32 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        });
+        let (element, _) = encode_image_message(
+            &jpeg_with_exif(&pixels, &exif(6)),
+            131_072,
+            ImageQuality::High,
+        )
+        .unwrap();
+        let sent = sent_pixels(&element);
+        assert_eq!(sent.dimensions(), (32, 64));
+        // Red above, blue below.
+        assert!(sent.get_pixel(16, 8)[0] > 200 && sent.get_pixel(16, 8)[2] < 60);
+        assert!(sent.get_pixel(16, 56)[2] > 200 && sent.get_pixel(16, 56)[0] < 60);
+
+        // Upright already (1), or without EXIF: as stored.
+        for input in [jpeg_with_exif(&pixels, &exif(1)), encoded_jpeg(&pixels)] {
+            let (element, _) = encode_image_message(&input, 131_072, ImageQuality::High).unwrap();
+            assert_eq!(sent_pixels(&element).dimensions(), (64, 32));
+        }
+
+        // A large one shrinks into the upright 1600×1000 box: 2400×1350
+        // stored, 1350×2400 upright, sent at 563×1000.
+        let large = image::RgbImage::from_fn(2400, 1350, |x, y| image::Rgb([x as u8, y as u8, 0]));
+        let (element, _) = encode_image_message(
+            &jpeg_with_exif(&large, &exif(8)),
+            1_000_000,
+            ImageQuality::High,
+        )
+        .unwrap();
+        assert_eq!(sent_pixels(&element).dimensions(), (563, 1000));
+    }
+
+    #[cfg(feature = "images")]
+    fn encoded_jpeg(pixels: &image::RgbImage) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageRgb8(pixels.clone())
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+        jpeg
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn originals_keep_their_pixels_and_lose_their_metadata() {
+        let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
+            image::Rgba([(x * 5) as u8, ((y * 7) ^ (x * 13)) as u8, 90, 255])
+        });
+        let encoded = |format| {
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgba8(pixels.clone())
+                .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+                .unwrap();
+            bytes
+        };
+        let segment = |marker: u8, body: &[u8]| {
+            [
+                &[0xff, marker][..],
+                &(body.len() as u16 + 2).to_be_bytes(),
+                body,
+            ]
+            .concat()
+        };
+        // Turned (EXIF orientation 6), with a camera model, capture time and
+        // GPS position.
+        let turned = exif(6);
+
+        // JPEG: EXIF, XMP, a comment and a second picture's index (MPF),
+        // an ICC profile, and data after the end of the image.
+        let photo = jpeg_with_exif(&DynamicImage::ImageRgba8(pixels.clone()).to_rgb8(), &turned);
+        let jpeg = [
+            &photo[..2],
+            &segment(
+                0xe1,
+                b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>NUSCHL-XMP</x:xmpmeta>",
+            ),
+            &segment(0xe2, b"MPF\0NUSCHL-MPF"),
+            &segment(0xe2, b"ICC_PROFILE\0\x01\x01KEEP-ICC"),
+            &segment(0xfe, b"NUSCHL-COMMENT"),
+            &photo[2..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // PNG: EXIF, text, XMP and time chunks, and data after IEND.
+        let source = encoded(ImageFormat::Png);
+        let png = [
+            &source[..33],
+            &png_chunk(b"eXIf", &turned),
+            &png_chunk(b"tEXt", b"Comment\0NUSCHL-COMMENT"),
+            &png_chunk(b"iTXt", b"XML:com.adobe.xmp\0\0\0\0\0NUSCHL-XMP"),
+            &png_chunk(b"tIME", &[0x07, 0xea, 11, 3, 14, 30, 12]),
+            &source[33..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // WebP: the extended format with an ICC profile, EXIF and XMP, and
+        // data after the RIFF container.
+        let lossless = encoded(ImageFormat::WebP);
+        let riff = |kind: &[u8; 4], data: &[u8]| {
+            let pad = vec![0; data.len() % 2];
+            [
+                kind.as_slice(),
+                &(data.len() as u32).to_le_bytes(),
+                data,
+                &pad,
+            ]
+            .concat()
+        };
+        // ICC, alpha, EXIF and XMP; then the canvas size, less one, in 24 bits each.
+        let header = [
+            &[0x3c, 0, 0, 0][..],
+            &47u32.to_le_bytes()[..3],
+            &31u32.to_le_bytes()[..3],
+        ]
+        .concat();
+        let body = [
+            &b"WEBP"[..],
+            &riff(b"VP8X", &header),
+            &riff(b"ICCP", b"KEEP-ICC"),
+            &lossless[12..],
+            &riff(b"EXIF", &turned),
+            &riff(b"XMP ", b"<x:xmpmeta>NUSCHL-XMP</x:xmpmeta>"),
+        ]
+        .concat();
+        let webp = [
+            &b"RIFF"[..],
+            &(body.len() as u32).to_le_bytes(),
+            &body,
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // GIF: looping, a comment and XMP, and data after the trailer.
+        let source = encoded(ImageFormat::Gif);
+        let table = if source[10] & 0x80 != 0 {
+            3 << ((source[10] & 7) + 1)
+        } else {
+            0
+        };
+        let looping = [&[0x21, 0xff, 11][..], b"NETSCAPE2.0", &[3, 1, 0, 0, 0]].concat();
+        let comment = [&[0x21, 0xfe, 14][..], b"NUSCHL-COMMENT", &[0]].concat();
+        let xmp = [
+            &[0x21, 0xff, 11][..],
+            b"XMP DataXMP",
+            &[10],
+            b"NUSCHL-XMP",
+            &[0],
+        ]
+        .concat();
+        let gif = [
+            &source[..13 + table],
+            &looping,
+            &comment,
+            &xmp,
+            &source[13 + table..],
+            b"NUSCHL-TRAILER",
+        ]
+        .concat();
+
+        // BMP: data after the size its header gives.
+        let bmp = [&encoded(ImageFormat::Bmp)[..], b"NUSCHL-TRAILER"].concat();
+
+        let decoder = |bytes: &[u8]| {
+            ImageReader::new(std::io::Cursor::new(bytes.to_vec()))
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap()
+        };
+        let contains = |bytes: &[u8], text: &[u8]| bytes.windows(text.len()).any(|w| w == text);
+        for (format, input, upright) in [
+            (ImageFormat::Jpeg, &jpeg, false),
+            (ImageFormat::Png, &png, false),
+            (ImageFormat::WebP, &webp, false),
+            (ImageFormat::Gif, &gif, true),
+            (ImageFormat::Bmp, &bmp, true),
+        ] {
+            assert!(contains(input, b"NUSCHL"), "{format:?}");
+            let stripped = strip_metadata(input).unwrap_or_else(|| panic!("{format:?}"));
+            for gone in [&b"NUSCHL"[..], b"2026:11:03"] {
+                assert!(!contains(&stripped, gone), "{format:?}");
+            }
+            // The same format and pixels, as stored.
+            assert_eq!(image::guess_format(&stripped).unwrap(), format);
+            assert_eq!(
+                image::load_from_memory(&stripped).unwrap().to_rgba8(),
+                image::load_from_memory(input).unwrap().to_rgba8(),
+                "{format:?}"
+            );
+            // Turned as before, by EXIF that holds only that.
+            let mut decoder = decoder(&stripped);
+            if upright {
+                assert_eq!(decoder.exif_metadata().unwrap(), None, "{format:?}");
+            } else {
+                assert_eq!(
+                    decoder.orientation().unwrap(),
+                    Orientation::Rotate90,
+                    "{format:?}"
+                );
+                let exif = decoder.exif_metadata().unwrap().unwrap();
+                assert_eq!(
+                    exif,
+                    b"MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0"
+                );
+            }
+        }
+        // The colour profile and the looping stay.
+        assert!(contains(
+            &strip_metadata(&jpeg).unwrap(),
+            b"ICC_PROFILE\0\x01\x01KEEP-ICC"
+        ));
+        assert!(contains(
+            &strip_metadata(&webp).unwrap(),
+            b"ICCP\x08\0\0\0KEEP-ICC"
+        ));
+        assert!(contains(&strip_metadata(&gif).unwrap(), b"NETSCAPE2.0"));
+
+        // Upright already: no EXIF at all.
+        let upright = jpeg_with_exif(
+            &DynamicImage::ImageRgba8(pixels.clone()).to_rgb8(),
+            &exif(1),
+        );
+        let stripped = strip_metadata(&upright).unwrap();
+        assert_eq!(decoder(&stripped).exif_metadata().unwrap(), None);
+        assert!(!contains(&stripped, b"Exif"));
+
+        // Other formats, and broken files, are not stripped; no cut-off
+        // file panics.
+        for input in [&jpeg, &png, &webp, &gif, &bmp] {
+            for end in 0..input.len() {
+                strip_metadata(&input[..end]);
+            }
+        }
+        assert_eq!(strip_metadata(b"II*\0\x08\0\0\0"), None);
+        assert_eq!(strip_metadata(&encoded(ImageFormat::Png)[..60]), None);
+        assert_eq!(strip_metadata(&photo[..photo.len() - 2]), None);
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
     fn pasted_images_that_cannot_fit_or_decode_are_rejected() {
         assert!(matches!(
-            encode_image_message(&picture(64, 64, true), 40),
+            encode_image_message(&picture(64, 64, true), 40, ImageQuality::High),
             Err(Error::ImageTooLarge(40))
         ));
         assert!(matches!(
-            encode_image_message(b"not an image", 131_072),
+            encode_image_message(b"not an image", 131_072, ImageQuality::High),
             Err(Error::InvalidImage)
         ));
         assert!(matches!(
-            encode_image_message(&picture(64, 64, false)[..40], 131_072),
+            encode_image_message(&picture(64, 64, false)[..40], 131_072, ImageQuality::High),
             Err(Error::InvalidImage)
         ));
         assert!(matches!(
-            encode_image_message(b"<svg xmlns='http://www.w3.org/2000/svg'/>", 131_072),
+            encode_image_message(
+                b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+                131_072,
+                ImageQuality::High
+            ),
             Err(Error::InvalidImage)
         ));
     }
@@ -850,7 +1560,7 @@ mod tests {
         );
         assert!(decode_view(&uri).is_none());
         assert!(matches!(
-            encode_image_message(&gif, 131_072),
+            encode_image_message(&gif, 131_072, ImageQuality::High),
             Err(Error::InvalidImage)
         ));
     }

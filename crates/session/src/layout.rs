@@ -60,8 +60,9 @@ const APPLICATION: &str = "nuschl";
 const HISTORY: &str = "history";
 const IDENTITY: &str = "identity";
 const KEYS: &str = "keys";
-/// The folder under the cache folder.
+/// The folders under the cache folder.
 const DOWNLOADS: &str = "downloads";
+const OFFERS: &str = "offers";
 /// The crypto worker's folder in earlier versions, in the configuration folder.
 const OLD_KEYS: &str = "nuschel-identity";
 pub(crate) const HISTORY_FILE: &str = "history.sqlite3";
@@ -175,6 +176,12 @@ impl Layout {
     /// user chose.
     pub fn downloads(&self) -> PathBuf {
         self.cache.join(DOWNLOADS)
+    }
+
+    /// Copies of images being offered (originals without their metadata,
+    /// pasted images), until their offers end.
+    pub fn offers(&self) -> PathBuf {
+        self.cache.join(OFFERS)
     }
 
     /// A worker may write anywhere in its folder, so no other folder may lie
