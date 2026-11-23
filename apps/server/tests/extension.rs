@@ -814,7 +814,8 @@ async fn the_session_negotiates_the_extension_with_nuschld() {
             "kt/1",
             "kt-witness/1",
             "share/1",
-            "privacy/1"
+            "privacy/1",
+            "hidden-channels/1"
         ]
     );
     // The key-transparency log comes with `kt/1`.

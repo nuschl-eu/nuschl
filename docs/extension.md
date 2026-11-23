@@ -460,7 +460,10 @@ the wire definition):
   `Reject` is read).
 - **Capabilities**: `history/1` covers sending, history, edits, deletions, read
   markers, direct conversations and channel settings; `subscribe/1` and `typing/1` are
-  separate. The client's sticky record keeps `nuschl/1` and every negotiated
+  separate. `hidden-channels/1` has no messages: it says that the server sends a
+  client only the channels it may traverse and the people in them (docs/server.md,
+  "What each client sees"), which the desktop's description of the Private channel
+  type follows. The client's sticky record keeps `nuschl/1` and every negotiated
   capability.
 - **Rows** are `message`, `edit`, `delete` or `void`; deletion reasons are 0 author,
   1 moderator, 2 expired, 3 erased by the operator.

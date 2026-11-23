@@ -92,6 +92,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     nuschl::capability::KT_WITNESS,
     nuschl::capability::SHARE,
     nuschl::capability::PRIVACY,
+    nuschl::capability::HIDDEN_CHANNELS,
 ];
 
 /// Budgets against a hostile server. Stock Murmur defaults to 1,000 channels

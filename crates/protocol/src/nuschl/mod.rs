@@ -48,8 +48,22 @@ pub mod capability {
     pub const SHARE: &str = "share/1";
     pub const PRIVACY: &str = "privacy/1";
     pub const KNOCK: &str = "knock/1";
-    pub const ALL: [&str; 10] = [
-        HISTORY, SUBSCRIBE, TYPING, KT, MLS, E2EE, KT_WITNESS, SHARE, PRIVACY, KNOCK,
+    /// The server sends a client only the channels it may traverse and the
+    /// people in them (#341). No messages; it tells the client what the
+    /// server does.
+    pub const HIDDEN_CHANNELS: &str = "hidden-channels/1";
+    pub const ALL: [&str; 11] = [
+        HISTORY,
+        SUBSCRIBE,
+        TYPING,
+        KT,
+        MLS,
+        E2EE,
+        KT_WITNESS,
+        SHARE,
+        PRIVACY,
+        KNOCK,
+        HIDDEN_CHANNELS,
     ];
 }
 
