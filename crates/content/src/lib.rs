@@ -6,7 +6,10 @@ use std::cell::OnceCell;
 #[cfg(feature = "images")]
 use base64::Engine as _;
 #[cfg(feature = "images")]
-use image::{DynamicImage, ExtendedColorType, ImageEncoder as _, ImageFormat, ImageReader, Limits};
+use image::{
+    DynamicImage, ExtendedColorType, ImageDecoder as _, ImageEncoder as _, ImageFormat,
+    ImageReader, Limits, metadata::Orientation,
+};
 #[cfg(feature = "images")]
 use nuschl_core::preview::{ImageMime, img_element};
 use nuschl_core::{CodeRun, ContentBlock, MAX_CONTENT_BYTES, MessageDocument};
@@ -136,6 +139,17 @@ fn decode(
     max_dimension: u32,
     max_alloc: u64,
 ) -> Option<DynamicImage> {
+    decode_oriented(bytes, formats, max_dimension, max_alloc).map(|(image, _)| image)
+}
+
+/// [`decode`], and the EXIF orientation, which is not applied.
+#[cfg(feature = "images")]
+fn decode_oriented(
+    bytes: &[u8],
+    formats: &[ImageFormat],
+    max_dimension: u32,
+    max_alloc: u64,
+) -> Option<(DynamicImage, Orientation)> {
     let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -149,13 +163,18 @@ fn decode(
     limits.max_image_width = Some(max_dimension);
     limits.max_image_height = Some(max_dimension);
     limits.max_alloc = Some(max_alloc);
-    reader.limits(limits);
+    reader.limits(limits.clone());
+    // As `ImageReader::decode`: the pixels count against the allocation limit.
+    let mut decoder = reader.into_decoder().ok()?;
+    limits.reserve(decoder.total_bytes()).ok()?;
+    decoder.set_limits(limits).ok()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     // A GIF's screen may be 0 pixels high, and the decoder accepts it: an
     // image without pixels is no image.
-    reader
-        .decode()
+    DynamicImage::from_decoder(decoder)
         .ok()
         .filter(|image| image.width() > 0 && image.height() > 0)
+        .map(|image| (image, orientation))
 }
 
 /// Shrink only: `thumbnail` would also enlarge a small image.
@@ -175,9 +194,10 @@ const MAX_PASTE_DIMENSION: u32 = 8192;
 pub const ATTACHMENT_THUMBNAIL: u32 = 128;
 
 /// Re-encode a pasted image as a Mumble image message (an `<img>` element of
-/// at most `limit` bytes), as stock Mumble does (`Log::imageToImg`): at most
-/// 1600×1000 pixels, as JPEG at the highest quality that fits, or as PNG when
-/// that is smaller. When even low quality does not fit, the image shrinks.
+/// at most `limit` bytes), as stock Mumble does (`Log::imageToImg`): upright
+/// as its EXIF orientation says, at most 1600×1000 pixels, as JPEG at the
+/// highest quality that fits, or as PNG when that is smaller. When even low
+/// quality does not fit, the image shrinks.
 /// Also returns a thumbnail of at most [`ATTACHMENT_THUMBNAIL`] pixels.
 #[cfg(feature = "images")]
 pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, ContentBlock), Error> {
@@ -191,13 +211,22 @@ pub fn encode_image_message(bytes: &[u8], limit: usize) -> Result<(String, Conte
         // Sent re-encoded as JPEG or PNG, which every Mumble client shows.
         ImageFormat::WebP,
     ];
-    let mut image = visible(
-        decode(bytes, &formats, MAX_PASTE_DIMENSION, 256 * 1024 * 1024)
-            .ok_or(Error::InvalidImage)?,
-    );
-    if image.width() > VIEW_WIDTH || image.height() > VIEW_HEIGHT {
-        image = fit(image, VIEW_WIDTH, VIEW_HEIGHT);
+    let (image, orientation) =
+        decode_oriented(bytes, &formats, MAX_PASTE_DIMENSION, 256 * 1024 * 1024)
+            .ok_or(Error::InvalidImage)?;
+    let mut image = visible(image);
+    // Shrunk before it is turned upright, into the box turned with it.
+    let (width, height) = match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (VIEW_HEIGHT, VIEW_WIDTH),
+        _ => (VIEW_WIDTH, VIEW_HEIGHT),
+    };
+    if image.width() > width || image.height() > height {
+        image = fit(image, width, height);
     }
+    image.apply_orientation(orientation);
     let thumbnail =
         if image.width() > ATTACHMENT_THUMBNAIL || image.height() > ATTACHMENT_THUMBNAIL {
             fit(image.clone(), ATTACHMENT_THUMBNAIL, ATTACHMENT_THUMBNAIL)
@@ -1055,6 +1084,150 @@ mod tests {
                 .iter()
                 .all(|&channel| channel >= 250)
         );
+    }
+
+    /// EXIF as a phone writes it (TIFF, big-endian): the camera model, the
+    /// capture time, the GPS position and `orientation`.
+    #[cfg(feature = "images")]
+    fn exif(orientation: u16) -> Vec<u8> {
+        let entry = |tag: u16, kind: u16, count: u32, value: u32| {
+            [
+                &tag.to_be_bytes()[..],
+                &kind.to_be_bytes(),
+                &count.to_be_bytes(),
+                &value.to_be_bytes(),
+            ]
+            .concat()
+        };
+        let (ascii, short, long, rational) = (2, 3, 4, 5);
+        let ifd = |entries: &[Vec<u8>]| {
+            [
+                &(entries.len() as u16).to_be_bytes()[..],
+                &entries.concat(),
+                &[0; 4],
+            ]
+            .concat()
+        };
+        let rationals = |values: [(u32, u32); 3]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|(numerator, denominator)| {
+                    [numerator.to_be_bytes(), denominator.to_be_bytes()].concat()
+                })
+                .collect()
+        };
+        let model = b"NUSCHL-MODEL Pixel 9\0";
+        let time = b"2026:11:03 14:30:12\0";
+        // IFD0 at 8, then its strings, the Exif IFD, its string, the GPS IFD
+        // and its coordinates.
+        let model_at = 8 + 2 + 5 * 12 + 4;
+        let time_at = model_at + model.len() as u32;
+        let exif_at = time_at + time.len() as u32;
+        let original_at = exif_at + 2 + 12 + 4;
+        let gps_at = original_at + time.len() as u32;
+        let latitude_at = gps_at + 2 + 4 * 12 + 4;
+        let longitude_at = latitude_at + 24;
+        [
+            &b"MM\0*\0\0\0\x08"[..],
+            &ifd(&[
+                entry(0x0110, ascii, model.len() as u32, model_at),
+                entry(0x0112, short, 1, u32::from(orientation) << 16),
+                entry(0x0132, ascii, time.len() as u32, time_at),
+                entry(0x8769, long, 1, exif_at),
+                entry(0x8825, long, 1, gps_at),
+            ]),
+            model,
+            time,
+            &ifd(&[entry(0x9003, ascii, time.len() as u32, original_at)]),
+            time,
+            &ifd(&[
+                entry(0x0001, ascii, 2, u32::from_be_bytes(*b"N\0\0\0")),
+                entry(0x0002, rational, 3, latitude_at),
+                entry(0x0003, ascii, 2, u32::from_be_bytes(*b"E\0\0\0")),
+                entry(0x0004, rational, 3, longitude_at),
+            ]),
+            &rationals([(48, 1), (12, 1), (2952, 100)]),
+            &rationals([(16, 1), (22, 1), (2568, 100)]),
+        ]
+        .concat()
+    }
+
+    /// A JPEG of `pixels` with `exif` in its APP1 segment.
+    #[cfg(feature = "images")]
+    fn jpeg_with_exif(pixels: &image::RgbImage, exif: &[u8]) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .write_image(
+                pixels.as_raw(),
+                pixels.width(),
+                pixels.height(),
+                ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let app1 = [&b"Exif\0\0"[..], exif].concat();
+        [
+            &jpeg[..2],
+            &[0xff, 0xe1],
+            &(app1.len() as u16 + 2).to_be_bytes(),
+            &app1,
+            &jpeg[2..],
+        ]
+        .concat()
+    }
+
+    /// The pixels a sent `<img>` element carries.
+    #[cfg(feature = "images")]
+    fn sent_pixels(element: &str) -> image::RgbImage {
+        let source = element
+            .strip_prefix("<img src=\"")
+            .and_then(|element| element.strip_suffix("\" />"))
+            .unwrap();
+        let (bytes, _) = nuschl_core::data_uri_image(source).unwrap();
+        image::load_from_memory(&bytes).unwrap().to_rgb8()
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn photos_are_sent_upright() {
+        // A landscape picture, red on the left and blue on the right, that a
+        // phone held upright stored turned: EXIF orientation 6 (turn it 90°
+        // clockwise to show it).
+        let pixels = image::RgbImage::from_fn(64, 32, |x, _| {
+            if x < 32 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        });
+        let (element, _) =
+            encode_image_message(&jpeg_with_exif(&pixels, &exif(6)), 131_072).unwrap();
+        let sent = sent_pixels(&element);
+        assert_eq!(sent.dimensions(), (32, 64));
+        // Red above, blue below.
+        assert!(sent.get_pixel(16, 8)[0] > 200 && sent.get_pixel(16, 8)[2] < 60);
+        assert!(sent.get_pixel(16, 56)[2] > 200 && sent.get_pixel(16, 56)[0] < 60);
+
+        // Upright already (1), or without EXIF: as stored.
+        for input in [jpeg_with_exif(&pixels, &exif(1)), encoded_jpeg(&pixels)] {
+            let (element, _) = encode_image_message(&input, 131_072).unwrap();
+            assert_eq!(sent_pixels(&element).dimensions(), (64, 32));
+        }
+
+        // A large one shrinks into the upright 1600×1000 box: 2400×1350
+        // stored, 1350×2400 upright, sent at 563×1000.
+        let large = image::RgbImage::from_fn(2400, 1350, |x, y| image::Rgb([x as u8, y as u8, 0]));
+        let (element, _) =
+            encode_image_message(&jpeg_with_exif(&large, &exif(8)), 1_000_000).unwrap();
+        assert_eq!(sent_pixels(&element).dimensions(), (563, 1000));
+    }
+
+    #[cfg(feature = "images")]
+    fn encoded_jpeg(pixels: &image::RgbImage) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageRgb8(pixels.clone())
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+        jpeg
     }
 
     #[test]
