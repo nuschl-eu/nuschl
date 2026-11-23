@@ -2496,34 +2496,31 @@ fn requests_naming_a_hidden_channel_or_person_are_answered_as_for_missing_ones()
     );
     assert!(f.received(member).is_empty());
 
-    // A hidden sibling's name is free for whoever does not see it.
-    f.handle(
-        registered,
-        kind::CHANNEL_STATE,
-        &proto::ChannelState {
-            parent: Some(0),
-            name: Some("Secret".into()),
-            temporary: Some(true),
-            ..Default::default()
-        },
-    );
-    assert!(f.state.users[&registered].channel != LOBBY);
-    f.handle(
-        admin,
-        kind::CHANNEL_STATE,
-        &proto::ChannelState {
-            parent: Some(0),
-            name: Some("Secret".into()),
-            ..Default::default()
-        },
-    );
-    let denied = f
-        .received(admin)
+    // A hidden sibling's name is taken, as Murmur has it: the same answer as
+    // for a sibling in view.
+    f.received(registered);
+    let create = |f: &mut Fixture, name: &str| {
+        f.handle(
+            registered,
+            kind::CHANNEL_STATE,
+            &proto::ChannelState {
+                parent: Some(0),
+                name: Some(name.into()),
+                temporary: Some(true),
+                ..Default::default()
+            },
+        );
+        f.received(registered)
+    };
+    let hidden = create(&mut f, "Secret");
+    assert_eq!(hidden, create(&mut f, "Lobby"));
+    let denied = hidden
         .into_iter()
         .find(|(kind, _)| *kind == kind::PERMISSION_DENIED)
         .map(|(_, body)| proto::PermissionDenied::decode(body).unwrap())
         .unwrap();
     assert_eq!(denied.r#type(), DenyType::ChannelName);
+    assert_eq!(f.state.users[&registered].channel, LOBBY);
 
     // The registration list leaves out a last channel the reader does not see.
     f.state

@@ -656,8 +656,9 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   exist: moves, listeners, text, whisper targets, permission queries,
   descriptions, comments, statistics, kicks, channel edits, links, ACLs,
   knocks and share links; no `PermissionDenied` names them, the registration
-  list leaves out a last channel the reader does not see, and a hidden
-  channel's name does not count as taken among its siblings. Voice (speech
+  list leaves out a last channel the reader does not see. A hidden channel's
+  name stays taken among its siblings, as on Murmur, so someone allowed to
+  create channels there can find that a sibling of that name exists. Voice (speech
   into linked channels, whispers and shouts), stock text, typing indicators
   and plugin data reach only those who see the sender, and a stock text
   names only the channels and people its receiver sees. Knock notices and

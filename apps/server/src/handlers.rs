@@ -1807,13 +1807,10 @@ impl State {
         level + height < self.settings.config.channel_nesting_limit as usize
     }
 
-    /// Whether `parent` has a child named `name` that `viewer` sees: a hidden
-    /// one says nothing about itself, so it does not count.
-    fn sibling_named(&self, viewer: u32, parent: u32, name: &str, except: Option<u32>) -> bool {
+    fn sibling_named(&self, parent: u32, name: &str, except: Option<u32>) -> bool {
         self.channels.get(parent).is_some_and(|parent| {
             parent.children.iter().any(|child| {
                 Some(*child) != except
-                    && self.sees_channel(viewer, *child)
                     && self
                         .channels
                         .get(*child)
@@ -1885,7 +1882,7 @@ impl State {
                     .and_then(|id| self.channels.get(id)?.parent())
             });
             if let Some(parent) = siblings_of
-                && self.sibling_named(source, parent, name, None)
+                && self.sibling_named(parent, name, None)
             {
                 self.deny_type(source, DenyType::ChannelName);
                 return;
@@ -2041,7 +2038,7 @@ impl State {
                 return;
             }
             let name = message.name.clone().unwrap_or(old_name);
-            if self.sibling_named(source, parent, &name, None) {
+            if self.sibling_named(parent, &name, None) {
                 self.deny_type(source, DenyType::ChannelName);
                 return;
             }
