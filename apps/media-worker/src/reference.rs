@@ -31,6 +31,11 @@ pub const LEAD: Duration = Duration::from_millis(25);
 /// Reference audio older than this is no use to the canceller (a stalled
 /// stream resuming); it is dropped rather than fed in a burst.
 const STALE: Duration = Duration::from_millis(300);
+/// A stream lost audio when its stamps run this much ahead of its samples;
+/// smaller differences are the stamps' own jitter (PulseAudio interpolates
+/// its latency between polls).
+const GAP: Duration = Duration::from_millis(10);
+const FRAME_NANOS: u64 = FRAME as u64 * 1_000_000_000 / RATE as u64;
 
 /// Nanoseconds since the worker's epoch.
 #[derive(Clone, Copy)]
@@ -135,30 +140,121 @@ impl Timeline {
     }
 }
 
-/// What to do with the next reference frame for a microphone frame at `mic`.
+/// What the canceller's next reference frame is, for a microphone frame.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
     /// It sounded no later than the microphone frame: give it to the canceller.
     Feed,
-    /// Too old to be useful: discard it.
-    Drop,
     /// It sounds later: process the microphone frame first.
     Later,
     /// It has sounded but not arrived: hold the microphone frame if allowed.
     Wait,
 }
 
-/// Decide for one reference frame sounding at `reference` (if known) and
-/// whether its samples are in the ring, for a microphone frame starting at `mic`.
-pub fn step(reference: Option<u64>, available: bool, mic: u64) -> Step {
-    let horizon = mic + LEAD.as_nanos() as u64;
-    match reference {
-        None if available => Step::Feed,
-        None => Step::Later,
-        Some(time) if time >= horizon => Step::Later,
-        Some(_) if !available => Step::Wait,
-        Some(time) if Duration::from_nanos(mic.saturating_sub(time)) > STALE => Step::Drop,
-        Some(_) => Step::Feed,
+/// How much microphone audio was lost between a frame starting at `previous`
+/// and the next one at `mic`: a skipped device cycle, or a full ring while the
+/// worker was stalled.
+pub fn lost(previous: u64, mic: u64) -> Option<u64> {
+    let gap = mic.checked_sub(previous + FRAME_NANOS)?;
+    (gap > GAP.as_nanos() as u64).then_some(gap)
+}
+
+/// The canceller's reference stream, and when the next frame for the
+/// canceller starts.
+///
+/// AEC3 pairs render and capture by count, so the reference is fed one frame
+/// per 10 ms of the microphone's clock, timed by the stamps: what the recording
+/// lost is fed as silence, and what sounded while the microphone lost audio is
+/// skipped.
+pub struct Reference {
+    samples: Consumer<f32>,
+    timeline: Timeline,
+    pub channels: usize,
+    index: u64,
+    end: Option<u64>,
+    /// A gap is being bridged: audio is skipped up to the frame's start, or
+    /// silence fed up to the next sample.
+    bridging: bool,
+}
+
+impl Reference {
+    pub fn new(samples: Consumer<f32>, timeline: Timeline, channels: usize) -> Self {
+        Self {
+            samples,
+            timeline,
+            channels,
+            index: 0,
+            end: None,
+            bridging: false,
+        }
+    }
+
+    /// Discard what is queued: it played before the microphone opened.
+    pub fn skip(&mut self) {
+        let frames = self.samples.slots() / self.channels;
+        if let Ok(chunk) = self.samples.read_chunk(frames * self.channels) {
+            chunk.commit_all();
+        }
+        self.index += frames as u64;
+        self.end = None;
+        let _ = self.timeline.time_of(self.index);
+    }
+
+    /// The microphone lost `nanos` of audio: skip the reference of that time.
+    pub fn lose(&mut self, nanos: u64) {
+        self.end = self.end.map(|end| end + nanos);
+    }
+
+    /// The next reference frame for a microphone frame starting at `mic`, into
+    /// `frame` (`channels` interleaved): the 10 ms from where the previous one
+    /// ended, as long as the stamps agree within `GAP`.
+    pub fn next(&mut self, mic: u64, frame: &mut [f32]) -> Step {
+        let frames = |nanos: u64| (nanos * u64::from(RATE) / 1_000_000_000) as usize;
+        let Some(mut time) = self.timeline.time_of(self.index) else {
+            return Step::Later;
+        };
+        // Audio older than `STALE` is no use to the canceller (a stalled stream
+        // resuming): it is skipped.
+        let start = self
+            .end
+            .unwrap_or(time)
+            .max(mic.saturating_sub(STALE.as_nanos() as u64));
+        if start >= mic + LEAD.as_nanos() as u64 {
+            return Step::Later;
+        }
+        // Differences within `GAP` are the stamps' jitter. Audio from further
+        // before `start` sounded while the microphone lost audio: skipped.
+        let gap = GAP.as_nanos() as u64;
+        self.bridging |= time + gap < start || time > start + gap;
+        while self.bridging && time < start {
+            let late = frames(start - time).clamp(1, FRAME);
+            let Ok(chunk) = self.samples.read_chunk(late * self.channels) else {
+                return Step::Wait;
+            };
+            chunk.commit_all();
+            self.index += late as u64;
+            time = self.timeline.time_of(self.index).unwrap_or(start);
+        }
+        // Audio from further after `start` follows what the recording lost:
+        // silence up to it.
+        let silent = if self.bridging {
+            frames(time - start).min(FRAME)
+        } else {
+            0
+        };
+        let Ok(chunk) = self.samples.read_chunk((FRAME - silent) * self.channels) else {
+            return Step::Wait;
+        };
+        self.bridging = time > start + FRAME_NANOS;
+        let (silence, rest) = frame[..FRAME * self.channels].split_at_mut(silent * self.channels);
+        let (first, second) = chunk.as_slices();
+        silence.fill(0.);
+        rest[..first.len()].copy_from_slice(first);
+        rest[first.len()..].copy_from_slice(second);
+        chunk.commit_all();
+        self.index += (FRAME - silent) as u64;
+        self.end = Some(start + FRAME_NANOS);
+        Step::Feed
     }
 }
 
@@ -373,18 +469,68 @@ mod tests {
         assert_eq!(captured - first, 12_000_000);
     }
 
+    /// A reference of `frames` 48 kHz frames, value = its index, stamped
+    /// from `start` (nanoseconds) with a gap of `gap` after frame `at`.
+    fn recorded(frames: u64, start: u64, at: u64, gap: u64) -> Reference {
+        let (mut ring, samples) = RingBuffer::new(frames as usize);
+        let (mut stamper, timeline) = stamped();
+        for frame in 0..frames {
+            if frame == 0 || frame == at {
+                let gap = if frame == at { gap } else { 0 };
+                stamper.anchor(start + gap + frame * 1_000_000_000 / u64::from(RATE));
+            }
+            ring.push(frame as f32).unwrap();
+            stamper.advance(1);
+        }
+        Reference::new(samples, timeline, 1)
+    }
+
     #[test]
     fn reference_frames_are_fed_once_they_have_sounded() {
         let ms = 1_000_000;
         let lead = LEAD.as_nanos() as u64;
-        assert_eq!(step(Some(10 * ms), true, 20 * ms), Step::Feed);
-        // Starts before the lead runs out after the microphone frame: fed first.
-        assert_eq!(step(Some(20 * ms + lead - 1), true, 20 * ms), Step::Feed);
-        assert_eq!(step(Some(20 * ms + lead), true, 20 * ms), Step::Later);
-        assert_eq!(step(Some(10 * ms), false, 20 * ms), Step::Wait);
-        assert_eq!(step(Some(10 * ms), true, 400 * ms), Step::Drop);
-        assert_eq!(step(None, true, 20 * ms), Step::Feed);
-        assert_eq!(step(None, false, 20 * ms), Step::Later);
+        let mut frame = [0.; 2 * FRAME];
+        let mut reference = recorded(4 * FRAME as u64, 20 * ms + lead - 10 * ms, u64::MAX, 0);
+        // The first frame starts before the lead runs out after the microphone frame.
+        assert_eq!(reference.next(20 * ms, &mut frame), Step::Feed);
+        assert_eq!(frame[0], 0.);
+        assert_eq!(reference.next(20 * ms, &mut frame), Step::Later);
+        assert_eq!(reference.next(30 * ms, &mut frame), Step::Feed);
+        assert_eq!(frame[0], FRAME as f32);
+        // Audio from over 300 ms before the microphone frame is skipped.
+        assert_eq!(reference.next(400 * ms, &mut frame), Step::Wait);
+        assert!(reference.samples.is_empty());
+        let mut empty = Reference::new(RingBuffer::<f32>::new(1).1, stamped().1, 1);
+        assert_eq!(empty.next(20 * ms, &mut frame), Step::Later);
+    }
+
+    #[test]
+    fn audio_the_recording_lost_is_silence_and_audio_the_microphone_lost_is_skipped() {
+        let ms = 1_000_000;
+        let mut frame = [0.; 2 * FRAME];
+        // 15 ms lost by the recording after its first frame: a silent frame,
+        // then 5 ms (240 frames) of silence.
+        let mut reference = recorded(3 * FRAME as u64, 15 * ms, FRAME as u64, 15 * ms);
+        assert_eq!(reference.next(0, &mut frame), Step::Feed);
+        assert_eq!(reference.next(10 * ms, &mut frame), Step::Feed);
+        assert!(frame[..FRAME].iter().all(|&sample| sample == 0.));
+        assert_eq!(reference.next(20 * ms, &mut frame), Step::Feed);
+        assert!(frame[..240].iter().all(|&sample| sample == 0.));
+        assert_eq!(frame[240], FRAME as f32);
+        // Stamps 4 ms off are jitter: the frame follows on.
+        let mut reference = recorded(3 * FRAME as u64, 15 * ms, FRAME as u64, 4 * ms);
+        assert_eq!(reference.next(0, &mut frame), Step::Feed);
+        assert_eq!(reference.next(10 * ms, &mut frame), Step::Feed);
+        assert_eq!(frame[0], FRAME as f32);
+        // The microphone lost 21 ms (about one 1024-frame device cycle): the
+        // reference of that time is skipped.
+        assert_eq!(lost(20 * ms, 51 * ms), Some(21 * ms));
+        assert_eq!(lost(20 * ms, 39 * ms), None);
+        let mut reference = recorded(5 * FRAME as u64, 15 * ms, u64::MAX, 0);
+        assert_eq!(reference.next(0, &mut frame), Step::Feed);
+        reference.lose(21 * ms);
+        assert_eq!(reference.next(31 * ms, &mut frame), Step::Feed);
+        assert_eq!(frame[0], (FRAME + 21 * 48) as f32);
     }
 
     #[test]

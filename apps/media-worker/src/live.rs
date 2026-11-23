@@ -13,7 +13,7 @@ use crate::{
     mixer::{Mixer, Voice},
     playback::PlaybackConverter,
     probe::EchoProbe,
-    reference::{self, Clock, Played, ReferenceConverter, Stamper, Step, Timeline},
+    reference::{self, Clock, Played, Reference, ReferenceConverter, Stamper, Step, Timeline},
     sounds::Effects,
     timing::Timing,
 };
@@ -125,26 +125,6 @@ struct MicrophoneSource {
     labels: &'static Labels,
     timing: Timing,
     tx: SyncSender<Event>,
-}
-
-/// The canceller's reference stream and how far it has been fed.
-struct Reference {
-    samples: Consumer<f32>,
-    timeline: Timeline,
-    channels: usize,
-    index: u64,
-}
-
-impl Reference {
-    /// Discard what is queued: it played before the microphone opened.
-    fn skip(&mut self) {
-        let frames = self.samples.slots() / self.channels;
-        if let Ok(chunk) = self.samples.read_chunk(frames * self.channels) {
-            chunk.commit_all();
-        }
-        self.index += frames as u64;
-        let _ = self.timeline.time_of(self.index);
-    }
 }
 
 struct Transmit {
@@ -263,6 +243,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Microphone frames processed since the microphone opened, and a buffer for
     // one reference frame (up to two channels).
     let mut mic_index = 0_u64;
+    // The previous microphone frame: its index and start.
+    let mut previous_mic = None;
     let mut reference_frame = [0_f32; 2 * FRAME];
     let mut far_mono = [0_f32; FRAME];
     // A noise suppressor upstream of the microphone (e.g. RNNoise) replaces ours.
@@ -675,44 +657,39 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             };
             let mic_time = microphone.timeline.time_of(mic_index);
+            let lost = previous_mic
+                .take()
+                .filter(|&(index, _)| index + FRAME as u64 == mic_index)
+                .zip(mic_time)
+                .and_then(|((_, previous), mic)| reference::lost(previous, mic));
             let reference = match &mut microphone.recording {
                 Some((_, recorded)) => Some(recorded),
                 None if microphone.played => Some(&mut *played),
                 None => None,
             };
             if let (Some(reference), Some(mic_time)) = (reference, mic_time) {
-                let width = FRAME * reference.channels;
+                if let Some(lost) = lost {
+                    reference.lose(lost);
+                }
                 let mut hold = false;
                 loop {
-                    let available = reference.samples.slots() >= width;
-                    let time = reference.timeline.time_of(reference.index);
-                    match reference::step(time, available, mic_time) {
-                        decision @ (Step::Feed | Step::Drop) => {
-                            let Ok(chunk) = reference.samples.read_chunk(width) else {
-                                break;
-                            };
-                            let (first, second) = chunk.as_slices();
-                            reference_frame[..first.len()].copy_from_slice(first);
-                            reference_frame[first.len()..width].copy_from_slice(second);
-                            chunk.commit_all();
-                            reference.index += FRAME as u64;
-                            if decision == Step::Feed {
-                                let frame = &reference_frame[..width];
-                                chain.render(frame);
-                                for (mono, samples) in far_mono
-                                    .iter_mut()
-                                    .zip(frame.chunks_exact(reference.channels))
-                                {
-                                    // Activity is not an acoustic downmix: opposite
-                                    // LR phases must not conceal far-end playback.
-                                    *mono = samples
-                                        .iter()
-                                        .copied()
-                                        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-                                        .unwrap_or(0.);
-                                }
-                                controller.observe_render(&far_mono);
+                    match reference.next(mic_time, &mut reference_frame) {
+                        Step::Feed => {
+                            let frame = &reference_frame[..FRAME * reference.channels];
+                            chain.render(frame);
+                            for (mono, samples) in far_mono
+                                .iter_mut()
+                                .zip(frame.chunks_exact(reference.channels))
+                            {
+                                // Activity is not an acoustic downmix: opposite
+                                // LR phases must not conceal far-end playback.
+                                *mono = samples
+                                    .iter()
+                                    .copied()
+                                    .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+                                    .unwrap_or(0.);
                             }
+                            controller.observe_render(&far_mono);
                         }
                         Step::Later => break,
                         Step::Wait => {
@@ -731,6 +708,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             stats.capture(mic_index, mic_time);
+            previous_mic = mic_time.map(|time| (mic_index, time));
             mic_index += FRAME as u64;
             timing.report_capture();
             if first_processed {
@@ -1293,12 +1271,7 @@ fn open_host(
         output_channels,
         underruns,
         clock,
-        played: Reference {
-            samples: played_consumer,
-            timeline: played_timeline,
-            channels: 2,
-            index: 0,
-        },
+        played: Reference::new(played_consumer, played_timeline, 2),
         microphone,
         source: Some(source),
         route: Route {
@@ -1814,16 +1787,7 @@ fn record_output(
         build_recording(&device, stream_config, tx, callback)
     )?;
     stream.play().map_err(|error| error.to_string())?;
-    Ok((
-        stream,
-        Reference {
-            samples,
-            timeline,
-            channels: outputs,
-            index: 0,
-        },
-        name,
-    ))
+    Ok((stream, Reference::new(samples, timeline, outputs), name))
 }
 
 fn build_recording<T>(
