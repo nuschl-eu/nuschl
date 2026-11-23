@@ -23,7 +23,9 @@ deafened. All connected deafened contexts remain visible.
 Local privacy choices take effect immediately. If the authenticated own-user state
 has not acknowledged them, the status also says awaiting server. This distinction
 is important when a stock server drops rapid controls under its shared message
-bucket. Audio-device detail remains available in the footer tooltip, and each
+bucket: the connection sends the local state again 1.5 s after the last change
+while the server shows another one, at most five times, then says the server has
+not confirmed it. Audio-device detail remains available in the footer tooltip, and each
 server's reported health issue opens audio settings for that server. The fixed
 signal glyph is green only when the projection has a supported voice context.
 Chat/TLS alone, an unknown codec and unsupported/E2EE-only voice cannot produce a
