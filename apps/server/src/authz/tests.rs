@@ -2228,6 +2228,268 @@ fn a_new_channel_reaches_only_those_who_see_it() {
     );
 }
 
+#[test]
+fn requests_naming_a_hidden_channel_or_person_are_answered_as_for_missing_ones() {
+    use prost::Message as _;
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, anonymous] = f.actors;
+    f.state
+        .channels
+        .get_mut(SECRET)
+        .unwrap()
+        .set_description("behind the door".into());
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            comment: Some("inside".into()),
+            ..Default::default()
+        },
+    );
+    assert!(!f.state.sees_user(registered, member));
+    const MISSING_CHANNEL: u32 = 999;
+    const MISSING_USER: u32 = 9999;
+    type Request = (u16, Vec<u8>);
+    let requests = |channel: u32, user: u32| -> Vec<Request> {
+        let state = |message: proto::UserState| (kind::USER_STATE, message.encode_to_vec());
+        let text = |message: proto::TextMessage| (kind::TEXT_MESSAGE, message.encode_to_vec());
+        let named = |message: proto::ChannelState| (kind::CHANNEL_STATE, message.encode_to_vec());
+        vec![
+            (
+                kind::PERMISSION_QUERY,
+                proto::PermissionQuery {
+                    channel_id: Some(channel),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            (
+                kind::REQUEST_BLOB,
+                proto::RequestBlob {
+                    channel_description: vec![channel],
+                    session_comment: vec![user],
+                    session_texture: vec![user],
+                }
+                .encode_to_vec(),
+            ),
+            state(proto::UserState {
+                channel_id: Some(channel),
+                ..Default::default()
+            }),
+            state(proto::UserState {
+                listening_channel_add: vec![channel],
+                ..Default::default()
+            }),
+            state(proto::UserState {
+                session: Some(user),
+                mute: Some(true),
+                ..Default::default()
+            }),
+            state(proto::UserState {
+                session: Some(user),
+                channel_id: Some(LOBBY),
+                ..Default::default()
+            }),
+            (
+                kind::USER_STATS,
+                proto::UserStats {
+                    session: Some(user),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            (
+                kind::USER_REMOVE,
+                proto::UserRemove {
+                    session: user,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            text(proto::TextMessage {
+                channel_id: vec![channel],
+                message: "hello".into(),
+                ..Default::default()
+            }),
+            text(proto::TextMessage {
+                tree_id: vec![channel],
+                message: "hello".into(),
+                ..Default::default()
+            }),
+            text(proto::TextMessage {
+                session: vec![user],
+                message: "hello".into(),
+                ..Default::default()
+            }),
+            named(proto::ChannelState {
+                channel_id: Some(channel),
+                name: Some("Renamed".into()),
+                ..Default::default()
+            }),
+            named(proto::ChannelState {
+                parent: Some(channel),
+                name: Some("Below".into()),
+                temporary: Some(true),
+                ..Default::default()
+            }),
+            named(proto::ChannelState {
+                channel_id: Some(LOBBY),
+                links_add: vec![channel],
+                ..Default::default()
+            }),
+            (
+                kind::CHANNEL_REMOVE,
+                proto::ChannelRemove {
+                    channel_id: channel,
+                }
+                .encode_to_vec(),
+            ),
+            (
+                kind::ACL,
+                proto::Acl {
+                    channel_id: channel,
+                    query: Some(true),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+        ]
+    };
+    let answers = |f: &mut Fixture, requests: Vec<Request>| -> Vec<Vec<(u16, Bytes)>> {
+        requests
+            .into_iter()
+            .map(|(kind, body)| {
+                f.state.handle(
+                    registered,
+                    ControlFrame {
+                        kind,
+                        payload: Bytes::from(body),
+                    },
+                    &mut Datagrams::default(),
+                );
+                f.received(registered)
+            })
+            .collect()
+    };
+    f.received(registered);
+    let hidden = answers(&mut f, requests(SECRET, member));
+    let missing = answers(&mut f, requests(MISSING_CHANNEL, MISSING_USER));
+    assert_eq!(hidden, missing);
+    assert_eq!(f.state.users[&member].channel, SECRET);
+    assert!(!f.state.users[&member].mute);
+    assert!(f.state.channels.get(SECRET).is_some());
+    assert_eq!(
+        f.state
+            .authorize(registered, Action::Knock { channel: SECRET }),
+        Err(Denial::NotFound)
+    );
+
+    // Whisper targets keep only what the client sees.
+    f.handle(
+        registered,
+        kind::VOICE_TARGET,
+        &proto::VoiceTarget {
+            id: Some(1),
+            targets: vec![
+                proto::voice_target::Target {
+                    session: vec![member, anonymous],
+                    ..Default::default()
+                },
+                proto::voice_target::Target {
+                    channel_id: Some(SECRET),
+                    ..Default::default()
+                },
+            ],
+        },
+    );
+    let target = &f.state.users[&registered].targets[&1];
+    assert_eq!(
+        (target.sessions.as_slice(), target.channels.len()),
+        ([anonymous].as_slice(), 0)
+    );
+    // A message to someone seen and someone hidden reaches the one seen.
+    f.received(anonymous);
+    f.received(member);
+    f.handle(
+        registered,
+        kind::TEXT_MESSAGE,
+        &proto::TextMessage {
+            session: vec![member, anonymous],
+            message: "hello".into(),
+            ..Default::default()
+        },
+    );
+    assert!(
+        f.received(anonymous)
+            .iter()
+            .any(|(kind, _)| *kind == kind::TEXT_MESSAGE)
+    );
+    assert!(f.received(member).is_empty());
+
+    // A hidden sibling's name is free for whoever does not see it.
+    f.handle(
+        registered,
+        kind::CHANNEL_STATE,
+        &proto::ChannelState {
+            parent: Some(0),
+            name: Some("Secret".into()),
+            temporary: Some(true),
+            ..Default::default()
+        },
+    );
+    assert!(f.state.users[&registered].channel != LOBBY);
+    f.handle(
+        admin,
+        kind::CHANNEL_STATE,
+        &proto::ChannelState {
+            parent: Some(0),
+            name: Some("Secret".into()),
+            ..Default::default()
+        },
+    );
+    let denied = f
+        .received(admin)
+        .into_iter()
+        .find(|(kind, _)| *kind == kind::PERMISSION_DENIED)
+        .map(|(_, body)| proto::PermissionDenied::decode(body).unwrap())
+        .unwrap();
+    assert_eq!(denied.r#type(), DenyType::ChannelName);
+
+    // The registration list leaves out a last channel the reader does not see.
+    f.state
+        .registry
+        .users
+        .get_mut(&MEMBER)
+        .unwrap()
+        .last_channel = Some(SECRET);
+    f.state.channels.get_mut(0).unwrap().node.acls.push(entry(
+        "",
+        Some(REGISTERED),
+        perm::REGISTER,
+        0,
+    ));
+    f.state.invalidate();
+    let last_channel = |f: &mut Fixture, session: u32| {
+        f.received(session);
+        f.handle(session, kind::USER_LIST, &proto::UserList::default());
+        f.received(session)
+            .into_iter()
+            .find(|(kind, _)| *kind == kind::USER_LIST)
+            .map(|(_, body)| proto::UserList::decode(body).unwrap())
+            .unwrap()
+            .users
+            .into_iter()
+            .find(|user| user.user_id == MEMBER)
+            .unwrap()
+            .last_channel
+    };
+    assert_eq!(last_channel(&mut f, admin), Some(SECRET));
+    assert_eq!(last_channel(&mut f, registered), None);
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is

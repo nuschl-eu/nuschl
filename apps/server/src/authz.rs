@@ -333,7 +333,7 @@ impl State {
         };
         match action {
             A::Knock { channel } => found(
-                self.channels.get(channel).is_some()
+                self.sees_channel(actor, channel)
                     && user.channel != channel
                     && !self.has(actor, channel, perm::ENTER),
             ),
@@ -648,9 +648,14 @@ impl State {
         }
     }
 
-    /// Tell `to` why it was refused, as Murmur would.
+    /// Tell `to` why it was refused, as Murmur would; a refusal that would
+    /// name a channel or someone `to` does not see says nothing.
     pub fn refuse(&self, to: u32, denial: Denial) {
         match denial {
+            Denial::Permission {
+                session, channel, ..
+            } if !self.sees_channel(to, channel) || !self.sees_user(to, session) => {}
+            Denial::MissingCertificate { session } if !self.sees_user(to, session) => {}
             Denial::Permission {
                 session,
                 channel,

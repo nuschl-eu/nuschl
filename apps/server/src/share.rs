@@ -194,7 +194,7 @@ impl State {
             .and_then(|user| user.account)
             .ok_or((Code::NotFound, 0))?;
         let channel = message.channel;
-        if self.channels.get(channel).is_none() {
+        if !self.sees_channel(session, channel) {
             return Err((Code::NotFound, 0));
         }
         self.authorize(session, Action::Enter { channel })?;

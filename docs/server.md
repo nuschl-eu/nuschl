@@ -647,7 +647,13 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   leaving (`UserRemove`) by those who see only one of the two channels. A
   new channel reaches only those who see it; a channel moving under a parent
   a client did not know brings that parent first. A change sends a client at
-  most the channel tree it sees, as at login.
+  most the channel tree it sees, as at login. A request that names a channel
+  or someone the client does not see gets the answer for one that does not
+  exist: moves, listeners, text, whisper targets, permission queries,
+  descriptions, comments, statistics, kicks, channel edits, links, ACLs,
+  knocks and share links; no `PermissionDenied` names them, the registration
+  list leaves out a last channel the reader does not see, and a hidden
+  channel's name does not count as taken among its siblings.
 - **Output.** Each connection has a queue bounded in bytes (`max_queued_bytes`).
   Control frames are never dropped: a client that lets the limit fill is
   disconnected. Voice frames are dropped once 64 KiB are waiting. Broadcasts

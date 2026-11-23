@@ -186,7 +186,7 @@ impl State {
                 if let Some(message) = decode::<proto::PermissionQuery>(&frame.payload)
                     && !self.query_limited(session)
                     && let Some(channel) = message.channel_id
-                    && self.channels.get(channel).is_some()
+                    && self.sees_channel(session, channel)
                 {
                     self.send_permissions(session, channel, true);
                 }
@@ -372,7 +372,7 @@ impl State {
     /// changes.
     fn user_state(&mut self, source: u32, mut message: proto::UserState) {
         let target = message.session.unwrap_or(source);
-        if !self.users.contains_key(&source) || !self.users.contains_key(&target) {
+        if !self.users.contains_key(&source) || !self.sees_user(source, target) {
             return;
         }
         if !self.check(source, Action::ChangeUser { user: target }) {
@@ -423,7 +423,7 @@ impl State {
         let source_version_121 = source_user.info.at_least(1, 2, 1);
         let source_version_140 = source_user.info.at_least(1, 4, 0);
         if let Some(channel) = message.channel_id {
-            if self.channels.get(channel).is_none() || channel == destination_channel {
+            if !self.sees_channel(source, channel) || channel == destination_channel {
                 return;
             }
             if source != target && self.stock_knock_move(source, target, channel) {
@@ -460,6 +460,7 @@ impl State {
             let Some(listeners) = self
                 .channels
                 .get(channel)
+                .filter(|_| self.sees_channel(source, channel))
                 .map(|channel| channel.listeners.len())
             else {
                 continue;
@@ -939,7 +940,11 @@ impl State {
 
     fn user_remove(&mut self, source: u32, mut message: proto::UserRemove) {
         let target = message.session;
-        let Some(destination) = self.users.get(&target) else {
+        let Some(destination) = self
+            .users
+            .get(&target)
+            .filter(|_| self.sees_user(source, target))
+        else {
             return;
         };
         message.actor = Some(source);
@@ -1071,7 +1076,9 @@ impl State {
                     user_id: user.id,
                     name: Some(user.name.clone()),
                     last_seen: user.last_active.map(crate::timefmt::iso8601),
-                    last_channel: user.last_channel,
+                    last_channel: user
+                        .last_channel
+                        .filter(|channel| self.sees_channel(source, *channel)),
                 })
                 .collect();
             self.send(source, kind::USER_LIST, &proto::UserList { users });
@@ -1227,7 +1234,11 @@ impl State {
             return;
         }
         let target = message.session.unwrap_or(source);
-        let Some(destination) = self.users.get(&target) else {
+        let Some(destination) = self
+            .users
+            .get(&target)
+            .filter(|_| self.sees_user(source, target))
+        else {
             return;
         };
         if !self.check(source, Action::UserStats { user: target }) {
@@ -1283,11 +1294,9 @@ impl State {
         }
         let unique = |ids: Vec<u32>| ids.into_iter().take(64).collect::<BTreeSet<u32>>();
         for channel in unique(message.channel_description) {
-            if let Some(channel) = self
-                .channels
-                .get(channel)
-                .filter(|channel| !channel.description.is_empty())
-            {
+            if let Some(channel) = self.channels.get(channel).filter(|channel| {
+                !channel.description.is_empty() && self.sees_channel(source, channel.id)
+            }) {
                 self.send(
                     source,
                     kind::CHANNEL_STATE,
@@ -1303,7 +1312,7 @@ impl State {
             if let Some(user) = self
                 .users
                 .get(&session)
-                .filter(|user| !user.texture.is_empty())
+                .filter(|user| !user.texture.is_empty() && self.sees_user(source, session))
             {
                 self.send(
                     source,
@@ -1320,7 +1329,7 @@ impl State {
             if let Some(user) = self
                 .users
                 .get(&session)
-                .filter(|user| !user.comment.is_empty())
+                .filter(|user| !user.comment.is_empty() && self.sees_user(source, session))
             {
                 self.send(
                     source,
@@ -1354,12 +1363,12 @@ impl State {
                 if entries > MAX_VOICE_TARGET_ENTRIES {
                     break;
                 }
-                if self.users.contains_key(&session) && !target.sessions.contains(&session) {
+                if self.sees_user(source, session) && !target.sessions.contains(&session) {
                     target.sessions.push(session);
                 }
             }
             if let Some(channel) = entry.channel_id
-                && self.channels.get(channel).is_some()
+                && self.sees_channel(source, channel)
             {
                 entries += 1;
                 let mut group = entry.group.clone().unwrap_or_default();
@@ -1582,7 +1591,7 @@ impl State {
         // Every channel the message reaches, to be stored there.
         let mut reached = BTreeSet::new();
         for &channel in &message.channel_id {
-            if self.channels.get(channel).is_none()
+            if !self.sees_channel(source, channel)
                 || !self.check(source, Action::TextChannel { channel })
             {
                 return;
@@ -1596,7 +1605,7 @@ impl State {
         }
         let mut trees = Vec::new();
         for &channel in &message.tree_id {
-            if self.channels.get(channel).is_none()
+            if !self.sees_channel(source, channel)
                 || !self.check(source, Action::TextChannel { channel })
             {
                 return;
@@ -1617,7 +1626,7 @@ impl State {
             }
         }
         for &session in &message.session {
-            if self.users.contains_key(&session) {
+            if self.sees_user(source, session) {
                 if !self.check(source, Action::TextUser { user: session }) {
                     return;
                 }
@@ -1681,7 +1690,7 @@ impl State {
     // ---- channels ----
 
     fn channel_remove(&mut self, source: u32, channel: u32) {
-        if self.channels.get(channel).is_none() {
+        if !self.sees_channel(source, channel) {
             return;
         }
         if !self.check(source, Action::RemoveChannel { channel }) {
@@ -1797,10 +1806,13 @@ impl State {
         level + height < self.settings.config.channel_nesting_limit as usize
     }
 
-    fn sibling_named(&self, parent: u32, name: &str, except: Option<u32>) -> bool {
+    /// Whether `parent` has a child named `name` that `viewer` sees: a hidden
+    /// one says nothing about itself, so it does not count.
+    fn sibling_named(&self, viewer: u32, parent: u32, name: &str, except: Option<u32>) -> bool {
         self.channels.get(parent).is_some_and(|parent| {
             parent.children.iter().any(|child| {
                 Some(*child) != except
+                    && self.sees_channel(viewer, *child)
                     && self
                         .channels
                         .get(*child)
@@ -1834,14 +1846,14 @@ impl State {
     fn channel_state_message(&mut self, source: u32, mut message: proto::ChannelState) {
         let existing = message.channel_id;
         if let Some(id) = existing {
-            if self.channels.get(id).is_none() {
+            if !self.sees_channel(source, id) {
                 return;
             }
         } else if self.rate_limited(source) {
             return;
         }
         if let Some(parent) = message.parent
-            && self.channels.get(parent).is_none()
+            && !self.sees_channel(source, parent)
         {
             return;
         }
@@ -1872,7 +1884,7 @@ impl State {
                     .and_then(|id| self.channels.get(id)?.parent())
             });
             if let Some(parent) = siblings_of
-                && self.sibling_named(parent, name, None)
+                && self.sibling_named(source, parent, name, None)
             {
                 self.deny_type(source, DenyType::ChannelName);
                 return;
@@ -2028,7 +2040,7 @@ impl State {
                 return;
             }
             let name = message.name.clone().unwrap_or(old_name);
-            if self.sibling_named(parent, &name, None) {
+            if self.sibling_named(source, parent, &name, None) {
                 self.deny_type(source, DenyType::ChannelName);
                 return;
             }
@@ -2043,13 +2055,13 @@ impl State {
                 return;
             }
             for &link in &message.links_remove {
-                if self.channels.get(link).is_none() {
+                if !self.sees_channel(source, link) {
                     return;
                 }
                 remove.push(link);
             }
             for &link in &message.links_add {
-                if self.channels.get(link).is_none()
+                if !self.sees_channel(source, link)
                     || !self.check(source, Action::LinkChannel { channel: link })
                 {
                     return;
@@ -2142,7 +2154,7 @@ impl State {
 
     fn acl(&mut self, source: u32, message: proto::Acl) {
         let id = message.channel_id;
-        if self.channels.get(id).is_none() {
+        if !self.sees_channel(source, id) {
             return;
         }
         if !self.check(source, Action::EditAcl { channel: id }) {
