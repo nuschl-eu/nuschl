@@ -1,10 +1,52 @@
 # Optional audio with screen sharing
 
-Design requested 2026-11-11; platform documentation checked that day. This is
-future work, not an implemented capture feature or a claim of tested platform
-support. Enable sharing audio only when the selected backend can exclude every
-Nuschl playback source covered by the session. Otherwise offer a narrower,
-verified application source or video without audio.
+Design requested 2026-11-11; platform documentation checked that day. Linux
+shares the desktop's audio in native calls since 2026-11-23 (#146, below);
+Windows and macOS follow the rest of this design. Enable sharing audio only
+when the selected backend can exclude every Nuschl playback source covered by
+the session. Otherwise offer a narrower, verified application source or video
+without audio.
+
+## Linux implementation
+
+- **Controls.** While the screen is shared, *Share audio* sends the desktop's
+  audio, which is every application's playback except Nuschl's own. It starts
+  off, stops with the screen share and leaves the microphone as it is.
+  Received shared audio plays as a stream of its own, "Shared audio", with its
+  own volume in the system mixer and in the call's options menu.
+- **Worker.** One call audio worker per call (`nuschl-media-worker
+  --call-audio`, in the media role's sandbox) records, encodes and plays shared
+  audio. It starts when the call first needs it and ends with the call. A
+  crash ends the share; received audio starts the worker again after a growing
+  pause, at most three times per call.
+- **Capture.** The worker creates a PipeWire capture node with
+  `node.autoconnect = false` and links application playback streams into it,
+  following the registry as streams come and go
+  (`apps/media-worker/src/call_audio/policy.rs`). The links belong to its
+  connection, so PipeWire removes them when the share or the worker ends.
+  Existing links, defaults and volumes stay as they are. A link into the node
+  that another client makes ends the share.
+- **Exclusion.** A stream is Nuschl's when its node or client is named Nuschl
+  (`application.name`, which Nuschl's audio processes set), when its process
+  is `worker` or `nuschl-*` (Nuschl's sandbox runs every worker as `/worker`),
+  or when its client has the share's own `pipewire.sec.pid`. Nuschl's audio
+  taints every node it reaches through links and through a module's
+  `node.link-group`. The share leaves out a module's filter-chain and loopback
+  streams, the streams of an application that records a tainted node, a sink
+  or another stream, and every stream whose description has yet to arrive.
+  Names only exclude: a stream that claims to be Nuschl's leaves itself out.
+- **Track.** 20 ms stereo Opus at 128 kbit/s, on a 48 kHz clock of its own,
+  goes out as the call's system-audio track (`Purpose::SystemAudio`, SFrame
+  encoding 3) with its own queue and the transport's 256 kbit/s reserve. The
+  SFU forwards it as an `audio` source, and the browser call page plays it.
+  When the screen goes over direct legs to native viewers, the audio goes with
+  it, and both return to the SFU together.
+
+The exclusion covers Nuschl's streams on PipeWire, PulseAudio clients of
+pipewire-pulse included. Audio that another application records and plays
+again by its own means, and sound reaching a microphone, are outside it.
+`tests/share_audio.py` checks it in a private PipeWire session with synthetic
+tones, directly and in the sandbox.
 
 ## Current implementation and prerequisites
 
