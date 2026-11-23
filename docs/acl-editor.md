@@ -77,8 +77,9 @@ rules**, the rule list the server applies top to bottom. Each sentence says
 whom a rule covers (Mumble's built-in and dynamic groups such as `in`, `out`
 and `sub`, `!` for everyone except a group, `~` for a group as this channel
 defines it, access tokens, certificates by the start of their hash, people),
-what it allows and denies, and where. "Then" starts a rule that reverses an
-earlier rule's setting; the later rule wins where both apply. Eight sentences
+what it allows and denies, and where; a deny for Everyone reads "Nobody may".
+"But" starts a rule that reverses an earlier rule's setting; the later rule
+wins where both apply. Eight sentences
 show, then "and N more". While the table shows the channel,
 that list stays collapsed behind **Show advanced rules**. Every cell shows
 the result for a member of its row in this channel (Yes, No or Partly),

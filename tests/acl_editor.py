@@ -526,8 +526,8 @@ def actions(args, root, shell, application, bot, murmur):
         open_acl("Music", expand=False)
         for line in (
             "Members of @admin may move people here.",
-            "Everyone may not enter here and in subchannels.",
-            "Then certificate 01234567… may enter here and in subchannels.",
+            "Nobody may enter here and in subchannels.",
+            "But certificate 01234567… may enter here and in subchannels.",
         ):
             eventually(lambda line=line: text_contains(line), f"missing {line!r}")
         shell.screenshot(args.output / "advanced-description.png")

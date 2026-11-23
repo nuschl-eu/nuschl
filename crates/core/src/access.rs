@@ -506,9 +506,10 @@ fn whom(specification: &str) -> String {
     }
 }
 
-/// A channel's own rules (#341) in short sentences, in their order. "Then"
-/// marks a rule that reverses an earlier one for the people both cover.
-/// `name` names an account; at most `limit` lines, then "and N more".
+/// A channel's own rules (#341) in short sentences, in their order. "But"
+/// starts a rule that reverses an earlier one for the people both cover; a
+/// deny for Everyone reads "Nobody may". `name` names an account; at most
+/// `limit` lines, then "and N more".
 pub fn describe(rules: &[AclEntry], name: impl Fn(u32) -> String, limit: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
@@ -524,7 +525,9 @@ pub fn describe(rules: &[AclEntry], name: impl Fn(u32) -> String, limit: usize) 
                 .map(verb)
                 .collect::<Vec<_>>()
         };
+        let everyone = rule.user_id.is_none() && rule.group.as_deref() == Some("all");
         let what = match (grant, deny) {
+            (0, _) if everyone => format!("may {}", list(&verbs(deny), "or")),
             (0, _) => format!("may not {}", list(&verbs(deny), "or")),
             (_, 0) => format!("may {}", list(&verbs(grant), "and")),
             _ => format!(
@@ -541,13 +544,14 @@ pub fn describe(rules: &[AclEntry], name: impl Fn(u32) -> String, limit: usize) 
         };
         let who = match rule.user_id {
             Some(id) => name(id),
+            None if everyone && grant == 0 => "nobody".to_owned(),
             None => whom(rule.group.as_deref().unwrap_or_default()),
         };
         let reverses = rules[..index]
             .iter()
             .any(|earlier| earlier.grant & deny != 0 || earlier.deny & grant != 0);
         let sentence = if reverses {
-            format!("Then {who} {what} {place}.")
+            format!("But {who} {what} {place}.")
         } else {
             let mut who = who;
             if let Some(first) = who.get_mut(..1) {
@@ -829,8 +833,8 @@ mod tests {
             lines,
             [
                 "Members of @admin may move people here.",
-                "Everyone may not enter here and in subchannels.",
-                "Then certificate 01234567… may enter here and in subchannels.",
+                "Nobody may enter here and in subchannels.",
+                "But certificate 01234567… may enter here and in subchannels.",
             ]
         );
         // Dynamic groups, negation and `~`, a person, both directions.
@@ -873,7 +877,7 @@ mod tests {
         );
         assert_eq!(
             describe(&order, name, 8)[1],
-            "Then everyone may not speak here and in subchannels."
+            "But nobody may speak here and in subchannels."
         );
     }
 
