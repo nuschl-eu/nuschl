@@ -238,6 +238,15 @@ context.objects = [
         .await
         .expect("VA-API generates interframes");
         assert!(decode_av1(&sequence).len() >= 2 * raw.len());
+        // Screens get keyframes on request, also past vaav1enc's default
+        // interval of 60 frames.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..90 {
+                assert!(!capture.next().await.unwrap().keyframe);
+            }
+        })
+        .await
+        .expect("VA-API keeps sending interframes");
         capture.request_keyframe();
         tokio::time::timeout(Duration::from_millis(800), async {
             loop {
