@@ -4337,6 +4337,10 @@ fn strip_metadata(on: bool, cx: &mut Context<Desktop>) -> AnyElement {
             div()
                 .id("strip-metadata-help")
                 .flex()
+                // Centred on the label's letters, which sit below the
+                // middle of its line.
+                .relative()
+                .top(px(1.))
                 .tooltip(|_, cx| cx.new(|_| Tooltip(HELP.into())).into())
                 .child(icon("info", 14., color(TEXT_FAINT))),
         )
