@@ -27,6 +27,9 @@ use std::{cell::Cell, collections::HashMap, rc::Rc};
 const RAIL_WIDTH: f32 = 72. + layout::SCROLLBAR_GUTTER;
 const SPLITTER_WIDTH: f32 = 5.;
 const CONTROL_HEIGHT: f32 = 32.;
+/// The line height of the composer's status line, which keeps its height
+/// whatever it says.
+const STATUS_LINE: f32 = 20.;
 const CHANNELS_DIALOG: u8 = 1 << 6;
 const CHANNELS_SHEET_LIST: &str = "channels-sheet-list";
 
@@ -4063,14 +4066,23 @@ fn composer(
                 cx,
             ))
         })
+        // One line high: who is typing (or where the message goes) keeps at
+        // least half of it; the history state and the keyboard hint follow
+        // while they fit. What does not fit wraps below the line, out of
+        // sight, so a change of text moves nothing.
         .child(
             layout::row()
+                .flex_wrap()
+                .gap_x_4()
+                .h(px(STATUS_LINE))
+                .line_height(px(STATUS_LINE))
+                .overflow_hidden()
                 .px_1()
                 .text_xs()
                 .text_color(color(TEXT_FAINT))
                 .child(
                     layout::flexible()
-                        .flex_grow(2.)
+                        .min_w(relative(0.5))
                         .child(crate::typing::LiveStatus {
                             id: "typing-status".into(),
                             label: typing.clone().map(SharedString::from),
@@ -4095,22 +4107,31 @@ fn composer(
                             },
                         }),
                 )
-                .child(layout::label(
-                    "composer-hint",
-                    if this.settings.enter_sends {
-                        "Enter to send · Shift+Enter for a new line"
-                    } else {
-                        "Enter for a new line · Ctrl/Cmd+Enter to send"
-                    },
-                ))
-                .child(layout::label(
+                .child(layout::fixed().child(layout::label(
                     "history-default",
                     if this.history_enabled {
-                        "Local history on · no end-to-end encryption"
+                        "Local history on"
                     } else {
                         "Local history off"
                     },
-                )),
+                )))
+                .child(layout::fixed().child(if this.settings.enter_sends {
+                    layout::detailed_label(
+                        "composer-hint",
+                        "New line: Shift+Enter",
+                        "Enter to send · Shift+Enter for a new line",
+                    )
+                } else {
+                    layout::detailed_label(
+                        "composer-hint",
+                        if cfg!(target_os = "macos") {
+                            "Send: Cmd+Enter"
+                        } else {
+                            "Send: Ctrl+Enter"
+                        },
+                        "Enter for a new line · Ctrl/Cmd+Enter to send",
+                    )
+                })),
         );
     div()
         .min_w_0()
