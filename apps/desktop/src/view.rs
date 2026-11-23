@@ -882,7 +882,11 @@ fn sidebar(
                                         .rounded_full()
                                         .bg(color(status_color(server.status))),
                                 )
-                                .child(layout::label("connection", server.status_label())),
+                                .child(layout::detailed_label(
+                                    "connection",
+                                    connection_line(server),
+                                    server.status_label(),
+                                )),
                         ),
                 )
                 .child(icon_button(
@@ -4523,6 +4527,20 @@ fn downgrade_card(reason: &str, index: usize, cx: &mut Context<Desktop>) -> AnyE
         )))
         .into_any_element();
     layout::notice("downgrade-banner", DANGER, "shield", body, None).into_any_element()
+}
+
+/// The sidebar's connection status and round trip; `status_label` adds the
+/// transport.
+fn connection_line(server: &ServerView) -> String {
+    match &server.transport {
+        Some(stats) if server.status == Status::Connected && stats.udp_active => {
+            format!("Connected · {:.0} ms", stats.udp.average_ms)
+        }
+        Some(stats) if server.status == Status::Connected && stats.tcp.packets > 0 => {
+            format!("Connected · {:.0} ms", stats.tcp.average_ms)
+        }
+        _ => server.status_label(),
+    }
 }
 
 fn status_color(status: Status) -> Token {

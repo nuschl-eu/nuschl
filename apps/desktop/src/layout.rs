@@ -187,6 +187,28 @@ pub fn label(id: impl Into<ElementId>, text: impl Into<SharedString>) -> AnyElem
         .into_any_element()
 }
 
+/// A compact label whose `detail`, its full wording, shows on hover and is
+/// its accessible description.
+pub fn detailed_label(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+) -> AnyElement {
+    let text = text.into();
+    let detail = detail.into();
+    let full = detail.clone();
+    flexible()
+        .id(id.into())
+        // AccessKit names a label by its value.
+        .role(Role::Label)
+        .aria_value(text.clone())
+        .when(detail != text, |label| label.aria_description(detail))
+        .truncate()
+        .tooltip(move |_, cx| cx.new(|_| Tooltip(full.clone())).into())
+        .child(Text::new_inaccessible(text))
+        .into_any_element()
+}
+
 /// Complete wrapped text. A finite parent lane is essential for native
 /// emergency wrapping of paths, hashes, Unicode and other unbroken tokens.
 pub fn text(id: impl Into<ElementId>, text: impl Into<SharedString>) -> AnyElement {
