@@ -304,7 +304,7 @@ class VoiceTest:
         print("Listening to both: one media worker, one playback stream, and both servers are heard.", flush=True)
 
         # Beta (the last connected) is the talk server: its microphone, push-to-talk only there.
-        assert "Microphone destination · muted" in self.rail_label("Beta"), self.rail_label("Beta")
+        assert self.rail_label("Beta").endswith("; Muted"), self.rail_label("Beta")
         assert self.rail_label("Alpha").endswith("Listening"), self.rail_label("Alpha")
         self.select("Beta")
         self.press("push button", "Unmute")
@@ -315,7 +315,7 @@ class VoiceTest:
         assert quiet == {"Alpha": 0, "Beta": 0}, f"sent without push-to-talk: {quiet}"
         sent = self.transmit()
         assert sent["Beta"] >= 20 and sent["Alpha"] == 0, f"push-to-talk should reach Beta only: {sent}"
-        assert "Microphone destination · enabled" in self.rail_label("Beta")
+        assert self.rail_label("Beta").endswith(("; Unmuted", "; Speaking")), self.rail_label("Beta")
         print(f"Push-to-talk reached the talk server only: {sent}; nothing without it.", flush=True)
         self.hold("F9", True)
         self.shot("2-talking-on-beta")
@@ -327,8 +327,8 @@ class VoiceTest:
                    timeout=5)
         self.shot("3-listening-pulse")
         talker.join()
-        card = eventually(lambda: self.named("Beta #Lobby: Microphone destination · enabled"), "idle PTT destination summary absent")
-        assert card == "Beta #Lobby: Microphone destination · enabled · Alpha #Lobby: Listening", card
+        card = eventually(lambda: self.named("Beta #Lobby: Unmuted"), "idle PTT destination summary absent")
+        assert card == "Beta #Lobby: Unmuted · Alpha #Lobby: Listening", card
 
         # The mute shortcut acts on the talk server, not on Alpha in front.
         self.shell.key("F10")

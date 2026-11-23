@@ -44,8 +44,8 @@ together (each with its own volume in its menu), and your voice goes to one: the
 server whose channel you last joined, or the one you chose with **Use voice here**. It
 has a green microphone ring in the server rail; the servers you only listen to have a
 headphone badge that lights up while someone talks there, and see you muted. The card
-above your name says where you are ("Talking on Beta #Lobby · listening to Alpha
-#Lobby"); click a place to go there. Unmuting on a second server asks first, **Speak
+above your name lists each place with its status ("Beta #Lobby" Speaking, "Alpha
+#Lobby" Listening); click a place to go there. Unmuting on a second server asks first, **Speak
 on two servers?**; push to talk and the mute shortcuts act where your voice goes.
 ([clients.md](clients.md#voice-on-several-servers) has the design.)
 

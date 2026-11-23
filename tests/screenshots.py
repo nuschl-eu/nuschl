@@ -214,7 +214,7 @@ def notice_zoom(args, root, shell, registry, bots, profile, port, pin, shot):
                 connect.press()
             eventually(lambda: next((node for node, role, name, _ in items(application)
                                      if role == "push button" and name.startswith("Screenshot server;")
-                                     and "Microphone destination · muted" in name), None),
+                                     and name.endswith("; Muted")), None),
                        "the server did not reconnect while muted", timeout=30)
             for _ in range(steps):
                 shell.chord("Control_L", "equal")
@@ -224,7 +224,7 @@ def notice_zoom(args, root, shell, registry, bots, profile, port, pin, shot):
                        f"Ctrl++ did not reach {percent}%")
             rail = eventually(lambda: next((node for node, role, name, _ in items(application)
                                             if role == "push button" and name.startswith("Screenshot server;")
-                                            and "Microphone destination · muted" in name), None),
+                                            and name.endswith("; Muted")), None),
                               "the server rail does not announce muted voice", timeout=30)
             session = eventually(lambda: next((u["session"] for u in bots[0].users.values()
                                                if u["name"] == "Andi"), None), "Andi did not reconnect")

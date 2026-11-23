@@ -113,8 +113,10 @@ impl Facts {
 }
 
 impl State {
-    /// Short labels describe server-scoped intent/observations. "Enabled"
-    /// deliberately does not promise device readiness or continuous speech.
+    /// Short labels describe server-scoped intent/observations. On a server
+    /// that receives your microphone they say Muted, Unmuted or Speaking;
+    /// elsewhere Listening or Deafened. Unmuted is the user's intent; Speaking
+    /// is observed sending.
     pub fn label(self) -> &'static str {
         match self {
             Self::Offline => "Disconnected",
@@ -128,14 +130,14 @@ impl State {
             Self::ServerDeafened => "Deafened by server",
             Self::Listening => "Listening",
             Self::ListeningPending => "Listening · awaiting server",
-            Self::Muted => "Microphone destination · muted",
-            Self::MutedPending => "Microphone destination · muted · awaiting server",
-            Self::ServerMuted => "Microphone destination · server muted",
+            Self::Muted => "Muted",
+            Self::MutedPending => "Muted · awaiting server",
+            Self::ServerMuted => "Muted by server",
             Self::Suppressed => "Can't speak here",
             Self::NoTransmitBudget => "Microphone unavailable: server bandwidth",
-            Self::AwaitingAcknowledgement => "Microphone destination · awaiting server",
-            Self::PushMuted => "Microphone destination · push to mute",
-            Self::MicrophoneEnabled => "Microphone destination · enabled",
+            Self::AwaitingAcknowledgement => "Unmuted · awaiting server",
+            Self::PushMuted => "Muted · push to mute",
+            Self::MicrophoneEnabled => "Unmuted",
             Self::Speaking => "Speaking",
         }
     }

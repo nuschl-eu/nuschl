@@ -176,9 +176,7 @@ pub fn projected(client: &Client, server: &ServerView, push_muted: bool) -> Stat
 }
 
 pub fn rail_label(state: State, busy: bool) -> String {
-    if state == State::Speaking {
-        "Microphone destination · enabled · Speaking".into()
-    } else if state == State::Listening && busy {
+    if state == State::Listening && busy {
         "Listening · someone is speaking".into()
     } else if state == State::Offline {
         String::new()
@@ -915,7 +913,7 @@ mod tests {
         ];
         assert_eq!(
             summary(&places),
-            "Alpha #Lobby: Microphone destination · enabled · Beta #Root: Deafened"
+            "Alpha #Lobby: Unmuted · Beta #Root: Deafened"
         );
     }
     fn server(id: &str) -> ServerView {

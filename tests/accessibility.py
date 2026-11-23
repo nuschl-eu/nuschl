@@ -13,7 +13,7 @@ Orca would and checks that:
   Action interface, the server sees the user unmuted, the button becomes
   "Mute" and the voice card names its microphone destination;
 - where your voice goes is named: the rail button ("voice here, muted"), the
-  voice card ("Accessible server #Development: Microphone destination · muted") and its place, a
+  voice card ("Accessible server #Development: Muted") and its place, a
   button that goes there;
 - with --gnome-shell: a pointer click beside a branch's chevron, at the row's
   top and left edge, expands and collapses it at 100 % and 200 % zoom; Right
@@ -318,7 +318,7 @@ class AccessibilityTest:
             eventually(lambda: any(role == "push button" and name == "Mute"
                                    for _, _, role, name in snapshot(nuschl)),
                        "the button did not change to Mute")
-            eventually(lambda: any(name in ("Accessible server #Development: Microphone destination · enabled", "Accessible server #Development: Speaking")
+            eventually(lambda: any(name in ("Accessible server #Development: Unmuted", "Accessible server #Development: Speaking")
                        for _, _, _, name in snapshot(nuschl)), "the voice card did not expose the acknowledged microphone destination")
             print("Unmuted through the AT-SPI Action interface; the server saw it and the button became Mute.",
                   flush=True)
@@ -741,8 +741,8 @@ class AccessibilityTest:
         # Where your voice goes: the rail button and the voice card say it, and
         # the card's place is a button that goes there.
         rail = [name for _, _, role, name in nodes if role == "push button" and name.startswith("Accessible server;")]
-        assert rail and rail[0].endswith("; Microphone destination · muted"), f"the rail does not say where the voice is: {rail}"
-        assert "Accessible server #Development: Microphone destination · muted" in {name for _, _, _, name in nodes}, \
+        assert rail and rail[0].endswith("; Muted"), f"the rail does not say where the voice is: {rail}"
+        assert "Accessible server #Development: Muted" in {name for _, _, _, name in nodes}, \
             "the voice card is not named"
         self.find(nodes, "push button", "Go to Accessible server #Development")
 

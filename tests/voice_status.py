@@ -135,7 +135,7 @@ def run(args, root, shell, registry, bots, profile, second_port, second_pin, sho
     record("actual-audio-sending")
     admin.send(kind="moderate", session=own("beta")["session"], action="mute")
     eventually(lambda: own("beta")["muted"], "server mute not observed")
-    state("beta", "Microphone destination · server muted", "Root"); record("server-muted")
+    state("beta", "Muted by server", "Root"); record("server-muted")
     admin.send(kind="moderate", session=own("beta")["session"], action="deafen")
     eventually(lambda: own("beta")["deafened"], "server deafen not observed")
     # The server deafened the user: the row stays and says why.
