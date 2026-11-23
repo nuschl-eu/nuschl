@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// An independent synthetic AV1 frame plus a 4 KiB AV1 padding OBU.
+fn picture() -> Vec<u8> {
+    let mut picture = vec![
+        0x12, 0, 0x0a, 0x0a, 0, 0, 0, 2, 0x27, 0xfe, 0x6d, 0x7c, 0x80, 0x20, 0x32, 0x0e, 0x10, 0,
+        0x8c, 0, 0, 2, 0, 0, 0, 0, 0x3e, 0xfc, 0xc1, 8, 0x7a, 0x80, 0x20,
+    ];
+    picture.resize(picture.len() + 4096, 0);
+    picture
+}
+
 #[tokio::test]
 async fn native_call_switches_paths_and_sources() {
     let _media = MEDIA_TEST.lock().await;
@@ -61,12 +71,7 @@ async fn native_call_switches_paths_and_sources() {
     viewer.welcome.turn = None;
     let mut viewer = viewer.into_media(make_media(None)).await.unwrap();
 
-    // An independent synthetic AV1 frame plus a 4 KiB AV1 padding OBU.
-    let mut picture = vec![
-        0x12, 0, 0x0a, 0x0a, 0, 0, 0, 2, 0x27, 0xfe, 0x6d, 0x7c, 0x80, 0x20, 0x32, 0x0e, 0x10, 0,
-        0x8c, 0, 0, 2, 0, 0, 0, 0, 0x3e, 0xfc, 0xc1, 8, 0x7a, 0x80, 0x20,
-    ];
-    picture.resize(picture.len() + 4096, 0);
+    let picture = picture();
     let mut ready = false;
     let mut over_sfu = false;
     let mut sender_direct = false;
@@ -350,4 +355,206 @@ async fn native_call_switches_paths_and_sources() {
     publisher.stop().await.unwrap();
     viewer.stop().await.unwrap();
     extra.close().await.unwrap();
+}
+
+/// One publisher's camera frames and both endpoints' events.
+struct Call {
+    publisher: Media,
+    viewer: Media,
+    from: u64,
+    tick: tokio::time::Interval,
+    ready: bool,
+    timestamp: u64,
+    routes: [Option<Route>; 2],
+    published: Vec<Route>,
+    frames: usize,
+    bytes: usize,
+}
+
+impl Call {
+    /// The bytes the SFU sent and the frame bytes the viewer received over
+    /// three seconds, after a second for the SFU's count to catch up.
+    async fn measure(&mut self, sent: impl Fn() -> u64) -> (u64, usize) {
+        self.run(Duration::from_millis(1500), |_| false).await;
+        let (before, received) = (sent(), self.bytes);
+        self.run(Duration::from_secs(3), |_| false).await;
+        (sent() - before, self.bytes - received)
+    }
+
+    /// Runs the call until `done` holds or `limit` passes; tells whether it held.
+    async fn run(&mut self, limit: Duration, done: impl Fn(&Self) -> bool) -> bool {
+        let picture = picture();
+        timeout(limit, async {
+            while !done(self) {
+                tokio::select! {
+                    _ = self.tick.tick() => if self.ready {
+                        self.timestamp += 2970;
+                        self.publisher.send_keyframe(self.timestamp, picture.clone()).unwrap();
+                    },
+                    event = self.publisher.next() => match event.unwrap().unwrap() {
+                        MediaEvent::SourceReady { .. } => self.ready = true,
+                        MediaEvent::Route(route) => {
+                            self.routes[0] = Some(route);
+                            self.published.push(route);
+                        }
+                        _ => {}
+                    },
+                    event = self.viewer.next() => match event.unwrap().unwrap() {
+                        MediaEvent::Route(route) => self.routes[1] = Some(route),
+                        MediaEvent::Frame { publisher, data, .. } => {
+                            assert_eq!(publisher, self.from);
+                            assert_eq!(data, picture);
+                            self.frames += 1;
+                            self.bytes += data.len();
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+}
+
+#[tokio::test]
+async fn native_video_follows_the_upload_and_relay_only_stays_relayed() {
+    let _media = MEDIA_TEST.lock().await;
+    nuschl_testkit::sandbox();
+    let crypto = fixture("nuschl-crypto-worker");
+    let rtc = fixture("nuschl-rtc-worker");
+    let turn = nuschl_testkit::turn::start();
+    // The SFU saves the bytes it sent once a second.
+    let sfu = nuschl_testkit::sfu::start_with_turn(
+        fixture("nuschl-stream-sfu"),
+        "traffic_budget = 1000000000000000\nstate_directory = \"{directory}\"",
+        &turn.url,
+    );
+    let traffic = sfu.directory.path().join("traffic");
+    let sent = || -> u64 {
+        let count = std::fs::read_to_string(&traffic).unwrap();
+        count.split_whitespace().nth(1).unwrap().parse().unwrap()
+    };
+    let (host, roots) = tls_proxy(&sfu).await;
+    let directory = nuschl_testkit::temp_dir();
+    let posted = format!("https://{host}/call#{LINK}");
+    let owner = format!("{posted}&p={OWNER}");
+    let join = |name: &str, link, relay_only| {
+        Connection::connect_with_roots(
+            CryptoHandle::start(crypto.clone(), directory.path().join(name)),
+            Connect {
+                generation: 1,
+                host: &host,
+                link,
+                codecs: &[Codec::Av1],
+                policy: PeerPolicy { relay_only },
+            },
+            roots.clone(),
+        )
+    };
+    let options = |publish| MediaOptions {
+        executable: rtc.clone(),
+        sfu_port: sfu.media.port(),
+        publish,
+    };
+    // Version 1, the first camera and screen tier, as in the test above.
+    let capacity = ClientMessage::Capacity {
+        decode: "010000".into(),
+    };
+    let publisher = join("publisher", &owner, false).await.unwrap();
+    let from = publisher.welcome().peer;
+    let publisher = publisher
+        .into_media(options(Some(Purpose::Camera)))
+        .await
+        .unwrap();
+    let mut viewer = join("viewer", &posted, false).await.unwrap();
+    write(&mut viewer.socket, &capacity).await.unwrap();
+    let mut tick = tokio::time::interval(Duration::from_millis(33));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut call = Call {
+        publisher,
+        viewer: viewer.into_media(options(None)).await.unwrap(),
+        from,
+        tick,
+        ready: false,
+        timestamp: 0,
+        routes: [None; 2],
+        published: Vec::new(),
+        frames: 0,
+        bytes: 0,
+    };
+
+    let direct = [Some(Route::Direct); 2];
+    assert!(
+        call.run(Duration::from_secs(20), |call| call.routes == direct)
+            .await,
+        "both endpoints go direct: {:?}",
+        call.routes
+    );
+    // Media runs on one path: the SFU forwards none of it while the
+    // direct leg carries every frame. Probes and RTCP remain.
+    let (forwarded, received) = call.measure(&sent).await;
+    assert_eq!(call.routes, direct);
+    eprintln!("direct: the SFU sent {forwarded} bytes, the viewer received {received}");
+    assert!(received > 100_000 && forwarded * 3 < received as u64);
+
+    // A throttled leg backs its estimate off below the stream rate. Both
+    // endpoints return to the SFU, and frames keep decrypting under the
+    // keys they used on the direct leg.
+    call.publisher.throttle_direct(12_000).await;
+    let throttled = std::time::Instant::now();
+    let relayed = |route: &Option<Route>| matches!(route, Some(Route::Sfu(_)));
+    assert!(
+        call.run(Duration::from_secs(20), |call| call
+            .routes
+            .iter()
+            .all(relayed))
+            .await,
+        "both endpoints return to the SFU: {:?}",
+        call.routes
+    );
+    eprintln!("fallback after {:?}", throttled.elapsed());
+    let (forwarded, received) = call.measure(&sent).await;
+    assert!(call.routes.iter().all(relayed));
+    eprintln!("SFU: the SFU sent {forwarded} bytes, the viewer received {received}");
+    assert!(received > 40_000 && forwarded * 3 > received as u64 * 2);
+    eprintln!("publisher routes: {:?}", call.published);
+
+    // A relay-only viewer never sends a candidate, and its crypto worker
+    // seals no direct signaling.
+    let Call { viewer, .. } = call;
+    viewer.stop().await.unwrap();
+    let mut viewer = join("relay-only", &posted, true).await.unwrap();
+    let refused = viewer
+        .signal(Action::Seal {
+            peer: from,
+            publisher: false,
+            data: b"candidates".to_vec(),
+        })
+        .await;
+    assert!(
+        matches!(&refused, Err(error) if error.to_string().contains("direct signaling disabled")),
+        "{:?}",
+        refused.err()
+    );
+    write(&mut viewer.socket, &capacity).await.unwrap();
+    let mut call = Call {
+        viewer: viewer.into_media(options(None)).await.unwrap(),
+        routes: [None; 2],
+        published: Vec::new(),
+        frames: 0,
+        ..call
+    };
+    call.run(Duration::from_secs(8), |_| false).await;
+    assert!(call.frames > 30, "{} frames through TURN", call.frames);
+    assert!(!call.published.contains(&Route::Direct));
+    assert_eq!(
+        call.routes,
+        [
+            Some(Route::Sfu(Reason::Viewer)),
+            Some(Route::Sfu(Reason::RelayOnly))
+        ]
+    );
+    call.publisher.stop().await.unwrap();
+    call.viewer.stop().await.unwrap();
 }

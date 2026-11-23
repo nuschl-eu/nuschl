@@ -175,6 +175,8 @@ enum Input {
     RequestKeyframe(Option<u64>, Purpose),
     #[cfg(test)]
     LoseDirect,
+    #[cfg(test)]
+    ThrottleDirect(u64),
 }
 
 struct Video {
@@ -355,6 +357,16 @@ impl Media {
     #[cfg(test)]
     pub(super) async fn lose_direct(&self) {
         assert!(self.input.send(Input::LoseDirect).await.is_ok());
+    }
+
+    #[cfg(test)]
+    pub(super) async fn throttle_direct(&self, bytes_per_second: u64) {
+        assert!(
+            self.input
+                .send(Input::ThrottleDirect(bytes_per_second))
+                .await
+                .is_ok()
+        );
     }
 
     pub async fn next(&mut self) -> Option<Result<MediaEvent, Error>> {
@@ -567,6 +579,45 @@ struct Leg {
     bandwidth: Option<(Instant, u64)>,
     last_packet: Option<Instant>,
     video_gates: HashMap<(u64, Purpose), FrameGate>,
+    #[cfg(test)]
+    throttle: Option<Shaper>,
+}
+
+/// A bottleneck for a leg's outgoing datagrams: a queue drained at a byte
+/// rate that drops what would wait longer than a second.
+#[cfg(test)]
+struct Shaper {
+    rate: f64,
+    free: Instant,
+    queue: std::collections::VecDeque<(Instant, Vec<u8>, SocketAddr)>,
+}
+
+#[cfg(test)]
+impl Shaper {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate: rate as f64,
+            free: Instant::now(),
+            queue: Default::default(),
+        }
+    }
+
+    fn push(&mut self, data: Vec<u8>, destination: SocketAddr) {
+        let now = Instant::now();
+        let start = self.free.max(now);
+        if start <= now + Duration::from_secs(1) {
+            self.free = start + Duration::from_secs_f64(data.len() as f64 / self.rate);
+            self.queue.push_back((self.free, data, destination));
+        }
+    }
+
+    fn due(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
+        let (at, ..) = self.queue.front()?;
+        (*at <= Instant::now())
+            .then(|| self.queue.pop_front())
+            .flatten()
+            .map(|(_, data, destination)| (data, destination))
+    }
 }
 
 impl Leg {
@@ -639,6 +690,8 @@ impl Leg {
             bandwidth: None,
             last_packet: None,
             video_gates: HashMap::new(),
+            #[cfg(test)]
+            throttle: None,
         })
     }
 
@@ -1101,6 +1154,12 @@ async fn run(
                     }
                 }
                 #[cfg(test)]
+                Some(Input::ThrottleDirect(rate)) => {
+                    for attempt in direct.iter_mut().flat_map(|direct| &mut direct.legs) {
+                        attempt.transport.throttle = Some(Shaper::new(rate));
+                    }
+                }
+                #[cfg(test)]
                 Some(Input::LoseDirect) => {
                     for attempt in direct.iter_mut().flat_map(|direct| &mut direct.legs) {
                         if let Network::Direct { remote, .. } = &mut attempt.transport.network {
@@ -1557,6 +1616,10 @@ async fn drain(
     sending: bool,
     output: &Output<'_>,
 ) -> Result<(), Error> {
+    #[cfg(test)]
+    while let Some((data, destination)) = leg.throttle.as_mut().and_then(Shaper::due) {
+        leg.network.send(&data, destination).await?;
+    }
     for _ in 0..UDP_BURST {
         let packet = worker
             .exchange(Command::Poll { leg: leg.id }, Vec::new())
@@ -1564,9 +1627,22 @@ async fn drain(
         match packet.kind {
             Reply::Wake { after_millis, .. } => {
                 leg.wake = Some(Instant::now() + Duration::from_millis(after_millis));
+                #[cfg(test)]
+                if let Some((at, ..)) = leg
+                    .throttle
+                    .as_ref()
+                    .and_then(|shaper| shaper.queue.front())
+                {
+                    leg.wake = leg.wake.min(Some(*at));
+                }
                 return Ok(());
             }
             Reply::Datagram { destination, .. } => {
+                #[cfg(test)]
+                if let Some(shaper) = &mut leg.throttle {
+                    shaper.push(packet.data, destination);
+                    continue;
+                }
                 leg.network.send(&packet.data, destination).await?;
             }
             Reply::Event { event, .. } => match event {
