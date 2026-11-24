@@ -74,12 +74,13 @@ test("old transport promises cannot consume or release the next connection's aud
   for(const complete of completions.slice(1))complete();await turn();assert.equal(audio.txJobs.size,0);await audio.dispose();
 });
 
-test("a stalled transport closes capture instead of growing an unlimited RPC backlog",async()=>{
-  let reply;const audio=new BrowserAudio({onPacket:()=>new Promise(resolve=>{reply=resolve;})});audio.syncVoice(voice());
-  audio.sendPacket(0n,new Uint8Array([0xf8,0xff,0xfe]),false);
+test("a slow SDK holds six sends, later frames are dropped and capture stays open",async()=>{
+  const replies=[];const audio=new BrowserAudio({onPacket:()=>new Promise(resolve=>replies.push(resolve))});audio.syncVoice(voice());
+  for(let index=0;index<=MAX_CAPTURE;index++)audio.sendPacket(BigInt(2*index),new Uint8Array([0xf8,0xff,0xfe]),false);
   await new Promise(resolve=>setTimeout(resolve,300));
-  assert.equal(audio.transportStalled,true);assert.equal(audio.txJobs.size,1,"timeout is not an SDK acknowledgment");assert.equal(audio.phase,"transport-error");
-  reply();await turn();assert.equal(audio.txJobs.size,0);await audio.dispose();
+  assert.equal(replies.length,MAX_CAPTURE);assert.equal(audio.txJobs.size,MAX_CAPTURE);
+  assert.equal(audio.transportStalled,false);assert.notEqual(audio.phase,"transport-error");
+  for(const reply of replies)reply();await turn();assert.equal(audio.txJobs.size,0);await audio.dispose();
 });
 
 test("a codec worker that misses heartbeats for seconds keeps audio; one silent for 30 s has hung",async()=>{

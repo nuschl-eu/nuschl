@@ -23,9 +23,9 @@ or silently cleared. Drafts still live in page memory: copy an unsent draft befo
 explicitly reloading; this change does not add draft persistence.
 
 BrowserAudio's six acknowledged SDK audio-send slots are global across TX epoch
-changes. Its 250 ms capture deadline closes capture but does not acknowledge the
-SDK inbox or release those slots. A real result, or a synthetic rejection from
-an already permanently retired SDK owner, settles them. Old completion identity
+changes. While all six wait, captured frames are dropped and capture stays open.
+Elapsed time releases no slot: a real result, or a synthetic rejection from an
+already permanently retired SDK owner, settles them. Old completion identity
 checks remain, and a duplicate cannot consume a later slot.
 
 ## Logical retirement and physical shutdown
@@ -53,8 +53,8 @@ from the void termination API.
 `node --test tests/sdk_rpc.unit.mjs tests/web_audio.unit.mjs tests/web_playout_clock.mjs`
 exercises the audio and RPC bounds. The six focused RPC checks exercise the 128-command
 cap, exact acknowledgments, termination-before-synthetic-settlement ordering,
-transient errors, failed termination, and six audio slots through 20 epochs plus
-the 250 ms timeout.
+transient errors, failed termination, and six audio slots through 20 epochs and
+a slow SDK.
 
 `tests/sdk_rpc.browser.mjs APP RELAY_URL MURMUR_PORT WRAPPER OUTPUT` runs an actual
 packaged App under production CSP on a private server. The fixture appends only
