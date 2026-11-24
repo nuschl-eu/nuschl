@@ -433,7 +433,13 @@ impl Publisher {
             let bytes = frame.av1.len();
             let ticks = frame.capture_time_us.saturating_mul(9) / 100;
             if media
-                .send_source_frame(purpose(source), ticks, frame.keyframe, frame.av1)
+                .send_described_frame(
+                    purpose(source),
+                    ticks,
+                    frame.keyframe,
+                    frame.av1,
+                    frame.descriptor,
+                )
                 .map_err(text)?
             {
                 track.stats.encoded(bytes);

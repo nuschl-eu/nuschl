@@ -7,9 +7,16 @@ use rav1d::{
     pixel::{MatrixCoefficients, TransferCharacteristic, YUVRange},
 };
 
-pub fn to_bgra(picture: &Picture, source: Source) -> Result<DecodedFrame, Error> {
-    let width = u16::try_from(picture.width())?;
-    let height = u16::try_from(picture.height())?;
+pub fn to_bgra(
+    picture: &Picture,
+    source: Source,
+    render: Option<(u16, u16)>,
+) -> Result<DecodedFrame, Error> {
+    let frame = (
+        u16::try_from(picture.width())?,
+        u16::try_from(picture.height())?,
+    );
+    let (width, height) = super::shown(frame, render);
     let length = decode_frame_bytes(source, width, height)?;
     let bits = picture
         .bits_per_component()

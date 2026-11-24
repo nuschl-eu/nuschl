@@ -385,8 +385,9 @@ impl Call {
                 purpose,
                 timestamp,
                 key_frame,
+                descriptor,
             } => {
-                self.write(purpose, timestamp, key_frame, now, &data)?;
+                self.write(purpose, timestamp, key_frame, now, &data, &descriptor)?;
                 Reply::Done
             }
             Command::RequestKeyframe {
@@ -418,6 +419,7 @@ impl Call {
         key_frame: bool,
         now: Instant,
         data: &[u8],
+        descriptor: &[u8],
     ) -> Result<(), ()> {
         let index = usize::from(encoding(purpose));
         if self.active.is_empty()
@@ -440,7 +442,7 @@ impl Call {
             let track = live.peer.track_for(to_purpose(purpose)).ok_or(())?;
             written &= live
                 .peer
-                .write(track, timestamp, now, encrypted.clone())
+                .write(track, timestamp, now, encrypted.clone(), descriptor)
                 .is_ok();
         }
         if !written {

@@ -15245,6 +15245,90 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "v1_16" "v1_18" "v1_20" "v1_22" "v1_24" "v1_26" "v1_28" ];
       };
+      "gstreamer-allocators" = rec {
+        crateName = "gstreamer-allocators";
+        version = "0.25.4";
+        edition = "2024";
+        sha256 = "1ycf9syk9ksc9qfm3f5r1pxcpik126xwsdgazncnxwbisb25v52q";
+        libName = "gstreamer_allocators";
+        authors = [
+          "Sebastian Dröge <sebastian@centricular.com>"
+        ];
+        dependencies = [
+          {
+            name = "glib";
+            packageId = "glib";
+          }
+          {
+            name = "gstreamer";
+            packageId = "gstreamer";
+            rename = "gst";
+          }
+          {
+            name = "gstreamer-allocators-sys";
+            packageId = "gstreamer-allocators-sys";
+          }
+          {
+            name = "libc";
+            packageId = "libc";
+          }
+        ];
+        features = {
+          "v1_16" = [ "gst/v1_16" "gstreamer-allocators-sys/v1_16" ];
+          "v1_18" = [ "gst/v1_18" "gstreamer-allocators-sys/v1_18" "v1_16" ];
+          "v1_20" = [ "gst/v1_20" "gstreamer-allocators-sys/v1_20" "v1_18" ];
+          "v1_22" = [ "gst/v1_22" "gstreamer-allocators-sys/v1_22" "v1_20" ];
+          "v1_24" = [ "gst/v1_24" "gstreamer-allocators-sys/v1_24" "v1_22" ];
+          "v1_26" = [ "gst/v1_26" "gstreamer-allocators-sys/v1_26" "v1_24" ];
+          "v1_28" = [ "gst/v1_28" "gstreamer-allocators-sys/v1_28" "v1_26" ];
+          "v1_30" = [ "gst/v1_30" "gstreamer-allocators-sys/v1_30" "v1_28" ];
+        };
+        resolvedDefaultFeatures = [ "v1_16" "v1_18" "v1_20" "v1_22" "v1_24" "v1_26" "v1_28" ];
+      };
+      "gstreamer-allocators-sys" = rec {
+        crateName = "gstreamer-allocators-sys";
+        version = "0.25.4";
+        edition = "2024";
+        sha256 = "0z5ykf2c6krwfjxw250xdarnm0s3fzl3rcyapzzrq6zr4jkgcmhw";
+        libName = "gstreamer_allocators_sys";
+        authors = [
+          "Sebastian Dröge <sebastian@centricular.com>"
+        ];
+        dependencies = [
+          {
+            name = "glib-sys";
+            packageId = "glib-sys";
+          }
+          {
+            name = "gobject-sys";
+            packageId = "gobject-sys";
+          }
+          {
+            name = "gstreamer-sys";
+            packageId = "gstreamer-sys";
+          }
+          {
+            name = "libc";
+            packageId = "libc";
+          }
+        ];
+        buildDependencies = [
+          {
+            name = "system-deps";
+            packageId = "system-deps 9.0.1";
+          }
+        ];
+        features = {
+          "v1_18" = [ "v1_16" ];
+          "v1_20" = [ "v1_18" ];
+          "v1_22" = [ "v1_20" ];
+          "v1_24" = [ "v1_22" ];
+          "v1_26" = [ "v1_24" ];
+          "v1_28" = [ "v1_26" ];
+          "v1_30" = [ "v1_28" ];
+        };
+        resolvedDefaultFeatures = [ "v1_16" "v1_18" "v1_20" "v1_22" "v1_24" "v1_26" "v1_28" ];
+      };
       "gstreamer-app" = rec {
         crateName = "gstreamer-app";
         version = "0.25.2";
@@ -15482,6 +15566,112 @@ rec {
           "v1_30" = [ "v1_28" ];
         };
         resolvedDefaultFeatures = [ "v1_16" "v1_18" "v1_18_3" "v1_20" "v1_20_4" "v1_22" "v1_24" "v1_26" "v1_28" ];
+      };
+      "gstreamer-video" = rec {
+        crateName = "gstreamer-video";
+        version = "0.25.4";
+        edition = "2024";
+        sha256 = "116y7xlxw7v9z1r8h9jw7yw8dnlcv99c1dn6v5rrjrsy59xxgr7z";
+        libName = "gstreamer_video";
+        authors = [
+          "Sebastian Dröge <sebastian@centricular.com>"
+        ];
+        dependencies = [
+          {
+            name = "cfg-if";
+            packageId = "cfg-if";
+          }
+          {
+            name = "futures-channel";
+            packageId = "futures-channel";
+          }
+          {
+            name = "glib";
+            packageId = "glib";
+          }
+          {
+            name = "gstreamer";
+            packageId = "gstreamer";
+            rename = "gst";
+          }
+          {
+            name = "gstreamer-base";
+            packageId = "gstreamer-base";
+            rename = "gst-base";
+          }
+          {
+            name = "gstreamer-video-sys";
+            packageId = "gstreamer-video-sys";
+          }
+          {
+            name = "libc";
+            packageId = "libc";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.21";
+          }
+        ];
+        features = {
+          "serde" = [ "dep:serde" "gst/serde" ];
+          "v1_16" = [ "gst/v1_16" "gst-base/v1_16" "gstreamer-video-sys/v1_16" ];
+          "v1_18" = [ "gst/v1_18" "gst-base/v1_18" "gstreamer-video-sys/v1_18" "v1_16" ];
+          "v1_20" = [ "gst/v1_20" "gst-base/v1_20" "gstreamer-video-sys/v1_20" "v1_18" ];
+          "v1_22" = [ "gst/v1_22" "gst-base/v1_22" "gstreamer-video-sys/v1_22" "v1_20" ];
+          "v1_24" = [ "gst/v1_24" "gst-base/v1_24" "gstreamer-video-sys/v1_24" "v1_22" ];
+          "v1_26" = [ "gst/v1_26" "gst-base/v1_26" "gstreamer-video-sys/v1_26" "v1_24" ];
+          "v1_28" = [ "gst/v1_28" "gst-base/v1_28" "gstreamer-video-sys/v1_28" "v1_26" ];
+          "v1_30" = [ "gst/v1_30" "gst-base/v1_30" "gstreamer-video-sys/v1_30" "v1_28" ];
+        };
+        resolvedDefaultFeatures = [ "v1_16" "v1_18" "v1_20" "v1_22" "v1_24" "v1_26" "v1_28" ];
+      };
+      "gstreamer-video-sys" = rec {
+        crateName = "gstreamer-video-sys";
+        version = "0.25.4";
+        edition = "2024";
+        sha256 = "01n15pl1mcv10774hdrhgchxkwr7ha32ns4x574pmafw5si5sigg";
+        libName = "gstreamer_video_sys";
+        authors = [
+          "Sebastian Dröge <sebastian@centricular.com>"
+        ];
+        dependencies = [
+          {
+            name = "glib-sys";
+            packageId = "glib-sys";
+          }
+          {
+            name = "gobject-sys";
+            packageId = "gobject-sys";
+          }
+          {
+            name = "gstreamer-base-sys";
+            packageId = "gstreamer-base-sys";
+          }
+          {
+            name = "gstreamer-sys";
+            packageId = "gstreamer-sys";
+          }
+          {
+            name = "libc";
+            packageId = "libc";
+          }
+        ];
+        buildDependencies = [
+          {
+            name = "system-deps";
+            packageId = "system-deps 9.0.1";
+          }
+        ];
+        features = {
+          "v1_18" = [ "v1_16" ];
+          "v1_20" = [ "v1_18" ];
+          "v1_22" = [ "v1_20" ];
+          "v1_24" = [ "v1_22" ];
+          "v1_26" = [ "v1_24" ];
+          "v1_28" = [ "v1_26" ];
+          "v1_30" = [ "v1_28" ];
+        };
+        resolvedDefaultFeatures = [ "v1_16" "v1_18" "v1_20" "v1_22" "v1_24" "v1_26" "v1_28" ];
       };
       "guillotiere" = rec {
         crateName = "guillotiere";
@@ -25936,6 +26126,10 @@ rec {
             packageId = "nuschl-core";
           }
           {
+            name = "nuschl-stream-quality";
+            packageId = "nuschl-stream-quality";
+          }
+          {
             name = "str0m";
             packageId = "str0m";
             usesDefaultFeatures = false;
@@ -26226,6 +26420,10 @@ rec {
           {
             name = "nuschl-testkit";
             packageId = "nuschl-testkit";
+          }
+          {
+            name = "nuschl-video-encode";
+            packageId = "nuschl-video-encode";
           }
           {
             name = "tempfile";
@@ -26981,8 +27179,24 @@ rec {
             features = [ "v1_28" ];
           }
           {
+            name = "gstreamer-allocators";
+            packageId = "gstreamer-allocators";
+            optional = true;
+            usesDefaultFeatures = false;
+            target = { target, features }: ("linux" == target."os" or null);
+            features = [ "v1_28" ];
+          }
+          {
             name = "gstreamer-app";
             packageId = "gstreamer-app";
+            optional = true;
+            usesDefaultFeatures = false;
+            target = { target, features }: ("linux" == target."os" or null);
+            features = [ "v1_28" ];
+          }
+          {
+            name = "gstreamer-video";
+            packageId = "gstreamer-video";
             optional = true;
             usesDefaultFeatures = false;
             target = { target, features }: ("linux" == target."os" or null);
@@ -27053,15 +27267,18 @@ rec {
             packageId = "nuschl-testkit";
           }
           {
+            name = "nuschl-video-encode";
+            packageId = "nuschl-video-encode";
+          }
+          {
             name = "serde_json";
             packageId = "serde_json";
           }
         ];
         features = {
-          "va-encoder" = [ "dep:cros-libva" "dep:nuschl-video-encode" ];
-          "vaapi" = [ "dep:gstreamer" "dep:gstreamer-app" ];
+          "vaapi" = [ "dep:gstreamer" "dep:gstreamer-allocators" "dep:gstreamer-app" "dep:gstreamer-video" "dep:cros-libva" "dep:nuschl-video-encode" ];
         };
-        resolvedDefaultFeatures = [ "va-encoder" "vaapi" ];
+        resolvedDefaultFeatures = [ "vaapi" ];
       };
       "nuschl-web-relay" = rec {
         crateName = "nuschl-web-relay";
@@ -41871,8 +42088,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/ambiso/str0m";
-          rev = "942ad38e443915b762f10d3302e0f4a2a34a58de";
-          sha256 = "0fx1p0hbfrp650vh6jf6k2766av73xg7rrhaxnf768fkpfhf6108";
+          rev = "faa6cd05cac7d88bb4dfa46dfd87c13324dacafd";
+          sha256 = "1csmk7xvkwmhys4mbs85pfdfmp2xg1rgha1zc8cv5xagy0zq9xnw";
         };
         authors = [
           "Martin Algesten <martin@algesten.se>"

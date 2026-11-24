@@ -219,13 +219,9 @@ context.objects = [
     assert_eq!(frame.hardware, hardware);
     assert!(frame.width >= 16 && frame.height >= 16);
     assert!(frame.capture_time_us > 0);
-    let raw = decode_av1(&frame.av1);
-    assert_eq!(
-        raw.len(),
-        usize::from(frame.width) * usize::from(frame.height) * 3 / 2
-    );
+    let raw_bytes = usize::from(frame.width) * usize::from(frame.height) * 3 / 2;
     if hardware {
-        let mut sequence = frame.av1;
+        let mut sequence = frame.av1.clone();
         tokio::time::timeout(Duration::from_secs(6), async {
             loop {
                 let frame = capture.next().await.unwrap();
@@ -237,9 +233,8 @@ context.objects = [
         })
         .await
         .expect("VA-API generates interframes");
-        assert!(decode_av1(&sequence).len() >= 2 * raw.len());
-        // Screens get keyframes on request, also past vaav1enc's default
-        // interval of 60 frames.
+        // Screens get keyframes on request only. The frames are read as they
+        // arrive: the supervisor asks for a keyframe when one waits too long.
         tokio::time::timeout(Duration::from_secs(10), async {
             for _ in 0..90 {
                 assert!(!capture.next().await.unwrap().keyframe);
@@ -247,12 +242,13 @@ context.objects = [
         })
         .await
         .expect("VA-API keeps sending interframes");
+        assert!(decode_av1(&sequence).len() >= 2 * raw_bytes);
         capture.request_keyframe();
         tokio::time::timeout(Duration::from_millis(800), async {
             loop {
                 let frame = capture.next().await.unwrap();
                 if frame.keyframe {
-                    assert_eq!(decode_av1(&frame.av1).len(), raw.len());
+                    assert_eq!(decode_av1(&frame.av1).len(), raw_bytes);
                     break;
                 }
             }
@@ -260,6 +256,7 @@ context.objects = [
         .await
         .expect("VA-API generates a prompt keyframe on request");
     }
+    assert_eq!(decode_av1(&frame.av1).len(), raw_bytes);
     assert!(capture.set_bitrate(1).is_err());
     capture.set_bitrate(900_000).unwrap();
     let updated_at = tokio::time::timeout(Duration::from_secs(12), async {

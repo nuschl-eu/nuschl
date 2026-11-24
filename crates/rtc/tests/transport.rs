@@ -205,7 +205,7 @@ impl Pair {
     fn write(&mut self, from: usize, kind: Kind, timestamp: u64, data: Arc<[u8]>) {
         let track = self.peers[from].track(kind).unwrap();
         self.peers[from]
-            .write(track, timestamp, self.now, data)
+            .write(track, timestamp, self.now, data, &[])
             .unwrap();
     }
 }
@@ -238,6 +238,40 @@ fn selected_call_codecs_carry_fragmented_screen_frames() {
 }
 
 #[test]
+fn video_with_dependency_descriptors_arrives_whole() {
+    let mut pair = Pair::setup(true, false, &[Purpose::ScreenVideo], VideoCodec::Av1, None);
+    pair.connect();
+    let track = pair.peers[0].track_for(Purpose::ScreenVideo).unwrap();
+    // A keyframe's descriptor carries its template structure and needs the
+    // two-byte header extension form; later frames carry three bytes.
+    let structure = [0xc0; 30];
+    let mut encoded = vec![0x0a, 0x80, 0x20];
+    encoded.resize(4096 + 3, 0x42);
+    let encoded: Arc<[u8]> = encoded.into();
+    for (timestamp, descriptor) in [(9000, &structure[..]), (12000, &[0xc4, 0x00, 0x01][..])] {
+        pair.peers[0]
+            .write(track, timestamp, pair.now, encoded.clone(), descriptor)
+            .unwrap();
+        pair.advance(Duration::from_millis(100)).unwrap();
+    }
+    let timestamps: Vec<_> = pair.frames[1].iter().map(|frame| frame.timestamp).collect();
+    assert_eq!(timestamps, [9000, 12000]);
+    assert!(pair.frames[1].iter().all(|frame| frame.data == encoded));
+    let audio = pair.peers[0].track(Kind::Audio);
+    assert!(audio.is_none_or(|audio| {
+        pair.peers[0]
+            .write(
+                audio,
+                0,
+                pair.now,
+                Arc::from([0xf8, 0xff, 0xfe]),
+                &[0xc0, 0, 1],
+            )
+            .is_err()
+    }));
+}
+
+#[test]
 fn call_video_paces_a_fragmented_keyframe_alongside_following_frames() {
     let mut pair = Pair::setup(
         true,
@@ -260,7 +294,7 @@ fn call_video_paces_a_fragmented_keyframe_alongside_following_frames() {
     // The current sending budget refuses a keyframe that would take too long.
     let track = pair.peers[0].track_for(Purpose::ScreenVideo).unwrap();
     assert!(matches!(
-        pair.peers[0].write(track, 13_500, pair.now, vec![0x42; 300 * 1024].into()),
+        pair.peers[0].write(track, 13_500, pair.now, vec![0x42; 300 * 1024].into(), &[]),
         Err(Error::Backpressure)
     ));
     pair.advance(Duration::from_millis(300)).unwrap();
@@ -386,7 +420,7 @@ fn microphone_carries_the_largest_admitted_voice_frame_on_a_jittered_cadence() {
     for index in 50..100 {
         let now = pair.now;
         refused |= matches!(
-            pair.peers[0].write(track, index * 960, now, oversized.clone()),
+            pair.peers[0].write(track, index * 960, now, oversized.clone(), &[]),
             Err(Error::Backpressure)
         );
         pair.advance(Duration::from_millis(20)).unwrap();
@@ -436,7 +470,7 @@ fn video_backpressure_keeps_audio_available_and_does_not_queue_stale_frames() {
     let track = pair.peers[0].track(Kind::Video).unwrap();
     for i in 1..100 {
         assert!(matches!(
-            pair.peers[0].write(track, i * 1800, pair.now, video.clone()),
+            pair.peers[0].write(track, i * 1800, pair.now, video.clone(), &[]),
             Err(Error::Backpressure)
         ));
     }
@@ -523,7 +557,7 @@ fn rejects_unbounded_signaling_media_and_backwards_time() {
     assert!(matches!(peer.offer(false), Err(Error::SignalingState)));
     let track = peer.track(Kind::Audio).unwrap();
     assert!(matches!(
-        peer.write(track, 0, now, Arc::from([0xf8, 0xff, 0xfe])),
+        peer.write(track, 0, now, Arc::from([0xf8, 0xff, 0xfe]), &[]),
         Err(Error::NotConnected)
     ));
     assert!(matches!(
@@ -534,12 +568,12 @@ fn rejects_unbounded_signaling_media_and_backwards_time() {
     pair.connect();
     let track = pair.peers[0].track(Kind::Audio).unwrap();
     assert!(matches!(
-        pair.peers[0].write(track, 0, pair.now, vec![0; MAX_OPUS_BYTES + 1].into()),
+        pair.peers[0].write(track, 0, pair.now, vec![0; MAX_OPUS_BYTES + 1].into(), &[]),
         Err(Error::Frame)
     ));
     pair.peers[0].close();
     assert!(matches!(
-        pair.peers[0].write(track, 0, pair.now, Arc::from([0xf8, 0xff, 0xfe])),
+        pair.peers[0].write(track, 0, pair.now, Arc::from([0xf8, 0xff, 0xfe]), &[]),
         Err(Error::NotConnected)
     ));
 }
@@ -589,7 +623,7 @@ fn four_bidirectional_tracks_preserve_independent_mids_roles_bytes_and_timestamp
                 };
                 let track = pair.peers[from].track_for(purpose).unwrap();
                 pair.peers[from]
-                    .write(track, timestamp, pair.now, data)
+                    .write(track, timestamp, pair.now, data, &[])
                     .unwrap();
             }
         }
@@ -661,6 +695,7 @@ fn one_video_loss_does_not_block_either_audio_role_or_the_other_video() {
                     } else {
                         video()
                     },
+                    &[],
                 )
                 .unwrap();
         }
@@ -709,11 +744,11 @@ fn greedy_camera_cannot_consume_screen_share_or_either_audio_reserve() {
     for tick in 0..16 {
         let camera = pair.peers[0].track_for(Purpose::Camera).unwrap();
         pair.peers[0]
-            .write(camera, tick * 7200, pair.now, video())
+            .write(camera, tick * 7200, pair.now, video(), &[])
             .unwrap();
         for i in 1..100 {
             assert!(matches!(
-                pair.peers[0].write(camera, tick * 7200 + i, pair.now, video()),
+                pair.peers[0].write(camera, tick * 7200 + i, pair.now, video(), &[]),
                 Err(Error::Backpressure)
             ));
         }
@@ -737,6 +772,7 @@ fn greedy_camera_cannot_consume_screen_share_or_either_audio_reserve() {
                     } else {
                         video()
                     },
+                    &[],
                 )
                 .unwrap();
         }
@@ -765,7 +801,9 @@ fn keyframe_requests_are_bound_to_the_requested_video_mid() {
     pair.connect();
     for purpose in [Purpose::Camera, Purpose::ScreenVideo] {
         let track = pair.peers[0].track_for(purpose).unwrap();
-        pair.peers[0].write(track, 0, pair.now, video()).unwrap();
+        pair.peers[0]
+            .write(track, 0, pair.now, video(), &[])
+            .unwrap();
     }
     pair.advance(Duration::from_millis(150)).unwrap();
     for purpose in [Purpose::Camera, Purpose::ScreenVideo] {
@@ -795,7 +833,7 @@ fn each_audio_mid_rejects_tampering_and_replay_independently() {
         pair.frames[1].clear();
         let track = pair.peers[0].track_for(purpose).unwrap();
         pair.peers[0]
-            .write(track, 0, pair.now, Arc::from([0xf8, 0xff, 0xfe]))
+            .write(track, 0, pair.now, Arc::from([0xf8, 0xff, 0xfe]), &[])
             .unwrap();
         pair.peers[0].timeout(pair.now).unwrap();
         pair.drain(0).unwrap();
@@ -828,7 +866,13 @@ fn a_flooded_system_audio_track_cannot_spend_the_microphone_or_video_allocations
     let microphone = pair.peers[0].track_for(Purpose::Microphone).unwrap();
     for tick in 0..12 {
         pair.peers[0]
-            .write(system, tick * 3840, pair.now, Arc::from([0xf8, 0xff, 0xfe]))
+            .write(
+                system,
+                tick * 3840,
+                pair.now,
+                Arc::from([0xf8, 0xff, 0xfe]),
+                &[],
+            )
             .unwrap();
         for extra in 1..100 {
             assert!(matches!(
@@ -836,7 +880,8 @@ fn a_flooded_system_audio_track_cannot_spend_the_microphone_or_video_allocations
                     system,
                     tick * 3840 + extra,
                     pair.now,
-                    Arc::from([0xf8, 0xff, 0xfe])
+                    Arc::from([0xf8, 0xff, 0xfe]),
+                    &[]
                 ),
                 Err(Error::Backpressure)
             ));
@@ -848,7 +893,8 @@ fn a_flooded_system_audio_track_cannot_spend_the_microphone_or_video_allocations
                 microphone,
                 tick * 3840,
                 pair.now,
-                vec![0; MAX_OPUS_BYTES + 1].into()
+                vec![0; MAX_OPUS_BYTES + 1].into(),
+                &[]
             ),
             Err(Error::Frame)
         ));
@@ -857,7 +903,8 @@ fn a_flooded_system_audio_track_cannot_spend_the_microphone_or_video_allocations
                 microphone,
                 tick * 3840,
                 pair.now - Duration::from_nanos(1),
-                Arc::from([0xf8, 0xff, 0xfe])
+                Arc::from([0xf8, 0xff, 0xfe]),
+                &[]
             ),
             Err(Error::Clock)
         ));
@@ -867,17 +914,24 @@ fn a_flooded_system_audio_track_cannot_spend_the_microphone_or_video_allocations
                 tick * 3840,
                 pair.now,
                 Arc::from([0xf8, 0xff, 0xfe]),
+                &[],
             )
             .unwrap();
         for purpose in [Purpose::Camera, Purpose::ScreenVideo] {
             let track = pair.peers[0].track_for(purpose).unwrap();
             pair.peers[0]
-                .write(track, tick * 7200, pair.now, video())
+                .write(track, tick * 7200, pair.now, video(), &[])
                 .unwrap();
         }
         pair.advance(Duration::from_millis(80)).unwrap();
         assert!(matches!(
-            pair.peers[0].write(system, tick * 3840, pair.now, Arc::from([0xf8, 0xff, 0xfe])),
+            pair.peers[0].write(
+                system,
+                tick * 3840,
+                pair.now,
+                Arc::from([0xf8, 0xff, 0xfe]),
+                &[]
+            ),
             Err(Error::Frame)
         ));
     }

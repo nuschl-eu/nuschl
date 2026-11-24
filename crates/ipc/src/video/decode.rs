@@ -45,11 +45,11 @@ pub struct DecodedFrame {
 }
 
 pub fn decode_packet_limit(source: Source, keyframe: bool) -> usize {
-    let key_limit = match source {
-        Source::Camera => 256 * 1024,
-        Source::Screen => 1024 * 1024,
-    };
-    if keyframe { key_limit } else { key_limit / 2 }
+    match source {
+        Source::Camera if keyframe => 256 * 1024,
+        Source::Camera => 128 * 1024,
+        Source::Screen => super::SCREEN_FRAME_BYTES,
+    }
 }
 
 pub fn decode_frame_bytes(source: Source, width: u16, height: u16) -> io::Result<usize> {
@@ -294,7 +294,8 @@ mod tests {
     #[test]
     fn decode_limits_follow_source_and_accept_portrait() {
         assert_eq!(decode_packet_limit(Source::Camera, true), 256 * 1024);
-        assert_eq!(decode_packet_limit(Source::Screen, false), 512 * 1024);
+        assert_eq!(decode_packet_limit(Source::Camera, false), 128 * 1024);
+        assert_eq!(decode_packet_limit(Source::Screen, false), 8 * 1024 * 1024);
         assert_eq!(
             decode_frame_bytes(Source::Camera, 1080, 1920).ok(),
             Some(1920 * 1080 * 4)

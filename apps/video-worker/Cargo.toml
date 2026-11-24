@@ -8,9 +8,15 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-vaapi = ["dep:gstreamer", "dep:gstreamer-app"]
-# The encoder core over VA-API (#558), beside the GStreamer path.
-va-encoder = ["dep:cros-libva", "dep:nuschl-video-encode"]
+# GStreamer captures, scales and converts; the encoder core codes AV1 over VA-API.
+vaapi = [
+  "dep:gstreamer",
+  "dep:gstreamer-allocators",
+  "dep:gstreamer-app",
+  "dep:gstreamer-video",
+  "dep:cros-libva",
+  "dep:nuschl-video-encode",
+]
 
 [dependencies]
 nuschl-ipc.workspace = true
@@ -23,7 +29,9 @@ rav1e = { version = "0.8.1", default-features = false }
 # reads its frame state from. Move to a release that includes them.
 cros-libva = { git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf", version = "0.0.13", optional = true }
 gstreamer = { version = "0.25.4", default-features = false, optional = true, features = ["v1_28"] }
+gstreamer-allocators = { version = "0.25.4", default-features = false, optional = true, features = ["v1_28"] }
 gstreamer-app = { version = "0.25.2", default-features = false, optional = true, features = ["v1_28"] }
+gstreamer-video = { version = "0.25.4", default-features = false, optional = true, features = ["v1_28"] }
 nuschl-ipc = { workspace = true, features = ["video-portal"] }
 nuschl-video-encode = { workspace = true, optional = true }
 pipewire = { version = "0.10.1", default-features = false }
@@ -39,6 +47,7 @@ nuschl-capture-macos = { path = "../../crates/capture-macos", version = "0.3.0" 
 
 [dev-dependencies]
 nuschl-testkit.workspace = true
+nuschl-video-encode.workspace = true
 serde_json = "1.0.154"
 
 [lints]

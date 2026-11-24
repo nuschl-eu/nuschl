@@ -7,6 +7,7 @@
 
 use super::VaEncoder;
 use cros_libva::{Image, Surface, UsageHint};
+use nuschl_ipc::video::Source;
 use nuschl_video_encode::{Config, Encoder, Layering};
 use rav1d::{Decoder, PlanarImageComponent, Rav1dError, Settings};
 use std::{path::PathBuf, time::Duration};
@@ -654,6 +655,46 @@ fn a_still_screen_against_todays_qvbr() -> Result<(), Error> {
             measured[0].1,
         );
         assert!(psnr >= qvbr_psnr && ssim >= qvbr_ssim);
+    }
+    Ok(())
+}
+
+/// VCN 4 codes 1920 × 1080 as 1920 × 1082 and 3440 × 1440 as 3456 × 1440,
+/// with the picture's size as the render size. The decode worker shows the
+/// picture's size, from rav1d and from VA-API.
+#[test]
+#[ignore = "requires a host DRM render node with VA-API AV1 encode and decode"]
+fn decoders_show_the_picture_size() -> Result<(), Error> {
+    for (source, width, height, layering) in [
+        (Source::Camera, 1920, 1080, Layering::L1T1),
+        (Source::Screen, 3440, 1440, Layering::L1T3),
+    ] {
+        let screen = source == Source::Screen;
+        let mut run = Run::new(width, height, 30, 4_000_000, layering, screen)?;
+        let mut units = Vec::new();
+        for frame in 0..4 {
+            upload(&run.input, &camera(frame, run.width, run.height))?;
+            let time = Duration::from_secs(frame) / 30;
+            units.extend(
+                run.encoder
+                    .encode(&run.input, time)?
+                    .map(|encoded| encoded.data),
+            );
+        }
+        let decoded = decode(&mut decoder(0)?, &units[0])?.ok_or("no picture")?;
+        eprintln!(
+            "{width} × {height} codes as {} × {}",
+            decoded.width(),
+            decoded.height()
+        );
+        for hardware in [false, true] {
+            let shown = crate::decode::shown_sizes(hardware, source, &units)?;
+            assert_eq!(
+                shown,
+                [(width, height)].repeat(units.len()),
+                "hardware {hardware}"
+            );
+        }
     }
     Ok(())
 }

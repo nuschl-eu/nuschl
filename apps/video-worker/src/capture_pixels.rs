@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 
 use nuschl_ipc::video::{
-    CaptureLimits, HEADER_BYTES, Header, Kind, Settings, Source, fit_capture_preview,
+    CaptureLimits, HEADER_BYTES, Header, Kind, MAX_DESCRIPTOR, Settings, Source,
+    fit_capture_preview,
 };
 use std::{
     io::{self, Read},
@@ -191,8 +192,12 @@ pub(crate) fn write_frame(
     timestamp_us: u64,
     keyframe: bool,
     av1: &[u8],
+    descriptor: &[u8],
 ) -> io::Result<()> {
-    if av1.is_empty() || av1.len() > settings.packet_limit(keyframe) {
+    if av1.is_empty()
+        || av1.len() > settings.packet_limit(keyframe)
+        || descriptor.len() > MAX_DESCRIPTOR
+    {
         return Ok(());
     }
     let header = Header {
@@ -203,6 +208,8 @@ pub(crate) fn write_frame(
     };
     output.write_all(&header.to_bytes())?;
     output.write_all(&settings.to_bytes())?;
+    output.write_all(&[descriptor.len() as u8])?;
+    output.write_all(descriptor)?;
     output.write_all(av1)?;
     output.flush()
 }

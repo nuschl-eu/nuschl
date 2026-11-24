@@ -17,9 +17,6 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn start() -> Result<Self, Error> {
-        if std::env::var_os("NUSCHL_VIDEO_VAAPI").is_none() {
-            return Err("a confined DRM render node is unavailable".into());
-        }
         let plugins = option_env!("NUSCHL_VIDEO_GST_PLUGINS")
             .ok_or("the VA-API GStreamer plugin list is missing")?;
         gst::init()?;
@@ -65,6 +62,7 @@ impl Pipeline {
         encoded: Vec<u8>,
         id: u64,
         source: Source,
+        render: Option<(u16, u16)>,
         write: impl FnOnce(u16, u16, &[u8]) -> Result<(), Error>,
     ) -> Result<bool, Error> {
         let mut buffer = gst::Buffer::from_mut_slice(encoded);
@@ -89,14 +87,26 @@ impl Pipeline {
                 .caps()
                 .and_then(|caps| caps.structure(0))
                 .ok_or("missing decoded video dimensions")?;
-            let width = u16::try_from(format.get::<i32>("width")?)?;
-            let height = u16::try_from(format.get::<i32>("height")?)?;
+            let frame = (
+                u16::try_from(format.get::<i32>("width")?)?,
+                u16::try_from(format.get::<i32>("height")?)?,
+            );
+            let (width, height) = super::shown(frame, render);
             let length = decode_frame_bytes(source, width, height)?;
             let pixels = buffer.map_readable()?;
-            if pixels.size() != length {
+            let row = usize::from(frame.0) * 4;
+            if pixels.size() != row * usize::from(frame.1) {
                 return Err("invalid BGRA layout from VA-API".into());
             }
-            write(width, height, pixels.as_slice())?;
+            if width == frame.0 {
+                write(width, height, &pixels[..length])?;
+            } else {
+                let mut picture = Vec::with_capacity(length);
+                for line in pixels.chunks_exact(row).take(height.into()) {
+                    picture.extend_from_slice(&line[..usize::from(width) * 4]);
+                }
+                write(width, height, &picture)?;
+            }
             return Ok(true);
         }
         if let Some(message) = self

@@ -46,8 +46,7 @@ pub fn run() -> Result<(), Failure> {
     let (control, preview) = start_control(source)?;
     #[cfg(feature = "vaapi")]
     if std::env::var_os("NUSCHL_VIDEO_VAAPI").is_some()
-        && let Ok(pipeline) =
-            vaapi::prepare(source, target, control.limits().bitrate, preview.is_some())
+        && let Ok(pipeline) = vaapi::prepare(source, target, preview.is_some())
     {
         return vaapi::run(pipeline, source, control, preview).map_err(|error| {
             use nuschl_ipc::video::{CaptureFailure, write_capture_failure};
@@ -150,6 +149,7 @@ pub fn run() -> Result<(), Failure> {
                     capture_time_us,
                     true,
                     &packet,
+                    &[],
                 ) {
                     let _ = done.send(());
                     return Err(error.to_string());

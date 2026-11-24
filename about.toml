@@ -74,6 +74,11 @@ files = [{ path = "@licenses@/crates/akd/LICENSE-MIT", checksum = "da6d3703ed11c
 [cookie-factory.clarify]
 license = "MIT"
 files = [{ path = "@licenses@/crates/cookie-factory/MIT.txt", checksum = "d09216dc1ea5f273997667935a8d6514d80f00b89fb6954ecc3a43e0a6e360de" }]
+# The pinned chromeos/cros-libva revision keeps its text at the repository
+# root, beside the lib/ package.
+[cros-libva.clarify]
+license = "BSD-3-Clause"
+files = [{ path = "@licenses@/crates/cros-libva/LICENSE", checksum = "3abff8ddf961dfaf4b0cb5dc49a60da7f7c1f40db2c77a82c564349db91a8b04" }]
 [dasp_sample.clarify]
 license = "MIT OR Apache-2.0"
 files = [{ path = "@licenses@/crates/sample/LICENSE-MIT", checksum = "b1d6df41ed3aa96806e74c729444d7c121d90e6660a6aed01d298e03fde475a0" }]

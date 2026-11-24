@@ -40,6 +40,7 @@ const CALL_RTP_PACKETS: usize = 1024;
 /// target (640 bytes per 20 ms at 256 kb/s, `nuschl_core::bitrate`) plus
 /// 80 bytes per packet, at 50 packets per second.
 const MICROPHONE_RESERVE_BPS: u64 = (640 + 80) * 8 * 50;
+mod descriptor;
 mod pacing;
 mod signaling;
 use pacing::{Bucket, WINDOW};
@@ -257,11 +258,12 @@ impl Peer {
         if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
             return Err(Error::Address);
         }
-        let (initial, reorder, send, window) = if call_video_limit.is_some() {
+        let (initial, reorder, send, window) = if let Some(limit) = call_video_limit {
             (
                 CALL_INITIAL_BITRATE,
                 CALL_RTP_PACKETS,
-                CALL_RTP_PACKETS,
+                // Retransmissions can reach every packet of the largest frame.
+                CALL_RTP_PACKETS.max(limit / 1024),
                 CALL_VIDEO_WINDOW,
             )
         } else {
@@ -282,6 +284,7 @@ impl Peer {
             .set_send_buffer_audio(32)
             .set_send_buffer_video(send)
             .enable_bwe(Some(str0m::bwe::Bitrate::bps(initial)))
+            .set_extension(descriptor::ID, descriptor::extension())
             .build(now);
         if call_video_limit.is_some() {
             rtc.bwe().set_bitrate(
@@ -715,6 +718,7 @@ impl Peer {
     }
 
     /// Submit an already encoded frame. Audio uses a 48 kHz clock, video 90 kHz.
+    /// `descriptor` is a video frame's AV1 Dependency Descriptor, or empty.
     /// Timestamps increase independently per track. The caller bounds its capture
     /// queue and drops stale video on backpressure; a failed write consumes no
     /// frame budget or timestamp. Both audio roles have dedicated allocations,
@@ -726,6 +730,7 @@ impl Peer {
         timestamp: u64,
         now: Instant,
         data: Arc<[u8]>,
+        descriptor: &[u8],
     ) -> Result<(), Error> {
         if !self.is_connected() {
             return Err(Error::NotConnected);
@@ -738,6 +743,8 @@ impl Peer {
         let kind = self.tracks[index].purpose.kind();
         if data.is_empty()
             || data.len() > self.frame_limit(kind)
+            || descriptor.len() > usize::from(u8::MAX)
+            || (!descriptor.is_empty() && kind != Kind::Video)
             || self.tracks[index]
                 .timestamp
                 .is_some_and(|last| timestamp <= last)
@@ -797,7 +804,10 @@ impl Peer {
         if interval > WINDOW {
             return Err(Error::Backpressure);
         }
-        let writer = self.rtc.writer(track.0).ok_or(Error::Frame)?;
+        let mut writer = self.rtc.writer(track.0).ok_or(Error::Frame)?;
+        if !descriptor.is_empty() {
+            writer = writer.user_extension_value(descriptor::Descriptor(Arc::from(descriptor)));
+        }
         let params = *writer
             .payload_params()
             .find(|p| p.spec().codec == kind.codec(self.video))

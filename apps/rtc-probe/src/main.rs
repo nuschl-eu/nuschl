@@ -182,6 +182,7 @@ fn run(opus: Arc<[u8]>) -> Result<()> {
                     sent * 960,
                     now,
                     opus.clone(),
+                    &[],
                 ) {
                     Ok(()) => endpoint.sent_audio += 1,
                     Err(Error::Backpressure) => continue,
@@ -193,6 +194,7 @@ fn run(opus: Arc<[u8]>) -> Result<()> {
                         sent * 1800,
                         now,
                         video.clone(),
+                        &[],
                     ) {
                         Ok(()) => endpoint.sent_video += 1,
                         Err(Error::Backpressure) => {}

@@ -4466,6 +4466,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "gstreamer-allocators"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58945dc4d271f16e99fdea35cdbb1161c6cbfa0db9b8511d4e4ccf34bd4e8ef9"
+dependencies = [
+ "glib",
+ "gstreamer",
+ "gstreamer-allocators-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-allocators-sys"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c56f6a624f91b9cffbfcab33ce87743836ab36a1d14c1bb743c4fc3849bbe7c"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps 9.0.1",
+]
+
+[[package]]
 name = "gstreamer-app"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4529,6 +4554,36 @@ dependencies = [
  "cfg-if",
  "glib-sys",
  "gobject-sys",
+ "libc",
+ "system-deps 9.0.1",
+]
+
+[[package]]
+name = "gstreamer-video"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffe4d77b2a5e679973d9c6b6c052da8cda86b83f5c268872f8691fde693fde84"
+dependencies = [
+ "cfg-if",
+ "futures-channel",
+ "glib",
+ "gstreamer",
+ "gstreamer-base",
+ "gstreamer-video-sys",
+ "libc",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "gstreamer-video-sys"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef455da22edca97ac9299d682b868227f3d9217b303748ce0161b31ae82dc106"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "gstreamer-base-sys",
+ "gstreamer-sys",
  "libc",
  "system-deps 9.0.1",
 ]
@@ -7781,6 +7836,7 @@ name = "nuschl-rtc"
 version = "0.3.0"
 dependencies = [
  "nuschl-core",
+ "nuschl-stream-quality",
  "str0m",
  "thiserror 2.0.21",
 ]
@@ -7845,6 +7901,7 @@ dependencies = [
  "nuschl-sandbox",
  "nuschl-stream-quality",
  "nuschl-testkit",
+ "nuschl-video-encode",
  "p12-keystore",
  "prost",
  "rcgen",
@@ -8054,7 +8111,9 @@ dependencies = [
  "cameras",
  "cros-libva",
  "gstreamer",
+ "gstreamer-allocators",
  "gstreamer-app",
+ "gstreamer-video",
  "nuschl-capture-macos",
  "nuschl-ipc",
  "nuschl-sandbox",
@@ -11921,7 +11980,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "str0m"
 version = "0.25.0"
-source = "git+https://github.com/ambiso/str0m?rev=942ad38e443915b762f10d3302e0f4a2a34a58de#942ad38e443915b762f10d3302e0f4a2a34a58de"
+source = "git+https://github.com/ambiso/str0m?rev=faa6cd05cac7d88bb4dfa46dfd87c13324dacafd#faa6cd05cac7d88bb4dfa46dfd87c13324dacafd"
 dependencies = [
  "arrayvec",
  "base64ct",

@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 pub const MAX_SDP: usize = 32 * 1024;
 pub const MAX_DATAGRAM: usize = 2048;
-pub const MAX_VIDEO: usize = 1024 * 1024;
+pub const MAX_VIDEO: usize = crate::video::SCREEN_FRAME_BYTES;
 const MAX_METADATA: usize = MAX_SDP * 2 + 8192;
 pub const MAX_TRACKS: usize = 48;
 
@@ -152,6 +152,9 @@ pub enum Command {
         purpose: Purpose,
         timestamp: u64,
         key_frame: bool,
+        /// The video frame's AV1 Dependency Descriptor for its RTP packets;
+        /// empty for none.
+        descriptor: Vec<u8>,
     },
     RequestKeyframe {
         leg: u32,
@@ -167,7 +170,16 @@ impl Command {
                 Self::Datagram { leg, source } => {
                     *leg != 0 && endpoint(*source) && length <= MAX_DATAGRAM
                 }
-                Self::Write { purpose, .. } => length <= purpose.frame_limit(),
+                Self::Write {
+                    purpose,
+                    descriptor,
+                    ..
+                } => {
+                    length <= purpose.frame_limit()
+                        && descriptor.len() <= crate::video::MAX_DESCRIPTOR
+                        && (descriptor.is_empty()
+                            || matches!(purpose, Purpose::Camera | Purpose::ScreenVideo))
+                }
                 _ => false,
             };
         }
