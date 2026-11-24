@@ -1213,16 +1213,16 @@ mod tests {
         (1, 1, "---D", [3, 2]),
     ];
 
-    struct Writer(Vec<bool>);
+    pub(super) struct Writer(pub(super) Vec<bool>);
 
     impl Writer {
-        fn put(&mut self, value: u32, n: u32) {
+        pub(super) fn put(&mut self, value: u32, n: u32) {
             for i in (0..n).rev() {
                 self.0.push((value >> i) & 1 == 1);
             }
         }
 
-        fn ns(&mut self, value: u32, n: u32) {
+        pub(super) fn ns(&mut self, value: u32, n: u32) {
             let width = u32::BITS - n.leading_zeros();
             let m = (1 << width) - n;
             if value < m {
@@ -1233,7 +1233,7 @@ mod tests {
             }
         }
 
-        fn bytes(mut self) -> Vec<u8> {
+        pub(super) fn bytes(mut self) -> Vec<u8> {
             while !self.0.len().is_multiple_of(8) {
                 self.0.push(false);
             }
@@ -2014,8 +2014,8 @@ mod tests {
     }
 }
 
-/// The selection model of docs/video-plan.md §5.3 over seeded random calls
-/// (proptest is not in the lock file). The source is an L1T2 or L1T3 screen,
+/// The selection model of docs/video-plan.md §5.3 over random calls from a
+/// seeded generator. The source is an L1T2 or L1T3 screen,
 /// or an L2T2_KEY or L3T3_KEY camera, with key pictures, new structures and
 /// active targets, frame-rate changes and static stretches, frames of up to
 /// three packets that arrive reordered, repaired late or repeated, frame
@@ -2024,10 +2024,10 @@ mod tests {
 /// frame, every second and the end of each run check the invariants.
 #[cfg(test)]
 mod model {
-    use super::tests::{l2t2_key, l2t2_unit};
+    use super::tests::Writer;
     use super::*;
     use crate::budget;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     /// A seeded xorshift generator.
     struct Rng(u64);
@@ -2043,6 +2043,283 @@ mod model {
         fn chance(&mut self, percent: u64) -> bool {
             self.below(100) < percent
         }
+
+        fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+            items[self.below(items.len() as u64) as usize]
+        }
+    }
+
+    /// A KEY-SVC structure: spatial layers that reference each other only in
+    /// key pictures, temporal layers that each double the frame rate, one
+    /// chain per spatial layer. Decode target s·T + t is spatial layer s up to
+    /// temporal layer t.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Svc {
+        spatial: u8,
+        temporal: u8,
+    }
+
+    impl Svc {
+        fn targets(self) -> usize {
+            usize::from(self.spatial * self.temporal)
+        }
+
+        fn layer(self, target: usize) -> Target {
+            let temporal = usize::from(self.temporal);
+            Target {
+                spatial: (target / temporal) as u8,
+                temporal: (target % temporal) as u8,
+            }
+        }
+
+        /// Per spatial layer a key picture's template, then one per temporal
+        /// layer.
+        fn template(self, frame: &Made) -> u32 {
+            let k = if frame.key { 0 } else { 1 + frame.temporal };
+            u32::from(frame.spatial * (self.temporal + 1) + k)
+        }
+
+        fn dti(self, spatial: u8, key: bool, temporal: u8, target: usize) -> Dti {
+            let layer = self.layer(target);
+            if key {
+                return if layer.spatial >= spatial {
+                    Dti::Switch
+                } else {
+                    Dti::NotPresent
+                };
+            }
+            if layer.spatial != spatial || layer.temporal < temporal {
+                Dti::NotPresent
+            } else if temporal == 0 || layer.temporal > temporal {
+                Dti::Switch
+            } else {
+                Dti::Discardable
+            }
+        }
+
+        fn write(self, w: &mut Writer, offset: u32, heights: &[u32]) {
+            w.put(offset, 6);
+            w.put(self.targets() as u32 - 1, 5);
+            let mut templates = Vec::new();
+            for spatial in 0..self.spatial {
+                templates.push((spatial, true, 0));
+                templates.extend((0..self.temporal).map(|t| (spatial, false, t)));
+            }
+            for pair in templates.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                w.put(
+                    match (b.0 - a.0, b.2) {
+                        (0, t) if t == a.2 => 0,
+                        (0, _) => 1,
+                        _ => 2,
+                    },
+                    2,
+                );
+            }
+            w.put(3, 2);
+            for &(spatial, key, temporal) in &templates {
+                for target in 0..self.targets() {
+                    let dti = self.dti(spatial, key, temporal, target);
+                    w.put(dti as u32, 2);
+                }
+            }
+            for _ in &templates {
+                w.put(0, 1);
+            }
+            let chains = u32::from(self.spatial);
+            w.ns(chains, self.targets() as u32 + 1);
+            for target in 0..self.targets() {
+                w.ns(u32::from(self.layer(target).spatial), chains);
+            }
+            for _ in 0..templates.len() * usize::from(self.spatial) {
+                w.put(0, 4);
+            }
+            w.put(1, 1);
+            for &height in heights {
+                w.put(height * 16 / 9 - 1, 16);
+                w.put(height - 1, 16);
+            }
+        }
+    }
+
+    /// A frame the source made.
+    #[derive(Clone, Debug)]
+    struct Made {
+        number: u16,
+        spatial: u8,
+        temporal: u8,
+        key: bool,
+        references: Vec<u16>,
+        chains: Vec<u8>,
+        packets: usize,
+        timestamp: u64,
+        /// The temporal unit's index in the run.
+        unit: u64,
+        /// The structure's version, for its template ids, its layer sizes and
+        /// the active layers.
+        version: u32,
+        heights: Vec<u32>,
+        active: (u8, u8),
+    }
+
+    /// One packet on its way to the SFU.
+    #[derive(Clone)]
+    struct Packet {
+        descriptor: Vec<u8>,
+        frame: u16,
+        index: usize,
+        timestamp: u64,
+        /// The publisher's marker: the unit's last packet.
+        marker: bool,
+    }
+
+    /// The source: its structure, its active layers and its timing.
+    struct Source {
+        svc: Svc,
+        heights: Vec<u32>,
+        version: u32,
+        /// The active spatial and temporal layers.
+        active: (u8, u8),
+        fps: u64,
+        moving: bool,
+        timestamp: u64,
+        number: u16,
+        since_key: u64,
+        units: u64,
+        /// Per spatial layer, the latest frame of each temporal layer since the
+        /// key picture.
+        latest: Vec<Vec<Option<u16>>>,
+        /// Per chain, its latest frame.
+        chains: Vec<Option<u16>>,
+        frames: HashMap<u16, Made>,
+    }
+
+    impl Source {
+        /// The active temporal layer of the unit `since_key` after a key
+        /// picture: T0 T2 T1 T2 for three layers, T0 T1 for two.
+        fn temporal(&self) -> u8 {
+            let position = self.since_key % (1 << (self.active.1 - 1));
+            match (self.active.1, position) {
+                (3, 0) | (2, 0) | (1, _) => 0,
+                (3, 2) => 1,
+                (3, _) => 2,
+                _ => 1,
+            }
+        }
+
+        /// The frames of the next temporal unit.
+        fn unit(&mut self, key: bool) -> Vec<Made> {
+            if key {
+                self.since_key = 0;
+                self.latest = vec![vec![None; usize::from(self.svc.temporal)]; 3];
+            }
+            let temporal = if key { 0 } else { self.temporal() };
+            let mut frames = Vec::new();
+            for spatial in 0..self.active.0 {
+                let number = self.number;
+                self.number = self.number.wrapping_add(1);
+                let references: Vec<u16> = if key {
+                    frames
+                        .last()
+                        .map(|f: &Made| vec![f.number])
+                        .unwrap_or_default()
+                } else {
+                    // The latest frame of a lower temporal layer, T0 for T0.
+                    let latest = &self.latest[usize::from(spatial)];
+                    let below = latest[..usize::from(temporal.max(1))].iter().flatten();
+                    let reference = below.min_by_key(|&&n| number.wrapping_sub(n));
+                    reference.into_iter().copied().collect()
+                };
+                // A key picture's base starts every chain.
+                let chains = self
+                    .chains
+                    .iter()
+                    .map(|last| match last {
+                        Some(last) if !(key && spatial == 0) => {
+                            number.wrapping_sub(*last).min(255) as u8
+                        }
+                        _ => 0,
+                    })
+                    .collect();
+                for (chain, last) in self.chains.iter_mut().enumerate() {
+                    let chain = chain as u8;
+                    if key && chain >= spatial || !key && temporal == 0 && chain == spatial {
+                        *last = Some(number);
+                    }
+                }
+                self.latest[usize::from(spatial)][usize::from(temporal)] = Some(number);
+                frames.push(Made {
+                    number,
+                    spatial,
+                    temporal,
+                    key,
+                    references,
+                    chains,
+                    packets: 1,
+                    timestamp: self.timestamp,
+                    unit: self.units,
+                    version: self.version,
+                    heights: self.heights.clone(),
+                    active: self.active,
+                });
+            }
+            self.since_key += 1;
+            self.units += 1;
+            frames
+        }
+
+        /// The descriptor of packet `index` of `frame`; the first carries the
+        /// structure on a key picture's base, the active targets when asked,
+        /// the references and the chains.
+        fn descriptor(&self, frame: &Made, index: usize, mask: Option<u32>) -> Vec<u8> {
+            let mut w = Writer(Vec::new());
+            let (start, end) = (index == 0, index + 1 == frame.packets);
+            w.put(u32::from(start), 1);
+            w.put(u32::from(end), 1);
+            let offset = frame.version % 2 * 32;
+            w.put((self.svc.template(frame) + offset) % 64, 6);
+            w.put(u32::from(frame.number), 16);
+            if start {
+                let structure = frame.key && frame.spatial == 0;
+                for flag in [structure, mask.is_some(), false, true, true] {
+                    w.put(u32::from(flag), 1);
+                }
+                if structure {
+                    self.svc.write(&mut w, offset, &self.heights);
+                }
+                if let Some(mask) = mask {
+                    w.put(mask, self.svc.targets() as u32);
+                }
+                for &reference in &frame.references {
+                    let diff = u32::from(frame.number.wrapping_sub(reference)) - 1;
+                    let size = 1 + u32::from(diff >= 16) + u32::from(diff >= 256);
+                    w.put(size, 2);
+                    w.put(diff, 4 * size);
+                }
+                w.put(0, 2);
+                for &chain in &frame.chains {
+                    w.put(u32::from(chain), 8);
+                }
+            }
+            w.bytes()
+        }
+
+        fn mask(&self) -> u32 {
+            (0..self.svc.targets())
+                .filter(|&t| {
+                    let layer = self.svc.layer(t);
+                    layer.spatial < self.active.0 && layer.temporal < self.active.1
+                })
+                .fold(0, |mask, t| mask | 1 << t)
+        }
+
+        fn kind(&self) -> Kind {
+            if self.heights.len() == 1 {
+                Kind::Screen
+            } else {
+                Kind::Camera
+            }
+        }
     }
 
     #[derive(Default)]
@@ -2054,40 +2331,59 @@ mod model {
         steps: usize,
         wanted: Option<Wanted>,
         meanwhile: Option<Wanted>,
-        /// The frames it got, for the chains.
-        held: HashSet<u16>,
         /// The wanted layer, when it last changed, and when it last moved to
         /// another group of eligible choices.
         layer: Option<Target>,
         changed: Duration,
         crossed: Option<Duration>,
+        /// When its tier last fell, and the units since the latest key picture
+        /// after that.
+        fell: Option<(Duration, Option<u32>)>,
+        /// The packets it got, per frame, and the units it lost frames of at
+        /// the SFU.
+        got: HashMap<u16, HashSet<usize>>,
+        lost: HashSet<u64>,
+        /// The units it got a late frame of, with the publisher's marker alone.
+        late: HashSet<u64>,
+        /// The latest unit the queue shed.
+        shed: Option<u64>,
+        generation: Option<u32>,
+        /// The marked packets it got, per unit.
+        marked: BTreeMap<u64, HashSet<(u16, usize)>>,
     }
 
-    /// The camera's active frame rate.
-    const FPS: u64 = 30;
-    /// Shorter sides of the two layers (960 × 540 and 1920 × 1080).
-    const HEIGHTS: [u32; 2] = [540, 1080];
-
-    /// Whether `layer` fits camera tier `tier`: the invariant, from the
-    /// generator's own frame rate.
-    fn fits(layer: Target, tier: usize) -> bool {
-        let cap = Kind::Camera.ladder()[tier];
-        let fps = FPS >> (1 - layer.temporal);
-        Kind::Camera.tier_of(HEIGHTS[usize::from(layer.spatial)]) <= tier
-            && 4 * fps <= 5 * u64::from(cap.fps)
+    /// What the SFU knows of the source: the layer sizes and active layers of
+    /// the latest key picture it read.
+    #[derive(Clone, Default)]
+    struct Known {
+        heights: Vec<u32>,
+        active: (u8, u8),
     }
 
-    fn second(viewer: &mut Viewer, layers: &Layers, smooth: bool, now: Duration) {
-        let choices = layers.choices(Kind::Camera, viewer.tier, smooth, viewer.steps);
+    /// Whether `layer` fits `tier` by the layer sizes the SFU knows and, while
+    /// the source runs `steady`, by its own frame rate.
+    fn fits(source: &Source, known: &Known, layer: Target, tier: usize, steady: bool) -> bool {
+        let kind = source.kind();
+        let height = known.heights.get(usize::from(layer.spatial)).copied();
+        let cap = u64::from(kind.ladder()[tier].fps);
+        let top = known.active.1.max(1) - 1;
+        let fps = source.fps >> (top - layer.temporal.min(top));
+        height.is_none_or(|h| kind.tier_of(h) <= tier) && (!steady || 4 * fps <= 5 * cap)
+    }
+
+    fn second(
+        viewer: &mut Viewer,
+        layers: &Layers,
+        source: &Source,
+        known: &Known,
+        steady: bool,
+        smooth: bool,
+        now: Duration,
+    ) {
+        let kind = source.kind();
+        let choices = layers.choices(kind, viewer.tier, smooth, viewer.steps);
         if !layers.measured() {
-            assert!(choices.len() <= 1, "a choice before a full second");
-        }
-        for choice in choices.iter().skip(1) {
-            assert!(
-                fits(choice.layer, viewer.tier),
-                "{choice:?} above tier {}",
-                viewer.tier
-            );
+            assert!(choices.len() <= 1, "a choice before a full rate window");
         }
         let rates: Vec<u64> = choices.iter().map(|c| c.rate).collect();
         let current = viewer.pace.map_or(0, |p| p.seat(&choices) + 1);
@@ -2098,9 +2394,9 @@ mod model {
             rates: &rates,
             current,
         };
-        let layers_given = budget::allocate(&limits, &[viewer.budget], &[stream])[0].layers;
-        let wanted = layers_given.checked_sub(1).map(|ceiling| {
-            let had = viewer.pace.is_some();
+        let given = budget::allocate(&limits, &[viewer.budget], &[stream])[0].layers;
+        let wanted = given.checked_sub(1).map(|ceiling| {
+            let had = viewer.pace.is_some() && layers.measured();
             let (point, wanted) = pick(
                 &choices,
                 ceiling,
@@ -2110,6 +2406,15 @@ mod model {
                 now,
             );
             let layer = choices[point].layer;
+            // Within the tier, by the source's own frame rate once it has
+            // run steadily for a second.
+            if point > 0 {
+                assert!(
+                    fits(source, known, layer, viewer.tier, steady),
+                    "{layer:?} above tier {}",
+                    viewer.tier
+                );
+            }
             // A layer that is still a choice changes only by the stepper's
             // rules: down within a group at once, to another group at most
             // once per 10 s, up after the budget allowed it for 10 s within a
@@ -2125,7 +2430,12 @@ mod model {
                 let since = now.saturating_sub(viewer.changed);
                 if point > old {
                     let hold = Duration::from_secs(if crossed { 30 } else { 10 });
-                    assert!(since >= hold, "up after {since:?}, not {hold:?}");
+                    assert!(
+                        since >= hold,
+                        "up after {since:?}, not {hold:?}: {:?} to {layer:?} in {:?}",
+                        choices[old].layer,
+                        choices.iter().map(|c| c.layer).collect::<Vec<_>>()
+                    );
                 } else if crossed {
                     let at = viewer
                         .crossed
@@ -2136,121 +2446,445 @@ mod model {
                     viewer.crossed = Some(now);
                 }
             }
-            if viewer.layer != Some(layer) {
-                viewer.changed = now;
+            // While the rates are measured again, the pace waits.
+            if layers.measured() {
+                if viewer.layer != Some(layer) {
+                    viewer.changed = now;
+                }
+                viewer.layer = Some(layer);
             }
-            viewer.layer = Some(layer);
             wanted
         });
         viewer.wanted = wanted;
         viewer.meanwhile = viewer.selector.current().and_then(|c| layers.base(c));
         viewer.selector.meanwhile(viewer.meanwhile);
         viewer.selector.want(wanted);
+        viewer.generation = Some(layers.generation());
+    }
+
+    fn run(seed: u64) -> [usize; 4] {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let camera = seed.is_multiple_of(2);
+        let svcs: &[Svc] = if camera {
+            &[
+                Svc {
+                    spatial: 3,
+                    temporal: 3,
+                },
+                Svc {
+                    spatial: 2,
+                    temporal: 2,
+                },
+            ]
+        } else {
+            &[
+                Svc {
+                    spatial: 1,
+                    temporal: 3,
+                },
+                Svc {
+                    spatial: 1,
+                    temporal: 2,
+                },
+            ]
+        };
+        let heights = |svc: Svc| -> Vec<u32> {
+            match svc.spatial {
+                3 => vec![270, 540, 1080],
+                2 => vec![540, 1080],
+                _ => vec![1080],
+            }
+        };
+        let svc = svcs[0];
+        let mut source = Source {
+            svc,
+            heights: heights(svc),
+            version: 0,
+            active: (svc.spatial, svc.temporal),
+            fps: 30,
+            moving: false,
+            timestamp: 1 << 40,
+            number: 65_000,
+            since_key: 0,
+            units: 0,
+            latest: Vec::new(),
+            chains: vec![None; usize::from(svc.spatial)],
+            frames: HashMap::new(),
+        };
+        let mut layers = Layers::default();
+        let mut viewers: Vec<Viewer> = Vec::new();
+        let mut smooth = camera;
+        let (mut last_key, mut next_second) = (None::<Duration>, Duration::ZERO);
+        let mut wall = Duration::ZERO;
+        let mut steady_since = None::<u64>;
+        let mut pending: Vec<(usize, Packet)> = Vec::new();
+        let mut delivered = 0usize;
+        let mut seen = Seen::default();
+        let mut mask = None;
+        for _ in 0..3000 {
+            // Timing: active at the source's frame rate with jitter, or static;
+            // the SFU's clock runs on while media time may jump back.
+            let interval = if source.moving {
+                CLOCK / source.fps + rng.below(CLOCK / source.fps / 8)
+            } else {
+                CLOCK / 2 + rng.below(CLOCK * 2)
+            };
+            source.timestamp += interval;
+            wall += Duration::from_micros(interval * 1_000_000 / CLOCK);
+            if rng.chance(2) {
+                source.moving = !source.moving;
+                steady_since = None;
+            }
+            if source.moving && rng.chance(1) {
+                let rates: &[u64] = if camera { &[15, 30] } else { &[15, 30, 60] };
+                source.fps = rng.pick(rates);
+                steady_since = None;
+            }
+            if rng.chance(1) {
+                // A new stream on the source: back in time.
+                source.timestamp -= 10 * CLOCK;
+                steady_since = None;
+            }
+            if source.moving {
+                steady_since.get_or_insert(source.timestamp);
+            }
+            let wants_key = viewers.iter().any(|v| v.selector.needs_keyframe());
+            let can_key = last_key.is_none_or(|at| wall - at >= Duration::from_secs(2));
+            let key = last_key.is_none() || (wants_key || rng.chance(1)) && can_key;
+            if key {
+                last_key = Some(wall);
+                seen.stats[3] += 1;
+                if rng.chance(10) {
+                    // A new structure, or other active layers.
+                    let svc = rng.pick(svcs);
+                    if svc != source.svc {
+                        source.svc = svc;
+                        source.heights = heights(svc);
+                        source.version += 1;
+                        source.chains = vec![None; usize::from(svc.spatial)];
+                    }
+                    source.active = (svc.spatial, svc.temporal);
+                    mask = None;
+                } else if rng.chance(15) {
+                    let spatial = 1 + rng.below(u64::from(source.svc.spatial)) as u8;
+                    let temporal = 1 + rng.below(u64::from(source.svc.temporal)) as u8;
+                    source.active = (spatial, temporal);
+                    mask = Some(source.mask());
+                }
+            }
+            let now = wall;
+            let steady = steady_since.is_some_and(|at| source.timestamp - at >= 3 * CLOCK / 2);
+            if now >= next_second {
+                next_second = now + Duration::from_secs(1);
+                if rng.chance(2) {
+                    smooth = !smooth;
+                }
+                if viewers.len() < 4 && rng.chance(10) {
+                    viewers.push(Viewer::default());
+                }
+                if !viewers.is_empty() && rng.chance(1) {
+                    viewers.swap_remove(rng.below(viewers.len() as u64) as usize);
+                }
+                for viewer in &mut viewers {
+                    if rng.chance(3) || viewer.budget == 0 {
+                        let tier = rng.below(4) as usize;
+                        if tier < viewer.tier {
+                            viewer.fell = Some((now, None));
+                        } else if tier > viewer.tier {
+                            viewer.fell = None;
+                        }
+                        viewer.tier = tier;
+                    }
+                    if rng.chance(4) || viewer.budget == 0 {
+                        viewer.budget = rng.pick(&[150_000, 600_000, 2_000_000, 50_000_000]);
+                    }
+                    if rng.chance(3) {
+                        viewer.steps = rng.below(4) as usize;
+                    }
+                    second(viewer, &layers, &source, &seen.known, steady, smooth, now);
+                }
+            }
+            // The unit's frames in packets, some reordered, late or repeated.
+            let frames = source.unit(key);
+            let count = frames.len();
+            for (index, mut frame) in frames.into_iter().enumerate() {
+                frame.packets = 1 + rng.below(3) as usize;
+                for packet in 0..frame.packets {
+                    let marker = index + 1 == count && packet + 1 == frame.packets;
+                    let first_mask = if packet == 0 && frame.key { mask } else { None };
+                    let packet = Packet {
+                        descriptor: source.descriptor(&frame, packet, first_mask),
+                        frame: frame.number,
+                        index: packet,
+                        timestamp: frame.timestamp,
+                        marker,
+                    };
+                    let at = delivered + pending.len();
+                    let at = if rng.chance(2) {
+                        at + 2 + rng.below(6) as usize
+                    } else {
+                        at
+                    };
+                    if rng.chance(1) {
+                        pending.push((at + 3 + rng.below(20) as usize, packet.clone()));
+                    }
+                    pending.push((at, packet));
+                }
+                source.frames.insert(frame.number, frame);
+            }
+            if rng.chance(3) && pending.len() >= 2 {
+                let n = pending.len();
+                let (a, b) = (pending[n - 2].0, pending[n - 1].0);
+                pending[n - 2].0 = b;
+                pending[n - 1].0 = a;
+            }
+            pending.sort_by_key(|(at, _)| *at);
+            let ready = pending
+                .iter()
+                .take_while(|(at, _)| *at <= delivered + 8)
+                .count();
+            let ready: Vec<(usize, Packet)> = pending.drain(..ready).collect();
+            for (_, packet) in ready {
+                delivered += 1;
+                deliver(
+                    &mut layers,
+                    &mut viewers,
+                    &source,
+                    &packet,
+                    now,
+                    &mut rng,
+                    &mut seen,
+                );
+            }
+            for viewer in &mut viewers {
+                if let Some((_, units)) = &mut viewer.fell {
+                    *units = if key { Some(0) } else { units.map(|n| n + 1) };
+                }
+            }
+        }
+        let now = wall;
+        for (_, packet) in std::mem::take(&mut pending) {
+            deliver(
+                &mut layers,
+                &mut viewers,
+                &source,
+                &packet,
+                now,
+                &mut rng,
+                &mut seen,
+            );
+        }
+        for viewer in &viewers {
+            check(viewer, &source, &seen.unreadable);
+        }
+        seen.stats
+    }
+
+    /// What the runs saw: forwarded packets, switches, frames checked after a
+    /// tier fell and key pictures; and the frames with a packet the SFU found
+    /// unreadable.
+    #[derive(Default)]
+    struct Seen {
+        stats: [usize; 4],
+        unreadable: HashSet<u16>,
+        known: Known,
+    }
+
+    fn deliver(
+        layers: &mut Layers,
+        viewers: &mut [Viewer],
+        source: &Source,
+        packet: &Packet,
+        now: Duration,
+        rng: &mut Rng,
+        seen: &mut Seen,
+    ) {
+        let made = &source.frames[&packet.frame];
+        // A packet the SFU cannot read, from before or after the structure
+        // it has, reaches no viewer.
+        let Some(frame) = layers.packet(&packet.descriptor, 1000, packet.timestamp, now) else {
+            seen.unreadable.insert(packet.frame);
+            return;
+        };
+        if frame.start && made.key {
+            seen.known = Known {
+                heights: made.heights.clone(),
+                active: made.active,
+            };
+        }
+        for viewer in viewers {
+            // As the SFU: a new target list moves the viewer to the lowest
+            // target until the next second.
+            let generation = layers.generation();
+            if viewer
+                .generation
+                .replace(generation)
+                .is_some_and(|g| g != generation)
+            {
+                viewer.meanwhile = None;
+                viewer.wanted = layers.lowest();
+                viewer.selector.meanwhile(None);
+                viewer.selector.want(viewer.wanted);
+            }
+            // As the SFU's queue: a shed frame start drops the rest of its
+            // unit and the second before, but the rest of a frame that went
+            // out.
+            let owed = viewer.selector.owes(&frame);
+            let rest = viewer.selector.sent(&frame) || owed;
+            let shed = viewer
+                .shed
+                .is_some_and(|shed| packet.timestamp <= shed && packet.timestamp + CLOCK > shed);
+            if shed && !rest {
+                viewer.selector.dropped(&frame);
+                viewer.lost.insert(made.unit);
+                continue;
+            }
+            let before = viewer.selector.current();
+            let Some(marker) = viewer
+                .selector
+                .forward(&frame, packet.timestamp, packet.marker)
+            else {
+                continue;
+            };
+            if frame.start && !rest && rng.chance(1) {
+                viewer.selector.dropped(&frame);
+                viewer.lost.insert(made.unit);
+                viewer.shed = viewer.shed.max(Some(packet.timestamp));
+                continue;
+            }
+            seen.stats[0] += 1;
+            if owed {
+                viewer.late.insert(made.unit);
+            }
+            let current = viewer.selector.current();
+            if !rest {
+                let units = &viewer.selector.units;
+                let unit = units.iter().find(|unit| unit.0 == packet.timestamp);
+                let (_, (target, _)) = unit.expect("a unit");
+                assert_ne!(
+                    frame.dti(*target),
+                    Dti::NotPresent,
+                    "a frame of its unit's target"
+                );
+            }
+            if let Some(current) = current.filter(|&c| before != Some(c)) {
+                seen.stats[1] += 1;
+                assert!(frame.start && frame.dti(current) == Dti::Switch);
+                // The wanted target, or the current spatial layer's base
+                // while a spatial downswitch waits.
+                let to = Some(current);
+                assert!(to == viewer.wanted.map(|w| w.0) || to == viewer.meanwhile.map(|w| w.0));
+            }
+            // Past the bound after its tier fell, a viewer gets frames within
+            // the tier's height when the source has a layer that fits: 3.5 s,
+            // and two base-layer periods after a key picture, as a reordered
+            // start misses one switch point.
+            let layer = Target {
+                spatial: made.spatial,
+                temporal: made.temporal,
+            };
+            if let Some((at, Some(units))) = viewer.fell
+                && !rest
+                && now.saturating_sub(at) > Duration::from_millis(3500)
+                && units > 1 << source.svc.temporal
+                && fits(source, &seen.known, Target::default(), viewer.tier, false)
+            {
+                seen.stats[2] += 1;
+                assert!(
+                    fits(source, &seen.known, layer, viewer.tier, false),
+                    "{layer:?} after the tier fell to {} at {at:?}, now {now:?}, {units} units after a key; wanted {:?} meanwhile {:?} current {:?} needs key {} heights {:?}",
+                    viewer.tier,
+                    viewer.wanted,
+                    viewer.meanwhile,
+                    viewer.selector.current(),
+                    viewer.selector.needs_keyframe(),
+                    (
+                        source.heights.clone(),
+                        layers.targets(),
+                        layers.measured(),
+                        source.svc,
+                        source.version,
+                        made.version,
+                        viewer.budget,
+                        viewer.layer
+                    )
+                );
+            }
+            viewer
+                .got
+                .entry(packet.frame)
+                .or_default()
+                .insert(packet.index);
+            if marker {
+                let marks = viewer.marked.entry(made.unit).or_default();
+                marks.insert((packet.frame, packet.index));
+            }
+        }
+    }
+
+    /// Every whole frame a viewer got is decodable from whole frames it got,
+    /// and a unit whose frames all reached the viewer whole has one marker, on
+    /// its last packet.
+    fn check(viewer: &Viewer, source: &Source, unreadable: &HashSet<u16>) {
+        let whole = |number: &u16| {
+            let made = &source.frames[number];
+            viewer
+                .got
+                .get(number)
+                .is_some_and(|p| p.len() == made.packets)
+        };
+        let mut units: BTreeMap<u64, Vec<u16>> = BTreeMap::new();
+        for number in viewer.got.keys() {
+            let made = &source.frames[number];
+            units.entry(made.unit).or_default().push(*number);
+            if whole(number) {
+                for reference in made.references.iter().filter(|r| !unreadable.contains(r)) {
+                    assert!(
+                        whole(reference),
+                        "frame {number} lacks {reference}: {:?} refs {:?}; got {:?} lost {}",
+                        made,
+                        source.frames.get(reference),
+                        viewer.got.get(reference),
+                        viewer.lost.contains(&source.frames[reference].unit)
+                    );
+                }
+            }
+        }
+        // A unit with a packet the SFU found unreadable may lack its marker.
+        let unreadable: HashSet<u64> = unreadable.iter().map(|f| source.frames[f].unit).collect();
+        for (unit, frames) in units {
+            let lost = viewer.lost.contains(&unit) || viewer.late.contains(&unit);
+            if frames.iter().all(whole) && !lost && !unreadable.contains(&unit) {
+                let top = frames
+                    .iter()
+                    .max_by_key(|f| source.frames[f].spatial)
+                    .expect("a frame");
+                let last = (*top, source.frames[top].packets - 1);
+                let marks = viewer.marked.get(&unit);
+                assert_eq!(
+                    marks.map(|m| m.iter().copied().collect::<Vec<_>>()),
+                    Some(vec![last]),
+                    "unit {unit}: {:?}",
+                    frames
+                        .iter()
+                        .map(|f| (source.frames[f].clone(), viewer.got.get(f)))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]
     fn invariants_hold_over_random_calls() {
-        for seed in 1..=60u64 {
-            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            let mut layers = Layers::default();
-            let mut viewers: Vec<Viewer> = Vec::new();
-            let (mut active, mut smooth) = (false, false);
-            let (mut timestamp, mut last_key, mut next_second) = (0u64, None::<u64>, 0u64);
-            let mut since_key = 0u16;
-            for unit in 0..2400u16 {
-                // The source: 30 fps with jitter, or static with long gaps.
-                timestamp += if active {
-                    CLOCK / FPS + rng.below(300)
-                } else {
-                    CLOCK / 2 + rng.below(CLOCK * 2)
-                };
-                if rng.chance(2) {
-                    active = !active;
-                }
-                let wants_key = viewers.iter().any(|v| v.selector.needs_keyframe());
-                let can_key = last_key.is_none_or(|at| timestamp - at >= 2 * CLOCK);
-                if last_key.is_none() || (wants_key || rng.chance(1)) && can_key {
-                    since_key = 0;
-                    last_key = Some(timestamp);
-                }
-                let now = Duration::from_micros(timestamp * 1_000_000 / CLOCK);
-                if timestamp >= next_second {
-                    next_second = timestamp + CLOCK;
-                    if rng.chance(10) {
-                        smooth = !smooth;
-                    }
-                    if viewers.len() < 4 && rng.chance(20) {
-                        viewers.push(Viewer::default());
-                    }
-                    if !viewers.is_empty() && rng.chance(3) {
-                        viewers.swap_remove(rng.below(viewers.len() as u64) as usize);
-                    }
-                    for viewer in &mut viewers {
-                        if rng.chance(15) {
-                            viewer.tier = rng.below(4) as usize;
-                        }
-                        if rng.chance(15) || viewer.budget == 0 {
-                            viewer.budget =
-                                [100_000, 400_000, 1_500_000, 8_000_000][rng.below(4) as usize];
-                        }
-                        if rng.chance(10) {
-                            viewer.steps = rng.below(4) as usize;
-                        }
-                        second(viewer, &layers, smooth, now);
-                    }
-                }
-                let mut marks = vec![(0, false, false); viewers.len()];
-                for (spatial, template) in l2t2_unit(since_key).into_iter().enumerate() {
-                    let number = unit.wrapping_mul(2).wrapping_add(spatial as u16);
-                    let descriptor = l2t2_key(template, number, template == 0);
-                    let size = [1500, 6000][spatial] * if template < 2 { 4 } else { 1 };
-                    let frame = layers
-                        .packet(&descriptor, size, timestamp, now)
-                        .expect("valid");
-                    assert_eq!(frame.layer.spatial as usize, spatial);
-                    for (viewer, mark) in viewers.iter_mut().zip(&mut marks) {
-                        if rng.chance(1) {
-                            viewer.selector.dropped(&frame);
-                            mark.1 = true;
-                            continue;
-                        }
-                        let before = viewer.selector.current();
-                        let Some(marker) = viewer.selector.forward(&frame, timestamp, spatial == 1)
-                        else {
-                            continue;
-                        };
-                        let current = viewer.selector.current().expect("a target");
-                        assert_ne!(frame.dti(current), Dti::NotPresent, "a frame of its target");
-                        if before != Some(current) {
-                            assert!(frame.start && frame.dti(current) == Dti::Switch);
-                            // The wanted target, or the current spatial layer's
-                            // base while a spatial downswitch waits.
-                            let to = Some(current);
-                            assert!(
-                                to == viewer.wanted.map(|w| w.0)
-                                    || to == viewer.meanwhile.map(|w| w.0)
-                            );
-                        }
-                        // The viewer holds the frame's chain: it can decode it.
-                        let chain = frame.chain_diff(current).unwrap_or(0);
-                        let previous = number.wrapping_sub(u16::from(chain));
-                        assert!(
-                            chain == 0 || viewer.held.contains(&previous),
-                            "a held chain"
-                        );
-                        viewer.held.insert(number);
-                        *mark = (mark.0 + u8::from(marker), mark.1, marker);
-                    }
-                }
-                for (count, lost, last) in marks {
-                    // A unit without a loss ends with one marker, on its last
-                    // forwarded frame.
-                    if !lost && count > 0 {
-                        assert!(count == 1 && last, "one marker per unit");
-                    }
-                }
-                since_key = since_key.wrapping_add(1);
+        let mut totals = [0; 4];
+        for seed in 1..=200 {
+            let stats = run(seed);
+            for (total, n) in totals.iter_mut().zip(stats) {
+                *total += n;
             }
         }
+        // Forwarded packets, switches, frames checked after a tier fell, key
+        // pictures.
+        assert!(totals.iter().all(|&n| n > 100), "{totals:?}");
     }
 }
