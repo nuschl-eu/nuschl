@@ -345,7 +345,10 @@ State, per viewer and source, updated once a second:
   moves toward the allocation: down at once within a group (spatial layer for
   Sharp, temporal for Smooth) and to another group at most once per 10 s; up
   after the allocation has allowed the next choice for 10 s within a group or
-  30 s to another group. Its choice is the wanted target.
+  30 s to another group. Its choice is the wanted target. When the choices
+  change (a new mode, tier, frame rate or set of active targets), it keeps its
+  layer, or takes the highest choice at or below it in both layers, and the
+  hold toward a higher choice starts over.
 - The selector forwards the current target's frames. It switches to the
   wanted target at the first frame that starts a temporal unit, is a switch
   point for the wanted target and whose chain the viewer holds; when the viewer

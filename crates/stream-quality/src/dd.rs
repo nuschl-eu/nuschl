@@ -510,26 +510,58 @@ impl Layers {
     }
 }
 
-/// The point of `choices` a viewer wants, and its target, at most `ceiling`,
-/// the budgets' choice. The `stepper` paces the moves, grouped by what the
-/// source's mode keeps; it starts at `ceiling` once the source is `measured`.
+/// A viewer's moves along its choices: the stepper and the layer it chose.
+#[derive(Clone, Copy, Debug)]
+pub struct Pace {
+    stepper: Stepper,
+    layer: Target,
+}
+
+impl Pace {
+    /// Its point in `choices`: its layer, else the highest choice at or below
+    /// it in both layers, else the lowest.
+    pub fn seat(&self, choices: &[Choice]) -> usize {
+        let below = |c: &Choice| {
+            c.layer.spatial <= self.layer.spatial && c.layer.temporal <= self.layer.temporal
+        };
+        choices.iter().rposition(below).unwrap_or(0)
+    }
+}
+
+/// The point of nonempty `choices` a viewer wants, and its target, at most
+/// `ceiling`, the budgets' choice. The `pace` moves along the choices, grouped
+/// by what the source's mode keeps; it starts at `ceiling` once the source is
+/// `measured`. When the choices change, it keeps its layer, or takes the
+/// highest one below it.
 pub fn pick(
     choices: &[Choice],
     ceiling: usize,
     smooth: bool,
     measured: bool,
-    stepper: &mut Option<Stepper>,
+    pace: &mut Option<Pace>,
     now: Duration,
 ) -> (usize, Wanted) {
     let groups: Vec<u32> = choices.iter().map(|c| u32::from(c.kept(smooth))).collect();
-    let point = match stepper {
-        Some(stepper) => stepper.update(&groups, ceiling, now),
-        None if measured => stepper
-            .insert(Stepper::new(ceiling))
-            .update(&groups, ceiling, now),
+    let point = match pace {
+        Some(pace) => {
+            if choices.get(pace.stepper.current()).map(|c| c.layer) != Some(pace.layer) {
+                pace.stepper.seat(pace.seat(choices));
+            }
+            pace.stepper.update(&groups, ceiling, now)
+        }
+        None if measured => {
+            let mut stepper = Stepper::new(ceiling);
+            let point = stepper.update(&groups, ceiling, now);
+            let layer = choices[point].layer;
+            *pace = Some(Pace { stepper, layer });
+            point
+        }
         None => ceiling,
     };
     let choice = &choices[point.min(choices.len() - 1)];
+    if let Some(pace) = pace {
+        pace.layer = choice.layer;
+    }
     (point, (choice.target, choice.layer.spatial))
 }
 
@@ -1331,6 +1363,87 @@ mod tests {
         assert_eq!(pick(&choices, 6, false, true, &mut stepper, later).0, 6);
     }
 
+    fn layers_of(choices: &[Choice]) -> Vec<(u8, u8)> {
+        let layer = |c: &Choice| (c.layer.spatial, c.layer.temporal);
+        choices.iter().map(layer).collect()
+    }
+
+    /// Two seconds of an L2T2_KEY screen (960 × 540, 1920 × 1080) from media
+    /// time `start`, a temporal unit every `interval` ticks, from unit
+    /// `first`; returns the time after them.
+    fn l2t2_screen(layers: &mut Layers, start: u64, interval: u64, first: u16) -> u64 {
+        let mut timestamp = start;
+        for unit in first..first + 2 * (CLOCK / interval) as u16 {
+            for (spatial, template) in l2t2_unit(unit).into_iter().enumerate() {
+                let number = unit * 2 + spatial as u16;
+                let descriptor = l2t2_key(template, number, template == 0);
+                let now = Duration::from_micros(timestamp * 1_000_000 / CLOCK);
+                layers.packet(&descriptor, 1000, timestamp, now);
+            }
+            timestamp += interval;
+        }
+        timestamp
+    }
+
+    #[test]
+    fn a_mode_change_keeps_the_viewers_target() {
+        // A Smooth viewer of an L3T3 camera on S2T2; its sender switches to
+        // Sharp, whose S2T2 is a later choice.
+        let (mut layers, _) = chrome();
+        layers.structure.as_mut().expect("structure").active = u32::MAX;
+        let smooth = layers.choices(Kind::Camera, 3, true, 0);
+        let sharp = layers.choices(Kind::Camera, 3, false, 0);
+        let mut pace = None;
+        let at = Duration::from_secs;
+        let top = |choices: &[Choice]| choices.len() - 1;
+        assert_eq!(
+            pick(&smooth, top(&smooth), true, true, &mut pace, at(10)).1,
+            (8, 2)
+        );
+        assert_eq!(
+            pick(&sharp, top(&sharp), false, true, &mut pace, at(11)).1,
+            (8, 2)
+        );
+    }
+
+    #[test]
+    fn a_tier_change_keeps_a_sharp_viewers_resolution() {
+        // A Sharp viewer of a 60 fps L2T2_KEY screen on the 1440p60 tier gets
+        // S1T1; its tile shrinks to the 1080p30 tier, S1T0, and grows back.
+        let mut layers = Layers::default();
+        l2t2_screen(&mut layers, 0, 1500, 0);
+        let large = layers.choices(Kind::Screen, 2, false, 0);
+        let small = layers.choices(Kind::Screen, 1, false, 0);
+        assert_eq!(layers_of(&large), [(0, 0), (0, 1), (1, 0), (1, 1)]);
+        assert_eq!(layers_of(&small), [(0, 0), (1, 0)]);
+        let mut pace = None;
+        let at = Duration::from_secs;
+        assert_eq!(pick(&large, 3, false, true, &mut pace, at(10)).1.1, 1);
+        assert_eq!(pick(&small, 1, false, true, &mut pace, at(11)).1.1, 1);
+        // Back on S1T0, the step to S1T1 waits for its 10 s hold.
+        assert_eq!(pick(&large, 3, false, true, &mut pace, at(12)), (2, (2, 1)));
+        assert_eq!(pick(&large, 3, false, true, &mut pace, at(22)), (3, (3, 1)));
+    }
+
+    #[test]
+    fn a_frame_rate_change_keeps_a_sharp_viewers_resolution() {
+        // The 1080p30 tier of the screen at 30, 60 and 30 fps.
+        let mut layers = Layers::default();
+        let end = l2t2_screen(&mut layers, 0, 3000, 0);
+        let mut pace = None;
+        let at = Duration::from_secs;
+        let at30 = layers.choices(Kind::Screen, 1, false, 0);
+        assert_eq!(layers_of(&at30), [(0, 0), (0, 1), (1, 0), (1, 1)]);
+        assert_eq!(pick(&at30, 3, false, true, &mut pace, at(10)).1.1, 1);
+        let end = l2t2_screen(&mut layers, end, 1500, 60);
+        let at60 = layers.choices(Kind::Screen, 1, false, 0);
+        assert_eq!(layers_of(&at60), [(0, 0), (1, 0)]);
+        assert_eq!(pick(&at60, 1, false, true, &mut pace, at(11)).1.1, 1);
+        l2t2_screen(&mut layers, end, 3000, 240);
+        let at30 = layers.choices(Kind::Screen, 1, false, 0);
+        assert_eq!(pick(&at30, 3, false, true, &mut pace, at(12)).1.1, 1);
+    }
+
     #[test]
     fn active_targets_and_layer_sizes_limit_the_choice() {
         let (mut layers, _) = chrome();
@@ -1442,18 +1555,18 @@ mod model {
     #[derive(Default)]
     struct Viewer {
         selector: Selector,
-        stepper: Option<Stepper>,
+        pace: Option<Pace>,
         tier: usize,
         budget: u64,
         steps: usize,
         wanted: Option<Wanted>,
         /// The frames it got, for the chains.
         held: HashSet<u16>,
-        /// The choices' targets and the mode of the last second.
-        last: Option<(Vec<usize>, bool)>,
-        /// The wanted target's group, and when the stepper last moved it to
-        /// another group.
-        group: Option<(u8, Option<Duration>)>,
+        /// The wanted layer, when it last changed, and when it last moved to
+        /// another group of eligible choices.
+        layer: Option<Target>,
+        changed: Duration,
+        crossed: Option<Duration>,
     }
 
     /// The camera's active frame rate.
@@ -1483,7 +1596,7 @@ mod model {
             );
         }
         let rates: Vec<u64> = choices.iter().map(|c| c.rate).collect();
-        let current = viewer.stepper.map_or(0, |s| s.current() + 1);
+        let current = viewer.pace.map_or(0, |p| p.seat(&choices) + 1);
         let limits = budget::Limits::project(10_000_000_000);
         let stream = budget::Stream {
             room: 0,
@@ -1493,36 +1606,48 @@ mod model {
         };
         let layers_given = budget::allocate(&limits, &[viewer.budget], &[stream])[0].layers;
         let wanted = layers_given.checked_sub(1).map(|ceiling| {
+            let had = viewer.pace.is_some();
             let (point, wanted) = pick(
                 &choices,
                 ceiling,
                 smooth,
                 layers.measured(),
-                &mut viewer.stepper,
+                &mut viewer.pace,
                 now,
             );
-            // The stepper moves to another group at most once per 10 s; new
-            // choices or a new mode may move it at once.
-            let group = choices[point].kept(smooth);
-            let targets: Vec<usize> = choices.iter().map(|c| c.target).collect();
-            let same = viewer.last == Some((targets, smooth));
-            let mut moved = viewer.group.and_then(|(_, at)| at);
-            if let Some((previous, at)) = viewer.group
-                && previous != group
-                && same
+            let layer = choices[point].layer;
+            // A layer that is still a choice changes only by the stepper's
+            // rules: down within a group at once, to another group at most
+            // once per 10 s, up after the budget allowed it for 10 s within a
+            // group or 30 s to another.
+            let old = viewer
+                .layer
+                .and_then(|old| choices.iter().position(|c| c.layer == old));
+            if had
+                && let Some(old) = old
+                && viewer.layer != Some(layer)
             {
-                assert!(
-                    at.is_none_or(|at| now - at >= Duration::from_secs(10)),
-                    "group changes 10 s apart"
-                );
-                moved = Some(now);
+                let crossed = choices[old].kept(smooth) != choices[point].kept(smooth);
+                let since = now.saturating_sub(viewer.changed);
+                if point > old {
+                    let hold = Duration::from_secs(if crossed { 30 } else { 10 });
+                    assert!(since >= hold, "up after {since:?}, not {hold:?}");
+                } else if crossed {
+                    let at = viewer
+                        .crossed
+                        .map_or(Duration::MAX, |at| now.saturating_sub(at));
+                    assert!(at >= Duration::from_secs(10), "groups 10 s apart");
+                }
+                if crossed {
+                    viewer.crossed = Some(now);
+                }
             }
-            viewer.group = Some((group, moved));
+            if viewer.layer != Some(layer) {
+                viewer.changed = now;
+            }
+            viewer.layer = Some(layer);
             wanted
         });
-        // A second without a target starts the comparison over.
-        let targets = choices.iter().map(|c| c.target).collect();
-        viewer.last = wanted.is_some().then_some((targets, smooth));
         viewer.wanted = wanted;
         viewer.selector.want(wanted);
     }

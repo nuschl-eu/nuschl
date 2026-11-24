@@ -19,8 +19,7 @@
 use crate::protocol::{Mode, Prefer, VideoLimit};
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
-    adapt::Stepper,
-    dd::{Frame, Layers, Selector},
+    dd::{Frame, Layers, Pace, Selector},
     receive,
 };
 use std::{
@@ -85,7 +84,7 @@ pub struct View {
     pub throttle: Throttle,
     pub selector: Selector,
     /// Paces moves toward the receiver's share of the budgets.
-    pub stepper: Option<Stepper>,
+    pub pace: Option<Pace>,
     pub rewrite: Rewrite,
     pub backlog: Backlog,
     pub reported_limit: Option<VideoLimit>,

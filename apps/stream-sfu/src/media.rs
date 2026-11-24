@@ -1357,12 +1357,12 @@ impl Core {
                 estimates.push(peer.estimate);
                 estimates.len() - 1
             });
-            let stepper = peer.forwards[planned.forward].view.stepper;
+            let pace = peer.forwards[planned.forward].view.pace;
             streams.push(budget::Stream {
                 room,
                 receiver,
                 rates,
-                current: stepper.map_or(0, |s| s.current() + 1),
+                current: pace.map_or(0, |p| p.seat(&planned.choices) + 1),
             });
         }
         (estimates, streams)
@@ -1417,7 +1417,7 @@ impl Core {
                     ceiling,
                     smooth,
                     planned.measured,
-                    &mut view.stepper,
+                    &mut view.pace,
                     since,
                 );
                 if limit == VideoLimit::WithinTarget && point < ceiling {

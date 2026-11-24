@@ -59,6 +59,13 @@ impl Stepper {
         self.current
     }
 
+    /// Moves to `point` of new points without a step: the hold toward a
+    /// higher point starts over.
+    pub fn seat(&mut self, point: usize) {
+        self.current = point;
+        self.up_since = None;
+    }
+
     /// Moves toward `ceiling`, the highest point the budget allows now (for
     /// example from [`ceiling`] or [`crate::budget::allocate`]). `groups[i]` is
     /// point i's group, its resolution or frame rate; returns the point to use.
