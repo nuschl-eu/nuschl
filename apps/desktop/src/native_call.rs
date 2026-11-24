@@ -30,7 +30,7 @@ use nuschl_core::{model::TextTarget, network::PeerPolicy};
 #[cfg(target_os = "linux")]
 use nuschl_ipc::video::portal::Grant;
 use nuschl_ipc::video::{CaptureFailure, DecodedFrame, Source};
-use nuschl_protocol::sfu::Codec;
+use nuschl_protocol::sfu::{Codec, Mode, Prefer};
 use nuschl_session::{config::ClientSettings, identity::CryptoHandle};
 use std::{
     cell::Cell,
@@ -1279,40 +1279,83 @@ impl Desktop {
         }
     }
 
+    /// The featured feed's menu: Sharp, Smooth and Low latency for an own
+    /// source, then Auto and the tier limits.
     pub(crate) fn video_quality_commands(
         &self,
         generation: u64,
         feed: Feed,
-    ) -> impl Iterator<Item = (Quality, String, bool)> {
+    ) -> impl Iterator<Item = (VideoChoice, String, bool)> {
         let kind = feed.kind;
         let current = self.call_with_generation(generation).and_then(|call| {
             let selection = *call.quality.borrow();
-            (call.featured(&call.updates.sources(), selection) == Some(feed)).then(|| {
-                match selection.preference(feed).quality {
-                    Quality::Auto => Quality::Auto,
-                    Quality::Tier(tier) => Quality::Tier(tier.min(kind.top() as u8)),
-                }
-            })
+            (call.featured(&call.updates.sources(), selection) == Some(feed))
+                .then(|| selection.preference(feed))
         });
-        std::iter::once(Quality::Auto)
-            .chain((0..=kind.top() as u8).map(Quality::Tier))
-            .filter_map(move |quality| {
-                current.map(|current| (quality, quality_label(kind, quality), current == quality))
+        let modes = [
+            VideoChoice::Prefer(Prefer::Sharp),
+            VideoChoice::Prefer(Prefer::Smooth),
+            VideoChoice::LowLatency,
+        ];
+        let own = feed.publisher.is_none();
+        modes
+            .into_iter()
+            .filter(move |_| own)
+            .chain(
+                std::iter::once(Quality::Auto)
+                    .chain((0..=kind.top() as u8).map(Quality::Tier))
+                    .map(VideoChoice::Quality),
+            )
+            .filter_map(move |choice| {
+                let preference = current?;
+                let mode = preference.mode(kind);
+                Some(match choice {
+                    VideoChoice::Prefer(prefer) => (
+                        choice,
+                        match prefer {
+                            Prefer::Sharp => "Sharp".into(),
+                            Prefer::Smooth => "Smooth".into(),
+                        },
+                        mode.prefer == prefer,
+                    ),
+                    VideoChoice::LowLatency => (choice, "Low latency".into(), mode.low_latency),
+                    VideoChoice::Quality(quality) => {
+                        let chosen = match preference.quality {
+                            Quality::Auto => Quality::Auto,
+                            Quality::Tier(tier) => Quality::Tier(tier.min(kind.top() as u8)),
+                        };
+                        (choice, quality_label(kind, quality), chosen == quality)
+                    }
+                })
             })
     }
 
-    pub(crate) fn set_video_quality(
+    pub(crate) fn set_video_choice(
         &mut self,
         generation: u64,
         feed: Feed,
-        quality: Quality,
+        choice: VideoChoice,
         cx: &mut Context<Self>,
     ) {
         if let Some(call) = self.call_with_generation(generation) {
             let sources = call.updates.sources();
             call.quality.send_if_modified(|selection| {
                 call.featured(&sources, *selection) == Some(feed)
-                    && selection.change(feed, &sources, |preference| preference.quality = quality)
+                    && selection.change(feed, &sources, |preference| {
+                        let mode = preference.mode(feed.kind);
+                        match choice {
+                            VideoChoice::Quality(quality) => preference.quality = quality,
+                            VideoChoice::Prefer(prefer) => {
+                                preference.mode = Some(Mode { prefer, ..mode });
+                            }
+                            VideoChoice::LowLatency => {
+                                preference.mode = Some(Mode {
+                                    low_latency: !mode.low_latency,
+                                    ..mode
+                                });
+                            }
+                        }
+                    })
             });
             cx.notify();
         }
@@ -1485,9 +1528,29 @@ fn quality_label(kind: VideoKind, quality: Quality) -> String {
         Quality::Auto => "Auto".into(),
         Quality::Tier(_) => {
             let tier = kind.ladder()[kind.request(quality, 0)];
-            format!("{}p{}", tier.height, tier.fps)
+            format!("Max {}p{}", tier.height, tier.fps)
         }
     }
+}
+
+/// An entry of the video quality menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoChoice {
+    Prefer(Prefer),
+    LowLatency,
+    /// Auto, or a tier limit.
+    Quality(Quality),
+}
+
+/// Tells the SFU the mode of each own source.
+fn apply_modes(media: &Media, selection: Selection) -> Result<(), String> {
+    for kind in [VideoKind::Camera, VideoKind::Screen] {
+        let feed = Feed::local(kind);
+        media
+            .set_mode(feed.purpose(), selection.preference(feed).mode(kind))
+            .map_err(text)?;
+    }
+    Ok(())
 }
 
 fn video_stats(stats: Option<&VideoStats>, owned: bool) -> impl IntoElement {
@@ -1891,6 +1954,7 @@ async fn meeting(
 ) -> Result<Finish, String> {
     let changes = display.source_changes;
     let mut selection = *display.quality.borrow_and_update();
+    apply_modes(media, selection)?;
     let mut picker = initial.map(pick_source);
     let mut allowed = None;
     let mut timer = tokio::time::interval(stats::INTERVAL);
@@ -2020,6 +2084,7 @@ async fn meeting(
             _ = publisher.retiring.next(), if !publisher.retiring.is_empty() => continue,
             Ok(()) = display.quality.changed() => {
                 selection = *display.quality.borrow_and_update();
+                apply_modes(media, selection)?;
                 publisher.retune(display, selection, None);
                 continue;
             }

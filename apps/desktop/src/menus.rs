@@ -5,6 +5,7 @@ use crate::{
     assets::icon,
     dialogs::{Tone, modal, styled_button},
     names::display_name,
+    native_call::VideoChoice,
     state::{Desktop, Panel, Status},
     theme::*,
 };
@@ -17,7 +18,7 @@ use gpui_kit::{
     prelude::*,
     *,
 };
-use nuschl_client::native::{Presences, UserKey};
+use nuschl_client::native::{Presences, UserKey, sfu::Quality};
 use nuschl_session::{
     connection::{ActionSubject, Command, CommandAuthority, TextTarget, User},
     model::{ChannelEdit, UserAction, VoiceTargetSpec, permission as perm},
@@ -854,19 +855,21 @@ impl Desktop {
             return entries;
         }
         if let MenuTarget::VideoQuality(generation, feed) = menu.target {
-            return self
-                .video_quality_commands(generation, feed)
-                .map(|(quality, label, selected)| {
-                    let mut entry = local_item(label, "check", move |this, _, _, cx| {
-                        this.set_video_quality(generation, feed, quality, cx);
-                    })
-                    .key(format!("quality:{quality:?}"));
-                    if let Entry::Item { choice, .. } = &mut entry {
-                        *choice = Some(selected);
-                    }
-                    entry
+            for (video, label, selected) in self.video_quality_commands(generation, feed) {
+                // The tier limits follow an own source's modes.
+                if video == VideoChoice::Quality(Quality::Auto) && !entries.is_empty() {
+                    entries.push(Entry::Separator);
+                }
+                let mut entry = local_item(label, "check", move |this, _, _, cx| {
+                    this.set_video_choice(generation, feed, video, cx);
                 })
-                .collect();
+                .key(format!("quality:{video:?}"));
+                if let Entry::Item { choice, .. } = &mut entry {
+                    *choice = Some(selected);
+                }
+                entries.push(entry);
+            }
+            return entries;
         }
         if let MenuTarget::VideoFeeds(generation) = menu.target {
             return self

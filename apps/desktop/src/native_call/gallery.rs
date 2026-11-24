@@ -3,6 +3,7 @@
 
 use nuschl_client::native::sfu::{Purpose, Quality, VideoKind};
 use nuschl_ipc::video::Source;
+use nuschl_protocol::sfu::Mode;
 
 pub(super) const REMOTE_SOURCES: usize = 16;
 const SOURCES: usize = 2 + REMOTE_SOURCES;
@@ -118,6 +119,8 @@ impl Sources {
 pub(super) struct Preference {
     pub(super) quality: Quality,
     pub(super) pixels: u32,
+    /// An own source's mode; `None` for its kind's default.
+    pub(super) mode: Option<Mode>,
 }
 
 impl Default for Preference {
@@ -125,7 +128,15 @@ impl Default for Preference {
         Self {
             quality: Quality::Auto,
             pixels: 0,
+            mode: None,
         }
+    }
+}
+
+impl Preference {
+    pub(super) fn mode(self, kind: VideoKind) -> Mode {
+        self.mode
+            .unwrap_or_else(|| Mode::default_for(kind == VideoKind::Screen))
     }
 }
 

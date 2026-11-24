@@ -34,6 +34,8 @@ body.standalone-call {
 .video-session footer a { margin-left: auto; color: var(--muted); font-size: 0.85rem; }
 .video-session #controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .video-session select { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
+.video-session #controls summary { cursor: pointer; color: var(--muted); }
+.video-session #controls details label { margin-left: 8px; }
 .video-session #controls button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text, #0e1220); }
 .video-session button:disabled { opacity: 0.5; cursor: default; }
 .video-session #notice { color: var(--muted); }

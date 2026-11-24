@@ -510,9 +510,11 @@ fn write_frames(
     let mut stdout = io::stdout().lock();
     let mut previous = 0;
     let mut current: Option<(Settings, Encoder<VaEncoder<Dmabuf>>)> = None;
+    // Frames sent: a reopened encoder numbers its frames on from them.
+    let mut sent = 0;
     loop {
         if scale.update(source, control.limits())? {
-            current = None;
+            sent = current.take().map_or(sent, |(_, encoder)| encoder.sent());
         }
         let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(300)) else {
             if let Some(message) =
@@ -596,7 +598,9 @@ fn write_frames(
             .as_ref()
             .is_none_or(|(started, _)| (started.width, started.height) != (width, height))
         {
-            current = Some((settings, open_encoder(&node, source, settings)?));
+            sent = current.take().map_or(sent, |(_, encoder)| encoder.sent());
+            let encoder = open_encoder(&node, source, settings)?.continuing(sent);
+            current = Some((settings, encoder));
         }
         let Some((_, encoder)) = &mut current else {
             continue;

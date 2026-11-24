@@ -116,6 +116,27 @@ impl Bucket {
         self.tokens -= amount;
         true
     }
+
+    pub fn burst(&self) -> f64 {
+        self.burst
+    }
+
+    /// The tokens left and the burst.
+    #[cfg(test)]
+    pub fn level(&self) -> (f64, f64) {
+        (self.tokens, self.burst)
+    }
+
+    /// Takes `amount` on credit, down to minus one burst: later takes wait
+    /// until it is paid back. False past that.
+    pub fn lend(&mut self, amount: f64, now: Instant) -> bool {
+        self.take(0.0, now);
+        if self.tokens - amount < -self.burst {
+            return false;
+        }
+        self.tokens -= amount;
+        true
+    }
 }
 
 /// A media budget in bytes for `bits_per_second`, with a burst of one second,

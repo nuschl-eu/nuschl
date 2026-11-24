@@ -167,6 +167,9 @@ test("SFU messages: the page's bounds", () => {
     { type: "key", from: 1, data: "ab".repeat(16 * 1024 + 1) },
     { ...offer, tracks: [{ mid: "0", peer: 1, source: "1" }] },
     { ...offer, tracks: [{ mid: "0", peer: 1, source: "1", kind: "slides" }] },
+    { type: "mode", mid: "0", peer: 1, mode: { prefer: "crisp" } },
+    { type: "mode", mid: "0", peer: 1, mode: { prefer: "sharp", low_latency: 1 } },
+    { type: "mode", mid: "0", peer: 1 },
     { type: "error", reason: 5 },
     [],
     "text",
@@ -188,7 +191,7 @@ test("viewer quality uses tile pixels and the v1 request layout", () => {
   assert.equal(qualityRequest(23, "camera", 0).request, "0100000000000000170000");
 });
 
-test("an explicit receive tier applies before layout and survives a tile resize", () => {
+test("a receive limit applies before layout and caps the tile's tier", () => {
   class Element extends EventTarget {
     constructor(ownerDocument) {
       super();
@@ -220,8 +223,12 @@ test("an explicit receive tier applies before layout and survives a tile resize"
   assert.equal(requested(), TIERS.screen[2]);
   assert.deepEqual(sent, [{ type: "quality", request: "0100000000000000040102" }]);
   view.sizes.get(video).resize(400);
+  assert.equal(requested(), TIERS.screen[0]);
+  view.sizes.get(video).resize(4000);
   assert.equal(requested(), TIERS.screen[2]);
-  assert.equal(sent.length, 1);
+  select.value = "";
+  select.dispatchEvent(new Event("change"));
+  assert.equal(requested(), TIERS.screen[3]);
 });
 
 test("negotiated video limits follow only the accepted video track", async () => {
@@ -297,6 +304,50 @@ test("publisher quality applies bounded encoder limits to the matching MID", asy
   call.sources.set("camera", { transceiver: { mid: "5", sender }, track, tier: "2" });
   await call.receive({ ...quality, source: "5", max_height: 1080, max_fps: 30, max_bitrate: 4_000_000 });
   assert.deepEqual(applied[8], { scaleResolutionDownBy: 2, maxFramerate: 30, maxBitrate: 2_000_000 });
+});
+
+test("a source's mode sets its sender's hints and reaches the SFU", async () => {
+  const call = new Call({}, { codecs: ["av1"] });
+  const messages = [];
+  call.send = (message) => messages.push(message);
+  const parameters = [];
+  const sender = {
+    getParameters: () => ({ encodings: [{}] }),
+    setParameters: async (value) => parameters.push(value),
+  };
+  const screen = { getSettings: () => ({ width: 1920, height: 1080 }) };
+  call.publisher = { addTransceiver: () => ({ mid: "1", sender }) };
+  call.stream = { worker: {} };
+  globalThis.RTCRtpScriptTransform = class {};
+  const transceiver = call.sender("screen", screen);
+  assert.equal(screen.contentHint, "detail");
+  call.sources.set("screen", { track: screen, transceiver, tier: "" });
+  await call.applyCap("screen", call.sources.get("screen"));
+  assert.equal(parameters.at(-1).degradationPreference, "maintain-resolution");
+  await call.setMode("screen", { prefer: "smooth", low_latency: true });
+  assert.equal(screen.contentHint, "motion");
+  assert.equal(parameters.at(-1).degradationPreference, "maintain-framerate");
+  assert.deepEqual(messages, [{ type: "modes", modes: { 1: { prefer: "smooth", low_latency: true } } }]);
+  // A camera starts Smooth.
+  const camera = { getSettings: () => ({}) };
+  call.sender("camera", camera);
+  assert.equal(camera.contentHint, "motion");
+  delete globalThis.RTCRtpScriptTransform;
+});
+
+test("a Low latency source's receiver renders at once", async () => {
+  const call = new Call({}, { codecs: ["av1"] });
+  const receiver = { jitterBufferTarget: null };
+  const track = { peer: 4, source: "2", kind: "video", receiver };
+  call.tracks.set("1", track);
+  const mode = { type: "mode", mid: "1", peer: 4, mode: { prefer: "smooth", low_latency: true } };
+  await call.receive(parse(JSON.stringify({ ...mode, peer: 5 })));
+  assert.equal(receiver.jitterBufferTarget, null);
+  await call.receive(parse(JSON.stringify(mode)));
+  assert.equal(receiver.jitterBufferTarget, 0);
+  assert.deepEqual(track.mode, mode.mode);
+  await call.receive(parse(JSON.stringify({ ...mode, mode: { prefer: "smooth" } })));
+  assert.equal(receiver.jitterBufferTarget, null);
 });
 
 test("ultrawide publisher stats distinguish capture, verified caps and encoded resolution", () => {
