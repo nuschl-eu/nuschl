@@ -475,9 +475,21 @@ def actions(args, root, shell, application, bot, murmur):
     if args.change_preview:
         # Before saving, the editor says how the change alters who may do what
         # here and in the subchannels (Music has Listening party).
+        def press(name):
+            # The cells sit at the dialog's lower edge; a button's action
+            # reaches it wherever the dialog has scrolled.
+            def pressed():
+                try:
+                    named(name, "push button").press()
+                except (AttributeError, RuntimeError, AssertionError):
+                    return False
+                return True
+
+            eventually(pressed, f"missing ACL UI {name}")
+
         open_acl("Music", expand=False)
-        activate("Registered users · Speak: Yes, not set here")
-        activate("Registered users · Speak: Yes, set here")
+        press("Registered users · Speak: Yes, not set here")
+        press("Registered users · Speak: Yes, set here")
         eventually(
             lambda: text_contains(
                 "Registered users may no longer speak here and in 1 subchannel"
@@ -486,7 +498,7 @@ def actions(args, root, shell, application, bot, murmur):
         )
         shell.screenshot(args.output / "change-preview.png")
         mark("change_preview_counts_subchannels")
-        activate("Reload and discard draft")
+        press("Reload and discard draft")
         eventually(
             lambda: not text_contains("may no longer speak"),
             "the preview outlived the draft",
