@@ -477,6 +477,14 @@ try:
     chrome.save_screenshot(str(OUT / "large-screen.png"))
     fox.save_screenshot(str(OUT / "large-screen-firefox.png"))
 
+    # Strip tiles grow with the window, and Auto asks for the camera tier they show.
+    camera_tier = f"return window.qualityRequests.filter(r => r.startsWith('01{b:016x}00')).at(-1)"
+    wait(chrome, f"{camera_tier} === '01{b:016x}0000'", "180p for a strip tile in a small window")
+    chrome.set_window_size(2560, 1440)
+    wait(chrome, f"{camera_tier} === '01{b:016x}0001'", "360p for a strip tile in a large window")
+    chrome.set_window_size(1280, 800)
+    wait(chrome, f"{camera_tier} === '01{b:016x}0000'", "180p again in a small window")
+
     # Actual receiver measurements become available on the selected tile.
     screen_stats = chrome.find_element(By.CSS_SELECTOR, "#large .video-stats")
     screen_stats.find_element(By.TAG_NAME, "summary").click()
