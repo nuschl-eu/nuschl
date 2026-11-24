@@ -394,6 +394,39 @@ fn microphone_carries_the_largest_admitted_voice_frame_on_a_jittered_cadence() {
     assert!(refused);
 }
 
+/// A call video frame longer than the 300 ms window, such as a large key
+/// frame, goes out on an idle connection, and the frames written while it
+/// drains follow it.
+#[test]
+fn call_video_sends_a_key_frame_longer_than_the_window() {
+    let mut pair = Pair::setup(
+        true,
+        false,
+        &[Purpose::ScreenVideo],
+        VideoCodec::Av1,
+        Some(1024 * 1024 + 64),
+    );
+    pair.connect();
+    pair.advance(Duration::from_millis(300)).unwrap();
+    // A 400 KiB sequence header OBU, 800 ms at the initial 4 Mbit/s for video.
+    let mut key = vec![0x0a, 0x80, 0x80, 0x19];
+    key.resize(400 * 1024 + 4, 0x42);
+    let key: Arc<[u8]> = key.into();
+    pair.write(0, Kind::Video, 9_000, key.clone());
+    let delta: Arc<[u8]> = vec![0x2a, 0x01, 0x5a].into();
+    for index in 1..30 {
+        pair.advance(Duration::from_millis(33)).unwrap();
+        pair.write(0, Kind::Video, 9_000 + index * 3_000, delta.clone());
+    }
+    pair.advance(Duration::from_secs(1)).unwrap();
+    let video: Vec<_> = pair.frames[1]
+        .iter()
+        .filter(|f| f.kind == Kind::Video)
+        .collect();
+    assert_eq!(video.len(), 30);
+    assert_eq!(video[0].data, key);
+}
+
 #[test]
 fn video_backpressure_keeps_audio_available_and_does_not_queue_stale_frames() {
     let mut pair = Pair::new(true, false);

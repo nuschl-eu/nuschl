@@ -108,6 +108,8 @@ struct TrackState {
     bucket: Bucket,
     next: Instant,
     timestamp: Option<u64>,
+    /// The bytes of a call video frame longer than the window while they drain.
+    oversized: usize,
 }
 
 #[derive(Debug)]
@@ -658,6 +660,7 @@ impl Peer {
                     ),
                     next: self.now,
                     timestamp: None,
+                    oversized: 0,
                 }
             })
             .collect();
@@ -748,9 +751,9 @@ impl Peer {
         let bits = ((data.len() + data.len().div_ceil(1000) * 80) * 8) as f64;
         if rate == 0
             || now < self.tracks[index].next
-            || self.total_budget.available(now, total) < bits
-            || self.tracks[index].bucket.available(now, rate) < bits
-            || (kind == Kind::Video && self.video_budget.available(now, video) < bits)
+            || !self.total_budget.admits(now, total, bits)
+            || !self.tracks[index].bucket.admits(now, rate, bits)
+            || (kind == Kind::Video && !self.video_budget.admits(now, video, bits))
         {
             return Err(Error::Backpressure);
         }
@@ -770,10 +773,21 @@ impl Peer {
                         .queue_info()
                         .map(|q| (q.byte_size(), q.first_unsent()))
                 });
-            if let Some((bytes, oldest)) = queued
-                && (oldest.is_some_and(|at| now.saturating_duration_since(at) >= CALL_VIDEO_WINDOW)
-                    || (bits + bytes as f64 * 8.0) / rate as f64 > CALL_VIDEO_WINDOW.as_secs_f64())
-            {
+            // A frame longer than the window, such as a large key frame, goes
+            // out when the queue is empty; the frames behind it may queue for
+            // as long as it takes, up to its size more.
+            let window = rate as f64 * CALL_VIDEO_WINDOW.as_secs_f64();
+            let state = &mut self.tracks[index];
+            let (bytes, oldest) = queued.unwrap_or((0, None));
+            if (bytes * 8) as f64 <= window {
+                state.oversized = 0;
+            }
+            let late =
+                oldest.is_some_and(|at| now.saturating_duration_since(at) >= CALL_VIDEO_WINDOW);
+            let fits = bits + (bytes * 8) as f64 <= window + (state.oversized * 8) as f64;
+            if bytes == 0 && bits > window {
+                state.oversized = data.len();
+            } else if (late && state.oversized == 0) || !fits {
                 return Err(Error::Backpressure);
             }
             Duration::from_millis(1)

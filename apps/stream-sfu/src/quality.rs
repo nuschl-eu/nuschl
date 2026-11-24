@@ -8,7 +8,8 @@
 //! Q1's `Selector`, which switches at switch points whose chains the receiver
 //! holds and marks the end of each temporal unit it forwards, with sequence
 //! numbers of its own ([`Rewrite`]) so intentional layer skips leave no gaps.
-//! The queue budget sheds pictures when a receiver falls behind.
+//! When a receiver falls behind, its queue leaves out whole frames that its
+//! target can do without and lowers its target; other frames go out whole.
 //!
 //! A receiver asks for a tier per source (`QualityRequest`) and states the
 //! tiers it decodes (`DecodeCapacity`), each at most once a second. The tier it
@@ -19,7 +20,7 @@ use crate::protocol::VideoLimit;
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
     adapt::Stepper,
-    dd::{Layers, Selector},
+    dd::{Frame, Layers, Selector},
     receive,
 };
 use std::{
@@ -31,6 +32,12 @@ use str0m::rtp::{Extension, ExtensionSerializer, ExtensionValues, StreamTxQueueI
 const QUEUE_AGE: Duration = Duration::from_millis(300);
 const MIN_QUEUE_BYTES: u64 = 32 * 1024;
 const MAX_QUEUE_BYTES: u64 = 2 * 1024 * 1024;
+/// How long a layered frame may wait in a receiver's queue before the queue
+/// leaves frames out.
+pub const QUEUE_BOUND: Duration = Duration::from_millis(300);
+/// The largest frame a publisher sends, an 8 MiB screen frame: a key picture's
+/// temporal unit, and a recovery picture, up to this size goes out whole.
+pub const MAX_KEY_BYTES: u64 = 8 * 1024 * 1024;
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// A video source: its kind and the demand last sent to its publisher.
@@ -71,6 +78,11 @@ pub struct View {
 #[derive(Default)]
 pub struct Backlog {
     dropped_through: Option<u64>,
+    /// The layered frame left out whole.
+    skipping: Option<u16>,
+    /// The bytes of the last key picture's temporal unit, and whether more of
+    /// it is to come: the queue's bound grows by the time they take.
+    key: (u64, bool),
     sampled_at: Option<Instant>,
     unsampled_bytes: usize,
     overloaded: Option<VideoLimit>,
@@ -97,6 +109,14 @@ pub enum VideoAdmission {
     Pause,
     RequestKeyframe,
     Burst(u64),
+}
+
+/// What happens to a packet of a layered frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Layered {
+    Send,
+    /// Its frame is left out whole.
+    Skip,
 }
 
 impl Backlog {
@@ -131,6 +151,8 @@ impl Backlog {
             .saturating_add(self.unsampled_bytes)
     }
 
+    /// Whether `payload` more bytes take the queue of a source without a
+    /// descriptor past about 300 ms, beyond the last recovery picture.
     pub fn full(
         &mut self,
         queue: Option<&dyn StreamTxQueueInfo>,
@@ -139,13 +161,74 @@ impl Backlog {
         now: Instant,
     ) -> bool {
         let limit = (bitrate / 8 * 3 / 10).clamp(MIN_QUEUE_BYTES, MAX_QUEUE_BYTES);
-        let oldest = queue.and_then(StreamTxQueueInfo::first_unsent);
-        self.queued_bytes(queue).saturating_add(payload) as u64 > limit
-            || oldest.is_some_and(|at| now.saturating_duration_since(at) >= QUEUE_AGE)
+        let age = queue
+            .and_then(StreamTxQueueInfo::first_unsent)
+            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        let queued = self.queued_bytes(queue) as u64;
+        if queued <= limit && age < QUEUE_AGE && !self.key.1 {
+            self.key.0 = 0;
+        }
+        let picture = Duration::from_secs_f64(self.key.0 as f64 * 8.0 / bitrate.max(1) as f64);
+        queued + payload as u64 > limit + self.key.0 || age >= QUEUE_AGE + picture
+    }
+
+    /// Admits a packet of the layered `frame` by how long a frame starting now
+    /// waits in the queue, less the time the last key picture's temporal unit
+    /// takes. Past `bound` the receiver's target drops a step, and a frame its
+    /// target can do without (`discardable`) is left out whole; past twice
+    /// `bound` every frame but a key picture is, and the receiver waits for the
+    /// next switch point.
+    pub fn layered(
+        &mut self,
+        frame: &Frame,
+        discardable: bool,
+        queue: Option<&dyn StreamTxQueueInfo>,
+        bitrate: u64,
+        bound: Duration,
+        now: Instant,
+    ) -> Layered {
+        if frame.start {
+            self.skipping = None;
+            let queued = self.queued_bytes(queue) as u64;
+            let age = queue
+                .and_then(StreamTxQueueInfo::first_unsent)
+                .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            let time =
+                |bytes: u64| Duration::from_secs_f64(bytes as f64 * 8.0 / bitrate.max(1) as f64);
+            let delay = age.max(time(queued));
+            if delay <= bound && !self.key.1 {
+                self.key.0 = 0;
+            }
+            let delay = delay.saturating_sub(time(self.key.0));
+            let key = frame.references().next().is_none();
+            if key {
+                self.key = (0, true);
+            } else if delay > bound {
+                self.overloaded(VideoLimit::ForwardingBacklog);
+                if discardable || delay > bound * 2 {
+                    self.skipping = Some(frame.number);
+                }
+            }
+        }
+        if self.skipping == Some(frame.number) {
+            Layered::Skip
+        } else {
+            Layered::Send
+        }
+    }
+
+    /// Whether `payload` more bytes would take the queue past
+    /// [`MAX_QUEUE_BYTES`] beyond the last key picture's temporal unit.
+    pub fn capped(&mut self, queue: Option<&dyn StreamTxQueueInfo>, payload: usize) -> bool {
+        let cap = MAX_QUEUE_BYTES + self.key.0.min(MAX_KEY_BYTES);
+        self.queued_bytes(queue).saturating_add(payload) as u64 > cap
     }
 
     pub fn enqueued(&mut self, payload: usize, cost: u64, marker: bool) {
         self.unsampled_bytes += payload;
+        if self.key.1 {
+            self.key = (self.key.0 + payload as u64, !marker);
+        }
         if let Recovery::Picture { timestamp, bytes } = self.recovery {
             self.recovery = if marker {
                 Recovery::Live
@@ -185,6 +268,7 @@ impl Backlog {
                     timestamp,
                     bytes: 0,
                 };
+                self.key = (0, true);
                 VideoAdmission::Burst(0)
             }
             Recovery::Picture {
@@ -202,14 +286,10 @@ impl Backlog {
         }
     }
 
-    pub fn burst_full(
-        &mut self,
-        queue: Option<&dyn StreamTxQueueInfo>,
-        cost: u64,
-        burst: u64,
-    ) -> bool {
-        let burst = burst.min(MAX_QUEUE_BYTES);
-        cost > burst || self.queued_bytes(queue) as u64 > burst
+    /// Whether a recovery picture of `cost` bytes so far outgrows
+    /// [`MAX_KEY_BYTES`].
+    pub fn burst_full(&mut self, queue: Option<&dyn StreamTxQueueInfo>, cost: u64) -> bool {
+        cost > MAX_KEY_BYTES || self.queued_bytes(queue) as u64 > MAX_KEY_BYTES
     }
 
     pub fn tick(&mut self, now: Instant) {
@@ -403,6 +483,88 @@ mod tests {
     }
 
     #[test]
+    fn a_late_queue_leaves_out_whole_frames_and_lets_key_pictures_through() {
+        let now = Instant::now();
+        let mut backlog = Backlog::default();
+        // One-packet frames of two templates: a key picture and a delta
+        // frame referencing the frame before it.
+        let mut layers = Layers::default();
+        let mut frame = |number: u16, start: bool| {
+            let [high, low] = number.to_be_bytes();
+            let template = u8::from(number != 1);
+            let mut descriptor = vec![0x40 | u8::from(start) << 7 | template, high, low];
+            if number == 1 && start {
+                descriptor.extend([0x80, 0x00, 0x3a, 0x40, 0x00]);
+            }
+            layers
+                .packet(&descriptor, 1, std::time::Duration::ZERO)
+                .expect("valid")
+        };
+        let key = frame(1, true);
+        let frames: Vec<Frame> = (2..8).map(|n| frame(n, true)).collect();
+        let later = frame(2, false);
+        // 2 Mbit/s: 100 kB wait 400 ms, 200 kB 800 ms.
+        let queue = |bytes: usize| Queue { oldest: now, bytes };
+        let admit = |backlog: &mut Backlog, frame: &Frame, discardable, bytes| {
+            let queue = queue(bytes);
+            backlog.layered(
+                frame,
+                discardable,
+                Some(&queue),
+                2_000_000,
+                QUEUE_BOUND,
+                now,
+            )
+        };
+        assert_eq!(admit(&mut backlog, &frames[0], true, 70_000), Layered::Send);
+        // Past the bound a discardable frame stays out to its end, even once
+        // the queue drains; a required one goes out.
+        assert_eq!(
+            admit(&mut backlog, &frames[0], true, 100_000),
+            Layered::Skip
+        );
+        assert_eq!(admit(&mut backlog, &later, true, 0), Layered::Skip);
+        assert_eq!(
+            admit(&mut backlog, &frames[1], false, 100_000),
+            Layered::Send
+        );
+        // Past twice the bound only a key picture goes out.
+        assert_eq!(
+            admit(&mut backlog, &frames[2], false, 200_000),
+            Layered::Skip
+        );
+        assert_eq!(admit(&mut backlog, &key, false, 200_000), Layered::Send);
+        // The key picture's 400 kB, 1.6 s, extend the bound for the frames
+        // behind it: with 100 kB more they wait 400 ms past it.
+        backlog.enqueued(400_000, 400_000, true);
+        let sample = |bytes| Queue {
+            oldest: now + Duration::from_millis(1),
+            bytes,
+        };
+        let mut layered = |frame: &Frame, discardable, bytes| {
+            let queue = sample(bytes);
+            backlog.layered(
+                frame,
+                discardable,
+                Some(&queue),
+                2_000_000,
+                QUEUE_BOUND,
+                now,
+            )
+        };
+        assert_eq!(layered(&frames[3], true, 400_000), Layered::Send);
+        assert_eq!(layered(&frames[4], false, 500_000), Layered::Send);
+        assert_eq!(layered(&frames[5], true, 500_000), Layered::Skip);
+        let cap = MAX_QUEUE_BYTES as usize + 400_000;
+        assert!(!backlog.capped(Some(&sample(cap - 1000)), 1000));
+        assert!(backlog.capped(Some(&sample(cap)), 1000));
+        // The drops lowered the target.
+        backlog.tick(now);
+        assert_eq!(backlog.tier(3), 2);
+        assert_eq!(backlog.limit(), Some(VideoLimit::ForwardingBacklog));
+    }
+
+    #[test]
     fn video_shedding_covers_the_whole_remainder_and_recovers_slowly() {
         let now = Instant::now();
         let mut backlog = Backlog::default();
@@ -461,8 +623,8 @@ mod tests {
             backlog.admission(15, None, true, ready),
             VideoAdmission::Burst(0)
         ));
-        assert!(!backlog.burst_full(None, 125_000, 125_000));
-        assert!(backlog.burst_full(None, 125_001, 125_000));
+        assert!(!backlog.burst_full(None, MAX_KEY_BYTES));
+        assert!(backlog.burst_full(None, MAX_KEY_BYTES + 1));
         backlog.enqueued(1200, 1248, false);
         assert!(matches!(
             backlog.admission(15, None, true, ready),
