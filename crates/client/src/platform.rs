@@ -13,6 +13,11 @@ use nuschl_core::{SearchCursor, audio::Sound, bookmark::ServerBookmark};
 pub enum Request {
     /// Move our own session to a channel.
     Join(u32),
+    /// Move someone else's session to a channel (Mumble's Move permission).
+    MoveUser {
+        session: u32,
+        channel: u32,
+    },
     /// Text to a channel, a session or a direct conversation. A direct
     /// message names the session instance it was meant for, so a reused
     /// session number never receives it.

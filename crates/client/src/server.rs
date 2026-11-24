@@ -434,6 +434,17 @@ impl ServerState {
             .is_some_and(|permissions| permissions & bits == bits)
     }
 
+    /// Whether the server granted us Move where `session` is and in `channel`,
+    /// so we may drag someone else there. The server still decides.
+    pub fn may_move(&self, session: u32, channel: u32) -> bool {
+        self.own_session != Some(session)
+            && self.users.get(&session).is_some_and(|user| {
+                user.channel != channel
+                    && self.may(user.channel, perm::MOVE)
+                    && self.may(channel, perm::MOVE)
+            })
+    }
+
     /// Like `may`, but optimistic while permissions are still unknown.
     pub fn may_try(&self, channel: u32, bits: u32) -> bool {
         self.permissions

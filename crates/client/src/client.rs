@@ -970,6 +970,31 @@ impl Client {
         self.apply_voice(changes);
     }
 
+    /// Move someone else to `channel` of server `index`. Offered only where
+    /// the server granted Move ([`ServerState::may_move`]); it stays the
+    /// authority, and a refusal arrives as its denial.
+    pub fn move_user(&mut self, index: usize, session: u32, channel: u32) -> Result<(), String> {
+        let server = self.servers.get(index).ok_or("Unknown server.")?;
+        if !server.may_move(session, channel) {
+            return Err("You may not move them there.".into());
+        }
+        self.platform
+            .request(&server.id, Request::MoveUser { session, channel })
+    }
+
+    /// Ask server `index` for our permissions in `channel`, unless they are
+    /// known or were just asked for.
+    pub fn query_permissions(&mut self, index: usize, channel: u32) {
+        let now = self.now_ms;
+        if let Some(server) = self.servers.get_mut(index)
+            && server.begin_permission_query(channel, now)
+        {
+            let _ = self
+                .platform
+                .request(&server.id, Request::RequestPermissions(channel));
+        }
+    }
+
     /// Send a request the client does not model to server `index`.
     pub fn request(&self, index: usize, request: Request) -> Result<(), String> {
         self.platform.request(&self.servers[index].id, request)
@@ -3518,7 +3543,7 @@ mod tests {
         model::{Channel, User},
         timeline::IncomingMessage,
     };
-    use nuschl_core::ChatMessage;
+    use nuschl_core::{ChatMessage, model::permission as perm};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -4423,6 +4448,49 @@ mod tests {
             .unwrap();
         assert!(channel.timeline.missed_live);
         assert_eq!(channel.timeline.messages.len(), 2);
+    }
+
+    #[test]
+    fn moving_someone_needs_move_where_they_are_and_where_they_go() {
+        let (mut client, recorder, id) = connected();
+        client.handle(Input::Server {
+            server: id,
+            generation: 1,
+            event: ServerEvent::User(User {
+                session: 2,
+                name: "bob".into(),
+                channel: 2,
+                ..Default::default()
+            }),
+        });
+        let moves = || {
+            recorder
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, request)| matches!(request, Request::MoveUser { .. }))
+                .count()
+        };
+        assert!(client.move_user(0, 2, 3).is_err(), "unknown permissions");
+        client.servers[0].permissions.insert(2, perm::MOVE);
+        client.servers[0].permissions.insert(3, perm::ENTER);
+        assert!(client.move_user(0, 2, 3).is_err(), "no Move in the target");
+        client.servers[0].permissions.insert(3, perm::MOVE);
+        assert!(client.move_user(0, 1, 3).is_err(), "ourselves");
+        assert!(client.move_user(0, 2, 2).is_err(), "where they are");
+        assert_eq!(moves(), 0);
+        client.move_user(0, 2, 3).unwrap();
+        assert!(matches!(
+            recorder.requests.lock().unwrap().last(),
+            Some((
+                _,
+                Request::MoveUser {
+                    session: 2,
+                    channel: 3
+                }
+            ))
+        ));
     }
 
     #[test]
