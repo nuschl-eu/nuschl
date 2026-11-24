@@ -3049,6 +3049,49 @@ fn the_registration_list_does_not_follow_people_in_hidden_channels() {
     assert_eq!(listed(&mut f), before);
 }
 
+/// With `archive_stock_direct_messages`, a stock message naming a session
+/// the sender does not see archives nothing: no direct conversation with
+/// that session's account appears.
+#[test]
+fn a_stock_message_to_a_hidden_session_archives_nothing() {
+    let mut config = Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap();
+    config.history.archive_stock_direct_messages = true;
+    let mut f = Fixture::new(config);
+    f.add_secret();
+    let [_, _, _, member, registered, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    assert!(!f.state.sees_user(registered, member));
+    // Only the channels' conversations, without the fixture's direct one.
+    f.state.conversations = Default::default();
+    for channel in f.state.channels.0.values() {
+        f.state
+            .conversations
+            .add_channel(channel.conversation_id, channel.id);
+    }
+    f.handle(
+        registered,
+        kind::TEXT_MESSAGE,
+        &proto::TextMessage {
+            session: vec![member],
+            message: "who are you".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        f.state
+            .conversations
+            .direct(account(REGISTERED), account(MEMBER)),
+        None
+    );
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is

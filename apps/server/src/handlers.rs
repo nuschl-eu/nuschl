@@ -1666,7 +1666,8 @@ impl State {
             && let Some(sender) = self.users.get(&source).and_then(|user| user.account)
         {
             for session in &message.session {
-                if let Some(peer) = self.users.get(session).and_then(|user| user.account)
+                if self.sees_user(source, *session)
+                    && let Some(peer) = self.users.get(session).and_then(|user| user.account)
                     && peer != sender
                     && self.allowed(source, Action::SendDirect { peer: &peer })
                 {
