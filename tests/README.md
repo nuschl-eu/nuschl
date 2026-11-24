@@ -321,7 +321,10 @@ render node with AV1 encode (`NUSCHL_TEST_RENDER_NODE`, default
 screenshot as a screen, decode every frame with rav1d at each operating point,
 and check the rate in each second, bitrate changes without keyframes, keyframes
 on request and the picture quality. One compares a still screen with GStreamer's
-`vaav1enc` in QVBR, the encoder the worker used before.
+`vaav1enc` in QVBR, the encoder the worker used before. One checks that the
+decode worker shows a 1920 × 1080 camera and a 3440 × 1440 screen at exactly
+those sizes from rav1d and from VA-API; VCN 4 codes them in aligned frames with
+the picture's size as the render size.
 
 ## WebRTC transport trial
 

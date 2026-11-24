@@ -27267,6 +27267,10 @@ rec {
             packageId = "nuschl-testkit";
           }
           {
+            name = "nuschl-video-encode";
+            packageId = "nuschl-video-encode";
+          }
+          {
             name = "serde_json";
             packageId = "serde_json";
           }
