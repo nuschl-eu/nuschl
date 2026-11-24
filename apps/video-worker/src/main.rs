@@ -6,6 +6,8 @@ mod capture;
 mod capture_native;
 mod capture_pixels;
 mod decode;
+#[cfg(all(test, target_os = "linux", feature = "vaapi"))]
+mod encoder_tests;
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
 mod va_encoder;
 
