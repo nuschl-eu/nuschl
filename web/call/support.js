@@ -35,10 +35,12 @@ export function sendCodecs(scope, codec, kind = "video") {
 }
 
 /** A single AV1 encoding can expose multiple decode targets through its RTP
- * Dependency Descriptor. Probe at the capture size before enabling it. */
+ * Dependency Descriptor. Probe at the capture size before enabling it. Screens
+ * use temporal layers only: Chromium's screen-content AV1 encoder writes key
+ * pictures with an undecodable inter-layer predicted frame. */
 export async function scalabilityMode(scope, codec, kind, { width, height, frameRate }) {
   if (codec !== "av1" || !width || !height || !frameRate) return undefined;
-  const mode = kind === "screen" ? "L2T2_KEY" : "L3T3_KEY";
+  const mode = kind === "screen" ? "L1T3" : "L3T3_KEY";
   try {
     const capabilities = await scope.navigator.mediaCapabilities.encodingInfo({
       type: "webrtc",

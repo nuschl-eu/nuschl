@@ -210,8 +210,10 @@ Realtime AV1 estimates from published guidance (±50 %), to be measured by S0f:
 
 Grid tiles request 360p, the large view 720p or more. Cameras need several
 resolutions at once, so cameras publish three spatial layers (SVC) or three
-simulcast encodings, chosen by S0f; screens use temporal layers and, where the
-encoder offers them, spatial layers.
+simulcast encodings, chosen by S0f; screens use temporal layers (`L1T3`).
+Chromium's AV1 encoder in screen-content mode writes key pictures with an
+undecodable inter-layer predicted frame (dav1d and libaom fail in its tile
+data), so screens keep one resolution.
 
 Local S0f throughput sample on a Radeon RX 7900 XTX with Mesa 26.3.0 and
 FFmpeg 9.0.2. The input is ten seconds of moving `testsrc2` with one
@@ -274,7 +276,10 @@ screen-rate capability, the SFU supplies a separate encoder ceiling. The
 ceiling leaves packet overhead and a share of the host, room and viewer
 budgets for each forwarded screen alongside camera and audio. A single-layer
 source uses the tightest viewer path; layered sources can keep higher rates for
-viewers that can receive them. The SFU probes within configured limits while
+viewers that can receive them. A screen with one spatial layer sends every
+viewer the same picture, so its rate stops at the ceiling of that picture's
+tier (from the Dependency Descriptor's layer size) or of the viewer's tier,
+whichever is lower. The SFU probes within configured limits while
 actual payload varies with screen motion. The traffic pacing tier also caps
 screen bitrate whenever pacing is active. Direct screen publishers use their
 direct congestion controller for bitrate.
