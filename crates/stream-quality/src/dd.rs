@@ -427,6 +427,17 @@ impl Layers {
         self.measured
     }
 
+    /// The active target with `target`'s spatial layer and its lowest
+    /// temporal layer.
+    pub fn base(&self, target: usize) -> Option<Wanted> {
+        let structure = self.structure.as_ref()?;
+        let spatial = structure.targets.get(target)?.spatial;
+        (0..structure.targets.len())
+            .filter(|&t| structure.active >> t & 1 == 1 && structure.targets[t].spatial == spatial)
+            .min_by_key(|&t| structure.targets[t].temporal)
+            .map(|t| (t, spatial))
+    }
+
     /// Whether `layer`'s frame rate is at most a quarter above `fps`. The
     /// source's frame rate halves with each temporal layer below the top.
     fn within(&self, layer: Target, top: u8, fps: u64) -> bool {
@@ -582,6 +593,9 @@ pub struct Selector {
     ended: Option<u64>,
     /// Whether the receiver lacks the wanted target's chain.
     broken: bool,
+    /// The target to forward while a switch to a lower spatial layer waits
+    /// for a key picture.
+    meanwhile: Option<Wanted>,
 }
 
 impl Selector {
@@ -593,6 +607,13 @@ impl Selector {
             self.broken = false;
         }
         self.wanted = target;
+    }
+
+    /// Sets the target to forward while a switch to a lower spatial layer
+    /// waits for a key picture: the current spatial layer's lowest temporal
+    /// layer ([`Layers::base`]), so the receiver gets fewer frames at once.
+    pub fn meanwhile(&mut self, target: Option<Wanted>) {
+        self.meanwhile = target;
     }
 
     pub fn current(&self) -> Option<usize> {
@@ -631,11 +652,24 @@ impl Selector {
         if frame.start && self.current != self.wanted {
             match self.wanted {
                 None => self.current = None,
-                Some((target, _)) => {
+                Some((target, spatial)) => {
                     let intact = self.intact(frame, target);
                     self.broken = !intact;
-                    if intact && frame.dti(target) == Dti::Switch && self.ended != Some(timestamp) {
+                    let switch = |target| {
+                        self.intact(frame, target)
+                            && frame.dti(target) == Dti::Switch
+                            && self.ended != Some(timestamp)
+                    };
+                    if intact && switch(target) {
                         self.current = self.wanted;
+                    } else if let (Some(base), Some(current)) = (self.meanwhile, self.current)
+                        && !intact
+                        && spatial < current.1
+                        && base.1 == current.1
+                        && base != current
+                        && switch(base.0)
+                    {
+                        self.current = Some(base);
                     }
                 }
             }
@@ -1142,6 +1176,39 @@ mod tests {
         assert!(!selector.waiting());
     }
 
+    /// An L2T2_KEY viewer on S1T1 whose wanted target drops one step at unit
+    /// 20, without a key picture: the frames it gets over the next 19 units.
+    fn after_a_drop(wanted: Wanted) -> (usize, bool) {
+        let mut layers = Layers::default();
+        let mut selector = Selector::default();
+        selector.want(Some((3, 1)));
+        let mut forwarded = 0;
+        for unit in 0..40u16 {
+            if unit == 20 {
+                selector.meanwhile(selector.current().and_then(|c| layers.base(c)));
+                selector.want(Some(wanted));
+            }
+            for (spatial, template) in l2t2_unit(unit).into_iter().enumerate() {
+                let number = unit * 2 + spatial as u16;
+                let descriptor = l2t2_key(template, number, template == 0);
+                let frame = layers
+                    .packet(&descriptor, 1, 0, Duration::ZERO)
+                    .expect("valid");
+                let sent = selector.forward(&frame, u64::from(unit), spatial == 1);
+                forwarded += usize::from(sent.is_some() && unit > 20);
+            }
+        }
+        (forwarded, selector.needs_keyframe())
+    }
+
+    #[test]
+    fn a_spatial_downswitch_drops_temporal_layers_while_it_waits() {
+        // Sharp, S1T0: every other unit at once.
+        assert_eq!(after_a_drop((2, 1)), (9, false));
+        // Smooth, S0T1: S1T0 until a key picture brings the S0 chain.
+        assert_eq!(after_a_drop((1, 0)), (9, true));
+    }
+
     #[test]
     fn a_downswitch_needs_the_lower_chain() {
         let mut layers = Layers::default();
@@ -1560,6 +1627,7 @@ mod model {
         budget: u64,
         steps: usize,
         wanted: Option<Wanted>,
+        meanwhile: Option<Wanted>,
         /// The frames it got, for the chains.
         held: HashSet<u16>,
         /// The wanted layer, when it last changed, and when it last moved to
@@ -1649,6 +1717,8 @@ mod model {
             wanted
         });
         viewer.wanted = wanted;
+        viewer.meanwhile = viewer.selector.current().and_then(|c| layers.base(c));
+        viewer.selector.meanwhile(viewer.meanwhile);
         viewer.selector.want(wanted);
     }
 
@@ -1727,7 +1797,13 @@ mod model {
                         assert_ne!(frame.dti(current), Dti::NotPresent, "a frame of its target");
                         if before != Some(current) {
                             assert!(frame.start && frame.dti(current) == Dti::Switch);
-                            assert_eq!(Some(current), viewer.wanted.map(|w| w.0));
+                            // The wanted target, or the current spatial layer's
+                            // base while a spatial downswitch waits.
+                            let to = Some(current);
+                            assert!(
+                                to == viewer.wanted.map(|w| w.0)
+                                    || to == viewer.meanwhile.map(|w| w.0)
+                            );
                         }
                         // The viewer holds the frame's chain: it can decode it.
                         let chain = frame.chain_diff(current).unwrap_or(0);

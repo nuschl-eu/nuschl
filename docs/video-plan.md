@@ -353,7 +353,8 @@ State, per viewer and source, updated once a second:
   wanted target at the first frame that starts a temporal unit, is a switch
   point for the wanted target and whose chain the viewer holds; when the viewer
   lacks that chain, the SFU asks the publisher for a key frame, at most once
-  per 2 s. A frame the current target needs and the viewer misses leaves it
+  per 2 s. While a switch to a lower spatial layer waits for that key frame,
+  the selector forwards the current spatial layer's lowest temporal layer. A frame the current target needs and the viewer misses leaves it
   without a target until the next such switch point.
 - The queue leaves out a frame the target can do without once the queue's
   delay passes the bound, every frame but a key picture past twice the bound,

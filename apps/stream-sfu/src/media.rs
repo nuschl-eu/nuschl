@@ -1293,6 +1293,11 @@ impl Core {
                     forward: index,
                     choices,
                     measured: video.layers.measured(),
+                    meanwhile: forward
+                        .view
+                        .selector
+                        .current()
+                        .and_then(|c| video.layers.base(c)),
                     mode: video.mode,
                     ceiling: probe,
                     limit,
@@ -1459,6 +1464,7 @@ impl Core {
             {
                 view.reported_mode = Some(planned.mode);
             }
+            view.selector.meanwhile(planned.meanwhile);
             view.selector.want(target);
         }
         for (id, desired) in desired {
@@ -1566,6 +1572,9 @@ struct Planned {
     choices: Vec<Choice>,
     /// Whether a full second has measured the source's rates.
     measured: bool,
+    /// The target to forward while a spatial downswitch waits for a key
+    /// picture: the current spatial layer's lowest temporal layer.
+    meanwhile: Option<dd::Wanted>,
     mode: Mode,
     /// The most its tier needs, bits per second.
     ceiling: u64,
