@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EUPL-1.2
 
+use nuschl_client::native::sfu::{Reason, Route};
 use nuschl_ipc::video::CaptureLimits;
 use nuschl_protocol::sfu::VideoLimit;
 use std::{
@@ -11,19 +12,32 @@ pub(super) const INTERVAL: Duration = Duration::from_secs(1);
 const MAX_SAMPLE_SPAN: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Path {
-    Sfu,
-    Direct,
-    Turn,
+struct Path {
+    route: Route,
+    relay_only: bool,
 }
 
 impl Path {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Sfu => "Call server (SFU)",
-            Self::Direct => "Direct",
-            Self::Turn => "TURN relay",
-        }
+    fn label(self) -> String {
+        let reason = match self.route {
+            Route::Direct => return "Direct".into(),
+            Route::Sfu(Reason::RelayOnly) => "relay-only",
+            Route::Sfu(Reason::TwoWay) => "video both ways",
+            Route::Sfu(Reason::Viewers) => "more than two viewers",
+            Route::Sfu(Reason::Senders) => "several senders",
+            Route::Sfu(Reason::Viewer) => "waiting for a native viewer",
+            Route::Sfu(Reason::Sender) => "set by the sender",
+            Route::Sfu(Reason::Measuring) => "measuring upload",
+            Route::Sfu(Reason::Upload) => "upload too low for direct",
+            Route::Sfu(Reason::Connecting) => "connecting directly",
+            Route::Sfu(Reason::Failed) => "direct connection failed",
+        };
+        let path = if self.relay_only {
+            "TURN relay"
+        } else {
+            "Call server (SFU)"
+        };
+        format!("{path} · {reason}")
     }
 }
 
@@ -53,7 +67,14 @@ impl Stats {
             window: Interval::default(),
             requested: None,
             sfu_limit: None,
-            path: if relay_only { Path::Turn } else { Path::Sfu },
+            path: Path {
+                route: Route::Sfu(if relay_only {
+                    Reason::RelayOnly
+                } else {
+                    Reason::Connecting
+                }),
+                relay_only,
+            },
         }
     }
 
@@ -71,10 +92,8 @@ impl Stats {
         }
     }
 
-    pub(super) fn direct(&mut self, active: bool) {
-        if self.path != Path::Turn {
-            self.path = if active { Path::Direct } else { Path::Sfu };
-        }
+    pub(super) fn route(&mut self, route: Route) {
+        self.path.route = route;
     }
 
     pub(super) fn requested(&mut self, requested: CaptureLimits) {
@@ -128,8 +147,8 @@ impl Snapshot {
     }
 
     fn receiver_limit(self) -> &'static str {
-        match self.path {
-            Some(Path::Direct) => "Direct connection · unavailable",
+        match self.path.map(|path| path.route) {
+            Some(Route::Direct) => "Direct connection · unavailable",
             _ if self.sfu_limit == Some(VideoLimit::WithinTarget) => "SFU within selected quality",
             _ => self.sfu_limit.map_or("Unavailable", limit_label),
         }
@@ -146,8 +165,7 @@ impl Snapshot {
             ("Video payload bitrate", bitrate(self.bitrate)),
             (
                 "Connection",
-                self.path
-                    .map_or_else(unavailable, |path| path.label().into()),
+                self.path.map_or_else(unavailable, Path::label),
             ),
         ]
         .into_iter()
@@ -282,7 +300,10 @@ mod tests {
                 ("Resolution", "1920 × 1080".into()),
                 ("Encoded FPS", "30.0 fps".into()),
                 ("Video payload bitrate", "1.50 Mb/s".into()),
-                ("Connection", "Call server (SFU)".into()),
+                (
+                    "Connection",
+                    "Call server (SFU) · connecting directly".into()
+                ),
             ]
         );
         let quiet = stats.sample(at + INTERVAL);
@@ -310,7 +331,10 @@ mod tests {
                 ("Resolution", "1280 × 720".into()),
                 ("Decoded FPS", "2.0 fps".into()),
                 ("Video payload bitrate", "256.0 kb/s".into()),
-                ("Connection", "Call server (SFU)".into()),
+                (
+                    "Connection",
+                    "Call server (SFU) · connecting directly".into()
+                ),
                 ("Local decode delay", "15.0 ms".into()),
             ]
         );
@@ -328,20 +352,26 @@ mod tests {
         let mut stats = Stats::new(false, start);
         stats.frame(640, 480, None);
         stats.encoded(16_000);
-        stats.direct(true);
+        stats.route(Route::Direct);
         let delayed = stats.sample(start + Duration::from_secs(6));
-        assert_eq!(delayed.path, Some(Path::Direct));
+        assert_eq!(delayed.path.map(Path::label).as_deref(), Some("Direct"));
         assert_eq!(delayed.fps, None);
         assert_eq!(delayed.bitrate, None);
-        stats.direct(false);
+        stats.route(Route::Sfu(Reason::Upload));
         assert_eq!(
-            stats.sample(start + Duration::from_secs(7)).path,
-            Some(Path::Sfu)
+            stats
+                .sample(start + Duration::from_secs(7))
+                .path
+                .map(Path::label)
+                .as_deref(),
+            Some("Call server (SFU) · upload too low for direct")
         );
 
-        let mut forced = Stats::new(true, start);
-        forced.direct(true);
-        assert_eq!(forced.sample(start + INTERVAL).path, Some(Path::Turn));
+        let forced = Stats::new(true, start).sample(start + INTERVAL);
+        assert_eq!(
+            forced.path.map(Path::label).as_deref(),
+            Some("TURN relay · relay-only")
+        );
     }
 
     #[test]

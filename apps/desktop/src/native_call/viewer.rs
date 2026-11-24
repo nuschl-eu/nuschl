@@ -193,9 +193,9 @@ impl Viewer {
                     }
                 }
             }
-            MediaEvent::Direct { active } => {
+            MediaEvent::Route(route) => {
                 for lane in &mut self.lanes {
-                    lane.stats.direct(active);
+                    lane.stats.route(route);
                 }
             }
             MediaEvent::Frame {

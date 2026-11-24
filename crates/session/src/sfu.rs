@@ -18,7 +18,7 @@ use tokio_tungstenite::{
 mod keys;
 mod media;
 mod turn;
-pub use media::{Media, MediaEvent, MediaOptions, Purpose};
+pub use media::{Media, MediaEvent, MediaOptions, Purpose, Reason, Route};
 pub use nuschl_stream_quality::{Kind as VideoKind, Quality};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);

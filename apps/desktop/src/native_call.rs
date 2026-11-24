@@ -1799,7 +1799,7 @@ async fn meeting(
                     Some(Err(error)) => return Err(text(error)),
                     None => return Ok(Finish::MediaEnded),
                 };
-                let retune = matches!(event, MediaEvent::SourceLimits { .. } | MediaEvent::Direct { .. });
+                let retune = matches!(event, MediaEvent::SourceLimits { .. } | MediaEvent::Route(_));
                 publisher.event(&event);
                 if retune {
                     publisher.retune(display, selection, None);
