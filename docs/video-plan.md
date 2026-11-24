@@ -318,9 +318,9 @@ Measurements, per source:
 - The frame rate is the median temporal-unit interval of the latest active
   window: 9 consecutive temporal units within one second of media time, so a
   short pause inside a window leaves the median. A slower window, from a
-  static or slow source, keeps the measurement. Until
-  the first active window the source counts as 60 fps, the highest rate any
-  tier asks for. A target whose highest temporal layer is t of T has
+  static or slow source, keeps the measurement. Until the first active window,
+  the latest slow window's median counts, and before 9 units the source counts
+  as 60 fps, the highest rate any tier asks for. A target whose highest temporal layer is t of T has
   2^(t−T) of the source's frame rate: WebRTC's scalability modes double the
   frame rate with each temporal layer.
 - The bitrate of each target is its bytes over one-second windows from the

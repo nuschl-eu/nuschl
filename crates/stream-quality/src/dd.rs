@@ -291,6 +291,8 @@ pub struct Layers {
     units: VecDeque<u64>,
     /// The median temporal-unit interval of the latest active window, in ticks.
     interval: Option<u64>,
+    /// The median interval of the latest slow window, until an active one.
+    slow: Option<u64>,
 }
 
 impl Layers {
@@ -330,13 +332,18 @@ impl Layers {
             if self.units.len() > RATE_UNITS + 1 {
                 self.units.pop_front();
             }
-            if self.units.len() > RATE_UNITS && timestamp - self.units[0] <= CLOCK {
+            if self.units.len() > RATE_UNITS {
                 let mut intervals: Vec<u64> = (1..self.units.len())
                     .map(|i| self.units[i] - self.units[i - 1])
                     .collect();
                 // The shorter median: a pause inside the window leaves it.
                 intervals.sort_unstable();
-                self.interval = Some(intervals[RATE_UNITS / 2 - 1]);
+                let median = Some(intervals[RATE_UNITS / 2 - 1]);
+                if timestamp - self.units[0] <= CLOCK {
+                    self.interval = median;
+                } else if self.interval.is_none() {
+                    self.slow = median;
+                }
             }
         }
         Some(frame)
@@ -441,7 +448,7 @@ impl Layers {
     /// Whether `layer`'s frame rate is at most a quarter above `fps`. The
     /// source's frame rate halves with each temporal layer below the top.
     fn within(&self, layer: Target, top: u8, fps: u64) -> bool {
-        let interval = self.interval.unwrap_or(CLOCK / MAX_FPS);
+        let interval = self.interval.or(self.slow).unwrap_or(CLOCK / MAX_FPS);
         (4 * CLOCK) << layer.temporal <= (5 * fps * interval) << top
     }
 
@@ -1332,15 +1339,21 @@ mod tests {
     #[test]
     fn frame_rates_come_from_rtp_timestamps() {
         let mut layers = Layers::default();
-        // 5 frames a second: 8 units span 1.6 s, no active window. The source
-        // counts as 60 fps: a 15 fps tier takes the quarter rate alone, a
-        // 30 fps tier the half rate too.
-        for number in 0..16 {
+        // 5 frames a second. Before 9 units the source counts as 60 fps: a
+        // 15 fps tier takes the quarter rate alone, a 30 fps tier the half
+        // rate too.
+        for number in 0..8 {
             l1t3_at(&mut layers, number, u64::from(number) * 200);
         }
         assert!(layers.measured());
         assert_eq!(targets(&layers, Kind::Screen, 0), [0]);
         assert_eq!(targets(&layers, Kind::Screen, 1), [0, 1]);
+        // Then 9 units span 1.6 s: a slow window, 5 fps, without an active
+        // one: the full rate fits the 15 fps tier.
+        for number in 8..16 {
+            l1t3_at(&mut layers, number, u64::from(number) * 200);
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1, 2]);
         // Eight units 33 ms apart in media time, all arriving at once: 30 fps.
         for number in 16..25 {
             let id = [0, 2, 1, 2][usize::from(number) % 4];
@@ -1357,6 +1370,16 @@ mod tests {
             Duration::from_millis(3300),
         );
         assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+    }
+
+    #[test]
+    fn a_slow_screen_reaches_a_15_fps_viewer_whole() {
+        // A screen at 4 fps from its start, as while typing.
+        let mut layers = Layers::default();
+        for number in 0..40u16 {
+            l1t3_at(&mut layers, number, u64::from(number) * 250);
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1, 2]);
     }
 
     #[test]
