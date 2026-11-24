@@ -462,6 +462,8 @@
           # The signer's tests need its feature; the default build has none.
           nuschl-update-worker.features = [ "signer" ];
           nuschl-link-preview.testInputs = [ pkgs.python3 ];
+          # The notification tests run fake services on a private session bus.
+          nuschl.testInputs = [ pkgs.dbus ];
           # One throwaway server in the build directory, on a unix socket
           # there; nothing listens on the network. The ignored checks run too.
           nuschl-storage = {
@@ -1218,6 +1220,7 @@
               pkgs.util-linux
               pkgs.ffmpeg-headless
               pkgs.coturn
+              pkgs.dbus
             ];
           LD_LIBRARY_PATH = lib.optionalString pkgs.stdenv.hostPlatform.isLinux (
             lib.makeLibraryPath buildInputs

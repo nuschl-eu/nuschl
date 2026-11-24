@@ -24320,6 +24320,12 @@ rec {
             packageId = "embed-resource";
           }
         ];
+        devDependencies = [
+          {
+            name = "nuschl-testkit";
+            packageId = "nuschl-testkit";
+          }
+        ];
         features = {
           "frame-timing" = [ "dep:gpui-profiler" ];
         };
