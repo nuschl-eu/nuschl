@@ -1,0 +1,38 @@
+[package]
+name = "nuschl-aom"
+description = "libaom's AV1 encoder in real-time mode for the confined video worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# One of two first-party crates with unsafe code: the FFI calls into libaom
+# (SECURITY.md, "Explicit exceptions"). No published crate exposes libaom's
+# temporal-layer controls, which take pointers to structures.
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3.34"
+
+[dev-dependencies]
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2e7216c20ac2a75de204d6c8d7268b75a45959b4", version = "1.1.1", default-features = false, features = [
+  "bitdepth_8",
+] }
+
+# Not the workspace lints, whose `forbid` cannot be lifted for the FFI
+# module. Everything else in this crate is still denied unsafe code.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+as_conversions = "deny"
+ptr_as_ptr = "deny"
+ptr_cast_constness = "deny"
+borrow_as_ptr = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"

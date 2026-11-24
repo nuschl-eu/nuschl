@@ -53,6 +53,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "nuschl-aom" = rec {
+      packageId = "nuschl-aom";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nuschl-aom";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "nuschl-audio-jitter" = rec {
       packageId = "nuschl-audio-jitter";
       build = internal.buildRustCrateWithFeatures {
@@ -24659,6 +24669,32 @@ rec {
           "frame-timing" = [ "dep:gpui-profiler" ];
         };
         resolvedDefaultFeatures = [ "call-test-roots" "frame-timing" ];
+      };
+      "nuschl-aom" = rec {
+        crateName = "nuschl-aom";
+        version = "0.3.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../../crates/aom; };
+        libName = "nuschl_aom";
+        buildDependencies = [
+          {
+            name = "bindgen";
+            packageId = "bindgen 0.72.1";
+          }
+          {
+            name = "pkg-config";
+            packageId = "pkg-config";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "rav1d";
+            packageId = "rav1d";
+            usesDefaultFeatures = false;
+            features = [ "bitdepth_8" ];
+          }
+        ];
+
       };
       "nuschl-audio-jitter" = rec {
         crateName = "nuschl-audio-jitter";

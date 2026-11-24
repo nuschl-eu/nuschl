@@ -15,6 +15,7 @@ license = "EUPL-1.2"
 publish = false
 
 [workspace.dependencies]
+nuschl-aom = { path = "crates/aom", version = "0.3.0" }
 nuschl-audio-jitter = { path = "crates/audio-jitter", version = "0.3.0" }
 nuschl-core = { path = "crates/core", version = "0.3.0" }
 nuschl-client = { path = "crates/client", version = "0.3.0" }

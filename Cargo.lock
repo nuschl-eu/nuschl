@@ -7453,6 +7453,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuschl-aom"
+version = "0.3.0"
+dependencies = [
+ "bindgen 0.72.1",
+ "pkg-config",
+ "rav1d",
+]
+
+[[package]]
 name = "nuschl-audio-jitter"
 version = "0.3.0"
 

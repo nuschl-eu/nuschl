@@ -11,6 +11,7 @@ let
   # Read by the desktop's build script (apps/desktop/build.rs).
   emojiAssets = import ./emoji.nix { inherit pkgs; };
   pkgConfig = [ pkgs.pkg-config ];
+  libaom = import ./libaom.nix { inherit pkgs; };
   # Libraries the final binaries link against (and whose -sys crates probe).
   linuxLibraries = [
     pkgs.alsa-lib
@@ -65,6 +66,11 @@ let
     cros-libva = _: {
       nativeBuildInputs = pkgConfig ++ [ pkgs.rustPlatform.bindgenHook ];
       buildInputs = [ pkgs.libva ];
+    };
+    # Generates its libaom bindings with bindgen and links libaom.
+    nuschl-aom = _: {
+      nativeBuildInputs = pkgConfig ++ [ pkgs.rustPlatform.bindgenHook ];
+      buildInputs = [ libaom ];
     };
     # Their build scripts probe the PipeWire version with pkg-config.
     pipewire = bindgen;

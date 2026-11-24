@@ -143,6 +143,8 @@
           pkgs.libxcb
           # The video worker's VA-API encoder (feature vaapi).
           pkgs.libva
+          # libaom for nuschl-aom, the video worker's software encoder.
+          (import ./nix/libaom.nix { inherit pkgs; })
         ];
         # Twemoji images and emojibase names for both clients; the sources
         # are pinned together in nix/emoji.nix.
