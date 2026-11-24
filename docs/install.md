@@ -119,10 +119,10 @@ sudo apt update && sudo apt install nuschl
 The suites `trixie` and `noble` have the same contents as `stable`. Ubuntu 23.10
 and later restrict unprivileged user namespaces with AppArmor. The package's
 AppArmor profile `/etc/apparmor.d/nuschl-bwrap` allows them for Nuschl's sandbox
-launcher `/usr/lib/nuschl/bwrap`, the system's bubblewrap it runs and the workers
-in the sandbox; other programs stay restricted. APT updates Nuschl with the rest
-of the system. `sudo apt purge nuschl` removes the program and the profile; your
-settings and history stay in your home folder
+launcher `/usr/lib/nuschl/bwrap` and the system's bubblewrap it runs. Workers in
+the sandbox cannot create user namespaces, and other programs stay restricted.
+APT updates Nuschl with the rest of the system. `sudo apt purge nuschl` removes
+the program and the profile; your settings and history stay in your home folder
 ([desktop.md](desktop.md#where-nuschl-keeps-its-files)).
 
 ## Arch Linux

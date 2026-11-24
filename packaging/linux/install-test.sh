@@ -19,6 +19,10 @@ profile=/etc/apparmor.d/nuschl-bwrap
 sandbox() {
   unshare --mount sh -c "$hidden nuschl render 'sandboxed **content**'" | grep -F content
   if unshare --mount sh -c "$hidden env PATH=/nonexistent /usr/bin/nuschl render text"; then exit 1; fi
+  # unshare runs in the content worker's sandbox and cannot create a user namespace.
+  probe="$hidden nuschl sandbox-probe /usr/bin/unshare --"
+  unshare --mount sh -c "$probe /worker --version"
+  if unshare --mount sh -c "$probe --user /worker --version"; then exit 1; fi
 }
 
 # Whether AppArmor restricts unprivileged user namespaces, as Ubuntu does.

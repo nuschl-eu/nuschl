@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Linux: bubblewrap under prlimit. Every worker gets all namespaces
-//! unshared (no network), read-only system libraries, private /proc, /dev
-//! and /tmp, itself at `/worker` and an empty environment; its role adds to that.
+//! unshared (no network) and cannot create user namespaces, read-only system
+//! libraries, private /proc, /dev and /tmp, itself at `/worker` and an empty
+//! environment; its role adds to that.
 
 use std::{
     os::unix::fs::{FileTypeExt as _, MetadataExt as _},
@@ -40,7 +41,15 @@ pub(crate) fn command(executable: &Path, role: Role) -> Result<Command, Error> {
         command.arg(format!("--cpu={seconds}"));
     }
     command.arg("--").arg(helper("bwrap")?);
-    command.args(["--die-with-parent", "--new-session", "--unshare-all"]);
+    // bubblewrap 0.8.0 and later: --disable-userns needs --unshare-user, and
+    // bubblewrap fails when the worker could still create a user namespace.
+    command.args([
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+    ]);
     if matches!(
         role,
         Role::Preview { .. }
@@ -330,7 +339,13 @@ mod tests {
             assert_eq!(&command[end + 1..], worker);
             let options = &command[..end];
             let position = |option: &str| options.iter().position(|a| a == option);
-            for option in ["--die-with-parent", "--unshare-all", "--clearenv"] {
+            for option in [
+                "--die-with-parent",
+                "--unshare-all",
+                "--unshare-user",
+                "--disable-userns",
+                "--clearenv",
+            ] {
                 assert!(position(option).is_some(), "{option} in {options:?}");
             }
             // Variables are set after the environment is cleared.

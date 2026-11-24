@@ -47,8 +47,8 @@ let
     install -Dm644 ${appstreamXML} "$out/usr/share/metainfo/org.nuschl.Nuschl.metainfo.xml"
   '';
   # Debian packages of the libraries the programs link and open, and of the
-  # sandbox tools; bubblewrap 0.8 has --clearenv, PipeWire 0.3.53 has
-  # pw_stream_get_time_n.
+  # sandbox tools; bubblewrap 0.8 has --clearenv and --disable-userns,
+  # PipeWire 0.3.53 has pw_stream_get_time_n.
   depends = [
     "libxcb1"
     "libxkbcommon0"
