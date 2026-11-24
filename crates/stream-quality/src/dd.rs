@@ -480,7 +480,12 @@ impl Layers {
             return Vec::new();
         };
         let tier_fps = u64::from(kind.ladder()[tier.min(kind.top())].fps);
-        let top = structure.targets.iter().map(|t| t.temporal).max();
+        // The temporal layers sent: those of the active targets.
+        let active = |target: &usize| structure.active >> target & 1 == 1;
+        let top = (0..structure.targets.len())
+            .filter(active)
+            .map(|t| structure.targets[t].temporal)
+            .max();
         let mut all: Vec<_> = structure
             .targets
             .iter()
@@ -1380,6 +1385,25 @@ mod tests {
             l1t3_at(&mut layers, number, u64::from(number) * 250);
         }
         assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1, 2]);
+    }
+
+    #[test]
+    fn an_inactive_top_temporal_layer_leaves_the_frame_rate_cap() {
+        // A 60 fps capture without its top temporal layer: units arrive at
+        // 30 fps, T0 T1 T0 T1, so T1 runs at 30 fps.
+        let mut layers = Layers::default();
+        for number in 0..61u16 {
+            let millis = u64::from(number) * 1000 / 30;
+            let descriptor = l1t3(u32::from(number % 2), number, number == 0);
+            layers.packet(
+                &descriptor,
+                1000,
+                millis * 90,
+                Duration::from_millis(millis),
+            );
+        }
+        layers.structure.as_mut().expect("structure").active = 0b011;
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0]);
     }
 
     #[test]
