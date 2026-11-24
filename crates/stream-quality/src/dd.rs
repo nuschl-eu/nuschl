@@ -231,6 +231,9 @@ pub struct Frame {
     /// Whether the packet came after a packet of a later frame, or repeats
     /// its frame's start.
     pub late: bool,
+    /// Whether the packet is the first of a new stream that numbers its frames
+    /// anew, as from a reopened encoder.
+    pub restart: bool,
     dtis: Dtis,
     fdiffs: Fdiffs,
     /// Per decode target, the frame diff to the previous frame of the chain
@@ -303,8 +306,11 @@ pub struct Layers {
     /// Counts the target lists the source sent: a receiver's target indices
     /// belong to one.
     generation: u32,
-    /// The newest frame a packet came for, and whether its start came.
-    newest: Option<(u16, bool)>,
+    /// The newest frame a packet came for, whether its start came, and its
+    /// RTP timestamp.
+    newest: Option<(u16, bool, u64)>,
+    /// The RTP timestamp of the latest new stream's first unit.
+    restarted: Option<u64>,
 }
 
 impl Layers {
@@ -319,6 +325,15 @@ impl Layers {
         timestamp: u64,
         now: Duration,
     ) -> Option<Frame> {
+        // A late packet of the stream before a restart carries the old frame
+        // numbers: it is unreadable. A jump back of over five seconds starts
+        // another stream.
+        if self
+            .restarted
+            .is_some_and(|at| timestamp < at && at - timestamp <= 5 * CLOCK)
+        {
+            return None;
+        }
         let mut frame = self.parse(descriptor)?;
         self.paused |= self
             .last
@@ -353,15 +368,28 @@ impl Layers {
         {
             self.units.clear();
         }
+        // A frame behind the newest one in a temporal unit up to five seconds
+        // later starts a new stream that numbers its frames anew, as from a
+        // reopened encoder. Further ahead it comes from before a jump back.
+        frame.restart = self.newest.is_some_and(|(newest, _, at)| {
+            let behind = newest.wrapping_sub(frame.number);
+            (1..HISTORY as u16).contains(&behind) && (at + 1..=at + 5 * CLOCK).contains(&timestamp)
+        });
+        if frame.restart {
+            self.newest = None;
+            self.restarted = Some(timestamp);
+        }
         // A jump back of more than the history in frame numbers, as from a new
         // stream, starts them over.
-        frame.late = self.newest.is_some_and(|(newest, started)| {
+        frame.late = self.newest.is_some_and(|(newest, started, _)| {
             let behind = newest.wrapping_sub(frame.number);
             (1..HISTORY as u16).contains(&behind) || behind == 0 && started && frame.start
         });
         if !frame.late {
-            let started = self.newest == Some((frame.number, true));
-            self.newest = Some((frame.number, frame.start || started));
+            let started = self
+                .newest
+                .is_some_and(|(n, started, _)| n == frame.number && started);
+            self.newest = Some((frame.number, frame.start || started, timestamp));
         }
         if frame.start && self.units.back().is_none_or(|&last| timestamp > last) {
             self.units.push_back(timestamp);
@@ -448,6 +476,7 @@ impl Layers {
             number,
             layer: template.layer,
             late: false,
+            restart: false,
             dtis,
             fdiffs,
             chains,
@@ -784,6 +813,7 @@ impl Selector {
     /// `timestamp`, and with which marker: `marker` is the publisher's, set at
     /// the end of its temporal unit.
     pub fn forward(&mut self, frame: &Frame, timestamp: u64, marker: bool) -> Option<bool> {
+        self.renew(frame);
         let passed = self.passed(frame.number);
         if frame.start {
             if self.seen.is_empty() {
@@ -951,12 +981,12 @@ impl Selector {
 
     /// Whether `frame`'s start went out: its other packets go out too.
     pub fn sent(&self, frame: &Frame) -> bool {
-        self.went(frame).is_some()
+        !frame.restart && self.went(frame).is_some()
     }
 
     /// Whether forwarded frames reference `frame` and owe it to the receiver.
     pub fn owes(&self, frame: &Frame) -> bool {
-        self.owed.iter().any(|o| o.0 == frame.number)
+        !frame.restart && self.owed.iter().any(|o| o.0 == frame.number)
     }
 
     fn record(&mut self, frame: &Frame, target: Wanted) {
@@ -982,6 +1012,19 @@ impl Selector {
         self.owe(frame, target);
     }
 
+    /// A new stream numbers its frames anew: the frames and units of the old
+    /// one go.
+    fn renew(&mut self, frame: &Frame) {
+        if frame.restart {
+            *self = Self {
+                current: self.current,
+                wanted: self.wanted,
+                meanwhile: self.meanwhile,
+                ..Self::default()
+            };
+        }
+    }
+
     /// Whether the decode target forwarded now can do without `frame`.
     pub fn discardable(&self, frame: &Frame) -> bool {
         self.current
@@ -992,6 +1035,7 @@ impl Selector {
     /// it. Its chains break there, and when the current target needs the frame
     /// the receiver gets nothing more until it can switch again.
     pub fn dropped(&mut self, frame: &Frame) {
+        self.renew(frame);
         if let Some(entry) = self.history.get_mut(usize::from(frame.number) % HISTORY)
             && entry.0 == frame.number
         {
@@ -1579,7 +1623,7 @@ mod tests {
         // A jump back of more than the history in frame numbers starts over.
         assert!(!late(&l2t2_key(1, 1002, false), 6000));
         assert!(!late(&l2t2_key(1, 2, false), 9000));
-        assert!(late(&l2t2_key(1, 1, false), 12_000));
+        assert!(late(&l2t2_key(1, 1, false), 9000));
     }
 
     #[test]
@@ -1667,6 +1711,37 @@ mod tests {
             }
         }
         assert_eq!(unit_two, [(4, true)]);
+    }
+
+    #[test]
+    fn a_reopened_encoder_starts_a_new_stream() {
+        // An L1T3 screen for 100 frames, then its encoder reopens and numbers
+        // frames from 0 with a key picture. A viewer of the full rate goes
+        // down to T0 at frame 50: it keeps T0, and the new stream reaches it.
+        let mut layers = Layers::default();
+        let mut selector = Selector::default();
+        selector.want(Some((2, 0)));
+        let mut timestamp = 0;
+        let mut send = |selector: &mut Selector, number: u16| {
+            timestamp += 3000;
+            let id = [0, 2, 1, 2][usize::from(number) % 4];
+            let at = Duration::from_micros(timestamp * 100 / 9);
+            let descriptor = l1t3(id, number, number == 0);
+            let frame = layers
+                .packet(&descriptor, 1000, timestamp, at)
+                .expect("valid");
+            selector
+                .forward(&frame, timestamp, true)
+                .map(|_| (number, frame.layer.temporal))
+        };
+        for number in 0..100 {
+            if number == 50 {
+                selector.want(Some((0, 0)));
+            }
+            send(&mut selector, number);
+        }
+        let got: Vec<_> = (0..100).filter_map(|n| send(&mut selector, n)).collect();
+        assert_eq!(got, (0..100).step_by(4).map(|n| (n, 0)).collect::<Vec<_>>());
     }
 
     /// Frame `number` of an L1T3 source (T0 T2 T1 T2), 1000 bytes, at `millis`
