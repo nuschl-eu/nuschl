@@ -355,25 +355,42 @@ State, per viewer and source, updated once a second:
   change (a new mode, tier, frame rate or set of active targets), it keeps its
   layer, or takes the highest choice at or below it in both layers, and the
   hold toward a higher choice starts over.
-- The selector forwards the current target's frames. It switches to the
-  wanted target at the first frame that starts a temporal unit, is a switch
-  point for the wanted target and whose chain the viewer holds; when the viewer
-  lacks that chain, the SFU asks the publisher for a key frame, at most once
-  per 2 s. While a switch to a lower spatial layer waits for that key frame,
-  the selector forwards the current spatial layer's lowest temporal layer. A frame the current target needs and the viewer misses leaves it
-  without a target until the next such switch point.
+- The selector forwards each temporal unit for one target: the current target
+  when the unit's first packet goes out. It switches to the wanted target at
+  the first frame that starts a temporal unit with no packet out, comes in
+  order (the first copy of its start, before any packet of a later frame), is
+  a switch point for the wanted target and whose chain the viewer holds;
+  when the viewer lacks that chain, the SFU asks the publisher for a key
+  frame, at most once per 2 s. While a switch to a lower spatial layer waits
+  for that key frame, the selector forwards the current spatial layer's lowest
+  temporal layer. A frame the current target needs and the viewer misses
+  leaves it without a target until the next such switch point.
+- Late and repeated packets: the rest of a frame whose start went out goes
+  out, and so does a late frame that forwarded frames reference. A frame stays
+  out, with its later and repeated packets, when its start came and stayed
+  out, when a packet of it came before its start and stayed out, when a frame
+  it references came and stayed out, or when it is older than the current
+  target's first frame in a unit with no packet out.
+- A new set of targets gives target indices other layers: each viewer takes
+  the lowest target until the next second's choice.
 - The queue leaves out a frame the target can do without once the queue's
   delay passes the bound, every frame but a key picture past twice the bound,
   and keeps a temporal unit with a packet out whole: its byte cap passes the
-  rest, and the budgets lend it. Each overloaded second adds a step; steps
-  recover one per 10 s.
+  rest, and the budgets lend it. The time the last key picture's unit takes
+  extends the bound until the delay falls to half the bound. A shed frame
+  takes the rest of its unit and the second before it. Each overloaded second
+  adds a step; steps recover one per 10 s.
 
 Invariants:
 
 - The wanted target is eligible: it never exceeds the viewer's tier in height
   or frame rate.
-- Every forwarded frame belongs to the current target, and the current target
-  changes only at a switch point whose chain the viewer holds.
+- Every forwarded frame belongs to its temporal unit's target, arrives whole
+  with the frames it references, and the current target changes only at a
+  switch point whose chain the viewer holds.
+- After a viewer's tier falls, frames above it stop at the first fitting
+  switch point that comes in order: the key picture the SFU asks for, or the
+  next base-layer frame on an intact chain.
 - No target above the lowest comes from an incomplete bitrate window, and no
   frame rate from a window that is not active.
 - A static or slow source keeps its measured frame rate, so it makes no target
