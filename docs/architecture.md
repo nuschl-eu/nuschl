@@ -27,6 +27,7 @@ platform decisions reversible without duplicating the session model.
 | `nuschl-media-worker` | Audio device adapters, DSP, Opus | Server credentials, history database, arbitrary files, network |
 | `nuschl-video-worker` | Linux PipeWire capture, AV1 encoding and AV1 decoding in separate roles | Server credentials, arbitrary files, network, the session bus |
 | `nuschl-video-encode` | The real-time AV1 encoder core: frame drops and quantizers from earlier frame sizes, temporal layers, AV1 headers and the Dependency Descriptor; platform backends code frames through its `Backend` trait | Platform video APIs, native code, I/O, a clock |
+| `nuschl-aom` | libaom's AV1 encoder in real-time mode behind a safe API, for the video worker's software path (SECURITY.md exception) | Decoding, I/O, anything outside libaom's encoder |
 | `nuschl-rtc-worker` | Linux call transport, SFrame and its active media keys | Identity keys, call links, session tokens, devices, codecs, host network sockets |
 | `nuschl-storage-worker` | Own the explicitly selected history database | Server credentials, microphone, network |
 | `nuschl-musicbot` | Credential/network parent for Subsonic playback, queues/history and authenticated web controls (docs/musicbot.md) | Codec/DSP dependencies and execution, GPUI, user private identity keys |

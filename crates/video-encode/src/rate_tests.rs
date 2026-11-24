@@ -44,6 +44,20 @@ impl Backend for Model {
     }
 }
 
+/// The model with reference slots that follow every frame it codes, as
+/// libaom's do.
+struct Stateful(Model);
+
+impl Backend for Stateful {
+    type Input = Scene;
+    type Error = Infallible;
+    const DISCARDS: bool = false;
+
+    fn encode(&mut self, scene: &Scene, frame: &Frame<'_>) -> Result<Vec<u8>, Infallible> {
+        self.0.encode(scene, frame)
+    }
+}
+
 struct Run {
     encoder: Encoder<Model>,
     fps: u32,
@@ -251,4 +265,50 @@ fn a_still_screen_refines_and_a_change_keeps_the_window() {
         }
     }
     within(&run.per_second(7, 10), 3_000_000.0, 0.15);
+}
+
+#[test]
+fn a_stateful_backend_codes_each_input_once_and_follows_a_drop_with_a_keyframe() {
+    // A cut at 2 s that the inter frames' limit cannot hold.
+    let config = Config {
+        frame_bytes: 40_000,
+        ..camera(2_000_000, Layering::L1T3)
+    };
+    let model = Model {
+        pixels: 1280.0 * 720.0,
+        seed: 7,
+        calls: 0,
+    };
+    let mut encoder = Encoder::new(Stateful(model), config).unwrap();
+    let mut dropped = 0;
+    let mut after_drop = false;
+    for frame in 0..120 {
+        let time = f64::from(frame) / 30.0;
+        let scene = if (60..63).contains(&frame) {
+            Scene {
+                intra: 120.0,
+                inter: 2000.0,
+            }
+        } else {
+            moving(time)
+        };
+        let calls = encoder.backend().0.calls;
+        let encoded = encoder
+            .encode(&scene, Duration::from_secs_f64(time))
+            .unwrap();
+        let coded = encoder.backend().0.calls - calls;
+        assert!(coded <= 1, "frame {frame} coded {coded} times");
+        match encoded {
+            Some(encoded) => {
+                assert!(!after_drop || encoded.keyframe, "frame {frame}");
+                after_drop = false;
+            }
+            None if coded == 1 => {
+                dropped += 1;
+                after_drop = true;
+            }
+            None => {}
+        }
+    }
+    assert!(dropped > 0);
 }

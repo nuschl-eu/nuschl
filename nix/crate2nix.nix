@@ -11,6 +11,7 @@ let
   # Read by the desktop's build script (apps/desktop/build.rs).
   emojiAssets = import ./emoji.nix { inherit pkgs; };
   pkgConfig = [ pkgs.pkg-config ];
+  libaom = import ./libaom.nix { inherit pkgs; };
   # Libraries the final binaries link against (and whose -sys crates probe).
   linuxLibraries = [
     pkgs.alsa-lib
@@ -66,6 +67,11 @@ let
       nativeBuildInputs = pkgConfig ++ [ pkgs.rustPlatform.bindgenHook ];
       buildInputs = [ pkgs.libva ];
     };
+    # Generates its libaom bindings with bindgen and links libaom.
+    nuschl-aom = _: {
+      nativeBuildInputs = pkgConfig ++ [ pkgs.rustPlatform.bindgenHook ];
+      buildInputs = [ libaom ];
+    };
     # Their build scripts probe the PipeWire version with pkg-config.
     pipewire = bindgen;
     libspa = bindgen;
@@ -103,6 +109,12 @@ let
     nuschl = attrs: withLibraries attrs // { NUSCHL_EMOJI_ASSETS = emojiAssets; };
     nuschl-media-worker = withLibraries;
     nuschl-video-worker = attrs: {
+      # The encoder tests' screen source; isolated crate sources do not
+      # contain ../../docs.
+      postPatch = ''
+        substituteInPlace src/encoder_tests.rs --replace-fail \
+          '"../../docs/images/nuschl.png"' '"${../docs/images/nuschl.png}"'
+      '';
       nativeBuildInputs = pkgConfig;
       buildInputs = [
         pkgs.pipewire

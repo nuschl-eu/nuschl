@@ -129,10 +129,14 @@ deny = [
   { name = "cros-libva", wrappers = [
     "nuschl-video-worker",
   ], reason = "libva and the VA driver run only in the confined video worker" },
+  { name = "nuschl-aom", wrappers = [
+    "nuschl-video-worker",
+  ], reason = "libaom's encoder and its FFI run only in the confined video worker" },
   { name = "rav1d", wrappers = [
     "nuschl-video-worker",
     "nuschl-video-encode",
-  ], reason = "The confined video worker decodes untrusted AV1; the encoder core's tests decode its own synthetic streams" },
+    "nuschl-aom",
+  ], reason = "The confined video worker decodes untrusted AV1; the encoder core's and libaom's tests decode their own synthetic streams" },
   { name = "opus-rs", wrappers = [
     "nuschl-media-worker",
     "nuschl-audio-wasm",

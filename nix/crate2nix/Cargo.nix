@@ -53,6 +53,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "nuschl-aom" = rec {
+      packageId = "nuschl-aom";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nuschl-aom";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "nuschl-audio-jitter" = rec {
       packageId = "nuschl-audio-jitter";
       build = internal.buildRustCrateWithFeatures {
@@ -24660,6 +24670,32 @@ rec {
         };
         resolvedDefaultFeatures = [ "call-test-roots" "frame-timing" ];
       };
+      "nuschl-aom" = rec {
+        crateName = "nuschl-aom";
+        version = "0.3.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../../crates/aom; };
+        libName = "nuschl_aom";
+        buildDependencies = [
+          {
+            name = "bindgen";
+            packageId = "bindgen 0.72.1";
+          }
+          {
+            name = "pkg-config";
+            packageId = "pkg-config";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "rav1d";
+            packageId = "rav1d";
+            usesDefaultFeatures = false;
+            features = [ "bitdepth_8" ];
+          }
+        ];
+
+      };
       "nuschl-audio-jitter" = rec {
         crateName = "nuschl-audio-jitter";
         version = "0.3.0";
@@ -27203,6 +27239,12 @@ rec {
             features = [ "v1_28" ];
           }
           {
+            name = "nuschl-aom";
+            packageId = "nuschl-aom";
+            optional = true;
+            target = { target, features }: ("linux" == target."os" or null);
+          }
+          {
             name = "nuschl-capture-macos";
             packageId = "nuschl-capture-macos";
             target = { target, features }: ("macos" == target."os" or null);
@@ -27229,7 +27271,6 @@ rec {
           {
             name = "nuschl-video-encode";
             packageId = "nuschl-video-encode";
-            optional = true;
             target = { target, features }: ("linux" == target."os" or null);
           }
           {
@@ -27276,9 +27317,10 @@ rec {
           }
         ];
         features = {
-          "vaapi" = [ "dep:gstreamer" "dep:gstreamer-allocators" "dep:gstreamer-app" "dep:gstreamer-video" "dep:cros-libva" "dep:nuschl-video-encode" ];
+          "aom" = [ "dep:nuschl-aom" ];
+          "vaapi" = [ "dep:gstreamer" "dep:gstreamer-allocators" "dep:gstreamer-app" "dep:gstreamer-video" "dep:cros-libva" ];
         };
-        resolvedDefaultFeatures = [ "vaapi" ];
+        resolvedDefaultFeatures = [ "aom" "vaapi" ];
       };
       "nuschl-web-relay" = rec {
         crateName = "nuschl-web-relay";

@@ -48,10 +48,16 @@ pub trait Backend {
     type Input;
     type Error;
 
+    /// Whether the encoder may drop a coded frame. VA-API takes each frame's
+    /// references with the frame; libaom's reference slots follow every frame
+    /// it codes, so the encoder codes each input once there and follows a
+    /// frame it cannot send with a keyframe.
+    const DISCARDS: bool = true;
+
     /// Codes `input` with the frame's quantizer, reference and refreshed slots,
     /// and returns the temporal unit: the temporal delimiter, the sequence header
-    /// before a keyframe, and the frame. The encoder may code the same input
-    /// again at a coarser quantizer.
+    /// before a keyframe, and the frame. With `DISCARDS`, the encoder may code
+    /// the same input again at a coarser quantizer.
     fn encode(&mut self, input: &Self::Input, frame: &Frame<'_>) -> Result<Vec<u8>, Self::Error>;
 }
 
@@ -203,7 +209,7 @@ impl<B: Backend> Encoder<B> {
             if !fits || bits > self.rate.frame_limit() {
                 // A sudden change after small frames: code it again with the
                 // measured model, once.
-                if !retried && qindex < self.rate.max_qindex() {
+                if B::DISCARDS && !retried && qindex < self.rate.max_qindex() {
                     self.rate.oversized(class, qindex, bits);
                     qindex = self.rate.qindex(class, target).max(qindex + 1);
                     retried = true;
@@ -211,6 +217,8 @@ impl<B: Backend> Encoder<B> {
                 }
                 if !fits {
                     self.rate.oversized(class, qindex, bits);
+                    // The backend's slots now hold the frame it cannot send.
+                    self.keyframe |= !B::DISCARDS;
                     return Ok(None);
                 }
             }

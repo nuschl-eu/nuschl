@@ -14,7 +14,7 @@ use nuschl_ipc::video::{
     CaptureFailure, CaptureLimits, Kind, PREVIEW_HEIGHT, PREVIEW_WIDTH, Settings, Source,
     write_capture_failure, write_capture_preview,
 };
-use nuschl_video_encode::{Config, Encoder, Layering};
+use nuschl_video_encode::Encoder;
 use std::{
     io,
     net::Shutdown,
@@ -28,9 +28,6 @@ use std::{
 };
 
 const QUEUE: &str = "max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream";
-/// The largest frame as time at the bitrate, the SFU's queue bound.
-const WINDOW: Duration = Duration::from_millis(300);
-
 pub fn prepare(
     source: Source,
     node: Option<u32>,
@@ -471,22 +468,8 @@ fn open_encoder(
     settings: Settings,
 ) -> Result<Encoder<VaEncoder<Dmabuf>>, Failure> {
     let backend = VaEncoder::open(node, settings.width, settings.height)?;
-    let config = Config {
-        width: settings.width,
-        height: settings.height,
-        fps: settings.fps,
-        bitrate: settings.bitrate,
-        // Screens send temporal layers for the SFU to pick from.
-        layering: match source {
-            Source::Screen => Layering::L1T3,
-            Source::Camera => Layering::L1T1,
-        },
-        screen: source == Source::Screen,
-        frame_bytes: settings.packet_limit(false),
-        window: WINDOW,
-        qindex: 1..=255,
-    };
-    Encoder::new(backend, config).ok_or_else(|| "the picture needs more than one AV1 tile".into())
+    Encoder::new(backend, super::config(source, settings, 1..=255))
+        .ok_or_else(|| "the picture needs more than one AV1 tile".into())
 }
 
 /// The NV12 picture in a sample's DMA-BUF, as the VA driver imports it.
