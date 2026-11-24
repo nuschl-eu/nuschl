@@ -32,7 +32,9 @@ Checks, with a screenshot of each state (look at them):
 5. Connected, Ada's menu: the volume slider at 100 %, a pointer drag (the
    menu stays open, one write), a key step and Delete back to 100 %; a drag
    whose menu is closed with Escape mid-drag is saved once and edits nothing
-   after.
+   after. Grace, connected without a certificate, has the same slider and
+   "Mute for me": both hold while she stays, settings.json keeps neither,
+   and after she reconnects her menu shows 100 % and "Mute for me" again.
 6. While muted (or deafened) in a call, the running test says that it still
    uses the microphone; unmuted, it does not.
 7. Quitting within half a second of a key (the compositor closes the window
@@ -40,12 +42,16 @@ Checks, with a screenshot of each state (look at them):
 """
 import argparse
 import array
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
 import signal
+import socket
+import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -57,6 +63,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import accessibility  # noqa: E402
 from accessibility import items, start_registry  # noqa: E402
 from gnome_session import GnomeSession  # noqa: E402
+from hash_document_wire import varint  # noqa: E402
 from local_murmur import Murmur, eventually, free_port  # noqa: E402
 from mumble_client import Client, certificate_pin  # noqa: E402
 
@@ -121,6 +128,50 @@ class Writes:
     def stop(self):
         self.running = False
         self.thread.join(timeout=2)
+
+
+class Uncertified:
+    """A loopback Mumble client without a certificate: TLS to the pinned
+    server, a name, and a ping every five seconds; it reads and drops the rest."""
+
+    def __init__(self, port, pin, name):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        self.stream = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=5),
+                                          server_hostname="localhost")
+        assert hashlib.sha256(self.stream.getpeercert(binary_form=True)).hexdigest() == pin
+        self.stream.settimeout(None)
+        self.closed = threading.Event()
+        self.send(0, b"\x08" + varint(0x010500))
+        self.send(2, b"\x0a" + varint(len(name)) + name + b"\x28\x01")
+        threading.Thread(target=self.drain, daemon=True).start()
+        threading.Thread(target=self.ping, daemon=True).start()
+
+    def send(self, kind, body):
+        self.stream.sendall(struct.pack(">HI", kind, len(body)) + body)
+
+    def drain(self):
+        try:
+            while self.stream.recv(65536):
+                pass
+        except OSError:
+            pass
+
+    def ping(self):
+        try:
+            while not self.closed.wait(5):
+                self.send(3, b"")
+        except OSError:
+            pass
+
+    def close(self):
+        self.closed.set()
+        try:
+            self.stream.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.stream.close()
 
 
 class Scenes:
@@ -283,7 +334,7 @@ class Scenes:
         murmur = Murmur(self.args.murmur, self.root / "murmur", port)
         murmur.seed()
         murmur.start()
-        peer = None
+        peer = grace = None
         try:
             pin = certificate_pin(self.args.binaries, "127.0.0.1", port, self.root / "probe")
             profile = self.root / "profile"
@@ -302,17 +353,21 @@ class Scenes:
             self.quit()
             peer = Client(self.args.binaries, "127.0.0.1", port, pin, "Ada Lovelace", self.root / "peer")
             peer.send(kind="join", channel=2)
+            grace = Uncertified(port, pin, b"Grace Hopper")
             self.launch(profile, f"mumble://Andi@127.0.0.1:{port}/Lobby/Development")
             peer.wait(lambda e: e["kind"] == "user" and e["user"]["name"] == "Andi"
                       and e["user"]["channel"] == 2, timeout=40)
             time.sleep(2.0)
             self.menu(writes, settings_path)
+            grace = self.uncertified_menu(writes, settings_path, port, pin, grace)
             self.mute_note()
             self.quit_mid_edit(writes, settings_path)
             writes.stop()
         finally:
             if peer:
                 peer.close()
+            if grace:
+                grace.close()
             murmur.stop()
 
     def settings(self, writes, settings_path):
@@ -523,11 +578,10 @@ class Scenes:
         (self.out / "zoom-geometry.json").write_text(json.dumps(records, indent=2) + "\n")
         print("Actual sensitivity direction/slider geometry:1280/100,900/100,900/200 reachable and contained.", flush=True)
 
-    def menu(self, writes, settings_path):
-        # Ada's row; right-click until her menu (with a volume slider) opens.
-        slider = None
+    def user_menu(self, person):
+        """Right-click `person`'s rows until their menu, with a volume slider, opens."""
         for node, role, name, _ in items(self.nuschl):
-            if not name.startswith("Ada Lovelace") or role not in ("tree item", "list item", "push button"):
+            if not name.startswith(person) or role not in ("tree item", "list item", "push button"):
                 continue
             x, y, width, height = node.extents()
             if width <= 0 or height <= 0:
@@ -536,10 +590,16 @@ class Scenes:
             time.sleep(0.8)
             slider = self.find("slider", "Volume")
             if slider:
-                break
+                return slider
             self.shell.key("Escape")
             time.sleep(0.4)
-        assert slider, "no menu with a volume slider on Ada"
+        raise AssertionError(f"no menu with a volume slider on {person}")
+
+    def listed(self, person):
+        return any(role == "tree item" and name.startswith(person) for _, role, name, _ in items(self.nuschl))
+
+    def menu(self, writes, settings_path):
+        slider = self.user_menu("Ada Lovelace")
         assert self.value(slider) == 100.0 and self.maximum(slider) == 400.0, (self.value(slider), self.maximum(slider))
         assert self.description(slider) == "100 % (+0.0 dB)", self.description(slider)
         self.shot("10-menu-volume-100")
@@ -614,6 +674,46 @@ class Scenes:
         self.shot("13-menu-closed-mid-drag")
         print(f"Escape mid-drag: the menu closed, the heard {heard:.1f} was saved once; moving on and releasing "
               "afterwards edited no one.", flush=True)
+
+    def uncertified_menu(self, writes, settings_path, port, pin, grace):
+        def kept():
+            return [saved(settings_path, key) or None for key in ("user_volumes", "local_mutes")]
+
+        before = kept()
+        start = time.monotonic()
+        slider = self.user_menu("Grace Hopper")
+        assert self.value(slider) == 100.0, self.value(slider)
+        slider.call("Component", "GrabFocus")
+        time.sleep(0.4)
+        self.shell.key("End")
+        eventually(lambda: self.value(self.find("slider", "Volume")) == 400.0, "End did not raise Grace's volume",
+                   timeout=3)
+        self.wait_for("menu item", "Mute for me", "no Mute for me on Grace").press()
+        time.sleep(1.0)
+        slider = self.user_menu("Grace Hopper")
+        assert self.value(slider) == 400.0, self.value(slider)
+        assert self.find("menu item", "Unmute for me"), "Grace's mute did not hold"
+        self.shot("16-uncertified-menu")
+        self.shell.key("Escape")
+        time.sleep(1.0)
+        assert kept() == before, (kept(), before)
+        assert "presence" not in settings_path.read_text()
+        print("Grace, without a certificate: volume slider and Mute for me; 400 % and muted held while she "
+              f"stayed; settings.json ({writes.since(start)} writes) keeps neither.", flush=True)
+
+        grace.close()
+        eventually(lambda: not self.listed("Grace Hopper"), "Grace stayed listed after leaving", timeout=40)
+        grace = Uncertified(port, pin, b"Grace Hopper")
+        eventually(lambda: self.listed("Grace Hopper"), "Grace did not come back", timeout=40)
+        time.sleep(1.0)
+        slider = self.user_menu("Grace Hopper")
+        assert self.value(slider) == 100.0, self.value(slider)
+        assert self.find("menu item", "Mute for me"), "Grace's new presence kept the old mute"
+        self.shot("17-uncertified-menu-reconnected")
+        self.shell.key("Escape")
+        time.sleep(0.5)
+        print("Grace reconnected: 100 % and Mute for me again.", flush=True)
+        return grace
 
     def microphone_test(self):
         self.wait_for("push button", "Settings", "no Settings button").press()

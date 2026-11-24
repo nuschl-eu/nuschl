@@ -16,6 +16,7 @@
 //! at once and saved after half a second without another (see [`Edits`]).
 use crate::{state::Desktop, theme::*};
 use gpui_kit::{prelude::*, *};
+use nuschl_client::native::Presences;
 use nuschl_session::config::{ClientSettings, ManagedSettings};
 use std::{
     cell::Cell,
@@ -160,14 +161,17 @@ impl Key {
     }
 }
 
-/// The settings a slider can change without saving. Nothing else can be
-/// previewed: none of these is read by the people preferences, the shortcuts
-/// or the relay rule, so a preview needs none of `Desktop::update_settings`'
-/// side effects, and the managed values are put back as there.
+/// The settings a slider can change without saving, and the volumes of users
+/// without a certificate ([`Presences`]). Nothing else can be previewed: none
+/// of these is read by the people preferences, the shortcuts or the relay
+/// rule, so a preview needs none of `Desktop::update_settings`' side effects,
+/// and the managed values are put back as there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Setting {
     /// A person's playback volume, by certificate hash.
     UserVolume(String),
+    /// The playback volume of a user without a certificate, by presence.
+    PresenceVolume(u64),
     /// A server's playback volume, by bookmark id.
     ServerVolume(String),
     /// Voice activity sensitivity.
@@ -179,15 +183,18 @@ pub enum Setting {
 impl Setting {
     pub fn scale(&self) -> Scale {
         match self {
-            Setting::UserVolume(_) | Setting::ServerVolume(_) => Scale::Gain,
+            Setting::UserVolume(_) | Setting::PresenceVolume(_) | Setting::ServerVolume(_) => {
+                Scale::Gain
+            }
             Setting::SoundVolume => Scale::Amplitude,
             Setting::Sensitivity => Scale::Fraction,
         }
     }
 
-    pub fn get(&self, settings: &ClientSettings) -> f32 {
+    pub fn get(&self, settings: &ClientSettings, presences: &Presences) -> f32 {
         match self {
             Setting::UserVolume(hash) => settings.volume_for(Some(hash)),
+            Setting::PresenceVolume(instance) => presences.volume(*instance),
             Setting::ServerVolume(id) => settings.server_volume(id),
             Setting::Sensitivity => settings.audio.vad_sensitivity,
             Setting::SoundVolume => settings.sound_volume,
@@ -195,7 +202,7 @@ impl Setting {
     }
 
     /// Not a number (NaN, infinity) sets nothing.
-    pub fn set(&self, settings: &mut ClientSettings, value: f32) {
+    pub fn set(&self, settings: &mut ClientSettings, presences: &mut Presences, value: f32) {
         if !value.is_finite() {
             return;
         }
@@ -203,6 +210,9 @@ impl Setting {
         match self {
             Setting::UserVolume(hash) => {
                 settings.user_volumes.insert(hash.clone(), value);
+            }
+            Setting::PresenceVolume(instance) => {
+                presences.volumes.insert(*instance, value);
             }
             Setting::ServerVolume(id) => {
                 settings.server_volumes.insert(id.clone(), value);
@@ -215,7 +225,7 @@ impl Setting {
     /// What Delete or 0 sets.
     pub fn default_value(&self) -> f32 {
         match self {
-            Setting::UserVolume(_) | Setting::ServerVolume(_) => 1.,
+            Setting::UserVolume(_) | Setting::PresenceVolume(_) | Setting::ServerVolume(_) => 1.,
             Setting::Sensitivity => ClientSettings::default().audio.vad_sensitivity,
             Setting::SoundVolume => ClientSettings::default().sound_volume,
         }
@@ -225,6 +235,8 @@ impl Setting {
     pub fn managed_key(&self) -> String {
         match self {
             Setting::UserVolume(hash) => format!("user_volumes.{hash}"),
+            // managed.json accepts only settings: this key is refused there.
+            Setting::PresenceVolume(_) => "presence_volumes".into(),
             Setting::ServerVolume(id) => format!("server_volumes.{id}"),
             Setting::Sensitivity => "audio.vad_sensitivity".into(),
             Setting::SoundVolume => "sound_volume".into(),
@@ -250,23 +262,24 @@ impl Setting {
     }
 }
 
-/// `settings` with `setting` at `value`, as a preview makes them: sanitised,
-/// with the managed values back in place. None when that changes nothing, and
-/// for a value that is not a number, before anything is touched: sanitising
-/// would drop a NaN volume, putting the person or server back to 100 %.
+/// `settings` and `presences` with `setting` at `value`, as a preview makes
+/// them: sanitised, with the managed values back in place. None when that
+/// changes nothing, and for a value that is not a number, before anything is
+/// touched: sanitising would drop a NaN volume, putting the person or server
+/// back to 100 %.
 pub fn previewed(
-    settings: &ClientSettings,
+    (settings, presences): (&ClientSettings, &Presences),
     managed: &ManagedSettings,
     setting: &Setting,
     value: f32,
-) -> Option<ClientSettings> {
+) -> Option<(ClientSettings, Presences)> {
     if !value.is_finite() {
         return None;
     }
-    let mut next = settings.clone();
-    setting.set(&mut next, value);
+    let (mut next, mut heard) = (settings.clone(), presences.clone());
+    setting.set(&mut next, &mut heard, value);
     let next = managed.apply(next.sanitized());
-    (next != *settings).then_some(next)
+    (next != *settings || heard != *presences).then_some((next, heard))
 }
 
 /// Where a slider is shown, by the invocation of the menu or of Settings that
@@ -491,7 +504,7 @@ impl Desktop {
         cx: &mut Context<Self>,
     ) {
         if self.slider_live(target) {
-            let value = change(target.setting.get(&self.settings));
+            let value = change(target.setting.get(&self.settings, &self.presences));
             self.preview_setting(&target.setting, value, Input::Keyboard, cx);
         }
     }
@@ -704,8 +717,8 @@ pub fn slider(spec: Spec, cx: &mut Context<Desktop>) -> AnyElement {
 mod tests {
     // Not `super::*`: gpui's `test` attribute would replace the standard one.
     use super::{
-        ClientSettings, Edits, Effects, Input, Key, MAX_GAIN, ManagedSettings, Owner, Scale,
-        Setting, TICK, Target, previewed,
+        ClientSettings, Edits, Effects, Input, Key, MAX_GAIN, ManagedSettings, Owner, Presences,
+        Scale, Setting, TICK, Target, previewed,
     };
     use std::time::{Duration, Instant};
 
@@ -809,6 +822,8 @@ mod tests {
         memory: ClientSettings,
         heard: ClientSettings,
         disk: ClientSettings,
+        presences: Presences,
+        heard_presences: Presences,
         sends: usize,
         saves: usize,
     }
@@ -817,6 +832,7 @@ mod tests {
         fn run(&mut self, effects: Effects) {
             if effects.driver {
                 self.heard = self.memory.clone();
+                self.heard_presences = self.presences.clone();
                 self.sends += 1;
             }
             if effects.save {
@@ -826,11 +842,15 @@ mod tests {
         }
         /// As `Desktop::preview_setting`.
         fn preview(&mut self, setting: &Setting, value: f32, input: Input, now: Instant) {
-            let Some(next) = previewed(&self.memory, &ManagedSettings::default(), setting, value)
-            else {
+            let Some(next) = previewed(
+                (&self.memory, &self.presences),
+                &ManagedSettings::default(),
+                setting,
+                value,
+            ) else {
                 return;
             };
-            self.memory = next;
+            (self.memory, self.presences) = next;
             let effects = self.edits.changed(setting.reaches_worker(), input, now);
             self.run(effects);
         }
@@ -873,6 +893,24 @@ mod tests {
         world.tick(start + Duration::from_secs(3), SHOWN);
         assert_eq!(world.saves, 1);
         assert!(!world.edits.armed());
+    }
+
+    #[test]
+    fn a_user_without_a_certificate_is_heard_at_once_and_never_saved() {
+        let mut world = World::default();
+        let grace = Target {
+            owner: Owner::Menu(1),
+            setting: Setting::PresenceVolume(22),
+        };
+        let start = Instant::now();
+        let effects = world.edits.press(grace.clone(), start);
+        world.run(effects);
+        world.preview(&grace.setting, 0.5, Input::Pointer, start);
+        assert_eq!(world.heard_presences.volumes.get(&22), Some(&0.5));
+        assert_eq!(world.heard_presences.volumes.len(), 1);
+        let effects = world.edits.release(&grace, start + TICK);
+        world.run(effects);
+        assert_eq!(world.disk, ClientSettings::default());
     }
 
     #[test]
@@ -1055,10 +1093,15 @@ mod tests {
         for setting in &settings {
             for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
                 let mut set = before.clone();
-                setting.set(&mut set, value);
+                setting.set(&mut set, &mut Presences::default(), value);
                 assert_eq!(set, before, "{setting:?} set to {value}");
                 assert_eq!(
-                    previewed(&before, &ManagedSettings::default(), setting, value),
+                    previewed(
+                        (&before, &Presences::default()),
+                        &ManagedSettings::default(),
+                        setting,
+                        value
+                    ),
                     None
                 );
                 world.preview(setting, value, Input::Keyboard, start);
@@ -1074,7 +1117,8 @@ mod tests {
         assert!(!world.edits.armed());
         // A number still previews.
         for setting in &settings {
-            assert!(previewed(&before, &ManagedSettings::default(), setting, 0.2).is_some());
+            let unchanged = (&before, &Presences::default());
+            assert!(previewed(unchanged, &ManagedSettings::default(), setting, 0.2).is_some());
         }
     }
 
@@ -1120,6 +1164,7 @@ mod tests {
     #[test]
     fn a_setting_edits_only_its_own_field() {
         let base = ClientSettings::default();
+        let none = Presences::default();
         let cases = [
             (Setting::UserVolume("ada".into()), "user_volumes"),
             (Setting::ServerVolume("home".into()), "server_volumes"),
@@ -1128,8 +1173,8 @@ mod tests {
         ];
         for (setting, field) in cases {
             let mut edited = base.clone();
-            setting.set(&mut edited, 0.25);
-            assert_eq!(setting.get(&edited), 0.25);
+            setting.set(&mut edited, &mut none.clone(), 0.25);
+            assert_eq!(setting.get(&edited, &none), 0.25);
             let (before, after) = (
                 serde_json::to_value(&base).unwrap(),
                 serde_json::to_value(&edited).unwrap(),
@@ -1150,12 +1195,12 @@ mod tests {
             );
             assert_eq!(setting.reaches_worker(), setting == Setting::Sensitivity);
             let mut reset = edited.clone();
-            setting.set(&mut reset, setting.default_value());
-            assert_eq!(setting.get(&reset), setting.get(&base));
+            setting.set(&mut reset, &mut none.clone(), setting.default_value());
+            assert_eq!(setting.get(&reset, &none), setting.get(&base, &none));
         }
         // Values outside the scale are clamped, as sanitising would.
         let mut edited = base.clone();
-        Setting::ServerVolume("home".into()).set(&mut edited, 9.);
+        Setting::ServerVolume("home".into()).set(&mut edited, &mut none.clone(), 9.);
         assert_eq!(edited.server_volume("home"), MAX_GAIN);
         assert_eq!(
             Setting::Sensitivity.readout(0.5),

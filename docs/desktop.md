@@ -84,9 +84,10 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
   local history**; while you read further up, a pill counts new messages and jumps
   back to the latest.
 - Right-click users, channels and servers for whisper and shout, listening to a
-  channel, links, per-user volume and local mute, direct messages, comments and
-  avatars, registration, moderation, the channel editor, ACLs, bans and registered
-  users. Entries appear only where the server's permissions allow them.
+  channel, links, per-user volume and local mute (kept by certificate; for someone
+  without one, until they leave), direct messages, comments and avatars,
+  registration, moderation, the channel editor, ACLs, bans and registered users.
+  Entries appear only where the server's permissions allow them.
 - Drag the channel list's edge to fit long names. Collapsed branches show how many
   people are inside; branches with people open on connect.
 - Search (Ctrl+F) finds messages saved on this device. History and the channel

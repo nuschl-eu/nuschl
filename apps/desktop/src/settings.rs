@@ -486,7 +486,7 @@ fn slider(
         crate::slider::Spec {
             id: id.into(),
             name: name.into(),
-            value: setting.get(&this.settings),
+            value: setting.get(&this.settings, &this.presences),
             target: crate::slider::Target {
                 owner: crate::slider::Owner::Settings(this.settings_invocation),
                 setting,
@@ -505,7 +505,7 @@ fn labelled_slider(
     setting: crate::slider::Setting,
     cx: &mut Context<Desktop>,
 ) -> AnyElement {
-    let readout = setting.readout(setting.get(&this.settings));
+    let readout = setting.readout(setting.get(&this.settings, &this.presences));
     div()
         .flex()
         .flex_col()

@@ -11,7 +11,7 @@ use gpui_kit::{
 };
 use nuschl_client::{
     Client, Conversation, SessionSecurity, Update,
-    native::{Driver, Event, Native},
+    native::{Driver, Event, Native, Presences, UserKey},
     platform::RenderKey,
     timeline::MAX_TIMELINE,
 };
@@ -246,6 +246,8 @@ pub struct Desktop {
     /// Pointer x and sidebar width where a sidebar resize started, and the live width.
     pub sidebar_drag: Option<(f32, f32, f32)>,
     pub settings: ClientSettings,
+    /// Volumes and mutes of users without a certificate, held in memory.
+    pub presences: Presences,
     /// What the system configuration (managed.json) sets; read-only here.
     pub managed: ManagedSettings,
     pub settings_open: bool,
@@ -569,6 +571,7 @@ impl Desktop {
             title_drag: false,
             sidebar_drag: None,
             settings,
+            presences: Presences::default(),
             managed,
             settings_open: false,
             settings_invocation: 0,
@@ -1575,6 +1578,20 @@ impl Desktop {
                 });
         }
     }
+    /// Mute a user for you, or unmute them (see `UserKey`).
+    pub fn toggle_local_mute(&mut self, user: &UserKey) {
+        match user {
+            UserKey::Certificate(hash) => self.update_settings(|settings| {
+                if !settings.local_mutes.remove(hash) {
+                    settings.local_mutes.insert(hash.clone());
+                }
+            }),
+            UserKey::Presence(instance) => {
+                self.presences.toggle_mute(*instance);
+                self.driver.apply_presences(self.presences.clone());
+            }
+        }
+    }
     pub fn update_settings(&mut self, change: impl FnOnce(&mut ClientSettings)) {
         let mut settings = self.settings.clone();
         change(&mut settings);
@@ -1608,12 +1625,15 @@ impl Desktop {
         input: crate::slider::Input,
         cx: &mut Context<Self>,
     ) {
-        let Some(settings) =
-            crate::slider::previewed(&self.settings, &self.managed, setting, value)
-        else {
+        let Some((settings, presences)) = crate::slider::previewed(
+            (&self.settings, &self.presences),
+            &self.managed,
+            setting,
+            value,
+        ) else {
             return;
         };
-        self.settings = settings;
+        (self.settings, self.presences) = (settings, presences);
         let effects =
             self.slider_edits
                 .changed(setting.reaches_worker(), input, std::time::Instant::now());
@@ -1630,6 +1650,7 @@ impl Desktop {
     pub(crate) fn apply_slider_effects(&mut self, effects: crate::slider::Effects) {
         if effects.driver {
             self.driver.apply_settings(self.settings.clone());
+            self.driver.apply_presences(self.presences.clone());
         }
         if effects.save
             && let Err(error) = self.profile.save_settings(&self.settings, &self.managed)
@@ -2544,6 +2565,9 @@ impl Desktop {
         // Channels sorted once a batch is applied, and edits and deletions
         // that came before their message's page.
         self.client.settle();
+        if forget_departed(&mut self.presences, &self.client.servers) {
+            self.driver.apply_presences(self.presences.clone());
+        }
         self.apply_updates(cx);
         self.sync_link_preview(cx);
         self.expire_typing(cx);
@@ -2965,6 +2989,56 @@ impl Desktop {
                 .unwrap_or(0);
             self.browse_server(index, window, cx);
         }
+    }
+}
+
+/// Keep the volumes and mutes of users without a certificate while a server
+/// shows their presence: they go when the user leaves or the connection ends.
+/// True when any went.
+fn forget_departed(presences: &mut Presences, servers: &[ServerView]) -> bool {
+    presences.retain(|instance| {
+        servers
+            .iter()
+            .any(|server| server.users.values().any(|user| user.instance == instance))
+    })
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::{Presences, ServerView, forget_departed};
+    use nuschl_session::{config::ServerBookmark, connection::User};
+
+    #[test]
+    fn a_presence_volume_goes_when_the_user_leaves_or_the_connection_ends() {
+        let mut servers = ["a", "b"].map(|name| {
+            ServerView::new(ServerBookmark::new(name, "localhost", 64738, "andi").unwrap())
+        });
+        for (server, (session, instance)) in servers.iter_mut().zip([(2, 22), (3, 33)]) {
+            server.users.insert(
+                session,
+                User {
+                    session,
+                    instance,
+                    ..User::default()
+                },
+            );
+        }
+        let mut presences = Presences::default();
+        for instance in [22, 33] {
+            presences.volumes.insert(instance, 0.5);
+            presences.toggle_mute(instance);
+        }
+        assert!(!forget_departed(&mut presences, &servers));
+        // The user left.
+        servers[0].users.remove(&2);
+        assert!(forget_departed(&mut presences, &servers));
+        assert_eq!(presences.volumes.keys().collect::<Vec<_>>(), [&33]);
+        assert_eq!(presences.mutes.iter().collect::<Vec<_>>(), [&33]);
+        // The other connection ended (the client clears its users on a
+        // disconnect or reconnect; a reconnect brings new presences).
+        servers[1].users.clear();
+        assert!(forget_departed(&mut presences, &servers));
+        assert_eq!(presences, Presences::default());
     }
 }
 

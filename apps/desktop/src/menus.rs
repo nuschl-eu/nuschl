@@ -17,6 +17,7 @@ use gpui_kit::{
     prelude::*,
     *,
 };
+use nuschl_client::native::{Presences, UserKey};
 use nuschl_session::{
     connection::{ActionSubject, Command, CommandAuthority, TextTarget, User},
     model::{ChannelEdit, UserAction, VoiceTargetSpec, permission as perm},
@@ -320,11 +321,10 @@ enum Entry {
     Separator,
 }
 
-/// Whose volume a menu sets: a person's (by certificate hash) or a
-/// server's playback (by id).
+/// Whose volume a menu sets: a person's or a server's playback (by id).
 #[derive(Clone, Debug)]
 enum Volume {
-    User(String),
+    User(UserKey),
     Server(String),
 }
 
@@ -332,7 +332,12 @@ impl Volume {
     /// The setting its slider edits.
     fn setting(&self) -> crate::slider::Setting {
         match self {
-            Volume::User(hash) => crate::slider::Setting::UserVolume(hash.clone()),
+            Volume::User(UserKey::Certificate(hash)) => {
+                crate::slider::Setting::UserVolume(hash.clone())
+            }
+            Volume::User(UserKey::Presence(instance)) => {
+                crate::slider::Setting::PresenceVolume(*instance)
+            }
             Volume::Server(id) => crate::slider::Setting::ServerVolume(id.clone()),
         }
     }
@@ -1038,32 +1043,7 @@ impl Desktop {
                         "message",
                         move |this, index, window, cx| this.open_direct(index, session, window, cx),
                     ));
-                    if let Some(hash) = user.certificate_hash.clone() {
-                        entries.push(Entry::Volume {
-                            of: Volume::User(hash.clone()),
-                            volume: self.settings.volume_for(Some(&hash)),
-                        });
-                        let muted = self.settings.locally_muted(Some(&hash));
-                        entries.push(
-                            local_item(
-                                if muted {
-                                    "Unmute for me"
-                                } else {
-                                    "Mute for me"
-                                },
-                                if muted { "volume" } else { "mic-off" },
-                                move |this, _index, _, _| {
-                                    let hash = hash.clone();
-                                    this.update_settings(|settings| {
-                                        if !settings.local_mutes.remove(&hash) {
-                                            settings.local_mutes.insert(hash);
-                                        }
-                                    });
-                                },
-                            )
-                            .key(format!("local-mute:{session}:{muted}")),
-                        );
-                    }
+                    volume_entries(&mut entries, (&self.settings, &self.presences), &user);
                     match user.certificate_hash.clone() {
                         Some(hash) => people_entries(&mut entries, &self.settings, &user, hash),
                         None => entries.push(Entry::Note(
@@ -1893,6 +1873,32 @@ fn push_context_actions(
     }
 }
 
+/// The volume slider and "Mute for me" for `user` (see [`UserKey`]).
+fn volume_entries(
+    entries: &mut Vec<Entry>,
+    (settings, presences): (&nuschl_session::config::ClientSettings, &Presences),
+    user: &User,
+) {
+    let key = UserKey::of(user);
+    let (volume, muted) = key.playback(settings, presences);
+    entries.push(Entry::Volume {
+        of: Volume::User(key.clone()),
+        volume,
+    });
+    entries.push(
+        local_item(
+            if muted {
+                "Unmute for me"
+            } else {
+                "Mute for me"
+            },
+            if muted { "volume" } else { "mic-off" },
+            move |this, _index, _, _| this.toggle_local_mute(&key),
+        )
+        .key(format!("local-mute:{}:{muted}", user.session)),
+    );
+}
+
 /// Friend and nickname entries for someone with a certificate, as in
 /// Mumble: both are kept by certificate hash, only on this device.
 fn people_entries(
@@ -2475,10 +2481,17 @@ pub fn prompt(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
 
 #[cfg(test)]
 mod target_and_focus_tests {
-    use super::{ActionOrigin, Entry, MenuTarget, item, push_context_actions};
+    use super::{
+        ActionOrigin, Entry, MenuTarget, Volume, item, push_context_actions, volume_entries,
+    };
     use crate::state::{ServerView, Status};
     use nuschl_client::conversation::ConversationState;
-    use nuschl_session::{config::ServerBookmark, connection::User, model::ContextAction};
+    use nuschl_client::native::{Presences, UserKey};
+    use nuschl_session::{
+        config::{ClientSettings, ServerBookmark},
+        connection::User,
+        model::ContextAction,
+    };
 
     fn server(id: &str) -> ServerView {
         let mut bookmark = ServerBookmark::new(id, "localhost", 64738, "reader").unwrap();
@@ -2558,6 +2571,48 @@ mod target_and_focus_tests {
         assert_eq!(origin.local_index_in(&servers), Some(0));
         servers[0].bookmark.host = "different.invalid".into();
         assert_eq!(origin.local_index_in(&servers), None);
+    }
+    #[test]
+    fn a_user_without_a_certificate_gets_a_volume_and_mute_for_their_presence() {
+        let settings = ClientSettings::default();
+        let shown = |presences: &Presences, user: &User| {
+            let mut entries = vec![];
+            volume_entries(&mut entries, (&settings, presences), user);
+            match &entries[..] {
+                [
+                    Entry::Volume {
+                        of: Volume::User(key),
+                        volume,
+                    },
+                    Entry::Item { label, .. },
+                ] => (key.clone(), *volume, label.clone()),
+                _ => panic!("expected a volume slider and a mute entry"),
+            }
+        };
+        let grace = User {
+            session: 2,
+            instance: 22,
+            ..User::default()
+        };
+        let mut presences = Presences::default();
+        assert_eq!(
+            shown(&presences, &grace),
+            (UserKey::Presence(22), 1., "Mute for me".into())
+        );
+        presences.volumes.insert(22, 0.5);
+        presences.toggle_mute(22);
+        assert_eq!(
+            shown(&presences, &grace),
+            (UserKey::Presence(22), 0.5, "Unmute for me".into())
+        );
+        let ada = User {
+            certificate_hash: Some("abc".into()),
+            ..grace.clone()
+        };
+        assert_eq!(
+            shown(&presences, &ada),
+            (UserKey::Certificate("abc".into()), 1., "Mute for me".into())
+        );
     }
     fn profile(label: &str) -> Entry {
         item(label, "info", |_, _, _, _| {})
