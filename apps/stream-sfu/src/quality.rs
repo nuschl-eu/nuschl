@@ -16,7 +16,7 @@
 //! gets is the least of both; until it asks, it asks for the top tier. Once a
 //! second the publisher hears the resulting demand for each source.
 
-use crate::protocol::VideoLimit;
+use crate::protocol::{Mode, Prefer, VideoLimit};
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
     adapt::Stepper,
@@ -40,22 +40,29 @@ pub const QUEUE_BOUND: Duration = Duration::from_millis(300);
 pub const MAX_KEY_BYTES: u64 = 8 * 1024 * 1024;
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
-/// A video source: its kind and the demand last sent to its publisher.
+/// A video source: its kind, its sender's mode and the demand last sent to its
+/// publisher.
 pub struct Video {
     pub kind: Kind,
+    pub mode: Mode,
     pub demand: Option<(usize, u64, Option<VideoLimit>)>,
     pub throttle: Throttle,
     pub layers: Layers,
 }
 
 impl Video {
-    pub fn new(kind: Kind) -> Self {
+    pub fn new(kind: Kind, mode: Mode) -> Self {
         Self {
             kind,
+            mode,
             demand: None,
             throttle: Throttle::default(),
             layers: Layers::default(),
         }
+    }
+
+    pub fn smooth(&self) -> bool {
+        self.mode.prefer == Prefer::Smooth
     }
 }
 
@@ -72,6 +79,7 @@ pub struct View {
     pub backlog: Backlog,
     pub reported_limit: Option<VideoLimit>,
     pub limit_throttle: Throttle,
+    pub reported_mode: Option<Mode>,
 }
 
 /// The video admitted to one receiver's send queue and its temporary quality limit.
@@ -313,6 +321,11 @@ impl Backlog {
 
     pub fn tier(&self, tier: usize) -> usize {
         tier.saturating_sub(self.steps)
+    }
+
+    /// How many steps a late queue lowers the receiver's quality.
+    pub fn steps(&self) -> usize {
+        self.steps
     }
 
     pub fn limited(&self) -> bool {

@@ -6,7 +6,7 @@
 //! targets only at switch points the receiver can decode from: a frame with a
 //! switch indication whose chain the receiver holds (§A.4.2).
 
-use crate::Kind;
+use crate::{Kind, adapt::Stepper};
 use std::{collections::VecDeque, time::Duration};
 
 pub const URI: &str =
@@ -262,6 +262,18 @@ pub struct Choice {
     pub rate: u64,
 }
 
+impl Choice {
+    /// What the choice keeps in its source's mode: its spatial layer for a
+    /// Sharp source, its temporal layer for a `smooth` one.
+    pub fn kept(&self, smooth: bool) -> u8 {
+        if smooth {
+            self.layer.temporal
+        } else {
+            self.layer.spatial
+        }
+    }
+}
+
 /// One source's descriptor state, the measured rate of each of its decode
 /// targets over the last second, and its frame rate (docs/video-plan.md §5.3,
 /// layer selection).
@@ -439,7 +451,13 @@ impl Layers {
     /// the tier's. These are the steps of [`crate::budget::Stream`] and
     /// [`crate::adapt::Stepper`]. Until a full second measures the rates, the
     /// lowest fitting target is the only choice.
-    pub fn choices(&self, kind: Kind, tier: usize) -> Vec<Choice> {
+    ///
+    /// A Sharp source's targets go by spatial, then temporal layer: a step down
+    /// drops temporal layers first. A `smooth` source's lowest spatial layer
+    /// gains temporal layers first, then its full frame rate gains spatial
+    /// layers: a step down drops spatial layers first. Each of `steps` removes
+    /// the top choice, down to the lowest one of the top group ([`Choice::kept`]).
+    pub fn choices(&self, kind: Kind, tier: usize, smooth: bool, steps: usize) -> Vec<Choice> {
         let Some(structure) = &self.structure else {
             return Vec::new();
         };
@@ -473,8 +491,46 @@ impl Layers {
         if !self.measured {
             all.truncate(1);
         }
+        if smooth
+            && let (Some(low), Some(top)) =
+                (all.first(), all.iter().map(|c| c.layer.temporal).max())
+        {
+            let low = low.layer.spatial;
+            all.retain(|c| c.layer.spatial == low || c.layer.temporal == top);
+            all.sort_by_key(|c| (c.layer.temporal, c.layer.spatial));
+        }
+        let group = all.last().map(|c| c.kept(smooth));
+        let floor = all.iter().position(|c| Some(c.kept(smooth)) == group);
+        all.truncate(
+            all.len()
+                .saturating_sub(steps)
+                .max(floor.map_or(0, |i| i + 1)),
+        );
         all
     }
+}
+
+/// The point of `choices` a viewer wants, and its target, at most `ceiling`,
+/// the budgets' choice. The `stepper` paces the moves, grouped by what the
+/// source's mode keeps; it starts at `ceiling` once the source is `measured`.
+pub fn pick(
+    choices: &[Choice],
+    ceiling: usize,
+    smooth: bool,
+    measured: bool,
+    stepper: &mut Option<Stepper>,
+    now: Duration,
+) -> (usize, Wanted) {
+    let groups: Vec<u32> = choices.iter().map(|c| u32::from(c.kept(smooth))).collect();
+    let point = match stepper {
+        Some(stepper) => stepper.update(&groups, ceiling, now),
+        None if measured => stepper
+            .insert(Stepper::new(ceiling))
+            .update(&groups, ceiling, now),
+        None => ceiling,
+    };
+    let choice = &choices[point.min(choices.len() - 1)];
+    (point, (choice.target, choice.layer.spatial))
 }
 
 /// A decode target and its spatial layer, the highest in the target.
@@ -1133,7 +1189,7 @@ mod tests {
     }
 
     fn targets(layers: &Layers, kind: Kind, tier: usize) -> Vec<usize> {
-        let choices = layers.choices(kind, tier);
+        let choices = layers.choices(kind, tier, false, 0);
         choices.iter().map(|c| c.target).collect()
     }
 
@@ -1144,7 +1200,7 @@ mod tests {
         for number in 0..61u16 {
             l1t3_at(&mut layers, number, u64::from(number) * 1000 / 30);
         }
-        let choices = layers.choices(Kind::Camera, 3);
+        let choices = layers.choices(Kind::Camera, 3, false, 0);
         let rates: Vec<_> = choices.iter().map(|c| c.rate).collect();
         // Frames 30 to 59 in the second window: 7, 15 and 30 of 8000 bits.
         assert_eq!(rates, [56_000, 120_000, 240_000]);
@@ -1229,10 +1285,57 @@ mod tests {
     }
 
     #[test]
+    fn a_late_queue_removes_choices_down_to_the_top_group() {
+        let (mut layers, _) = chrome();
+        layers.structure.as_mut().expect("structure").active = u32::MAX;
+        let layers_of = |smooth, steps| -> Vec<(u8, u8)> {
+            let choices = layers.choices(Kind::Camera, 3, smooth, steps);
+            choices
+                .iter()
+                .map(|c| (c.layer.spatial, c.layer.temporal))
+                .collect()
+        };
+        // Sharp keeps the top spatial layer: S2T2, then S2T1, then S2T0.
+        assert_eq!(layers_of(false, 1).last(), Some(&(2, 1)));
+        assert_eq!(layers_of(false, 9).last(), Some(&(2, 0)));
+        // Smooth keeps the full frame rate: S2T2, then S1T2, then S0T2.
+        assert_eq!(layers_of(true, 1).last(), Some(&(1, 2)));
+        assert_eq!(layers_of(true, 9).last(), Some(&(0, 2)));
+    }
+
+    #[test]
+    fn a_stepper_starts_once_the_source_is_measured() {
+        let (layers, _) = chrome();
+        let choices = layers.choices(Kind::Camera, 3, false, 0);
+        let mut stepper = None;
+        let at = Duration::from_secs(1);
+        assert_eq!(
+            pick(&choices, 5, false, false, &mut stepper, at),
+            (5, (5, 1))
+        );
+        assert!(stepper.is_none());
+        assert_eq!(pick(&choices, 5, false, true, &mut stepper, at).0, 5);
+        // Up to another spatial layer after the 30 s hold.
+        assert_eq!(pick(&choices, 5, false, true, &mut stepper, at).0, 5);
+        let mut choices = choices;
+        choices.push(Choice {
+            target: 6,
+            layer: Target {
+                spatial: 2,
+                temporal: 0,
+            },
+            rate: 0,
+        });
+        assert_eq!(pick(&choices, 6, false, true, &mut stepper, at).0, 5);
+        let later = at + Duration::from_secs(30);
+        assert_eq!(pick(&choices, 6, false, true, &mut stepper, later).0, 6);
+    }
+
+    #[test]
     fn active_targets_and_layer_sizes_limit_the_choice() {
         let (mut layers, _) = chrome();
         let targets: Vec<_> = layers
-            .choices(Kind::Camera, 3)
+            .choices(Kind::Camera, 3, false, 0)
             .iter()
             .map(|c| c.target)
             .collect();
@@ -1241,7 +1344,7 @@ mod tests {
         structure.active = u32::MAX;
         structure.heights = vec![180, 360, 720];
         let spatial = |tier| {
-            let choices = layers.choices(Kind::Camera, tier);
+            let choices = layers.choices(Kind::Camera, tier, false, 0);
             choices
                 .iter()
                 .map(|c| c.layer.spatial)
@@ -1255,10 +1358,39 @@ mod tests {
         assert_eq!(layers.picture_tier(Kind::Camera), None, "three pictures");
         // A screen tier is taller than every layer.
         layers.structure.as_mut().expect("structure").heights = vec![1440, 2160, 4320];
-        assert_eq!(layers.choices(Kind::Screen, 0).len(), 1);
+        assert_eq!(layers.choices(Kind::Screen, 0, false, 0).len(), 1);
         layers.structure.as_mut().expect("structure").heights = vec![1080];
         assert_eq!(layers.picture_tier(Kind::Screen), Some(1));
         assert_eq!(Layers::default().picture_tier(Kind::Screen), None);
+    }
+
+    #[test]
+    fn sharp_drops_temporal_layers_first_and_smooth_spatial_layers() {
+        let (mut layers, _) = chrome();
+        layers.structure.as_mut().expect("structure").active = u32::MAX;
+        let order = |smooth| -> Vec<(u8, u8)> {
+            layers
+                .choices(Kind::Camera, 3, smooth, 0)
+                .iter()
+                .map(|c| (c.layer.spatial, c.layer.temporal))
+                .collect()
+        };
+        // Each step down takes the point before it.
+        assert_eq!(
+            order(false),
+            [
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (1, 0),
+                (1, 1),
+                (1, 2),
+                (2, 0),
+                (2, 1),
+                (2, 2)
+            ]
+        );
+        assert_eq!(order(true), [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2)]);
     }
 
     #[test]
@@ -1272,7 +1404,7 @@ mod tests {
         layers.measured = true;
         layers.interval = Some(3000);
         let targets: Vec<_> = layers
-            .choices(Kind::Camera, 3)
+            .choices(Kind::Camera, 3, false, 0)
             .iter()
             .map(|c| c.target)
             .collect();

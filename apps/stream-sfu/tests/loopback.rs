@@ -1596,3 +1596,92 @@ async fn a_throttled_viewer_gets_decodable_frames() {
     let spatial: Vec<u8> = decoded.iter().map(|f| f.1).collect();
     assert!(recent >= 20, "{recent} recent frames, layers {spatial:?}");
 }
+
+/// A publisher replaying Chromium's L3T3_KEY camera in `mode`, and a viewer
+/// that joins once the replay runs.
+async fn camera_call(url: &str, mode: Value) -> (Peer, Peer) {
+    let (mut host, _) = join(url, &ADMIT, true, true).await;
+    host.replay = Some(Replay::new(fixture(include_str!(
+        "fixtures/chrome-l3t3-key.txt"
+    ))));
+    host.publish_source(Codec::Av1, false);
+    let mid = host.publish.as_ref().expect("publishing").2.to_string();
+    host.send(json!({"type": "modes", "modes": {mid: mode}}));
+    replay_alone(&mut host).await;
+    let (viewer, _) = join(url, &ADMIT, false, false).await;
+    (host, viewer)
+}
+
+/// Steps `host`, replaying, and `viewer` behind a `rate` downlink with 20 ms
+/// of delay for `duration`.
+async fn throttled(host: &mut Peer, viewer: &mut Peer, rate: u64, duration: Duration) {
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        host.step();
+        viewer.step();
+        host.send_replay();
+        if let Some(leg) = &mut viewer.subscribe {
+            let link = leg.link.get_or_insert_with(|| {
+                Link::new(rate, Duration::from_millis(20), Duration::from_secs(10))
+            });
+            link.rate = rate as f64;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn number(packet: &Received) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        packet.descriptor.as_ref()?.0[1..3].try_into().ok()?,
+    ))
+}
+
+/// The frame rate and the top spatial layer of the frames a viewer decoded
+/// in the last five seconds of media.
+fn recent_rate(packets: &[Received]) -> (f64, u8) {
+    let (decoded, broken) = decodable(packets);
+    assert!(broken.is_empty(), "undecodable frames {broken:?}");
+    let timestamps: HashMap<u16, u32> = packets
+        .iter()
+        .filter_map(|p| Some((number(p)?, p.timestamp)))
+        .collect();
+    let last = decoded
+        .iter()
+        .map(|f| timestamps[&f.0])
+        .max()
+        .expect("decoded frames");
+    let recent: Vec<_> = decoded
+        .iter()
+        .filter(|f| last.wrapping_sub(timestamps[&f.0]) < 5 * 90_000)
+        .collect();
+    let units: std::collections::HashSet<u32> = recent.iter().map(|f| timestamps[&f.0]).collect();
+    let spatial = recent.iter().map(|f| f.1).max().expect("recent frames");
+    (units.len() as f64 / 5.0, spatial)
+}
+
+/// Chromium's L3T3_KEY camera to a viewer behind a 1.5 Mbit/s downlink: the
+/// top spatial layer fits at up to half the frame rate (about 1 Mbit/s), and
+/// at the full rate of about 23 frames a second (1.4 Mbit/s and packet
+/// overhead) it does not. A Sharp source keeps the top spatial layer and
+/// loses frame rate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sharp_stream_keeps_its_resolution() {
+    let sfu = start("");
+    let (mut host, mut viewer) = camera_call(&sfu.url, json!({"prefer": "sharp"})).await;
+    throttled(&mut host, &mut viewer, 1_500_000, Duration::from_secs(20)).await;
+    let (rate, spatial) = recent_rate(&viewer.received[&host.id]);
+    assert_eq!(spatial, 2, "{rate} frames a second");
+    assert!(rate <= 16.0, "{rate} frames a second");
+}
+
+/// The camera of [`a_sharp_stream_keeps_its_resolution`] as a Smooth source
+/// keeps its frame rate on a lower spatial layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_smooth_stream_keeps_its_frame_rate() {
+    let sfu = start("");
+    let (mut host, mut viewer) = camera_call(&sfu.url, json!({"prefer": "smooth"})).await;
+    throttled(&mut host, &mut viewer, 1_500_000, Duration::from_secs(20)).await;
+    let (rate, spatial) = recent_rate(&viewer.received[&host.id]);
+    assert!(spatial < 2, "spatial layer {spatial}");
+    assert!(rate >= 18.0, "{rate} frames a second");
+}

@@ -12,7 +12,7 @@
 use crate::{
     config::Config,
     protocol::{
-        self, ClientMessage, Decoders, MAX_SCREEN_BITRATE, PeerInfo, ServerMessage, Track,
+        self, ClientMessage, Decoders, MAX_SCREEN_BITRATE, Mode, PeerInfo, ServerMessage, Track,
         TurnCredentials, VideoLimit, Welcome,
     },
     quality::{self, Layered, VideoAdmission},
@@ -21,7 +21,8 @@ use crate::{
     traffic::Traffic,
 };
 use nuschl_stream_quality::{
-    DecodeCapacity, Kind, QualityRequest, Throttle, adapt::Stepper, budget, dd::Choice,
+    DecodeCapacity, Kind, QualityRequest, Throttle, budget,
+    dd::{self, Choice},
 };
 use std::{
     cmp::Reverse,
@@ -131,6 +132,8 @@ struct Peer {
     deadlines: [Option<Instant>; 2],
     /// The video mids of its publish connection that carry a screen.
     screens: Vec<Mid>,
+    /// The modes its sender chose for its video mids.
+    modes: Vec<(Mid, Mode)>,
     /// The subscribe connection's bandwidth estimate, bits per second.
     estimate: u64,
     decode: DecodeCapacity,
@@ -416,6 +419,7 @@ impl Core {
             budget: rooms::media_budget(self.config.receiver_bitrate, now),
             deadlines: [None; 2],
             screens: Vec::new(),
+            modes: Vec::new(),
             estimate: INITIAL_ESTIMATE,
             decode: quality::full_capacity(),
             decode_throttle: Throttle::default(),
@@ -507,6 +511,20 @@ impl Core {
                     },
                 );
                 self.dirty.push((id, Leg::Publish));
+            }
+            ClientMessage::Modes { modes } => {
+                let limit = self.config.max_sources_per_peer;
+                let peer = self.peers.get_mut(&id).expect("exists");
+                peer.modes = modes
+                    .into_iter()
+                    .take(limit)
+                    .map(|(mid, mode)| (Mid::from(mid.as_str()), mode))
+                    .collect();
+                for source in &mut peer.sources {
+                    if let Some(video) = &mut source.video {
+                        video.mode = mode(&peer.modes, source.mid, video.kind);
+                    }
+                }
             }
             ClientMessage::Answer { sdp } => {
                 let answer = SdpAnswer::from_sdp_string(&sdp).map_err(|_| "sdp")?;
@@ -887,11 +905,12 @@ impl Core {
             return;
         }
         let video = (kind == MediaKind::Video).then(|| {
-            quality::Video::new(if peer.screens.contains(&mid) {
+            let kind = if peer.screens.contains(&mid) {
                 Kind::Screen
             } else {
                 Kind::Camera
-            })
+            };
+            quality::Video::new(kind, mode(&peer.modes, mid, kind))
         });
         peer.sources.push(Source {
             mid,
@@ -1183,7 +1202,13 @@ impl Core {
                 {
                     limit = active;
                 }
-                let mut choices = video.layers.choices(video.kind, tier);
+                // A late queue takes away what the source's mode gives up; the
+                // budgets lower the rest.
+                let smooth = video.smooth();
+                let mut choices =
+                    video
+                        .layers
+                        .choices(video.kind, requested, smooth, backlog.steps());
                 // Past the lowest tier the traffic budget leaves base layers only.
                 if self.step > video.kind.top() as u64 && choices.len() > 1 {
                     choices.truncate(1);
@@ -1199,7 +1224,11 @@ impl Core {
                 demand.request(tier, publisher_limit);
                 let raised = video.kind == Kind::Screen && publisher.screen_rate;
                 let single_layer = (raised || backlog.limited())
-                    && video.layers.choices(video.kind, video.kind.top()).len() <= 1;
+                    && video
+                        .layers
+                        .choices(video.kind, video.kind.top(), smooth, 0)
+                        .len()
+                        <= 1;
                 if backlog.limited() && single_layer {
                     let (configured, configured_limit) =
                         if self.config.receiver_bitrate <= self.config.room_bitrate {
@@ -1260,6 +1289,7 @@ impl Core {
                     forward: index,
                     choices,
                     measured: video.layers.measured(),
+                    mode: video.mode,
                     ceiling: probe,
                     limit,
                 });
@@ -1377,24 +1407,19 @@ impl Core {
                 view.backlog.overloaded(limit);
             }
             let target = share.layers.checked_sub(1).map(|ceiling| {
-                let resolutions: Vec<u32> = planned
-                    .choices
-                    .iter()
-                    .map(|c| u32::from(c.layer.spatial))
-                    .collect();
-                // The stepper starts once a full second has measured the
-                // source: from its first choice that fits.
-                let point = if planned.measured {
-                    let stepper = view.stepper.get_or_insert_with(|| Stepper::new(ceiling));
-                    stepper.update(&resolutions, ceiling, since)
-                } else {
-                    ceiling
-                };
+                let smooth = planned.mode.prefer == protocol::Prefer::Smooth;
+                let (point, target) = dd::pick(
+                    &planned.choices,
+                    ceiling,
+                    smooth,
+                    planned.measured,
+                    &mut view.stepper,
+                    since,
+                );
                 if limit == VideoLimit::WithinTarget && point < ceiling {
                     limit = VideoLimit::QualityRecovery;
                 }
-                let choice = &planned.choices[point];
-                (choice.target, choice.layer.spatial)
+                target
             });
             if peer.video_limits
                 && forward.open
@@ -1413,6 +1438,22 @@ impl Core {
                     .is_ok()
             {
                 view.reported_limit = Some(limit);
+            }
+            if forward.open
+                && !forward.stopping
+                && view.reported_mode != Some(planned.mode)
+                && peer.out.capacity() > crate::OUTGOING / 2
+                && let Some(mid) = forward.mid
+                && peer
+                    .out
+                    .try_send(ServerMessage::Mode {
+                        mid: mid.to_string(),
+                        peer: forward.from,
+                        mode: planned.mode,
+                    })
+                    .is_ok()
+            {
+                view.reported_mode = Some(planned.mode);
             }
             view.selector.want(target);
         }
@@ -1521,6 +1562,7 @@ struct Planned {
     choices: Vec<Choice>,
     /// Whether a full second has measured the source's rates.
     measured: bool,
+    mode: Mode,
     /// The most its tier needs, bits per second.
     ceiling: u64,
     limit: VideoLimit,
@@ -1599,6 +1641,15 @@ fn receiver_pt(config: &CodecConfig, pts: &[Pt], sent: PayloadParams) -> Option<
     };
     exact.or_else(av1).map(|p| p.pt())
 }
+
+/// The mode a sender chose in `modes` for its video source at `mid`.
+fn mode(modes: &[(Mid, Mode)], mid: Mid, kind: Kind) -> Mode {
+    modes.iter().find(|(m, _)| *m == mid).map_or_else(
+        || Mode::default_for(kind == Kind::Screen),
+        |(_, mode)| *mode,
+    )
+}
+
 fn forward(from: PeerId, source: Mid, kind: MediaKind, label: &'static str) -> Forward {
     Forward {
         from,

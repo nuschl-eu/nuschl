@@ -16,6 +16,7 @@
 //!             | error {reason}
 //! peer → SFU  offer {sdp, screens?: [mid]} publish connection; screens names
 //!                                          the video mids that carry a screen
+//! peer → SFU  modes {modes: {mid: mode}}   each video mid's mode, replacing the last
 //! SFU → peer  answer {sdp}
 //! SFU → peer  offer {sdp, tracks: [{mid, peer, source, kind}]}   subscribe connection
 //! peer → SFU  answer {sdp}
@@ -25,6 +26,7 @@
 //! SFU → peer  quality {request, source, max_height, max_fps, max_bitrate, limit?}
 //!                                          encoder limits for the publisher's mid
 //! SFU → peer  video_limit {mid, peer, limit} per-source limit for the receiver
+//! SFU → peer  mode {mid, peer, mode}       a forwarded video source's mode, ≤ 1/s
 //! peer → SFU  remove {peer} | end          hosts only
 //! SFU → peer  joined {peer, role} | left {peer}
 //! SFU → peer  codec {codec}
@@ -35,6 +37,14 @@
 //! Peers that want video limit reports echo `video_limits: true` when the
 //! server advertises it. The `video_limit` mid belongs to the receiver's
 //! subscribe connection. The `quality` mid belongs to the publish connection.
+//!
+//! **Modes.** A mode is `{prefer: "sharp" | "smooth", low_latency?: true}`.
+//! Sharp keeps a source's resolution and lowers its frame rate when bandwidth
+//! or CPU is short; Smooth keeps the frame rate and lowers the resolution. Low
+//! latency bounds each viewer's queue at the SFU to about 50 ms, and receivers
+//! render its frames at once. A video mid without a mode is Sharp for a screen
+//! and Smooth for a camera. The SFU sends each receiver the mode of each video
+//! source it forwards, again when the publisher changes it.
 //!
 //! **One codec per call** (docs/video-plan.md §6). `codecs` lists the video
 //! codecs the peer decodes in WebRTC, `"av1"` and `"vp9"`, at least one. The
@@ -85,7 +95,7 @@
 //! request uses one connection of the per-address limit.
 
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, collections::BTreeMap, fmt};
 
 pub type PeerId = u64;
 
@@ -137,6 +147,9 @@ pub enum ClientMessage {
     Key {
         to: PeerId,
         data: String,
+    },
+    Modes {
+        modes: BTreeMap<String, Mode>,
     },
     Quality {
         request: String,
@@ -202,6 +215,40 @@ impl fmt::Debug for Create {
     }
 }
 
+/// What gives way when bandwidth or CPU is short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Prefer {
+    /// Keeps the resolution and lowers the frame rate.
+    Sharp,
+    /// Keeps the frame rate and lowers the resolution.
+    Smooth,
+}
+
+/// A video source's Sharp/Smooth and Low latency settings, chosen by its sender.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mode {
+    pub prefer: Prefer,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub low_latency: bool,
+}
+
+impl Mode {
+    /// The mode of a video source whose sender chose none: Sharp for a screen,
+    /// Smooth for a camera.
+    pub fn default_for(screen: bool) -> Self {
+        Self {
+            prefer: if screen {
+                Prefer::Sharp
+            } else {
+                Prefer::Smooth
+            },
+            low_latency: false,
+        }
+    }
+}
+
 /// The quality constraint picked by the SFU for a publisher or a receiver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -263,6 +310,11 @@ pub enum ServerMessage {
         mid: String,
         peer: PeerId,
         limit: VideoLimit,
+    },
+    Mode {
+        mid: String,
+        peer: PeerId,
+        mode: Mode,
     },
     Error {
         reason: Cow<'static, str>,
@@ -342,6 +394,30 @@ mod tests {
         let offer: ClientMessage =
             serde_json::from_str(r#"{"type":"offer","sdp":"","screens":["1"]}"#).expect("offer");
         assert!(matches!(offer, ClientMessage::Offer { screens, .. } if screens == ["1"]));
+        let modes: ClientMessage = serde_json::from_str(
+            r#"{"type":"modes","modes":{"1":{"prefer":"smooth","low_latency":true},"2":{"prefer":"sharp"}}}"#,
+        )
+        .expect("modes");
+        let ClientMessage::Modes { modes } = modes else {
+            panic!("modes");
+        };
+        assert_eq!(
+            modes["1"],
+            Mode {
+                prefer: Prefer::Smooth,
+                low_latency: true
+            }
+        );
+        assert_eq!(modes["2"], Mode::default_for(true));
+        let mode = ServerMessage::Mode {
+            mid: "3".into(),
+            peer: 4,
+            mode: Mode::default_for(false),
+        };
+        assert_eq!(
+            serde_json::to_value(mode).expect("json"),
+            serde_json::json!({"type": "mode", "mid": "3", "peer": 4, "mode": {"prefer": "smooth"}})
+        );
         let demand = ServerMessage::Quality {
             request: "01".into(),
             source: "1".into(),
