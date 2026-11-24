@@ -6,14 +6,7 @@ mod capture;
 mod capture_native;
 mod capture_pixels;
 mod decode;
-#[cfg(all(target_os = "linux", feature = "va-encoder"))]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "capture switches to the encoder core in the next step of #558"
-    )
-)]
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
 mod va_encoder;
 
 mod codec {

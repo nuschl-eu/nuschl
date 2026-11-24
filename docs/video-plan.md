@@ -325,6 +325,14 @@ Owner rule (2026-11-18):
   most 2 queued frames. Encoders have had exploited bugs (libvpx's VP8
   encoder, [CVE-2023-5217](https://nvd.nist.gov/vuln/detail/CVE-2023-5217)),
   so encoding runs isolated too, including any native software VP8.
+- **Hardware AV1 encoder (#558).** On Linux, GStreamer imports, scales and
+  converts the PipeWire DMA-BUFs to NV12 DMA-BUFs, and the encoder core
+  (`nuschl-video-encode`) codes them over VA-API in constant-quantizer mode.
+  Its rate controller picks each frame's quantizer from the sizes of earlier
+  frames, applies a bitrate change on the next frame and drops frames under a
+  tight budget; a still picture is refined step by step. Keyframes come on
+  request only. Screens send L1T3 and cameras L1T1, each frame with the
+  Dependency Descriptor the SFU picks layers by.
 - **Decoding.** A `--decode` role per call: the hardware decoder first, rav1d
   (Owner) as the AV1 software fallback, with pixel, memory and CPU caps.
   Decoded frames stay on the device.

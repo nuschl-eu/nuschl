@@ -14,13 +14,15 @@ use cros_libva::{
     EncCodedBuffer, EncPackedHeaderParameter, EncPackedHeaderType, EncPictureParameter,
     EncPictureParameterBufferAV1, EncSegParamAV1, EncSegParamFlagsAV1, EncSequenceParameter,
     EncSequenceParameterBufferAV1, EncSliceParameter, EncTileGroupBufferAV1,
-    EncWarpedMotionParamsAV1, MappedCodedBuffer, Picture, RefFrameCtrlAV1, Surface, UsageHint,
+    EncWarpedMotionParamsAV1, ExternalBufferDescriptor, MappedCodedBuffer, MemoryType, Picture,
+    RefFrameCtrlAV1, Surface, SurfaceMemoryDescriptor, UsageHint,
     VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK, VA_ENC_PACKED_HEADER_PICTURE,
     VA_ENC_PACKED_HEADER_SEQUENCE, VA_FOURCC_NV12, VA_INVALID_SURFACE, VA_RC_CQP,
-    VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile,
+    VA_RT_FORMAT_YUV420, VAConfigAttrib, VAConfigAttribType, VADRMPRIMESurfaceDescriptor,
+    VADRMPRIMESurfaceDescriptorLayer, VADRMPRIMESurfaceDescriptorObject, VAEntrypoint, VAProfile,
 };
 use nuschl_video_encode::{Backend, Frame, temporal_delimiter};
-use std::{path::Path, rc::Rc};
+use std::{marker::PhantomData, os::fd::RawFd, path::Path, rc::Rc};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -29,7 +31,8 @@ const TX_MODE_SELECT: u32 = 2;
 /// AV1's PRIMARY_REF_NONE.
 const PRIMARY_REF_NONE: u8 = 7;
 
-pub struct VaEncoder {
+/// The backend for input frames in surfaces of descriptor `D`.
+pub struct VaEncoder<D = ()> {
     display: Rc<Display>,
     context: Rc<Context>,
     width: u16,
@@ -38,9 +41,10 @@ pub struct VaEncoder {
     coded_bytes: usize,
     /// Reconstructed frames, each with the id of the frame it holds.
     reconstructed: Vec<(Option<u64>, Surface<()>)>,
+    input: PhantomData<D>,
 }
 
-impl VaEncoder {
+impl<D: SurfaceMemoryDescriptor> VaEncoder<D> {
     /// An encoder for `width` × `height` NV12 frames on the render node at
     /// `device`.
     pub fn open(device: &Path, width: u16, height: u16) -> Result<Self, Error> {
@@ -78,6 +82,7 @@ impl VaEncoder {
             coded,
             coded_bytes,
             reconstructed: Vec::new(),
+            input: PhantomData,
         })
     }
 
@@ -129,7 +134,7 @@ impl VaEncoder {
 
     fn packed(
         &self,
-        picture: &mut Picture<cros_libva::PictureNew, &Surface<()>>,
+        picture: &mut Picture<cros_libva::PictureNew, &Surface<D>>,
         kind: EncPackedHeaderType,
         data: Vec<u8>,
     ) -> Result<(), Error> {
@@ -147,11 +152,96 @@ impl VaEncoder {
     }
 }
 
-impl Backend for VaEncoder {
-    type Input = Surface<()>;
+impl VaEncoder<Dmabuf> {
+    /// Imports an NV12 DMA-BUF of the encoder's size as an input surface.
+    pub fn import(&self, picture: Dmabuf) -> Result<Surface<Dmabuf>, Error> {
+        if picture.size != (self.width, self.height) {
+            return Err("the picture and the encoder differ in size".into());
+        }
+        let mut surfaces = self.display.create_surfaces(
+            VA_RT_FORMAT_YUV420,
+            Some(VA_FOURCC_NV12),
+            u32::from(self.width),
+            u32::from(self.height),
+            Some(UsageHint::USAGE_HINT_ENCODER),
+            vec![picture],
+        )?;
+        surfaces
+            .pop()
+            .ok_or_else(|| "the driver returned no surface".into())
+    }
+}
+
+/// One NV12 picture in a DMA-BUF that GStreamer owns for the frame's lifetime.
+pub struct Dmabuf {
+    fd: RawFd,
+    bytes: u32,
+    modifier: u64,
+    size: (u16, u16),
+    offsets: [u32; 2],
+    pitches: [u32; 2],
+}
+
+impl Dmabuf {
+    /// `None` unless both planes lie within the buffer.
+    pub fn new(
+        fd: RawFd,
+        bytes: u32,
+        modifier: u64,
+        size: (u16, u16),
+        offsets: [u32; 2],
+        pitches: [u32; 2],
+    ) -> Option<Self> {
+        let (width, height) = (u64::from(size.0), u64::from(size.1));
+        let fits = |plane: usize, rows: u64| {
+            u64::from(pitches[plane]) >= width
+                && u64::from(offsets[plane]) + u64::from(pitches[plane]) * rows <= u64::from(bytes)
+        };
+        (fd >= 0 && fits(0, height) && fits(1, height.div_ceil(2))).then_some(Self {
+            fd,
+            bytes,
+            modifier,
+            size,
+            offsets,
+            pitches,
+        })
+    }
+}
+
+impl ExternalBufferDescriptor for Dmabuf {
+    const MEMORY_TYPE: MemoryType = MemoryType::DrmPrime2;
+    type DescriptorAttribute = VADRMPRIMESurfaceDescriptor;
+
+    fn va_surface_attribute(&mut self) -> VADRMPRIMESurfaceDescriptor {
+        let mut descriptor = VADRMPRIMESurfaceDescriptor {
+            fourcc: VA_FOURCC_NV12,
+            width: u32::from(self.size.0),
+            height: u32::from(self.size.1),
+            num_objects: 1,
+            num_layers: 1,
+            ..Default::default()
+        };
+        descriptor.objects[0] = VADRMPRIMESurfaceDescriptorObject {
+            fd: self.fd,
+            size: self.bytes,
+            drm_format_modifier: self.modifier,
+        };
+        descriptor.layers[0] = VADRMPRIMESurfaceDescriptorLayer {
+            drm_format: VA_FOURCC_NV12,
+            num_planes: 2,
+            object_index: [0; 4],
+            offset: [self.offsets[0], self.offsets[1], 0, 0],
+            pitch: [self.pitches[0], self.pitches[1], 0, 0],
+        };
+        descriptor
+    }
+}
+
+impl<D: SurfaceMemoryDescriptor> Backend for VaEncoder<D> {
+    type Input = Surface<D>;
     type Error = Error;
 
-    fn encode(&mut self, input: &Surface<()>, frame: &Frame<'_>) -> Result<Vec<u8>, Error> {
+    fn encode(&mut self, input: &Surface<D>, frame: &Frame<'_>) -> Result<Vec<u8>, Error> {
         let (sequence, header) = (frame.sequence, frame.header);
         if (sequence.width, sequence.height) != (self.width, self.height) {
             return Err("the sequence and the encoder differ in size".into());

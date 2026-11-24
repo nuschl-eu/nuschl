@@ -107,13 +107,21 @@ deny = [
     "nuschl-video-worker",
   ], reason = "PipeWire bindings belong in the confined audio and video workers" },
   { name = "gstreamer", wrappers = [
+    "gstreamer-allocators",
     "gstreamer-app",
     "gstreamer-base",
+    "gstreamer-video",
     "nuschl-video-worker",
   ], reason = "Native video pipelines run only in the confined video worker" },
   { name = "gstreamer-app", wrappers = [
     "nuschl-video-worker",
   ], reason = "Only the confined video worker receives GStreamer media buffers" },
+  { name = "gstreamer-allocators", wrappers = [
+    "nuschl-video-worker",
+  ], reason = "Only the confined video worker reads DMA-BUF descriptors from GStreamer buffers" },
+  { name = "gstreamer-video", wrappers = [
+    "nuschl-video-worker",
+  ], reason = "Only the confined video worker reads GStreamer video layouts" },
   { name = "rav1e", wrappers = [
     "ravif",
     "nuschl-video-worker",

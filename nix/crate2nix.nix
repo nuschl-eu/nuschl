@@ -40,6 +40,8 @@ let
     pkgs.glib
     gst.gstreamer
     gst.gst-plugins-base
+    # gstreamer-allocators-1.0.pc requires libdrm.
+    pkgs.libdrm
   ];
   withGstreamer = _: {
     nativeBuildInputs = pkgConfig;
@@ -54,6 +56,8 @@ let
     gstreamer-sys = withGstreamer;
     gstreamer-base-sys = withGstreamer;
     gstreamer-app-sys = withGstreamer;
+    gstreamer-video-sys = withGstreamer;
+    gstreamer-allocators-sys = withGstreamer;
     rav1e = videoCodec;
     pipewire-sys = bindgen;
     libspa-sys = bindgen;
@@ -103,8 +107,7 @@ let
       buildInputs = [
         pkgs.pipewire
       ]
-      ++ lib.optionals (builtins.elem "vaapi" (attrs.features or [ ])) gstLibraries
-      ++ lib.optionals (builtins.elem "va-encoder" (attrs.features or [ ])) [ pkgs.libva ];
+      ++ lib.optionals (builtins.elem "vaapi" (attrs.features or [ ])) (gstLibraries ++ [ pkgs.libva ]);
       NUSCHL_VIDEO_GST_PLUGINS = lib.concatStringsSep ":" [
         "${lib.getLib gst.gstreamer}/lib/gstreamer-1.0/libgstcoreelements.so"
         "${gst.gst-plugins-base}/lib/gstreamer-1.0/libgstapp.so"

@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! Hardware AV1 from the authorized PipeWire stream. GStreamer imports
-//! DMA-BUFs supported by the VA driver and uses VA surfaces through encode.
+//! Hardware AV1 from the authorized PipeWire stream. GStreamer imports the
+//! PipeWire DMA-BUFs into the VA driver, scales them and converts them to NV12
+//! DMA-BUFs; the encoder core imports those into its own VA display and codes
+//! them without a CPU copy.
 
 use super::{Cadence, Control, Failure, PREVIEW_FPS};
+use crate::va_encoder::{Dmabuf, VaEncoder};
+use cros_libva::Surface;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app::AppSink;
+use gstreamer_video::{VideoInfoDmaDrm, VideoMeta};
 use nuschl_ipc::video::{
     CaptureFailure, CaptureLimits, Kind, PREVIEW_HEIGHT, PREVIEW_WIDTH, Settings, Source,
     write_capture_failure, write_capture_preview,
 };
+use nuschl_video_encode::{Config, Encoder, Layering};
 use std::{
     io,
     net::Shutdown,
     os::unix::net::UnixStream,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -21,20 +28,14 @@ use std::{
 };
 
 const QUEUE: &str = "max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream";
-
-const QVBR_QINDEX: u32 = 112;
-// Finest quantizers for a screen whose keyframes approach the frame limit, up
-// to 3440x1440 and above. Each keeps such a keyframe of a static screen full
-// of text below the 1 MiB limit and the encoder's coded buffer.
-const FLOOR_QINDEX: u32 = 128;
-const LARGE_FLOOR_QINDEX: u32 = 144;
+/// The largest frame as time at the bitrate, the SFU's queue bound.
+const WINDOW: Duration = Duration::from_millis(300);
 
 pub fn prepare(
     source: Source,
     node: Option<u32>,
-    bitrate: u32,
     preview: bool,
-) -> Result<gst::Pipeline, Failure> {
+) -> Result<(gst::Pipeline, String), Failure> {
     let plugins = option_env!("NUSCHL_VIDEO_GST_PLUGINS")
         .ok_or("the VA-API GStreamer plugin list is missing")?;
     gst::init()?;
@@ -42,18 +43,11 @@ pub fn prepare(
         gst::Plugin::load_file(path)?;
     }
     // Element registration probes the render node before the source starts.
-    if gst::ElementFactory::find("vaav1enc").is_none() {
-        return Err("the selected render node cannot encode AV1".into());
-    }
+    let nv12 = nv12_format().ok_or("the render node cannot convert to NV12 DMA-BUFs")?;
+    let (min_width, min_height) = encoder_minimum().ok_or("the render node cannot encode AV1")?;
 
     let target = node.map_or_else(String::new, |node| format!("path={node}"));
     let (width, height) = source.max_dimensions();
-    // Screens send keyframes when a receiver asks for one. 1024 frames is
-    // vaav1enc's longest keyframe interval.
-    let key_interval = match source {
-        Source::Screen => 1024,
-        Source::Camera => 60,
-    };
     // Fix square pixels before the branches negotiate their output dimensions.
     let tee = if preview {
         "video/x-raw(ANY),pixel-aspect-ratio=1/1 ! tee name=split split. ! "
@@ -80,65 +74,84 @@ pub fn prepare(
             "pipewiresrc name=capture fd=0 {target} ! ",
             "{tee}queue name=encode_queue {queue} ! ",
             "vapostproc name=scale ! capsfilter name=limit ",
-            "caps=\"video/x-raw(memory:VAMemory),format=NV12,width=[16,{width}],height=[16,{height}]\" ! ",
-            "vaav1enc name=encoder bitrate={bitrate} target-percentage=100 hierarchical-level=1 ",
-            "ref-frames=1 key-int-max={key_interval} ! ",
-            "av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! ",
-            "appsink name=encoded max-buffers=1 sync=false{preview_path}",
+            "caps=\"video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={nv12},width=[{min_width},{width}],height=[{min_height},{height}]\" ! ",
+            "appsink name=frames max-buffers=1 sync=false{preview_path}",
         ),
         target = target,
         tee = tee,
         queue = QUEUE,
+        nv12 = nv12,
+        min_width = min_width,
+        min_height = min_height,
         width = width,
         height = height,
-        bitrate = bitrate / 1000,
-        key_interval = key_interval,
         preview_path = preview_path,
     );
     let pipeline = gst::parse::launch(&description)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "invalid video pipeline")?;
-    let encoder = pipeline.by_name("encoder").ok_or("missing video encoder")?;
-    // Screens use quality-defined VBR where the driver offers it. The mode is
-    // fixed for the life of the encoder.
-    let modes: &[&str] = match source {
-        Source::Screen => &["qvbr", "vbr", "cbr"],
-        Source::Camera => &["cbr"],
+    Ok((pipeline, nv12))
+}
+
+/// The smallest picture the render node encodes in AV1, as GStreamer's VA
+/// plugin registered its encoder from the driver.
+pub fn encoder_minimum() -> Option<(u16, u16)> {
+    let factory = gst::ElementFactory::find("vaav1enc")?;
+    let template = factory
+        .static_pad_templates()
+        .into_iter()
+        .find(|template| template.direction() == gst::PadDirection::Sink)?;
+    let caps = template.caps();
+    let format = caps.structure(0)?;
+    let minimum = |field| {
+        let range = format.get::<gst::IntRange<i32>>(field).ok()?;
+        u16::try_from(range.min()).ok()
     };
-    let rates = encoder
-        .find_property("rate-control")
-        .and_then(|property| gst::glib::EnumClass::with_type(property.value_type()))
-        .ok_or("missing video rate control")?;
-    let (mode, rate) = modes
-        .iter()
-        .find_map(|mode| Some((*mode, rates.to_value_by_nick(mode)?)))
-        .ok_or("the render node has no supported video rate control")?;
-    // The target percentage makes the negotiated bitrate the codec's peak
-    // rate budget. QVBR drivers can still overshoot it. Other modes ignore
-    // the quality factor.
-    encoder.set_property_from_value("rate-control", &rate);
-    encoder.set_property("qp", QVBR_QINDEX);
-    // VBR keyframes of a static screen grow from one to the next until one
-    // overflows the coded buffer, so VBR and CBR screens start floored.
-    if source == Source::Screen && mode != "qvbr" {
-        encoder.set_property("min-qp", FLOOR_QINDEX);
-    }
-    Ok(pipeline)
+    Some((minimum("width")?, minimum("height")?))
+}
+
+/// The NV12 DMA-BUF format, with the driver's modifier, that vapostproc writes.
+fn nv12_format() -> Option<String> {
+    let factory = gst::ElementFactory::find("vapostproc")?;
+    factory
+        .static_pad_templates()
+        .into_iter()
+        .find_map(|template| {
+            if template.direction() != gst::PadDirection::Src {
+                return None;
+            }
+            template.caps().iter().find_map(|format| {
+                let formats = format.get::<gst::List>("drm-format").ok()?;
+                formats
+                    .iter()
+                    .filter_map(|value| value.get::<String>().ok())
+                    .find(|name| name.starts_with("NV12:"))
+            })
+        })
 }
 
 pub fn run(
-    pipeline: gst::Pipeline,
+    (pipeline, nv12): (gst::Pipeline, String),
     source: Source,
     control: Arc<Control>,
     preview: Option<UnixStream>,
 ) -> Result<(), Failure> {
     let sink = pipeline
-        .by_name("encoded")
+        .by_name("frames")
         .ok_or("missing video sink")?
         .downcast::<AppSink>()
         .map_err(|_| "invalid video sink")?;
-    let encoder = pipeline.by_name("encoder").ok_or("missing video encoder")?;
-    let mut scale = Scale::new(&pipeline, &encoder)?;
+    // vapostproc writes DMA-BUFs only for a consumer that reads their layout
+    // from the video metadata.
+    sink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .propose_allocation(|_, query| {
+                query.add_allocation_meta::<VideoMeta>(None);
+                true
+            })
+            .build(),
+    );
+    let mut scale = Scale::new(&pipeline, nv12)?;
     let timing = Mutex::new(Timing::default());
     let timing_control = control.clone();
     // Keep encoder caps changes downstream of the authorized PipeWire link.
@@ -178,7 +191,7 @@ pub fn run(
             scope.spawn(move || write_previews(stream, &sink, control, running));
             shutdown
         });
-        let result = write_frames(&pipeline, &sink, &encoder, &mut scale, source, &control);
+        let result = write_frames(&pipeline, &sink, &mut scale, source, &control);
         preview_running.store(false, Ordering::Relaxed);
         if let Some(stream) = stop_preview {
             let _ = stream.shutdown(Shutdown::Write);
@@ -375,12 +388,13 @@ fn cadence_caps(source: &gst::Caps, fps: u16) -> gst::Caps {
 struct Scale {
     input: gst::Pad,
     filter: gst::Element,
-    encoder: gst::Pad,
+    nv12: String,
+    minimum: (u16, u16),
     size: Option<(u16, u16)>,
 }
 
 impl Scale {
-    fn new(pipeline: &gst::Pipeline, encoder: &gst::Element) -> Result<Self, Failure> {
+    fn new(pipeline: &gst::Pipeline, nv12: String) -> Result<Self, Failure> {
         let input = pipeline
             .by_name("scale")
             .and_then(|element| element.static_pad("sink"))
@@ -388,45 +402,41 @@ impl Scale {
         let filter = pipeline
             .by_name("limit")
             .ok_or("missing video caps filter")?;
-        let encoder = encoder
-            .static_pad("sink")
-            .ok_or("missing video encoder input")?;
         Ok(Self {
             input,
             filter,
-            encoder,
+            nv12,
+            minimum: encoder_minimum().ok_or("the render node cannot encode AV1")?,
             size: None,
         })
     }
 
+    /// Fits the scaler's output to `limits`; true when its size changed.
     fn update(&mut self, source: Source, limits: CaptureLimits) -> Result<bool, Failure> {
         // Measure the unscaled PipeWire format upstream of the capsfilter.
         let Some(input) = self.input.current_caps() else {
             return Ok(false);
         };
         let size = dimensions(input.structure(0).ok_or("missing PipeWire video format")?)?;
-        let Some((width, height)) = limits.dimensions(source, size.0, size.1) else {
-            // Some PipeWire nodes produce dimensions below the VA encoder's
+        let Some((width, height)) = limits
+            .dimensions(source, size.0, size.1)
+            .filter(|&(width, height)| width >= self.minimum.0 && height >= self.minimum.1)
+        else {
+            // Some PipeWire nodes produce dimensions below the encoder's
             // minimum. Retain the legal format chosen by the existing filter.
-            return Ok(self.size.take().is_some());
+            return Ok(false);
         };
         if self.size == Some((width, height)) {
             return Ok(false);
         }
-        let caps =
-            format!("video/x-raw(memory:VAMemory),format=NV12,width={width},height={height}")
-                .parse::<gst::Caps>()?;
-        if !caps.can_intersect(&self.encoder.pad_template_caps()) {
-            return Ok(self.size.take().is_some());
-        }
+        let caps = format!(
+            "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={},width={width},height={height}",
+            self.nv12
+        )
+        .parse::<gst::Caps>()?;
         self.filter.set_property("caps", caps);
         self.size = Some((width, height));
-        // Request a keyframe when the encoder's input size changes.
-        let encoding = self
-            .encoder
-            .current_caps()
-            .and_then(|caps| caps.structure(0).and_then(|format| dimensions(format).ok()));
-        Ok(encoding != self.size)
+        Ok(true)
     }
 }
 
@@ -437,38 +447,89 @@ fn dimensions(format: &gst::StructureRef) -> Result<(u16, u16), Failure> {
     ))
 }
 
+/// The render node the worker may use: the first it can open.
+fn render_node() -> Result<PathBuf, Failure> {
+    let mut nodes: Vec<_> = std::fs::read_dir("/dev/dri")?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("renderD"))
+        })
+        .collect();
+    nodes.sort();
+    nodes
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no render node".into())
+}
+
+/// The encoder core for one picture size on the render node.
+fn open_encoder(
+    node: &Path,
+    source: Source,
+    settings: Settings,
+) -> Result<Encoder<VaEncoder<Dmabuf>>, Failure> {
+    let backend = VaEncoder::open(node, settings.width, settings.height)?;
+    let config = Config {
+        width: settings.width,
+        height: settings.height,
+        fps: settings.fps,
+        bitrate: settings.bitrate,
+        // Screens send temporal layers for the SFU to pick from.
+        layering: match source {
+            Source::Screen => Layering::L1T3,
+            Source::Camera => Layering::L1T1,
+        },
+        screen: source == Source::Screen,
+        frame_bytes: settings.packet_limit(false),
+        window: WINDOW,
+        qindex: 1..=255,
+    };
+    Encoder::new(backend, config).ok_or_else(|| "the picture needs more than one AV1 tile".into())
+}
+
+/// The NV12 picture in a sample's DMA-BUF, as the VA driver imports it.
+fn dmabuf(sample: &gst::Sample) -> Result<Dmabuf, Failure> {
+    let caps = sample.caps().ok_or("missing NV12 format")?;
+    let info = VideoInfoDmaDrm::from_caps(caps)?;
+    let buffer = sample.buffer().ok_or("missing NV12 frame")?;
+    let meta = buffer.meta::<VideoMeta>().ok_or("missing NV12 layout")?;
+    if buffer.n_memory() != 1 || meta.n_planes() != 2 {
+        return Err("expected NV12 in one DMA-BUF".into());
+    }
+    let memory = buffer.peek_memory(0);
+    let dmabuf = memory
+        .downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>()
+        .ok_or("expected a DMA-BUF")?;
+    let (offsets, strides) = (meta.offset(), meta.stride());
+    Dmabuf::new(
+        dmabuf.fd(),
+        u32::try_from(memory.maxsize())?,
+        info.modifier(),
+        (u16::try_from(meta.width())?, u16::try_from(meta.height())?),
+        [u32::try_from(offsets[0])?, u32::try_from(offsets[1])?],
+        [u32::try_from(strides[0])?, u32::try_from(strides[1])?],
+    )
+    .ok_or_else(|| "invalid NV12 layout".into())
+}
+
 fn write_frames(
     pipeline: &gst::Pipeline,
     sink: &AppSink,
-    encoder: &gst::Element,
     scale: &mut Scale,
     source: Source,
     control: &Control,
 ) -> Result<(), Failure> {
     let bus = pipeline.bus().ok_or("missing pipeline bus")?;
+    let node = render_node()?;
     let clock = Instant::now();
     let mut stdout = io::stdout().lock();
-    let mut bitrate = encoder.property::<u32>("bitrate");
     let mut previous = 0;
-    let mut waiting_for_key = true;
-    let mut requested_at: Option<Instant> = None;
-    let mut floored = false;
+    let mut current: Option<(Settings, Encoder<VaEncoder<Dmabuf>>)> = None;
     loop {
-        let limits = control.limits();
-        if scale.update(source, limits)? {
-            waiting_for_key = true;
-            requested_at = None;
-        }
-        let wanted = limits.bitrate / 1000;
-        if wanted != bitrate {
-            encoder.set_property("bitrate", wanted);
-            bitrate = encoder.property::<u32>("bitrate");
-        }
-        if requested_at.is_none_or(|time| time.elapsed() >= Duration::from_millis(150))
-            && (control.keyframe.swap(false, Ordering::Relaxed) || waiting_for_key)
-        {
-            force_keyframe(encoder)?;
-            requested_at = Some(Instant::now());
+        if scale.update(source, control.limits())? {
+            current = None;
         }
         let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(300)) else {
             if let Some(message) =
@@ -509,7 +570,7 @@ fn write_frames(
         let format = sample
             .caps()
             .and_then(|caps| caps.structure(0))
-            .ok_or("missing AV1 format")?;
+            .ok_or("missing NV12 format")?;
         let fps = format
             .get::<gst::Fraction>("framerate")
             .ok()
@@ -518,21 +579,11 @@ fn write_frames(
             });
         let (width, height) = dimensions(format)?;
         if scale.size.is_some_and(|wanted| wanted != (width, height))
-            || width.min(height) > limits.height
+            || width.min(height) > control.limits().height
         {
             continue;
         }
-        let settings = Settings {
-            source,
-            width,
-            height,
-            fps: u16::try_from(fps)?.min(limits.fps),
-            bitrate: bitrate * 1000,
-        };
-        settings.frame_bytes()?;
-
-        let buffer = sample.buffer().ok_or("missing AV1 packet")?;
-        let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+        let buffer = sample.buffer().ok_or("missing NV12 frame")?;
         let captured = sample.segment().and_then(|segment| {
             segment
                 .downcast_ref::<gst::ClockTime>()?
@@ -543,72 +594,58 @@ fn write_frames(
             .is_some_and(|(then, now)| {
                 now.saturating_sub(then) > gst::ClockTime::from_mseconds(250)
             });
-        let size = buffer.size();
-        if size == 0 || buffer.flags().contains(gst::BufferFlags::CORRUPTED) || stale {
-            waiting_for_key = true;
+        if buffer.flags().contains(gst::BufferFlags::CORRUPTED) || stale {
             continue;
         }
-        // The next keyframe after one within an eighth of the limit can exceed
-        // the limit or the coded buffer. Setting the quality factor makes the
-        // encoder reconfigure with the floor, for the rest of the capture.
-        if keyframe
-            && source == Source::Screen
-            && !floored
-            && size > settings.packet_limit(true) / 8 * 7
+        // The control socket delivers new limits before a keyframe request,
+        // so a requested keyframe carries the limits sent with it.
+        let key = control.keyframe.swap(false, Ordering::Relaxed);
+        let limits = control.limits();
+        let settings = Settings {
+            source,
+            width,
+            height,
+            fps: u16::try_from(fps)?.min(limits.fps),
+            bitrate: limits.bitrate,
+        };
+        settings.frame_bytes()?;
+        if current
+            .as_ref()
+            .is_none_or(|(started, _)| (started.width, started.height) != (width, height))
         {
-            floored = true;
-            let large = u32::from(width) * u32::from(height) > 3440 * 1440;
-            let floor = if large {
-                LARGE_FLOOR_QINDEX
-            } else {
-                FLOOR_QINDEX
-            };
-            encoder.set_property("min-qp", floor);
-            encoder.set_property("qp", QVBR_QINDEX);
+            current = Some((settings, open_encoder(&node, source, settings)?));
         }
-        if size > settings.packet_limit(keyframe) {
-            waiting_for_key = true;
+        let Some((_, encoder)) = &mut current else {
             continue;
+        };
+        encoder.set_bitrate(settings.bitrate);
+        if key {
+            encoder.request_keyframe();
         }
-        if waiting_for_key && !keyframe {
-            continue;
-        }
-        waiting_for_key = false;
-        let bytes = buffer.map_readable()?;
         let timestamp = captured
             .map_or_else(
                 || u64::try_from(clock.elapsed().as_micros()),
                 |time| Ok(time.useconds()),
             )?
             .max(previous + 1);
+        let surface: Surface<Dmabuf> = encoder.backend().import(dmabuf(&sample)?)?;
+        let encoded = encoder.encode(&surface, Duration::from_micros(timestamp))?;
+        drop(surface);
+        drop(sample);
+        let Some(encoded) = encoded else {
+            continue;
+        };
         previous = timestamp;
         super::write_frame(
             &mut stdout,
             Kind::HardwareFrame,
             settings,
             timestamp,
-            keyframe,
-            bytes.as_slice(),
-            &[],
+            encoded.keyframe,
+            &encoded.data,
+            &encoded.descriptor,
         )?;
     }
-}
-
-fn force_keyframe(encoder: &gst::Element) -> Result<(), Failure> {
-    let source = encoder
-        .static_pad("src")
-        .ok_or("missing video encoder output")?;
-    // The GstVideoEncoder upstream key-unit event takes a running time in ns.
-    let event = gst::event::CustomUpstream::new(
-        gst::Structure::builder("GstForceKeyUnit")
-            .field("running-time", u64::MAX)
-            .field("all-headers", true)
-            .field("count", 0u32)
-            .build(),
-    );
-    // The first request can race the pipeline's transition to Playing.
-    source.send_event(event);
-    Ok(())
 }
 
 #[cfg(test)]
