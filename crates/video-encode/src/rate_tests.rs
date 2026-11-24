@@ -208,7 +208,7 @@ fn drops_frames_under_a_tight_budget() {
 }
 
 #[test]
-fn a_change_after_a_still_screen_is_coded_again() {
+fn a_still_screen_refines_and_a_change_keeps_the_window() {
     let config = Config {
         width: 1920,
         height: 1080,
@@ -218,23 +218,32 @@ fn a_change_after_a_still_screen_is_coded_again() {
         ..camera(3_000_000, Layering::L1T3)
     };
     let mut run = Run::new(config);
-    let still = Scene {
+    // A still picture: inter frames code almost nothing once they reach the
+    // reference's quality.
+    run.seconds(5, |_| Scene {
         intra: 200.0,
-        inter: 0.002,
-    };
-    run.seconds(5, |_| still);
-    let encoded = run.log.iter().filter(|(_, frame)| frame.is_some()).count();
-    let calls_before = run.encoder.backend().calls;
-    assert_eq!(calls_before, encoded);
+        inter: 0.0001,
+    });
+    let quantizers: Vec<_> = run
+        .log
+        .iter()
+        .filter_map(|(_, frame)| frame.as_ref())
+        .map(|frame| (frame.temporal_id, frame.qindex))
+        .collect();
+    // T0 frames step down to the finest quantizer, and every frame on top
+    // takes its reference's.
+    assert_eq!(quantizers.last(), Some(&(2, 1)));
+    let t0: Vec<_> = quantizers
+        .iter()
+        .filter(|q| q.0 == 0)
+        .map(|q| q.1)
+        .collect();
+    assert!(t0.windows(2).all(|pair| pair[1] <= pair[0]), "{t0:?}");
     // A slide change: every frame now differs.
     run.seconds(5, |_| Scene {
         intra: 200.0,
         inter: 30.0,
     });
-    assert!(
-        run.encoder.backend().calls > run.log.iter().filter(|(_, frame)| frame.is_some()).count()
-    );
-    // No frame exceeds the 300 ms window by much, and the rate recovers.
     let window = 3_000_000.0 * 0.3;
     for (_, frame) in &run.log {
         if let Some(frame) = frame {

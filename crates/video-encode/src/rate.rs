@@ -106,17 +106,27 @@ impl Rate {
         fine.clamp(*self.qindex.start(), *self.qindex.end())
     }
 
+    pub fn min_qindex(&self) -> u8 {
+        *self.qindex.start()
+    }
+
     pub fn max_qindex(&self) -> u8 {
         *self.qindex.end()
     }
 
     /// A sent frame: spends its `bits` and moves the model halfway, in the log
-    /// domain, toward what the frame measured.
-    pub fn sent(&mut self, class: usize, qindex: u8, bits: f64) {
+    /// domain, toward what the frame measured. A frame of less than a byte per
+    /// 64 × 64 superblock repeats a still picture: it says nothing about the cost
+    /// of coding, the model keeps, and this returns true.
+    pub fn sent(&mut self, class: usize, qindex: u8, bits: f64) -> bool {
         self.credit -= bits;
-        let predicted = self.factors[class] * self.pixels / f64::from(ac_quantizer(qindex));
-        let ratio = (bits.max(8.0) / predicted).clamp(1.0 / 16.0, 16.0);
-        self.factors[class] *= ratio.sqrt();
+        let still = bits < self.pixels / 512.0;
+        if !still {
+            let predicted = self.factors[class] * self.pixels / f64::from(ac_quantizer(qindex));
+            let ratio = (bits / predicted).clamp(1.0 / 16.0, 16.0);
+            self.factors[class] *= ratio.sqrt();
+        }
+        still
     }
 
     /// A frame coded too large to send: the model takes what it measured.
