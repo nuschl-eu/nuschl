@@ -218,9 +218,25 @@ class Scenes:
         return eventually(lambda: self.find(role, name, prefix), message, timeout=timeout)
 
     def screen(self, x, y):
-        """Screen coordinates of a point in AT-SPI window coordinates."""
-        window = self.shell.window("Nuschl")
-        return window["x"] + x, window["y"] + y
+        """Screen coordinates of a point in AT-SPI window coordinates. These
+        start at the window's buffer, which includes GPUI's client-side shadow;
+        the compositor's frame starts inside it."""
+        origin = json.loads(self.shell.eval(
+            "JSON.stringify((() => { const b = global.get_window_actors().map(a => a.meta_window)"
+            ".find(w => (w.get_title() || '').startsWith('Nuschl')).get_buffer_rect();"
+            " return [b.x, b.y]; })())"))
+        return origin[0] + x, origin[1] + y
+
+    def reveal(self, node):
+        """Turn the wheel over Settings until `node` lies whole in its visible part."""
+        def shown():
+            _, top, _, height = node.extents()
+            x, y, width, dialog_height = self.find("dialog", "Settings").extents()
+            if y <= top and top + height <= y + dialog_height - 8:
+                return True
+            self.shell.wheel(*self.screen(x + width // 2, y + dialog_height // 2), 1 if top > y else -1)
+            time.sleep(0.2)
+        eventually(shown, f"{node.name} did not scroll into view in Settings")
 
     @staticmethod
     def value(node):
@@ -384,8 +400,10 @@ class Scenes:
         self.shot("05-meter-silence-again")
         print(f"Silence again: level {after[0]}, speech {after[1]}; Voice gate closed.", flush=True)
 
-        # A pointer drag: heard while held, one write after the release.
+        # A pointer drag: heard while held, one write after the release. The
+        # meter has pushed the slider below the dialog's visible part.
         slider = self.wait_for("slider", "Voice activity sensitivity", "no sensitivity slider")
+        self.reveal(slider)
         start = time.monotonic()
         begin, middle, end = self.thumb(slider, 0.5), self.thumb(slider, 0.65), self.thumb(slider, 0.8)
         self.shell.move(*begin)
@@ -460,7 +478,13 @@ class Scenes:
                 time.sleep(0.1)
             eventually(lambda: abs(saved(settings_path, "appearance", "zoom") - zoom / 100) < 0.001,
                        "zoom shortcut did not update the actual setting")
-            self.wait_for("push button", "Settings", "no Settings button").press()
+            button = eventually(lambda: self.find("push button", "Settings") or self.find("push button", "Channels"),
+                                "no Settings or Channels button")
+            if button.name == "Channels":
+                # A window too narrow for the sidebar shows it in the Channels sheet.
+                button.press()
+                button = self.wait_for("push button", "Settings", "no Settings button in the Channels sheet")
+            button.press()
             dialog = self.wait_for("dialog", "Settings", "Settings did not open")
             slider = self.wait_for("slider", "Voice activity sensitivity", "no sensitivity slider")
             slider.call("Component", "GrabFocus")
