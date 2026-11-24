@@ -1072,13 +1072,21 @@ impl State {
                 .users
                 .values()
                 .filter(|user| user.id > 0)
-                .map(|user| proto::user_list::User {
-                    user_id: user.id,
-                    name: Some(user.name.clone()),
-                    last_seen: user.last_active.map(crate::timefmt::iso8601),
-                    last_channel: user
+                .map(|user| {
+                    // Where and when go together: a move in a hidden channel
+                    // updates both.
+                    let shown = user
                         .last_channel
-                        .filter(|channel| self.sees_channel(source, *channel)),
+                        .is_none_or(|channel| self.sees_channel(source, channel));
+                    proto::user_list::User {
+                        user_id: user.id,
+                        name: Some(user.name.clone()),
+                        last_seen: user
+                            .last_active
+                            .filter(|_| shown)
+                            .map(crate::timefmt::iso8601),
+                        last_channel: user.last_channel.filter(|_| shown),
+                    }
                 })
                 .collect();
             self.send(source, kind::USER_LIST, &proto::UserList { users });

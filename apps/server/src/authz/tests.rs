@@ -3005,6 +3005,50 @@ fn a_permission_flush_never_names_a_channel_the_client_no_longer_sees() {
     assert!(!named.contains(&SECRET), "PermissionQuery names {named:?}");
 }
 
+/// The registration list leaves out when someone whose last channel is
+/// hidden was last seen, so it does not follow their moves there.
+#[test]
+fn the_registration_list_does_not_follow_people_in_hidden_channels() {
+    use prost::Message as _;
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let [_, _, _, member, registered, _, _] = f.actors;
+    f.state.channels.get_mut(0).unwrap().node.acls.push(entry(
+        "",
+        Some(REGISTERED),
+        perm::REGISTER,
+        0,
+    ));
+    f.state.invalidate();
+    let into = |channel: u32| proto::UserState {
+        channel_id: Some(channel),
+        ..Default::default()
+    };
+    f.handle(member, kind::USER_STATE, &into(SECRET));
+    f.state.registry.users.get_mut(&MEMBER).unwrap().last_active = Some(0);
+    let listed = |f: &mut Fixture| {
+        f.received(registered);
+        f.handle(registered, kind::USER_LIST, &proto::UserList::default());
+        f.received(registered)
+            .into_iter()
+            .find(|(kind, _)| *kind == kind::USER_LIST)
+            .map(|(_, body)| proto::UserList::decode(body).unwrap())
+            .unwrap()
+            .users
+            .into_iter()
+            .find(|user| user.user_id == MEMBER)
+            .unwrap()
+    };
+    let before = listed(&mut f);
+    assert_eq!(
+        (before.last_channel, before.last_seen.as_deref()),
+        (None, None)
+    );
+    f.handle(member, kind::USER_STATE, &into(INNER));
+    assert!(!f.state.sees_user(registered, member));
+    assert_eq!(listed(&mut f), before);
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is
