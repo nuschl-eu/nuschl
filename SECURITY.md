@@ -90,6 +90,13 @@ add only:
 | video decode, Linux only | bounded encoded AV1 input and BGRA output pipes, one optional DRM render device with read-only sysfs metadata and the hardware codec's driver libraries | 1 GiB, 1 h CPU over its life, bounded exchange deadline |
 | RTC, Linux only | private IPC sockets for call media, UDP datagrams and media epoch updates | 1 GiB, 1 h CPU over its life |
 
+The sandbox runs `prlimit` and `bwrap` from the executable's directory when they
+are there, else from the `PATH`. The Debian and Arch packages install
+`/usr/lib/nuschl/bwrap`, which runs `/usr/bin/bwrap`, and the AppArmor profile
+`nuschl-bwrap` for that path. Where AppArmor restricts unprivileged user
+namespaces (Ubuntu 23.10 and later), the profile lets the launcher, bubblewrap
+and the workers create them, as on systems without the restriction.
+
 Rules for every platform:
 
 - Confinement restricts filesystem and network access, environment, inherited

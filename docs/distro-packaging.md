@@ -25,9 +25,18 @@ Linux Nix package also includes VA-API hardware acceleration.
 
 `/usr/bin/nuschl` links to the executable. The stage adds the desktop entry,
 which registers `mumble://` and `nuschl://`, the hicolor icons, the AppStream
-file and the license notices in `/usr/share/licenses/nuschl/`. The package has no
-maintainer scripts and changes no system policy. The in-app updater is off on
-Linux; APT and pacman update the package.
+file and the license notices in `/usr/share/licenses/nuschl/`. The in-app updater
+is off on Linux; APT and pacman update the package.
+
+The sandbox runs the `bwrap` beside the executable before the one on the `PATH`.
+In the stage it is a launcher script that runs `/usr/bin/bwrap`, and the
+AppArmor profile `/etc/apparmor.d/nuschl-bwrap` attaches to it: Ubuntu 23.10 and
+later give user namespaces of programs without a profile no capabilities. The
+profile allows user namespaces and leaves everything else unconfined
+(`flags=(unconfined)`); bubblewrap and the workers inherit it. It needs
+AppArmor 4.0 (Debian 13, Ubuntu 24.04). The `.deb` marks it as a conffile, its
+postinst loads it where `aa-enabled` reports AppArmor active, and its postrm
+unloads it on purge.
 
 `Depends` names glibc 2.17 (from the newest glibc symbol), the libraries the
 desktop and its workers link or open (libxcb, libxkbcommon, Vulkan,
@@ -94,18 +103,18 @@ installs the package, runs `nuschl --version` and starts the RTC and video
 workers with the Nix store hidden, checks `xdg-mime query default` for both URL
 schemes, and renders a message with
 `nuschl render` as an unprivileged user, which runs the content worker in its
-sandbox; the same command fails without `bwrap` on the `PATH`. Debian and
+sandbox; the same command fails without `prlimit` on the `PATH`. Debian and
 Ubuntu install from the signed test repository with apt, upgrade to the next
 revision, remove and purge. Arch installs `nuschl-bin` with `pacman -U` and
 removes it.
 
-`nix build .#distroTests.ubuntuAppArmor` boots Ubuntu 24.04's own kernel with
-Ubuntu's AppArmor policy loaded and `kernel.apparmor_restrict_unprivileged_userns=1`,
-Ubuntu's default since 23.10. It fails: the restriction gives bwrap's user
-namespace no capabilities (`bwrap: loopback: Failed RTM_NEWADDR: Operation not
-permitted`), so the workers do not start. An AppArmor profile that allows user
-namespaces for `/usr/lib/nuschl/nuschl` makes it pass; shipping one needs the
-owner's approval and a SECURITY.md change (#148).
+The Ubuntu test boots Ubuntu 24.04's own kernel (`apparmor-test.sh` as PID 1)
+with Ubuntu's AppArmor policy loaded and
+`kernel.apparmor_restrict_unprivileged_userns=1`, Ubuntu's default since 23.10,
+and checks that an unprivileged user namespace gets no capabilities. After the
+first installation it unloads the `nuschl-bwrap` profile and checks that the
+sandbox then fails closed; the upgrade loads the profile again, and the purge
+deletes and unloads it.
 
 Building the AUR package also checks that makepkg refuses the `.deb` with its
 signature missing, with a signature by another key, and with modified contents.

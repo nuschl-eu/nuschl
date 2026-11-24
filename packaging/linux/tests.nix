@@ -1,8 +1,8 @@
 # Clean-system tests of the packages. Debian 13 and Ubuntu 24.04 install the
-# .deb from the signed test repository with apt, upgrade, remove and purge it.
-# Arch installs nuschl-bin with pacman into a root made from packages of the
-# Arch Linux Archive, and removes it. ubuntuAppArmor repeats the sandbox check
-# on Ubuntu's kernel with Ubuntu's AppArmor policy.
+# .deb from the signed test repository with apt, upgrade, remove and purge it;
+# Ubuntu runs on its own kernel with its AppArmor policy and user namespace
+# restriction. Arch installs nuschl-bin with pacman into a root made from
+# packages of the Arch Linux Archive, and removes it.
 {
   pkgs,
   aptRepository,
@@ -14,6 +14,8 @@
 }:
 let
   inherit (pkgs) lib vmTools;
+  # The installed and the upgraded package version.
+  versions = "${version}-${revision} ${version}-${toString (lib.toInt revision + 1)}";
   image =
     distro:
     vmTools.diskImageFuns.${distro} {
@@ -28,21 +30,22 @@ let
         ];
     };
   # Ubuntu's kernel restricts unprivileged user namespaces through AppArmor.
-  # vmTools boots the nixpkgs kernel, so the AppArmor test boots Ubuntu's.
+  # vmTools boots the nixpkgs kernel, so the Ubuntu test boots Ubuntu's, with
+  # the test repository in the image.
   ubuntuKernel = [
     "linux-image-virtual"
     "initramfs-tools"
     "apparmor"
   ];
-  ubuntuInstalled = vmTools.runInLinuxImage (
-    pkgs.runCommand "nuschl-ubuntu-installed"
+  ubuntuImage = vmTools.runInLinuxImage (
+    pkgs.runCommand "nuschl-ubuntu-image"
       {
         diskImage = image "ubuntu2404x86_64";
         memSize = 4096;
         postVM = ''mv disk-image.qcow2 "$out/"'';
       }
       ''
-        env -i PATH=$PATH sh ${./install-test.sh} apt-install ${aptRepository.test} noble
+        cp -R ${aptRepository.test} /repository
         install -m755 ${./apparmor-test.sh} /apparmor-test
         install -m644 ${./install-test.sh} /install-test.sh
         mkdir "$out"
@@ -50,18 +53,20 @@ let
         cp /boot/initrd.img-* "$out/initrd"
       ''
   );
-  ubuntuAppArmor =
-    pkgs.runCommand "nuschl-ubuntu-apparmor"
+  ubuntu =
+    pkgs.runCommand "nuschl-install-ubuntu2404x86_64"
       {
         nativeBuildInputs = [ pkgs.qemu_kvm ];
         requiredSystemFeatures = [ "kvm" ];
       }
       ''
-        qemu-img create -f qcow2 -F qcow2 -b ${ubuntuInstalled}/disk-image.qcow2 disk.qcow2
+        qemu-img create -f qcow2 -F qcow2 -b ${ubuntuImage}/disk-image.qcow2 disk.qcow2
+        # The arguments after -- go to apparmor-test.sh, which passes them to install-test.sh.
         timeout 900 qemu-kvm -m 4096 -smp 2 -nographic -no-reboot -drive file=disk.qcow2,if=virtio \
-          -kernel ${ubuntuInstalled}/vmlinuz -initrd ${ubuntuInstalled}/initrd \
-          -append "root=/dev/vda rw console=ttyS0 init=/apparmor-test panic=-1" | tee log
-        grep -q "apparmor test passed" log
+          -kernel ${ubuntuImage}/vmlinuz -initrd ${ubuntuImage}/initrd \
+          -append "root=/dev/vda rw console=ttyS0 init=/apparmor-test panic=-1 -- apt /repository noble ${versions}" \
+          | tee log
+        grep -q "^install test passed" log
         touch "$out"
       '';
   apt =
@@ -73,8 +78,7 @@ let
           memSize = 4096;
         }
         ''
-          env -i PATH=$PATH sh ${./install-test.sh} apt ${aptRepository.test} ${suite} ${version}-${revision} \
-            ${version}-${toString (lib.toInt revision + 1)}
+          env -i PATH=$PATH sh ${./install-test.sh} apt ${aptRepository.test} ${suite} ${versions}
           touch "$out"
         ''
     );
@@ -142,7 +146,6 @@ let
   );
 in
 {
-  inherit arch ubuntuAppArmor;
+  inherit arch ubuntu;
   debian = apt "debian13x86_64" "stable";
-  ubuntu = apt "ubuntu2404x86_64" "noble";
 }

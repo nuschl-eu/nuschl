@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: EUPL-1.2
+# Loads the sandbox launcher's AppArmor profile where AppArmor is active.
+# Without it the sandbox fails closed where AppArmor restricts user namespaces.
+set -e
+if [ "$1" = configure ] && aa-enabled --quiet 2>/dev/null; then
+  apparmor_parser --replace /etc/apparmor.d/nuschl-bwrap || true
+fi

@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: EUPL-1.2
+# Nuschl's sandbox launcher: runs the system's bubblewrap. The AppArmor
+# profile nuschl-bwrap attaches to this path.
+exec /usr/bin/bwrap "$@"
