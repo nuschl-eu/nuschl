@@ -73,7 +73,9 @@ fn prove(key: &[u8; 32], label: &[u8], nonce: &[u8]) -> String {
 struct Leg {
     rtc: Rtc,
     socket: UdpSocket,
-    events: Vec<Event>,
+    /// Each event with the time its datagram reached the socket.
+    events: Vec<(Instant, Event)>,
+    arrived: Instant,
     /// Drops every nth incoming AV1 media packet; retransmissions pass.
     loss: Option<(u64, u64)>,
     link: Option<Link>,
@@ -86,7 +88,8 @@ struct Link {
     delay: Duration,
     buffer: Duration,
     free: Instant,
-    queue: std::collections::VecDeque<(Instant, std::net::SocketAddr, Vec<u8>)>,
+    /// Each datagram with the time it leaves the link and the time it arrived.
+    queue: std::collections::VecDeque<(Instant, Instant, std::net::SocketAddr, Vec<u8>)>,
 }
 
 impl Link {
@@ -108,7 +111,7 @@ impl Link {
         // With the IPv4 and UDP headers.
         self.free = start + Duration::from_secs_f64((datagram.len() + 28) as f64 * 8.0 / self.rate);
         self.queue
-            .push_back((self.free + self.delay, source, datagram.to_vec()));
+            .push_back((self.free + self.delay, now, source, datagram.to_vec()));
     }
 }
 
@@ -128,6 +131,7 @@ impl Leg {
             rtc,
             socket,
             events: Vec::new(),
+            arrived: Instant::now(),
             loss: None,
             link: None,
         }
@@ -159,7 +163,7 @@ impl Leg {
                 Output::Transmit(t) => {
                     let _ = self.socket.send_to(&t.contents, t.destination);
                 }
-                Output::Event(event) => self.events.push(event),
+                Output::Event(event) => self.events.push((self.arrived, event)),
             }
         }
     }
@@ -176,6 +180,7 @@ impl Leg {
                 link.arrive(Instant::now(), source, &buffer[..length]);
                 continue;
             }
+            self.arrived = Instant::now();
             let input = Input::Receive(
                 Instant::now(),
                 Receive {
@@ -192,7 +197,8 @@ impl Leg {
         while let Some(link) = &mut self.link
             && link.queue.front().is_some_and(|(due, ..)| *due <= now)
         {
-            let (_, source, datagram) = link.queue.pop_front().expect("a datagram");
+            let (_, arrived, source, datagram) = link.queue.pop_front().expect("a datagram");
+            self.arrived = arrived;
             let input = Input::Receive(
                 now,
                 Receive {
@@ -214,6 +220,8 @@ impl Leg {
 
 /// A packet a subscriber received from one publisher.
 struct Received {
+    /// When it reached the subscriber's socket.
+    at: Instant,
     seq: u64,
     pt: u8,
     timestamp: u32,
@@ -265,6 +273,8 @@ struct Replay {
     timestamp: u32,
     sent_at: Option<Instant>,
     restart: Option<Instant>,
+    /// When each frame number went out.
+    sent: HashMap<u16, Instant>,
 }
 
 /// How long a replayed publisher takes to answer a key frame request, like a
@@ -281,6 +291,7 @@ impl Replay {
             timestamp: 0,
             sent_at: None,
             restart: None,
+            sent: HashMap::new(),
         }
     }
 }
@@ -591,7 +602,7 @@ impl Peer {
         }
         if let Some(leg) = &mut self.subscribe {
             leg.step();
-            for event in leg.events.drain(..) {
+            for (at, event) in leg.events.drain(..) {
                 if let Event::RtpPacket(packet) = event {
                     let mid = leg
                         .rtc
@@ -601,6 +612,7 @@ impl Peer {
                         .expect("a stream");
                     let from = self.tracks[&mid];
                     self.received.entry(from).or_default().push(Received {
+                        at,
                         seq: *packet.seq_no,
                         pt: *packet.header.payload_type,
                         timestamp: packet.header.timestamp,
@@ -618,7 +630,7 @@ impl Peer {
         }
         if let Some((leg, ..)) = &mut self.publish {
             leg.step();
-            for event in leg.events.drain(..) {
+            for (_, event) in leg.events.drain(..) {
                 if let Event::KeyframeRequest(_) = event {
                     self.keyframe_requests += 1;
                     if let Some(replay) = &mut self.replay {
@@ -674,6 +686,7 @@ impl Peer {
             replay.timestamp = replay.timestamp.wrapping_add(frame.timestamp);
             replay.number =
                 u16::from_be_bytes([frame.first[1], frame.first[2]]).wrapping_add(replay.offset);
+            replay.sent.insert(replay.number, now);
             let size = frame.bytes / frame.packets;
             for index in 0..frame.packets {
                 let (first, last) = (index == 0, index + 1 == frame.packets);
@@ -1684,4 +1697,43 @@ async fn a_smooth_stream_keeps_its_frame_rate() {
     let (rate, spatial) = recent_rate(&viewer.received[&host.id]);
     assert!(spatial < 2, "spatial layer {spatial}");
     assert!(rate >= 18.0, "{rate} frames a second");
+}
+
+/// A Low latency camera's viewer whose downlink falls from 3 to 0.7 Mbit/s
+/// while a key picture arrives. Once its layer has followed, two seconds
+/// later, its frames leave the SFU within the 50 ms budget, and the frames it
+/// needs within a few times that; the 300 ms queue of other sources holds them
+/// for hundreds of milliseconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_low_latency_stream_stays_within_its_budget() {
+    let sfu = start("");
+    let mode = json!({"prefer": "smooth", "low_latency": true});
+    let (mut host, mut viewer) = camera_call(&sfu.url, mode).await;
+    throttled(&mut host, &mut viewer, 3_000_000, Duration::from_secs(5)).await;
+    let drop = Instant::now();
+    host.replay.as_mut().expect("replay").restart = Some(drop);
+    throttled(&mut host, &mut viewer, 700_000, Duration::from_secs(7)).await;
+    // Each frame's wait at the SFU: until its first packet reaches the
+    // viewer's socket, in front of the downlink.
+    let sent = &host.replay.as_ref().expect("replay").sent;
+    let mut first: HashMap<u16, Instant> = HashMap::new();
+    for packet in &viewer.received[&host.id] {
+        if let Some(number) = number(packet) {
+            let at = first.entry(number).or_insert(packet.at);
+            *at = (*at).min(packet.at);
+        }
+    }
+    let settled = drop + Duration::from_secs(2);
+    let mut waits: Vec<Duration> = first
+        .iter()
+        .filter(|(number, _)| sent.get(number).is_some_and(|at| *at >= settled))
+        .map(|(number, at)| at.saturating_duration_since(sent[number]))
+        .collect();
+    waits.sort();
+    assert!(waits.len() >= 50, "{} frames", waits.len());
+    let p95 = waits[waits.len() * 95 / 100];
+    let max = waits[waits.len() - 1];
+    assert!(p95 <= Duration::from_millis(50), "95th percentile {p95:?}");
+    assert!(max <= Duration::from_millis(200), "longest {max:?}");
+    recent_rate(&viewer.received[&host.id]);
 }

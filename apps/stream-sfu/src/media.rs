@@ -1017,6 +1017,10 @@ impl Core {
             return;
         }
         let video = source.kind == MediaKind::Video;
+        let bound = source
+            .video
+            .as_ref()
+            .map_or(quality::QUEUE_BOUND, quality::Video::bound);
         let payload = packet.payload.len();
         let cost = (payload + PACKET_OVERHEAD) as u64;
         let can_request = source
@@ -1083,10 +1087,9 @@ impl Core {
                 let bitrate = peer.estimate.min(self.config.receiver_bitrate);
                 match view.backlog.admission(timestamp, queue, can_request, now) {
                     VideoAdmission::Regular => match &layered {
-                        None => view.backlog.full(queue, bitrate, payload, now),
+                        None => view.backlog.full(queue, bitrate, payload, bound, now),
                         Some(frame) => {
                             let discardable = view.selector.discardable(frame);
-                            let bound = quality::QUEUE_BOUND;
                             match view.backlog.layered(
                                 frame,
                                 timestamp,

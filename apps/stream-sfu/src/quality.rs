@@ -29,12 +29,13 @@ use std::{
 };
 use str0m::rtp::{Extension, ExtensionSerializer, ExtensionValues, StreamTxQueueInfo};
 
-const QUEUE_AGE: Duration = Duration::from_millis(300);
 const MIN_QUEUE_BYTES: u64 = 32 * 1024;
 const MAX_QUEUE_BYTES: u64 = 2 * 1024 * 1024;
-/// How long a layered frame may wait in a receiver's queue before the queue
-/// leaves frames out.
+/// How long a frame may wait in a receiver's queue before the queue leaves
+/// frames out.
 pub const QUEUE_BOUND: Duration = Duration::from_millis(300);
+/// [`QUEUE_BOUND`] for a Low latency source.
+pub const LOW_LATENCY_BOUND: Duration = Duration::from_millis(50);
 /// The largest frame a publisher sends, an 8 MiB screen frame: a key picture's
 /// temporal unit, and a recovery picture, up to this size goes out whole.
 pub const MAX_KEY_BYTES: u64 = 8 * 1024 * 1024;
@@ -63,6 +64,15 @@ impl Video {
 
     pub fn smooth(&self) -> bool {
         self.mode.prefer == Prefer::Smooth
+    }
+
+    /// How long its frames may wait in a receiver's queue.
+    pub fn bound(&self) -> Duration {
+        if self.mode.low_latency {
+            LOW_LATENCY_BOUND
+        } else {
+            QUEUE_BOUND
+        }
     }
 }
 
@@ -162,24 +172,28 @@ impl Backlog {
     }
 
     /// Whether `payload` more bytes take the queue of a source without a
-    /// descriptor past about 300 ms, beyond the last recovery picture.
+    /// descriptor past about `bound`, beyond the last recovery picture.
     pub fn full(
         &mut self,
         queue: Option<&dyn StreamTxQueueInfo>,
         bitrate: u64,
         payload: usize,
+        bound: Duration,
         now: Instant,
     ) -> bool {
-        let limit = (bitrate / 8 * 3 / 10).clamp(MIN_QUEUE_BYTES, MAX_QUEUE_BYTES);
+        let bytes = u128::from(bitrate) * bound.as_millis() / 8000;
+        let limit = u64::try_from(bytes)
+            .unwrap_or(u64::MAX)
+            .clamp(MIN_QUEUE_BYTES, MAX_QUEUE_BYTES);
         let age = queue
             .and_then(StreamTxQueueInfo::first_unsent)
             .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
         let queued = self.queued_bytes(queue) as u64;
-        if queued <= limit && age < QUEUE_AGE && !self.key.1 {
+        if queued <= limit && age < bound && !self.key.1 {
             self.key.0 = 0;
         }
         let picture = Duration::from_secs_f64(self.key.0 as f64 * 8.0 / bitrate.max(1) as f64);
-        queued + payload as u64 > limit + self.key.0 || age >= QUEUE_AGE + picture
+        queued + payload as u64 > limit + self.key.0 || age >= bound + picture
     }
 
     /// Admits a packet of the layered `frame` by how long a frame starting now
@@ -496,11 +510,31 @@ mod tests {
             oldest: now,
             bytes: 74_000,
         };
-        assert!(!backlog.full(Some(&sample), 2_000_000, 1000, now));
+        assert!(!backlog.full(Some(&sample), 2_000_000, 1000, QUEUE_BOUND, now));
         backlog.enqueued(1000, 1000, false);
-        assert!(backlog.full(Some(&sample), 2_000_000, 1, now));
-        assert!(backlog.full(Some(&sample), 15_000_000, 1000, now + QUEUE_AGE));
-        assert!(!backlog.full(None, 2_000_000, 1000, now));
+        assert!(backlog.full(Some(&sample), 2_000_000, 1, QUEUE_BOUND, now));
+        let late = now + QUEUE_BOUND;
+        assert!(backlog.full(Some(&sample), 15_000_000, 1000, QUEUE_BOUND, late));
+        assert!(!backlog.full(None, 2_000_000, 1000, QUEUE_BOUND, now));
+        // A Low latency source's queue holds 50 ms, and at least 32 KiB.
+        let mut backlog = Backlog::default();
+        let small = Queue {
+            oldest: now,
+            bytes: 30_000,
+        };
+        let wide = Queue {
+            oldest: now,
+            bytes: 80_000,
+        };
+        let mut low = |queue: &Queue, bitrate, payload, ms| {
+            let at = now + Duration::from_millis(ms);
+            backlog.full(Some(queue), bitrate, payload, LOW_LATENCY_BOUND, at)
+        };
+        assert!(!low(&small, 2_000_000, 1000, 49));
+        assert!(low(&small, 2_000_000, 1000, 50));
+        assert!(low(&small, 2_000_000, 4000, 0));
+        assert!(!low(&wide, 20_000_000, 1000, 0));
+        assert!(low(&wide, 20_000_000, 50_000, 0));
     }
 
     #[test]
@@ -624,6 +658,24 @@ mod tests {
         assert_eq!(admit(&key, 2), Layered::Send);
         assert_eq!(admit(&delta, 2), Layered::Send);
         assert_eq!(admit(&delta, 3), Layered::Skip);
+    }
+
+    #[test]
+    fn a_low_latency_queue_leaves_out_frames_past_50_ms() {
+        let now = Instant::now();
+        let (key, delta) = key_and_delta();
+        let mut backlog = Backlog::default();
+        // 2 Mbit/s: 15 kB wait 60 ms.
+        let queue = Queue {
+            oldest: now,
+            bytes: 15_000,
+        };
+        let mut admit = |frame: &Frame, unit, bound| {
+            backlog.layered(frame, unit, true, Some(&queue), 2_000_000, bound, now)
+        };
+        assert_eq!(admit(&delta, 1, QUEUE_BOUND), Layered::Send);
+        assert_eq!(admit(&delta, 2, LOW_LATENCY_BOUND), Layered::Skip);
+        assert_eq!(admit(&key, 3, LOW_LATENCY_BOUND), Layered::Send);
     }
 
     #[test]
