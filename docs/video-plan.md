@@ -334,7 +334,9 @@ Choices, per viewer: a target is eligible when its spatial layer's height
 belongs to the viewer's tier or a lower one and its frame rate is at most 1.25
 times the tier's. The lowest active target is always eligible, and until a
 bitrate window ends, after the source's first frame or a new set of targets,
-it is the only one; meanwhile the viewer's stepper waits. A Sharp source's eligible
+it is the only one; meanwhile the viewer's stepper waits. A viewer that gets
+a source in its first second therefore starts on the lowest target, and its
+move up a spatial layer when the second ends takes one more key picture. A Sharp source's eligible
 targets go by spatial, then temporal layer; a Smooth source's go along its
 lowest spatial layer by temporal layer, then along its top temporal layer by
 spatial layer. Each step of a late queue removes the top choice, down to the
