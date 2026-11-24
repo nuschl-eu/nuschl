@@ -51,12 +51,13 @@ impl Render for Ghost {
     }
 }
 
-struct Offset {
+/// A slot's distance from where it is laid out, settling to zero.
+pub(crate) struct Offset {
     from: f32,
     began: Instant,
 }
 impl Offset {
-    fn value(&self) -> f32 {
+    pub(crate) fn value(&self) -> f32 {
         let t = self.began.elapsed().as_secs_f32() / SETTLE.as_secs_f32();
         if t >= 1. {
             0.
@@ -64,9 +65,51 @@ impl Offset {
             self.from * (1. + 8. * t) * (-8. * t).exp()
         }
     }
-    fn moving(&self) -> bool {
+    pub(crate) fn moving(&self) -> bool {
         self.began.elapsed() < SETTLE
     }
+}
+
+/// Move `key`'s slot by `delta` from where it shows now, so a retarget
+/// continues from the current visual position.
+pub(crate) fn shift<K: Ord>(offsets: &mut BTreeMap<K, Offset>, key: K, delta: f32, reduce: bool) {
+    let value = offsets.get(&key).map_or(0., Offset::value) + delta;
+    if reduce || value.abs() < 0.05 {
+        offsets.remove(&key);
+    } else {
+        offsets.insert(
+            key,
+            Offset {
+                from: value,
+                began: Instant::now(),
+            },
+        );
+    }
+}
+
+/// Scroll `handle` while a drag holds the pointer near its top or bottom
+/// edge, faster the closer it is; whether it scrolled.
+pub(crate) fn edge_scroll(handle: &ScrollHandle, point: Point<Pixels>, dt: f32) -> bool {
+    let bounds = handle.bounds();
+    if !bounds.contains(&point) {
+        return false;
+    }
+    let edge = px(28.);
+    let speed = if point.y < bounds.top() + edge {
+        280. * ((bounds.top() + edge - point.y) / edge)
+    } else if point.y > bounds.bottom() - edge {
+        -280. * ((point.y - bounds.bottom() + edge) / edge)
+    } else {
+        0.
+    };
+    let prior = handle.offset();
+    let mut offset = prior;
+    offset.y = (offset.y + px(speed * dt)).clamp(-handle.max_offset().y, px(0.));
+    if offset == prior {
+        return false;
+    }
+    handle.set_offset(offset);
+    true
 }
 struct Drag {
     source: String,
@@ -128,19 +171,8 @@ impl Rail {
             let Some(prior) = old.iter().position(|old| old == id) else {
                 continue;
             };
-            let value = self.offsets.get(id).map_or(0., Offset::value)
-                + (prior as f32 - new as f32) * slot_height();
-            if reduce || value.abs() < 0.05 {
-                self.offsets.remove(id);
-            } else {
-                self.offsets.insert(
-                    id.clone(),
-                    Offset {
-                        from: value,
-                        began: Instant::now(),
-                    },
-                );
-            }
+            let delta = (prior as f32 - new as f32) * slot_height();
+            shift(&mut self.offsets, id.clone(), delta, reduce);
         }
     }
     fn point(&mut self, point: Point<Pixels>, handle: &ScrollHandle, reduce: bool) -> bool {
@@ -175,26 +207,11 @@ impl Rail {
             now.duration_since(prior).as_secs_f32().min(0.05)
         });
         let mut scrolling = false;
-        if let Some(point) = self.drag.as_ref().and_then(|drag| drag.pointer) {
-            let bounds = handle.bounds();
-            if bounds.contains(&point) {
-                let edge = px(28.);
-                let speed = if point.y < bounds.top() + edge {
-                    280. * ((bounds.top() + edge - point.y) / edge)
-                } else if point.y > bounds.bottom() - edge {
-                    -280. * ((point.y - bounds.bottom() + edge) / edge)
-                } else {
-                    0.
-                };
-                let prior = handle.offset();
-                let mut offset = prior;
-                offset.y = (offset.y + px(speed * dt)).clamp(-handle.max_offset().y, px(0.));
-                if offset != prior {
-                    handle.set_offset(offset);
-                    self.point(point, handle, reduce);
-                    scrolling = true;
-                }
-            }
+        if let Some(point) = self.drag.as_ref().and_then(|drag| drag.pointer)
+            && edge_scroll(handle, point, dt)
+        {
+            self.point(point, handle, reduce);
+            scrolling = true;
         }
         scrolling || !self.offsets.is_empty()
     }
