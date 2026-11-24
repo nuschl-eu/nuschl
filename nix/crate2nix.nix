@@ -109,6 +109,12 @@ let
     nuschl = attrs: withLibraries attrs // { NUSCHL_EMOJI_ASSETS = emojiAssets; };
     nuschl-media-worker = withLibraries;
     nuschl-video-worker = attrs: {
+      # The encoder tests' screen source; isolated crate sources do not
+      # contain ../../docs.
+      postPatch = ''
+        substituteInPlace src/encoder_tests.rs --replace-fail \
+          '"../../docs/images/nuschl.png"' '"${../docs/images/nuschl.png}"'
+      '';
       nativeBuildInputs = pkgConfig;
       buildInputs = [
         pkgs.pipewire

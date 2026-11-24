@@ -27239,6 +27239,12 @@ rec {
             features = [ "v1_28" ];
           }
           {
+            name = "nuschl-aom";
+            packageId = "nuschl-aom";
+            optional = true;
+            target = { target, features }: ("linux" == target."os" or null);
+          }
+          {
             name = "nuschl-capture-macos";
             packageId = "nuschl-capture-macos";
             target = { target, features }: ("macos" == target."os" or null);
@@ -27265,7 +27271,6 @@ rec {
           {
             name = "nuschl-video-encode";
             packageId = "nuschl-video-encode";
-            optional = true;
             target = { target, features }: ("linux" == target."os" or null);
           }
           {
@@ -27312,9 +27317,10 @@ rec {
           }
         ];
         features = {
-          "vaapi" = [ "dep:gstreamer" "dep:gstreamer-allocators" "dep:gstreamer-app" "dep:gstreamer-video" "dep:cros-libva" "dep:nuschl-video-encode" ];
+          "aom" = [ "dep:nuschl-aom" ];
+          "vaapi" = [ "dep:gstreamer" "dep:gstreamer-allocators" "dep:gstreamer-app" "dep:gstreamer-video" "dep:cros-libva" ];
         };
-        resolvedDefaultFeatures = [ "vaapi" ];
+        resolvedDefaultFeatures = [ "aom" "vaapi" ];
       };
       "nuschl-web-relay" = rec {
         crateName = "nuschl-web-relay";

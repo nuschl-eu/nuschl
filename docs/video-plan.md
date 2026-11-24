@@ -333,6 +333,14 @@ Owner rule (2026-11-18):
   tight budget; a still picture is refined step by step. Keyframes come on
   request only. Screens send L1T3 and cameras L1T1, each frame with the
   Dependency Descriptor the SFU picks layers by.
+- **Software AV1 encoder (#558).** Where no GPU encodes AV1, the encoder core
+  codes the captured I420 pictures with libaom in real-time mode
+  (`nuschl-aom`, feature `aom`): the same rate controller sets each frame's
+  quantizer, libaom's SVC controls carry the temporal layers and screens use
+  its screen tools. libaom's reference slots follow every frame it codes, so
+  the core codes each picture once and follows a frame it cannot send with a
+  keyframe. The Nix-built Linux packages enable it; the portable and macOS
+  builds keep rav1e's independent frames until they link libaom.
 - **Decoding.** A `--decode` role per call: the hardware decoder first, rav1d
   (Owner) as the AV1 software fallback, with pixel, memory and CPU caps.
   Decoded frames stay on the device.

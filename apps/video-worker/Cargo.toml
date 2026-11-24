@@ -15,8 +15,9 @@ vaapi = [
   "dep:gstreamer-app",
   "dep:gstreamer-video",
   "dep:cros-libva",
-  "dep:nuschl-video-encode",
 ]
+# libaom codes AV1 for the encoder core when no GPU encodes it.
+aom = ["dep:nuschl-aom"]
 
 [dependencies]
 nuschl-ipc.workspace = true
@@ -32,8 +33,9 @@ gstreamer = { version = "0.25.4", default-features = false, optional = true, fea
 gstreamer-allocators = { version = "0.25.4", default-features = false, optional = true, features = ["v1_28"] }
 gstreamer-app = { version = "0.25.2", default-features = false, optional = true, features = ["v1_28"] }
 gstreamer-video = { version = "0.25.4", default-features = false, optional = true, features = ["v1_28"] }
+nuschl-aom = { workspace = true, optional = true }
 nuschl-ipc = { workspace = true, features = ["video-portal"] }
-nuschl-video-encode = { workspace = true, optional = true }
+nuschl-video-encode.workspace = true
 pipewire = { version = "0.10.1", default-features = false }
 tokio = { version = "1.54.1", features = ["macros", "rt"] }
 

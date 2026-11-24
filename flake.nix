@@ -143,7 +143,7 @@
           pkgs.libxcb
           # The video worker's VA-API encoder (feature vaapi).
           pkgs.libva
-          # libaom for nuschl-aom, the video worker's software encoder.
+          # The video worker's software encoder (nuschl-aom, feature aom).
           (import ./nix/libaom.nix { inherit pkgs; })
         ];
         # Twemoji images and emojibase names for both clients; the sources
@@ -300,7 +300,10 @@
               cp -R ${rtcNotices.bundle}/share/licenses/nuschl/. "$out/share/licenses/nuschl/"
             '';
         videoWorker = crates.project.workspaceMembers.nuschl-video-worker.build.override {
-          features = [ "vaapi" ];
+          features = [
+            "vaapi"
+            "aom"
+          ];
         };
         videoProbeNoticeScope = "video-probe-${pkgs.stdenv.hostPlatform.rust.rustcTarget}";
         videoProbe =
@@ -428,7 +431,10 @@
             pkgs.util-linux
           ];
           nuschl-video-worker = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            features = [ "vaapi" ];
+            features = [
+              "vaapi"
+              "aom"
+            ];
             testInputs = [
               pkgs.bubblewrap
               pkgs.util-linux

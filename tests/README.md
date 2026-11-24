@@ -326,6 +326,18 @@ decode worker shows a 1920 × 1080 camera and a 3440 × 1440 screen at exactly
 those sizes from rav1d and from VA-API; VCN 4 codes them in aligned frames with
 the picture's size as the render size.
 
+The encoder core over libaom runs in CI: `cargo test -p nuschl-aom` and
+`cargo test -p nuschl-video-worker --features aom capture::aom`. They decode
+every frame with rav1d at each operating point and check the rate in each
+second at the software path's 15 frames per second, bitrate changes without
+keyframes, keyframes on request, each frame's quantizer and reference slot, and
+a screen through typing and scrolling. Locally, the `nuschl-aom` tests also run
+under AddressSanitizer: build libaom from the nixpkgs source with
+`-fsanitize=address` as a static library (`-DBUILD_SHARED_LIBS=OFF`, the
+`nix/libaom.nix` options), put its `aom.pc` first on `PKG_CONFIG_PATH` and run
+`RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p nuschl-aom --target
+x86_64-unknown-linux-gnu`.
+
 ## WebRTC transport trial
 
 `cargo test -p nuschl-rtc` exchanges ICE/DTLS/SRTP datagrams in memory with a virtual

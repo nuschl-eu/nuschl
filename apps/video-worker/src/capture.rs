@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Capture from one portal-granted PipeWire connection.
 
+#[cfg(feature = "aom")]
+mod aom;
 #[cfg(feature = "vaapi")]
 mod vaapi;
 
@@ -8,6 +10,10 @@ use crate::capture_pixels::{
     Cadence, Control, MappedPixels, PREVIEW_FPS, convert, watch_control, write_frame,
 };
 use nuschl_ipc::video::{Kind, Settings, Source, read_capture_start, write_capture_preview};
+#[cfg(feature = "aom")]
+use nuschl_video_encode::Encoder;
+#[cfg(any(feature = "aom", feature = "vaapi"))]
+use nuschl_video_encode::{Config, Layering};
 use pipewire::{self as pw, properties::properties, spa};
 use spa::{
     buffer::{ChunkFlags, DataType},
@@ -22,11 +28,40 @@ use spa::{
 use std::{
     io::{self, Cursor},
     os::{fd::AsFd as _, unix::net::UnixStream},
-    sync::{Arc, atomic::Ordering, mpsc::sync_channel},
+    sync::{
+        Arc,
+        atomic::Ordering,
+        mpsc::{Receiver, sync_channel},
+    },
     time::{Duration, Instant},
 };
 
 type Failure = Box<dyn std::error::Error>;
+
+/// The encoder core's largest frame as time at the bitrate, the SFU's queue
+/// bound.
+#[cfg(any(feature = "aom", feature = "vaapi"))]
+const WINDOW: Duration = Duration::from_millis(300);
+
+/// The encoder core's settings for `settings`' picture. Screens send
+/// temporal layers for the SFU to pick from.
+#[cfg(any(feature = "aom", feature = "vaapi"))]
+fn config(source: Source, settings: Settings, qindex: std::ops::RangeInclusive<u8>) -> Config {
+    Config {
+        width: settings.width,
+        height: settings.height,
+        fps: settings.fps,
+        bitrate: settings.bitrate,
+        layering: match source {
+            Source::Screen => Layering::L1T3,
+            Source::Camera => Layering::L1T1,
+        },
+        screen: source == Source::Screen,
+        frame_bytes: settings.packet_limit(false),
+        window: WINDOW,
+        qindex,
+    }
+}
 
 struct Picture {
     settings: Settings,
@@ -115,47 +150,11 @@ pub fn run() -> Result<(), Failure> {
         });
         let encode_control = control.clone();
         let encoder = scope.spawn(move || {
-            let mut stdout = io::stdout().lock();
-            for picture in next_picture {
-                let Picture {
-                    mut settings,
-                    captured_at,
-                    i420,
-                } = picture;
-                if clock.elapsed().saturating_sub(captured_at) > Duration::from_millis(250) {
-                    continue;
-                }
-                let capture_time_us = u64::try_from(captured_at.as_micros())
-                    .unwrap_or(u64::MAX)
-                    .max(1);
-                let limits = encode_control.limits();
-                if settings.width.min(settings.height) > limits.height || settings.fps > limits.fps
-                {
-                    continue;
-                }
-                settings.bitrate = limits.bitrate;
-                let packet =
-                    match super::codec::encode(&super::codec::config(settings), settings, &i420) {
-                        Ok(packet) => packet,
-                        Err(error) => {
-                            let _ = done.send(());
-                            return Err(error.to_string());
-                        }
-                    };
-                if let Err(error) = write_frame(
-                    &mut stdout,
-                    Kind::CaptureFrame,
-                    settings,
-                    capture_time_us,
-                    true,
-                    &packet,
-                    &[],
-                ) {
-                    let _ = done.send(());
-                    return Err(error.to_string());
-                }
+            let coded = encode_pictures(source, &encode_control, clock, next_picture);
+            if coded.is_err() {
+                let _ = done.send(());
             }
-            Ok(())
+            coded.map_err(|error| error.to_string())
         });
         let mut cadence = Cadence::default();
         let mut preview_cadence = Cadence::default();
@@ -272,6 +271,81 @@ pub fn run() -> Result<(), Failure> {
             .map_err(|_| "the video encoder thread stopped")??;
         Ok(())
     })
+}
+
+/// Codes each picture with the encoder core over libaom, as the VA-API path
+/// does on the GPU; without libaom, as an independent rav1e keyframe.
+fn encode_pictures(
+    source: Source,
+    control: &Control,
+    clock: Instant,
+    pictures: Receiver<Picture>,
+) -> Result<(), Failure> {
+    let mut stdout = io::stdout().lock();
+    let mut previous = 0;
+    #[cfg(feature = "aom")]
+    let mut current: Option<((u16, u16), Encoder<aom::Aom>)> = None;
+    for picture in pictures {
+        let Picture {
+            mut settings,
+            captured_at,
+            i420,
+        } = picture;
+        if clock.elapsed().saturating_sub(captured_at) > Duration::from_millis(250) {
+            continue;
+        }
+        let limits = control.limits();
+        if settings.width.min(settings.height) > limits.height || settings.fps > limits.fps {
+            continue;
+        }
+        // The control socket delivers new limits before a keyframe request,
+        // so a requested keyframe carries the limits sent with it.
+        let key = control.keyframe.swap(false, Ordering::Relaxed);
+        settings.bitrate = control.limits().bitrate;
+        let timestamp = u64::try_from(captured_at.as_micros())
+            .unwrap_or(u64::MAX)
+            .max(previous + 1);
+        #[cfg(feature = "aom")]
+        let encoded = {
+            let size = (settings.width, settings.height);
+            if current.as_ref().is_none_or(|(opened, _)| *opened != size) {
+                current = Some((size, aom::open(source, settings)?));
+            }
+            let Some((_, encoder)) = &mut current else {
+                continue;
+            };
+            encoder.set_bitrate(settings.bitrate);
+            if key {
+                encoder.request_keyframe();
+            }
+            encoder.encode(&i420, Duration::from_micros(timestamp))?
+        };
+        #[cfg(not(feature = "aom"))]
+        let encoded = {
+            let _ = (source, key);
+            Some(nuschl_video_encode::Encoded {
+                data: super::codec::encode(&super::codec::config(settings), settings, &i420)?,
+                keyframe: true,
+                temporal_id: 0,
+                qindex: 0,
+                descriptor: Vec::new(),
+            })
+        };
+        let Some(encoded) = encoded else {
+            continue;
+        };
+        previous = timestamp;
+        write_frame(
+            &mut stdout,
+            Kind::CaptureFrame,
+            settings,
+            timestamp,
+            encoded.keyframe,
+            &encoded.data,
+            &encoded.descriptor,
+        )?;
+    }
+    Ok(())
 }
 
 fn start_control(source: Source) -> io::Result<(Arc<Control>, Option<UnixStream>)> {

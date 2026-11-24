@@ -8123,6 +8123,7 @@ dependencies = [
  "gstreamer-allocators",
  "gstreamer-app",
  "gstreamer-video",
+ "nuschl-aom",
  "nuschl-capture-macos",
  "nuschl-ipc",
  "nuschl-sandbox",
