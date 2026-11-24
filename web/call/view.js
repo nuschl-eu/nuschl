@@ -50,6 +50,18 @@ const speaker = (document, silent) => {
   return icon;
 };
 
+/** Shows the picture inside a received frame. VCN 4 codes AV1 in frames aligned to
+ * 64 columns and 16 rows (1920 × 1080 as 1920 × 1082), the encoder core names the
+ * picture's size in the Dependency Descriptor, and browsers show the whole frame. The
+ * SFU forwards the descriptor outside the end-to-end encryption, so the crop stays
+ * within that alignment. */
+function crop(video, pictures) {
+  const [width, height] = pictures.get(video.srcObject?.getVideoTracks()[0]?.id) ?? [];
+  const right = video.videoWidth - width, bottom = video.videoHeight - height;
+  video.style.objectViewBox = right >= 0 && right < 64 && bottom >= 0 && bottom < 16 ?
+    `inset(0px ${right}px ${bottom}px 0px)` : "";
+}
+
 export class View {
   /** The pinned source, "peer/camera" or "peer/screen": it keeps its place when its
    * publisher restarts the encoder on a new media section. */
@@ -64,6 +76,8 @@ export class View {
   tiers = new Map();
   sentTiers = new WeakMap();
   sizes = new Map();
+  /** Each received video track's picture size, from its keyframes. */
+  pictures = new Map();
 
   constructor(root, call, retry = () => this.document.defaultView.location.reload()) {
     const document = root.ownerDocument ?? root;
@@ -88,6 +102,13 @@ export class View {
     };
     this.changed = () => this.render();
     call.addEventListener("change", this.changed);
+    this.picture = ({ data }) => {
+      if (!data?.picture) return;
+      const { track, width, height } = data.picture;
+      this.pictures.set(track, [width, height]);
+      for (const tile of this.tiles.values()) crop(tile.querySelector("video"), this.pictures);
+    };
+    call.stream?.worker.addEventListener("message", this.picture);
     this.render();
   }
 
@@ -113,6 +134,7 @@ export class View {
 
   close() {
     this.call.removeEventListener("change", this.changed);
+    this.call.stream?.worker.removeEventListener("message", this.picture);
     this.stats.close();
     this.observer.disconnect();
     this.sharedAudio(new Map());
@@ -280,6 +302,7 @@ export class View {
     }
     if (track.own || track.receiver) tile.append(this.videoStats(mid, video, track, label));
     video.addEventListener("loadeddata", () => { tile.dataset.state = "playing"; });
+    video.addEventListener("resize", () => crop(video, this.pictures));
     this.tiles.set(mid, tile);
     return tile;
   }
