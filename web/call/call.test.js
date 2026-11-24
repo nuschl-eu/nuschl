@@ -188,7 +188,7 @@ test("viewer quality uses tile pixels and the v1 request layout", () => {
   assert.equal(qualityRequest(23, "camera", 0).request, "0100000000000000170000");
 });
 
-test("an explicit receive tier applies before layout and survives a tile resize", () => {
+test("a receive limit applies before layout and caps the tile's tier", () => {
   class Element extends EventTarget {
     constructor(ownerDocument) {
       super();
@@ -220,8 +220,12 @@ test("an explicit receive tier applies before layout and survives a tile resize"
   assert.equal(requested(), TIERS.screen[2]);
   assert.deepEqual(sent, [{ type: "quality", request: "0100000000000000040102" }]);
   view.sizes.get(video).resize(400);
+  assert.equal(requested(), TIERS.screen[0]);
+  view.sizes.get(video).resize(4000);
   assert.equal(requested(), TIERS.screen[2]);
-  assert.equal(sent.length, 1);
+  select.value = "";
+  select.dispatchEvent(new Event("change"));
+  assert.equal(requested(), TIERS.screen[3]);
 });
 
 test("negotiated video limits follow only the accepted video track", async () => {

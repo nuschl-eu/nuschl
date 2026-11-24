@@ -1485,7 +1485,7 @@ fn quality_label(kind: VideoKind, quality: Quality) -> String {
         Quality::Auto => "Auto".into(),
         Quality::Tier(_) => {
             let tier = kind.ladder()[kind.request(quality, 0)];
-            format!("{}p{}", tier.height, tier.fps)
+            format!("Max {}p{}", tier.height, tier.fps)
         }
     }
 }
