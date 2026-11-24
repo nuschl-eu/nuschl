@@ -434,6 +434,20 @@ impl Layers {
         self.measured
     }
 
+    /// How many layer pairs the source's active targets have.
+    pub fn targets(&self) -> usize {
+        let Some(structure) = &self.structure else {
+            return 0;
+        };
+        let mut layers: Vec<Target> = (0..structure.targets.len())
+            .filter(|t| structure.active >> t & 1 == 1)
+            .map(|t| structure.targets[t])
+            .collect();
+        layers.sort_by_key(|l| (l.spatial, l.temporal));
+        layers.dedup();
+        layers.len()
+    }
+
     /// The active target with `target`'s spatial layer and its lowest
     /// temporal layer.
     pub fn base(&self, target: usize) -> Option<Wanted> {
@@ -1332,6 +1346,7 @@ mod tests {
             [0],
             "within the first second"
         );
+        assert_eq!(layers.targets(), 3, "three layers sent");
         l1t3_at(&mut layers, 30, 5000);
         assert!(layers.measured());
         // A 15 fps tier takes the quarter and the half rate.

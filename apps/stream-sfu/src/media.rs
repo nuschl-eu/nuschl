@@ -1239,12 +1239,7 @@ impl Core {
                 demand.request(tier, publisher_limit);
                 demand.wanted = demand.wanted.max(requested);
                 let raised = video.kind == Kind::Screen && publisher.screen_rate;
-                let single_layer = (raised || backlog.limited())
-                    && video
-                        .layers
-                        .choices(video.kind, video.kind.top(), smooth, 0)
-                        .len()
-                        <= 1;
+                let single_layer = (raised || backlog.limited()) && video.layers.targets() <= 1;
                 if backlog.limited() && single_layer {
                     let (configured, configured_limit) =
                         if self.config.receiver_bitrate <= self.config.room_bitrate {
