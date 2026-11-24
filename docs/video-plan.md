@@ -367,20 +367,29 @@ State, per viewer and source, updated once a second:
   temporal layer. A frame the current target needs and the viewer misses
   leaves it without a target until the next such switch point.
 - Late and repeated packets: the rest of a frame whose start went out goes
-  out, and so does a late frame that forwarded frames reference. A frame stays
-  out, with its later and repeated packets, when its start came and stayed
-  out, when a packet of it came before its start and stayed out, when a frame
-  it references came and stayed out, or when it is older than the current
-  target's first frame in a unit with no packet out.
+  out, and so does a late frame that forwarded frames reference, for its
+  unit's target or the referencing frame's, with its unit's marker when the
+  unit has none out. A frame stays out, with its later and repeated packets,
+  when its start came and stayed out, when a packet of it came before its
+  start and stayed out, when a frame it references came and stayed out, or
+  when it is older than the current target's first frame in a unit with no
+  packet out.
 - A new set of targets gives target indices other layers: each viewer takes
   the lowest target until the next second's choice.
+- A frame behind the newest one, in a temporal unit up to five seconds later,
+  starts a new stream that numbers its frames anew, as from a reopened
+  encoder: the selectors start over, and late packets of the old stream from
+  the five seconds before are unreadable. Nuschl's native encoder numbers its
+  frames on across reopens.
 - The queue leaves out a frame the target can do without once the queue's
   delay passes the bound, every frame but a key picture past twice the bound,
-  and keeps a temporal unit with a packet out whole: its byte cap passes the
-  rest, and the budgets lend it. The time the last key picture's unit takes
-  extends the bound until the delay falls to half the bound. A shed frame
-  takes the rest of its unit and the second before it. Each overloaded second
-  adds a step; steps recover one per 10 s.
+  and keeps a temporal unit with a packet out whole up to MAX_KEY_BYTES: its
+  byte cap passes the rest, and the budgets lend it up to one burst, down to
+  minus one burst. Past that the queue sheds the unit and releases its target.
+  The time the last key picture's unit takes extends the bound until the delay
+  falls to half the bound; a packet of a later unit, or of a new stream, ends
+  that unit. A shed frame takes the rest of its unit and the second before it.
+  Each overloaded second adds a step; steps recover one per 10 s.
 
 Invariants:
 
@@ -396,8 +405,12 @@ Invariants:
   frame rate from a window that is not active.
 - A static or slow source keeps its measured frame rate, so it makes no target
   eligible that was not eligible while it was active.
-- Moves follow the stepper's holds, and each forwarded temporal unit ends with
-  one marker.
+- Moves follow the stepper's holds; when the old layer leaves the choices, the
+  new choice is at most the highest one at or below it in both layers. Each
+  forwarded temporal unit ends with one marker.
+- One temporal unit takes at most MAX_KEY_BYTES past the queue's cap, and
+  each budget lends at most one burst: other sources and audio keep their
+  share.
 
 ### 5.4 Direct or relayed
 
