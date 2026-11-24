@@ -1237,7 +1237,7 @@ impl Core {
     }
 
     /// Split configured egress across simultaneously forwarded screens. Reserve
-    /// enough for the ceiling of the call's camera and Opus sources.
+    /// enough for each receiver's camera tiers and Opus sources.
     fn screen_shares(
         &self,
     ) -> (
@@ -1253,7 +1253,11 @@ impl Core {
             for forward in peer.forwards.iter().filter(|f| !f.stopping) {
                 match forward.label {
                     "screen" => usage.screens += 1,
-                    "camera" => usage.reserved += Kind::Camera.ladder()[Kind::Camera.top()].ceiling,
+                    "camera" => {
+                        let (tier, _) =
+                            quality::tier(Kind::Camera, &forward.view, peer.decode, self.step);
+                        usage.reserved += Kind::Camera.ladder()[tier].ceiling;
+                    }
                     _ => usage.reserved += 256_000,
                 }
             }
