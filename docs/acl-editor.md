@@ -24,6 +24,44 @@ dialog does: two local rules that apply in the channel only, `@all` denied and
 `#<password>` granted Enter, Speak, Whisper, Text message, Link channel and
 Traverse. People with the password as an access token may enter.
 
+**Channel type** sets who may join, speak and write in one step: Open, Members
+only, Password, Announcements or Private. A type is a template for the table's
+first three columns (See & join, Speak, Chat); the other columns and
+permissions stay as they are. A channel whose table matches a type shows it;
+otherwise none is selected and the editor says **Custom**. Moderators are
+`@admin`: Murmur and nuschld create that group in the root and add a new
+channel's creator to its own `admin` group. Members are registered users
+(`auth`). Each type stores these standard Mumble rules, in this order, applying
+here and in subchannels unless noted:
+
+| Type | Rules |
+| --- | --- |
+| Open | none: Mumble's defaults and the parent channels decide |
+| Members only | `@all` deny Enter, Listen, Speak, Whisper, Text message; `@auth` allow Traverse, Enter, Listen, Speak, Whisper, Text message |
+| Password | the channel password's two rules below (here only) |
+| Announcements | `@all` deny Speak, Whisper; `@admin` allow Speak, Whisper |
+| Private | `@all` deny Traverse, Enter, Listen, Speak, Whisper, Text message; `@admin` allow the same |
+
+Members only keeps Traverse, so a subchannel can admit everyone again. Private
+denies Traverse: only `@admin`, other holders of Write and the rows you add
+enter, listen, whisper or write here and in every subchannel. Stock Murmur and
+nuschld send every channel to every client, so others still see a private
+channel and the people in it, and its description says so. The description comes
+from `Kind::help`, which knows whether the server is nuschld, so it can change
+once nuschld hides channels. Password uses the typed password, or keeps the
+current one; the other types remove it. Mumble's password rules let `@admin`
+enter through Write; speaking there takes the password. Murmur checks Text
+message in the receiver's channel for private messages too, so Members only and
+Private also stop everyone else's private messages to people inside. Rules the
+table cannot show leave the type unset.
+
+**Create sub-channel…** offers the same types. Once the server shows the new
+channel on the same connection, its permissions open, take the type and save.
+The type applies only when the channel's rules name this account or certificate
+as its creator: its own `admin` group, or Murmur's Write rule for a creator
+without Write. A refusal, a reconnect or 15 seconds without the channel drop the
+request. Murmur and nuschld refuse a name a sibling already has.
+
 **Channel permissions** shows the channel's permissions as a table: rows for
 Everyone, groups and people, columns See & join (Traverse, Enter, Listen),
 Speak (Speak, Whisper), Chat (Text message), Moderate (Mute/deafen, Move) and
@@ -182,7 +220,10 @@ The same fixture's `--geometry` mode loads 512 rules and 512 groups, checking
 pointer/keyboard endpoints, bounded instantiated rows, focus reveal and text
 editing keys at 1280×800, 900×600 and 900×800 at 200% zoom. `--pending-input`
 attempts a real edit during a naturally paced save and verifies the original
-field value is retained, then editable after confirmation.
+field value is retained, then editable after confirmation. `--channel-types`
+checks that each cell starts under its column header, reads a custom table as
+Custom, saves Members only, Password and Open and compares the server's rules,
+then creates a channel as Announcements and checks the rules saved for it.
 [acl_e2ee_bootstrap.py](../tests/acl_e2ee_bootstrap.py) separately starts nuschld
 in E2EE-only mode and uses the native SuperUser password form and group editor
 to promote an offline account, without changing security policy or using a raw

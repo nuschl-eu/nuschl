@@ -215,6 +215,107 @@ pub fn read(rules: &[AclEntry]) -> Option<Table> {
     Some(table)
 }
 
+/// The permissions channel types set: the See & join, Speak and Chat columns.
+pub const ACCESS: u32 = COLUMNS[0].1 | COLUMNS[1].1 | COLUMNS[2].1;
+
+/// Channel types (#341): templates of the access columns. Moderators are
+/// `@admin`, which Murmur creates in the root and, with the creator, in each
+/// new channel; members are registered users (`auth`). Password also holds
+/// Mumble's password rules, which the draft keeps outside the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Open,
+    Members,
+    Password,
+    Announcements,
+    Private,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 5] = [
+        Kind::Open,
+        Kind::Members,
+        Kind::Password,
+        Kind::Announcements,
+        Kind::Private,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Open => "Open",
+            Kind::Members => "Members only",
+            Kind::Password => "Password",
+            Kind::Announcements => "Announcements",
+            Kind::Private => "Private",
+        }
+    }
+
+    /// What the type does, on a Nuschl server (`nuschl`) or a Mumble server.
+    /// nuschld lists every channel to everyone, as Murmur does, so Private
+    /// reads the same on both until nuschld hides channels.
+    pub fn help(self, _nuschl: bool) -> &'static str {
+        match self {
+            Kind::Open => "Anyone may join, speak and write.",
+            Kind::Members => "Registered users may join, speak and write.",
+            Kind::Password => "People with the password may join, speak and write.",
+            Kind::Announcements => "Only @admin may speak. Everyone may listen and write.",
+            Kind::Private => "Only @admin and people you add may join. Others see the channel.",
+        }
+    }
+
+    /// The access columns the type sets, by row, in the table's order.
+    fn rows(self) -> Vec<(Who, Bits)> {
+        let speak = COLUMNS[1].1;
+        let admin = Who::Group("admin".into());
+        let deny = |deny| Bits { grant: 0, deny };
+        let grant = |grant| Bits { grant, deny: 0 };
+        match self {
+            Kind::Open | Kind::Password => Vec::new(),
+            // Traverse stays, so a subchannel may admit everyone again.
+            Kind::Members => vec![
+                (Who::Everyone, deny(ACCESS & !TRAVERSE)),
+                (Who::Group("auth".into()), grant(ACCESS)),
+            ],
+            Kind::Announcements => vec![(Who::Everyone, deny(speak)), (admin, grant(speak))],
+            Kind::Private => vec![(Who::Everyone, deny(ACCESS)), (admin, grant(ACCESS))],
+        }
+    }
+}
+
+/// Gives `table` `kind`'s access columns; other permissions stay.
+pub fn apply(table: &mut Table, kind: Kind) {
+    for (_, bits) in &mut table.rows {
+        bits.grant &= !ACCESS;
+        bits.deny &= !ACCESS;
+    }
+    for (who, set) in kind.rows() {
+        let bits = table.row(who);
+        bits.grant |= set.grant;
+        bits.deny |= set.deny;
+    }
+}
+
+/// The type whose access columns `table` holds, for a channel with or
+/// without a password; `None` is a custom setup.
+pub fn kind(table: &Table, password: bool) -> Option<Kind> {
+    let mut access: Vec<_> = table
+        .rows
+        .iter()
+        .map(|(who, bits)| {
+            let bits = Bits {
+                grant: bits.grant & ACCESS,
+                deny: bits.deny & ACCESS,
+            };
+            (who.clone(), bits)
+        })
+        .filter(|(_, bits)| *bits != Bits::default())
+        .collect();
+    access.sort_by(|a, b| a.0.cmp(&b.0));
+    Kind::ALL
+        .into_iter()
+        .find(|kind| (*kind == Kind::Password) == password && kind.rows() == access)
+}
+
 /// What each target inherits from the parent channels: `entries` is the
 /// channel's rule list, inherited rules first; a later rule overrides an
 /// earlier one for the permissions it sets. Rules with group expressions are

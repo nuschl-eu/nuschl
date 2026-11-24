@@ -270,6 +270,8 @@ pub struct Desktop {
     pub menu_acl: Vec<(crate::acl_editor::Jump, String)>,
     /// Channel permissions to open at the next render.
     pub acl_jump: Option<crate::acl_editor::Jump>,
+    /// A channel being created with a type, until the server shows it.
+    pub acl_create: Option<crate::acl_editor::Create>,
     /// The emoji picker while it is open, recent picks, the chosen skin
     /// tone (0 default, 1 light to 5 dark), and its focus.
     pub emoji: Option<crate::emoji::Picker>,
@@ -580,6 +582,7 @@ impl Desktop {
             menu_image: None,
             menu_acl: Vec::new(),
             acl_jump: None,
+            acl_create: None,
             emoji: None,
             emoji_recent: Vec::new(),
             emoji_tone: 0,

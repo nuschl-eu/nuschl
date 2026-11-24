@@ -257,6 +257,9 @@ pub enum PromptAction {
     CreateChannel {
         parent: u32,
         temporary: bool,
+        kind: nuschl_core::access::Kind,
+        /// For the Password type.
+        password: Entity<InputState>,
     },
     Kick {
         session: u32,
@@ -679,9 +682,18 @@ impl Desktop {
                 .detach();
                 return;
             }
-            PromptAction::CreateChannel { parent, temporary } => {
+            PromptAction::CreateChannel {
+                parent,
+                temporary,
+                kind,
+                password,
+            } => {
                 if text.trim().is_empty() {
                     return;
+                }
+                if let Some(origin) = prompt.origin.clone() {
+                    let password = password.read(cx).value().to_string();
+                    crate::acl_editor::created(self, origin, parent, text.trim(), kind, password);
                 }
                 Command::CreateChannel {
                     parent,
@@ -1412,11 +1424,21 @@ impl Desktop {
                           index: usize,
                           window: &mut Window,
                           cx: &mut Context<Desktop>| {
+                        let password = cx.new(|cx| {
+                            crate::state::accessible(
+                                InputState::new(window, cx).placeholder("Channel password"),
+                                "Channel password",
+                                false,
+                                false,
+                            )
+                        });
                         this.open_prompt(
                             index,
                             PromptAction::CreateChannel {
                                 parent: channel,
                                 temporary,
+                                kind: nuschl_core::access::Kind::Open,
+                                password,
                             },
                             "Create a channel",
                             if temporary {
@@ -2293,6 +2315,67 @@ pub fn menu(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
     )
 }
 
+/// The channel type to create a channel with (#341), and the password for
+/// the Password type.
+fn channel_kind(this: &Desktop, prompt: &Prompt, cx: &mut Context<Desktop>) -> Option<AnyElement> {
+    use nuschl_core::access::Kind;
+    let PromptAction::CreateChannel { kind, password, .. } = &prompt.action else {
+        return None;
+    };
+    let nuschl = prompt
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.local_index(this))
+        .is_some_and(|index| !this.client.servers[index].capabilities.is_empty());
+    let options = Kind::ALL
+        .into_iter()
+        .map(|choice| {
+            let action: crate::settings::Action = Rc::new(move |this, _, _| {
+                if let Some(Prompt {
+                    action: PromptAction::CreateChannel { kind, .. },
+                    ..
+                }) = this.prompt.as_mut()
+                {
+                    *kind = choice;
+                }
+            });
+            (choice.label(), choice == *kind, action)
+        })
+        .collect();
+    Some(
+        div()
+            .mt_2()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(crate::settings::segmented(
+                "create-channel-kind",
+                "Channel type",
+                options,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(color(TEXT_MUTED))
+                    .child(text!(kind.help(nuschl)).with_id("create-channel-kind-help")),
+            )
+            .when(*kind == Kind::Password, |content| {
+                content.child(
+                    div()
+                        .px_3()
+                        .py(px(9.))
+                        .rounded(px(6.))
+                        .bg(color(APP))
+                        .border_1()
+                        .border_color(color(BORDER))
+                        .child(Input::new(password)),
+                )
+            })
+            .into_any_element(),
+    )
+}
+
 pub fn prompt(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
     let prompt = this.prompt.as_ref()?;
     // A question without text to enter (deleting a message).
@@ -2332,6 +2415,9 @@ pub fn prompt(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                             }))
                             .child(Input::new(&prompt.input)),
                     )
+                })
+                .when_some(channel_kind(this, prompt, cx), |content, kind| {
+                    content.child(kind)
                 }),
         )
         .child(
@@ -2375,7 +2461,12 @@ pub fn prompt(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
         if confirm_only { "Confirm" } else { "Input" },
         prompt.title.clone(),
         0,
-        460.,
+        // The channel types' labels fit on one line.
+        if matches!(prompt.action, PromptAction::CreateChannel { .. }) {
+            640.
+        } else {
+            460.
+        },
         content,
         cx,
         |this| this.prompt = None,

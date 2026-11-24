@@ -17,8 +17,9 @@ use gpui_kit::{
 };
 use nuschl_client::platform::request_id;
 use nuschl_core::{
-    admin::{AclEditorState, DraftRequest, RegisteredAccount, RowId},
-    model::{AclEntry, permission},
+    access::Kind,
+    admin::{self, AclEditorState, DraftRequest, RegisteredAccount, RowId},
+    model::{AclEntry, TextTarget, permission},
 };
 use nuschl_session::connection::Command;
 use std::{cell::Cell, ops::Range, rc::Rc};
@@ -87,6 +88,8 @@ pub struct Editor {
     show_rules: bool,
     /// Close once the save is confirmed.
     close_after_save: bool,
+    /// The type picked when creating this channel, applied once it loads.
+    create: Option<Applied>,
     member: Entity<InputState>,
     input_readonly: Cell<[bool; 4]>,
     rule_scroll: UniformListScrollHandle,
@@ -153,6 +156,7 @@ impl Editor {
             leaving: false,
             show_rules: false,
             close_after_save: false,
+            create: None,
             rule_scroll: UniformListScrollHandle::new(),
             table_scroll: UniformListScrollHandle::new(),
             group_scroll: UniformListScrollHandle::new(),
@@ -805,6 +809,161 @@ pub struct Flash {
 
 const FLASH: std::time::Duration = std::time::Duration::from_millis(1600);
 
+/// A channel created with a type (#341), until the server shows it on the
+/// connection that asked: then its permissions open, take the type and save.
+pub struct Create {
+    /// The parent channel on the creating connection.
+    origin: ActionOrigin,
+    parent: u32,
+    name: String,
+    kind: Kind,
+    password: String,
+    /// The server's notice when the request went out; a new one is a refusal.
+    notice: Option<String>,
+    deadline: std::time::Instant,
+    /// The new channel, once seen.
+    channel: Option<u32>,
+}
+
+/// The type to give a new channel, and who asked for it.
+struct Applied {
+    kind: Kind,
+    password: String,
+    user_id: Option<u32>,
+    hash: Option<String>,
+}
+
+/// Waits for the channel `name` that the connection behind `origin` asked to
+/// create under `parent`. Murmur refuses a name a sibling already has.
+pub fn created(
+    this: &mut Desktop,
+    origin: ActionOrigin,
+    parent: u32,
+    name: &str,
+    kind: Kind,
+    password: String,
+) {
+    this.acl_create = None;
+    let Some(view) = origin
+        .live_index(this)
+        .map(|index| &this.client.servers[index])
+    else {
+        return;
+    };
+    let taken = new_channel(view, parent, name).is_some();
+    if kind == Kind::Open || taken {
+        return;
+    }
+    this.acl_create = Some(Create {
+        notice: view.notice.clone(),
+        origin,
+        parent,
+        name: name.to_owned(),
+        kind,
+        password,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(15),
+        channel: None,
+    });
+}
+
+fn new_channel(view: &ServerView, parent: u32, name: &str) -> Option<u32> {
+    view.channels
+        .iter()
+        .find(|channel| {
+            matches!(channel.target, TextTarget::Channel(_))
+                && channel.parent == Some(parent)
+                && channel.name == name
+        })
+        .map(|channel| channel.id)
+}
+
+/// Notes the channel being created once it shows, and drops the request on
+/// a refusal, a reconnect or after its deadline.
+fn watch_create(this: &mut Desktop) {
+    let Some(create) = this
+        .acl_create
+        .as_ref()
+        .filter(|create| create.channel.is_none())
+    else {
+        return;
+    };
+    let view = create
+        .origin
+        .live_index(this)
+        .map(|index| &this.client.servers[index]);
+    let channel = match view {
+        Some(view)
+            if std::time::Instant::now() < create.deadline
+                && (view.notice.is_none() || view.notice == create.notice) =>
+        {
+            new_channel(view, create.parent, &create.name)
+        }
+        _ => {
+            this.acl_create = None;
+            return;
+        }
+    };
+    if let (Some(create), Some(channel)) = (this.acl_create.as_mut(), channel) {
+        create.channel = Some(channel);
+    }
+}
+
+/// Opens a channel created with a type, unless another panel is open.
+fn open_created(this: &mut Desktop, window: &mut Window, cx: &mut Context<Desktop>) {
+    let Some(create) = this.acl_create.take_if(|create| create.channel.is_some()) else {
+        return;
+    };
+    let (Some(index), Some(channel)) = (create.origin.live_index(this), create.channel) else {
+        return;
+    };
+    if this.panel.is_some() {
+        return;
+    }
+    let view = &this.client.servers[index];
+    let own = view
+        .own_session
+        .and_then(|session| view.users.get(&session));
+    let applied = Applied {
+        kind: create.kind,
+        password: create.password,
+        user_id: own.and_then(|user| user.user_id),
+        hash: own.and_then(|user| user.certificate_hash.clone()),
+    };
+    open(this, index, channel, window, cx);
+    if let Some(Panel::Acl { editor, .. }) = this.panel.as_mut() {
+        editor.create = Some(applied);
+    }
+}
+
+/// Gives a channel just created by this connection the type picked for it,
+/// then saves.
+fn apply_created(this: &mut Desktop, token: u64, cx: &mut Context<Desktop>) {
+    let Some(editor) = active_editor(this, token) else {
+        return;
+    };
+    let Some(applied) = editor.create.take() else {
+        return;
+    };
+    let Some(draft) = editor.state.draft_mut() else {
+        return;
+    };
+    let result = if admin::created_by(&draft.snapshot(), applied.user_id, applied.hash.as_deref()) {
+        draft.set_kind(applied.kind, &applied.password)
+    } else {
+        Err("Someone else made this channel. Its type stays as it is.")
+    };
+    match result {
+        Ok(()) => {
+            editor.dirty = true;
+            query(this, token, DraftRequest::Check, cx);
+        }
+        Err(error) => {
+            editor.state.error = true;
+            editor.state.message = error.into();
+        }
+    }
+}
+
 /// Opens `jump`'s channel permissions after the Save/Discard question, if the
 /// current editor holds unsaved changes.
 fn go(this: &mut Desktop, token: u64, jump: Jump) {
@@ -830,6 +989,7 @@ pub fn show_source(this: &mut Desktop, jump: Jump) {
 /// Opens a pending jump: that channel's permissions, its cell highlighted.
 /// Runs in the window's render, which editors need to open.
 pub fn follow_jump(this: &mut Desktop, window: &mut Window, cx: &mut Context<Desktop>) {
+    open_created(this, window, cx);
     let Some(jump) = this.acl_jump.take() else {
         return;
     };
@@ -1046,6 +1206,7 @@ pub fn open(
 /// Called after a client input is applied. Only this open panel's active ticket
 /// can load/verify its draft; remote/cache events never edit it directly.
 pub fn sync(this: &mut Desktop, cx: &mut Context<Desktop>) {
+    watch_create(this);
     let (token, index, channel, pending) = match this.panel.as_ref() {
         Some(Panel::Acl {
             origin,
@@ -1108,8 +1269,12 @@ pub fn sync(this: &mut Desktop, cx: &mut Context<Desktop>) {
             cx.notify();
             return;
         }
+        if editor.state.error {
+            editor.create = None;
+        }
         write
     };
+    apply_created(this, token, cx);
     if let Some(acl) = write {
         let request = request_id();
         if !active_editor(this, token)
@@ -1523,6 +1688,7 @@ pub fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Desktop>) -> 
         ));
     }
     body = body
+        .child(access_table::kinds(view, editor, cx))
         .child(password_section)
         .child(access_table::render(view, editor, cx));
     let count = draft.entries().len();

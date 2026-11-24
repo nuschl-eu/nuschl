@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Channel permissions (#341): the channel's own rules as a table of rows
 //! (Everyone, groups, people) and five columns. A cell cycles Not set, Allow
-//! and Deny and rewrites the rules in the table's order.
+//! and Deny and rewrites the rules in the table's order. A channel type sets
+//! the first three columns at once.
 use super::{
     Editor, FLASH, Jump, MEMBER, active_editor, change, check_access, group_target, name, note,
     parents::{self, Parents},
@@ -17,7 +18,7 @@ use crate::{
 };
 use gpui_kit::{prelude::*, *};
 use nuschl_core::{
-    access::{self, Bits, COLUMNS, Cell, Who},
+    access::{self, Bits, COLUMNS, Cell, Kind, Who},
     acl::{self, Reason},
     admin,
     model::{Acl, permission},
@@ -53,6 +54,59 @@ fn cycle(this: &mut Desktop, token: u64, who: Who, column: usize) {
         }
         editor.selected_rule = None;
     });
+}
+
+/// Gives the channel `kind`'s rules; Password takes the typed password.
+fn pick(this: &mut Desktop, token: u64, kind: Kind, cx: &mut Context<Desktop>) {
+    let Some(password) =
+        active_editor(this, token).map(|editor| editor.password.read(cx).value().to_string())
+    else {
+        return;
+    };
+    change(this, token, |editor| {
+        let Some(draft) = editor.state.draft_mut() else {
+            return;
+        };
+        if let Err(error) = draft.set_kind(kind, &password) {
+            editor.state.error = true;
+            editor.state.message = error.into();
+        }
+        editor.selected_rule = None;
+    });
+}
+
+/// The channel type: Open, Members only, Password, Announcements or Private,
+/// or none for a custom table. Left out when the table cannot show the rules.
+pub(super) fn kinds(view: &ServerView, editor: &Editor, cx: &mut Context<Desktop>) -> AnyElement {
+    let token = editor.token;
+    let Some(draft) = editor.state.draft().filter(|draft| draft.table().is_some()) else {
+        return div().into_any_element();
+    };
+    let current = draft.kind();
+    let options = Kind::ALL
+        .into_iter()
+        .map(|kind| {
+            let action: crate::settings::Action =
+                Rc::new(move |this, _, cx| pick(this, token, kind, cx));
+            (kind.label(), current == Some(kind), action)
+        })
+        .collect();
+    section(
+        "acl-kind-title",
+        "Channel type",
+        "Who may join, speak and write. The table shows the details.",
+    )
+    .child(crate::settings::segmented(
+        "acl-kind",
+        "Channel type",
+        options,
+        cx,
+    ))
+    .child(note(
+        "acl-kind-help",
+        current.map_or("Custom", |kind| kind.help(!view.capabilities.is_empty())),
+    ))
+    .into_any_element()
 }
 
 /// The search field that adds a row, for `Editor::new`.
@@ -284,7 +338,9 @@ fn row(
     };
     let own = bits_of(&rows.own, who);
     let row_label = label(view, who);
-    let mut row = line().h(px(TABLE_ROW)).child(
+    // The list lays rows out at their content's width unless they fill it;
+    // filled, the cells line up under the header's columns.
+    let mut row = line().w_full().h(px(TABLE_ROW)).child(
         div()
             .id(SharedString::from(format!("acl-row-{token}-{number}")))
             .w(px(130.))
@@ -513,7 +569,12 @@ pub(super) fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Deskto
         .bg(color(ELEVATED))
         .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
-        .child(div().w(px(130.)).flex_shrink_0().child("Who"));
+        .child(
+            div()
+                .w(px(130.))
+                .flex_shrink_0()
+                .child(text!("Who").with_id("acl-column-who")),
+        );
     for (column, (heading, _, help)) in COLUMNS.iter().enumerate() {
         header = header.child(
             div()
@@ -521,9 +582,8 @@ pub(super) fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Deskto
                 .flex_1()
                 .min_w_0()
                 .pl_3()
-                .whitespace_nowrap()
                 .tooltip(move |_, cx| cx.new(|_| Tooltip((*help).into())).into())
-                .child(SharedString::from(*heading)),
+                .child(text!(*heading).with_id(("acl-column-label", column))),
         );
     }
     let mut grid = div()
