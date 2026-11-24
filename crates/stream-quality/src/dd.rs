@@ -951,7 +951,7 @@ mod tests {
 
     /// The descriptor of one L2T2_KEY frame in one packet, with the structure
     /// and layer sizes when `structure`.
-    fn l2t2_key(template: usize, number: u16, structure: bool) -> Vec<u8> {
+    pub(super) fn l2t2_key(template: usize, number: u16, structure: bool) -> Vec<u8> {
         let mut w = Writer(Vec::new());
         w.put(0b11, 2);
         w.put(template as u32, 6);
@@ -1002,7 +1002,7 @@ mod tests {
 
     /// The templates of temporal unit `unit` after a key picture at unit 0:
     /// key, then T1 and T0 alternating.
-    fn l2t2_unit(unit: u16) -> [usize; 2] {
+    pub(super) fn l2t2_unit(unit: u16) -> [usize; 2] {
         match unit % 2 {
             _ if unit == 0 => [0, 3],
             1 => [2, 5],
@@ -1409,5 +1409,221 @@ mod tests {
             .map(|c| c.target)
             .collect();
         assert_eq!(targets, [0, 1]);
+    }
+}
+
+/// The selection model of docs/video-plan.md §5.3 over seeded random calls: an
+/// L2T2_KEY camera that goes active and static, key pictures, and viewers that
+/// join, leave, lose frames and change tier, budget, queue steps and mode. The
+/// invariants are checked on every frame and every second.
+#[cfg(test)]
+mod model {
+    use super::tests::{l2t2_key, l2t2_unit};
+    use super::*;
+    use crate::budget;
+    use std::collections::HashSet;
+
+    /// A seeded xorshift generator.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    #[derive(Default)]
+    struct Viewer {
+        selector: Selector,
+        stepper: Option<Stepper>,
+        tier: usize,
+        budget: u64,
+        steps: usize,
+        wanted: Option<Wanted>,
+        /// The frames it got, for the chains.
+        held: HashSet<u16>,
+        /// The choices' targets and the mode of the last second.
+        last: Option<(Vec<usize>, bool)>,
+        /// The wanted target's group, and when the stepper last moved it to
+        /// another group.
+        group: Option<(u8, Option<Duration>)>,
+    }
+
+    /// The camera's active frame rate.
+    const FPS: u64 = 30;
+    /// Shorter sides of the two layers (960 × 540 and 1920 × 1080).
+    const HEIGHTS: [u32; 2] = [540, 1080];
+
+    /// Whether `layer` fits camera tier `tier`: the invariant, from the
+    /// generator's own frame rate.
+    fn fits(layer: Target, tier: usize) -> bool {
+        let cap = Kind::Camera.ladder()[tier];
+        let fps = FPS >> (1 - layer.temporal);
+        Kind::Camera.tier_of(HEIGHTS[usize::from(layer.spatial)]) <= tier
+            && 4 * fps <= 5 * u64::from(cap.fps)
+    }
+
+    fn second(viewer: &mut Viewer, layers: &Layers, smooth: bool, now: Duration) {
+        let choices = layers.choices(Kind::Camera, viewer.tier, smooth, viewer.steps);
+        if !layers.measured() {
+            assert!(choices.len() <= 1, "a choice before a full second");
+        }
+        for choice in choices.iter().skip(1) {
+            assert!(
+                fits(choice.layer, viewer.tier),
+                "{choice:?} above tier {}",
+                viewer.tier
+            );
+        }
+        let rates: Vec<u64> = choices.iter().map(|c| c.rate).collect();
+        let current = viewer.stepper.map_or(0, |s| s.current() + 1);
+        let limits = budget::Limits::project(10_000_000_000);
+        let stream = budget::Stream {
+            room: 0,
+            receiver: 0,
+            rates: &rates,
+            current,
+        };
+        let layers_given = budget::allocate(&limits, &[viewer.budget], &[stream])[0].layers;
+        let wanted = layers_given.checked_sub(1).map(|ceiling| {
+            let (point, wanted) = pick(
+                &choices,
+                ceiling,
+                smooth,
+                layers.measured(),
+                &mut viewer.stepper,
+                now,
+            );
+            // The stepper moves to another group at most once per 10 s; new
+            // choices or a new mode may move it at once.
+            let group = choices[point].kept(smooth);
+            let targets: Vec<usize> = choices.iter().map(|c| c.target).collect();
+            let same = viewer.last == Some((targets, smooth));
+            let mut moved = viewer.group.and_then(|(_, at)| at);
+            if let Some((previous, at)) = viewer.group
+                && previous != group
+                && same
+            {
+                assert!(
+                    at.is_none_or(|at| now - at >= Duration::from_secs(10)),
+                    "group changes 10 s apart"
+                );
+                moved = Some(now);
+            }
+            viewer.group = Some((group, moved));
+            wanted
+        });
+        // A second without a target starts the comparison over.
+        let targets = choices.iter().map(|c| c.target).collect();
+        viewer.last = wanted.is_some().then_some((targets, smooth));
+        viewer.wanted = wanted;
+        viewer.selector.want(wanted);
+    }
+
+    #[test]
+    fn invariants_hold_over_random_calls() {
+        for seed in 1..=60u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut layers = Layers::default();
+            let mut viewers: Vec<Viewer> = Vec::new();
+            let (mut active, mut smooth) = (false, false);
+            let (mut timestamp, mut last_key, mut next_second) = (0u64, None::<u64>, 0u64);
+            let mut since_key = 0u16;
+            for unit in 0..2400u16 {
+                // The source: 30 fps with jitter, or static with long gaps.
+                timestamp += if active {
+                    CLOCK / FPS + rng.below(300)
+                } else {
+                    CLOCK / 2 + rng.below(CLOCK * 2)
+                };
+                if rng.chance(2) {
+                    active = !active;
+                }
+                let wants_key = viewers.iter().any(|v| v.selector.needs_keyframe());
+                let can_key = last_key.is_none_or(|at| timestamp - at >= 2 * CLOCK);
+                if last_key.is_none() || (wants_key || rng.chance(1)) && can_key {
+                    since_key = 0;
+                    last_key = Some(timestamp);
+                }
+                let now = Duration::from_micros(timestamp * 1_000_000 / CLOCK);
+                if timestamp >= next_second {
+                    next_second = timestamp + CLOCK;
+                    if rng.chance(10) {
+                        smooth = !smooth;
+                    }
+                    if viewers.len() < 4 && rng.chance(20) {
+                        viewers.push(Viewer::default());
+                    }
+                    if !viewers.is_empty() && rng.chance(3) {
+                        viewers.swap_remove(rng.below(viewers.len() as u64) as usize);
+                    }
+                    for viewer in &mut viewers {
+                        if rng.chance(15) {
+                            viewer.tier = rng.below(4) as usize;
+                        }
+                        if rng.chance(15) || viewer.budget == 0 {
+                            viewer.budget =
+                                [100_000, 400_000, 1_500_000, 8_000_000][rng.below(4) as usize];
+                        }
+                        if rng.chance(10) {
+                            viewer.steps = rng.below(4) as usize;
+                        }
+                        second(viewer, &layers, smooth, now);
+                    }
+                }
+                let mut marks = vec![(0, false, false); viewers.len()];
+                for (spatial, template) in l2t2_unit(since_key).into_iter().enumerate() {
+                    let number = unit.wrapping_mul(2).wrapping_add(spatial as u16);
+                    let descriptor = l2t2_key(template, number, template == 0);
+                    let size = [1500, 6000][spatial] * if template < 2 { 4 } else { 1 };
+                    let frame = layers
+                        .packet(&descriptor, size, timestamp, now)
+                        .expect("valid");
+                    assert_eq!(frame.layer.spatial as usize, spatial);
+                    for (viewer, mark) in viewers.iter_mut().zip(&mut marks) {
+                        if rng.chance(1) {
+                            viewer.selector.dropped(&frame);
+                            mark.1 = true;
+                            continue;
+                        }
+                        let before = viewer.selector.current();
+                        let Some(marker) = viewer.selector.forward(&frame, timestamp, spatial == 1)
+                        else {
+                            continue;
+                        };
+                        let current = viewer.selector.current().expect("a target");
+                        assert_ne!(frame.dti(current), Dti::NotPresent, "a frame of its target");
+                        if before != Some(current) {
+                            assert!(frame.start && frame.dti(current) == Dti::Switch);
+                            assert_eq!(Some(current), viewer.wanted.map(|w| w.0));
+                        }
+                        // The viewer holds the frame's chain: it can decode it.
+                        let chain = frame.chain_diff(current).unwrap_or(0);
+                        let previous = number.wrapping_sub(u16::from(chain));
+                        assert!(
+                            chain == 0 || viewer.held.contains(&previous),
+                            "a held chain"
+                        );
+                        viewer.held.insert(number);
+                        *mark = (mark.0 + u8::from(marker), mark.1, marker);
+                    }
+                }
+                for (count, lost, last) in marks {
+                    // A unit without a loss ends with one marker, on its last
+                    // forwarded frame.
+                    if !lost && count > 0 {
+                        assert!(count == 1 && last, "one marker per unit");
+                    }
+                }
+                since_key = since_key.wrapping_add(1);
+            }
+        }
     }
 }
