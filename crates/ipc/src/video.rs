@@ -26,6 +26,9 @@ pub const HEADER_BYTES: usize = 16;
 pub const VAAPI_AVAILABLE: bool =
     cfg!(target_os = "linux") && option_env!("NUSCHL_SOFTWARE_VIDEO_ONLY").is_none();
 const KIB: usize = 1024;
+/// The largest screen frame, keyframe or interframe. The largest keyframe
+/// measured from VA-API QVBR, of a 3840 × 2160 screen of noise, was 4.45 MB.
+pub const SCREEN_FRAME_BYTES: usize = 8 * 1024 * KIB;
 const KEY: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,12 +201,11 @@ impl Settings {
     }
 
     pub fn packet_limit(self, key: bool) -> usize {
-        let key_limit = match self.source {
-            Source::Camera => 256 * KIB,
-            Source::Screen if self.width.min(self.height) >= 1440 => 1024 * KIB,
-            Source::Screen => 512 * KIB,
-        };
-        if key { key_limit } else { key_limit / 2 }
+        match self.source {
+            Source::Camera if key => 256 * KIB,
+            Source::Camera => 128 * KIB,
+            Source::Screen => SCREEN_FRAME_BYTES,
+        }
     }
 
     pub fn to_bytes(self) -> [u8; Self::BYTES] {
@@ -407,13 +409,8 @@ mod tests {
         };
         assert_eq!(Settings::from_bytes(settings.to_bytes()).unwrap(), settings);
         assert_eq!(settings.frame_bytes().unwrap(), 7_430_400);
-        assert_eq!(settings.packet_limit(true), 1024 * KIB);
-        assert_eq!(settings.packet_limit(false), 512 * KIB);
-        let lower = Settings {
-            height: 1438,
-            ..settings
-        };
-        assert_eq!(lower.packet_limit(true), 512 * KIB);
+        assert_eq!(settings.packet_limit(true), 8 * 1024 * KIB);
+        assert_eq!(settings.packet_limit(false), 8 * 1024 * KIB);
         let camera = Settings {
             source: Source::Camera,
             ..settings

@@ -10,8 +10,8 @@ use aes_gcm::aead::{AeadInOut as _, KeyInit as _, Nonce, Tag};
 use crate::Error;
 
 pub const CIPHER_SUITE: u16 = 0x0004;
-/// The largest plaintext frame.
-pub const MAX_FRAME_LEN: usize = 1 << 20;
+/// The largest plaintext frame, an 8 MiB screen frame.
+pub const MAX_FRAME_LEN: usize = 8 << 20;
 const TAG_LEN: usize = 16;
 const MAX_HEADER_LEN: usize = 17;
 /// The most KIDs one [`Receiver`] holds.

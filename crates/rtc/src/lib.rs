@@ -257,11 +257,12 @@ impl Peer {
         if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
             return Err(Error::Address);
         }
-        let (initial, reorder, send, window) = if call_video_limit.is_some() {
+        let (initial, reorder, send, window) = if let Some(limit) = call_video_limit {
             (
                 CALL_INITIAL_BITRATE,
                 CALL_RTP_PACKETS,
-                CALL_RTP_PACKETS,
+                // Retransmissions can reach every packet of the largest frame.
+                CALL_RTP_PACKETS.max(limit / 1024),
                 CALL_VIDEO_WINDOW,
             )
         } else {
