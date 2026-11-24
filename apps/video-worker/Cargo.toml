@@ -9,6 +9,8 @@ publish.workspace = true
 
 [features]
 vaapi = ["dep:gstreamer", "dep:gstreamer-app"]
+# The encoder core over VA-API (#558), beside the GStreamer path.
+va-encoder = ["dep:cros-libva", "dep:nuschl-video-encode"]
 
 [dependencies]
 nuschl-ipc.workspace = true
@@ -17,9 +19,13 @@ rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2e7216c20ac2a75d
 rav1e = { version = "0.8.1", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# chromeos/cros-libva main: 0.0.13 has no packed-header buffers, which Mesa's AV1 encoder
+# reads its frame state from. Move to a release that includes them.
+cros-libva = { git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf", version = "0.0.13", optional = true }
 gstreamer = { version = "0.25.4", default-features = false, optional = true, features = ["v1_28"] }
 gstreamer-app = { version = "0.25.2", default-features = false, optional = true, features = ["v1_28"] }
 nuschl-ipc = { workspace = true, features = ["video-portal"] }
+nuschl-video-encode = { workspace = true, optional = true }
 pipewire = { version = "0.10.1", default-features = false }
 tokio = { version = "1.54.1", features = ["macros", "rt"] }
 

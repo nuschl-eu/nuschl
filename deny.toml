@@ -118,6 +118,9 @@ deny = [
     "ravif",
     "nuschl-video-worker",
   ], reason = "AVIF encoding stays behind ravif, and native video encoding runs inside the isolated video worker" },
+  { name = "cros-libva", wrappers = [
+    "nuschl-video-worker",
+  ], reason = "libva and the VA driver run only in the confined video worker" },
   { name = "rav1d", wrappers = [
     "nuschl-video-worker",
     "nuschl-video-encode",
@@ -256,11 +259,13 @@ deny = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Cargo.lock pins the owner's media transport and codec patches and the rav1d Rust decoder API.
+# Cargo.lock pins the owner's media transport and codec patches, the rav1d Rust decoder API, and
+# cros-libva's packed-header buffers, which no release has yet.
 allow-git = [
   "https://github.com/ambiso/opus-rs",
   "https://github.com/ambiso/str0m",
   "https://github.com/memorysafety/rav1d",
+  "https://github.com/chromeos/cros-libva",
 ]
 
 [[bans.features]]

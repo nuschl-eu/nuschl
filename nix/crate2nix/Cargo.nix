@@ -3745,6 +3745,88 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "log" "logging" "runtime" "which" "which-rustfmt" ];
       };
+      "bindgen 0.70.1" = rec {
+        crateName = "bindgen";
+        version = "0.70.1";
+        edition = "2018";
+        sha256 = "0vyf0jp6apcy9kjyz4s8vldj0xqycnbzb6zv3skkwiqdi3nqz7gl";
+        libPath = "lib.rs";
+        authors = [
+          "Jyun-Yan You <jyyou.tw@gmail.com>"
+          "Emilio Cobos Álvarez <emilio@crisal.io>"
+          "Nick Fitzgerald <fitzgen@gmail.com>"
+          "The Servo project developers"
+        ];
+        dependencies = [
+          {
+            name = "bitflags";
+            packageId = "bitflags 2.13.2";
+          }
+          {
+            name = "cexpr";
+            packageId = "cexpr";
+          }
+          {
+            name = "clang-sys";
+            packageId = "clang-sys";
+            features = [ "clang_6_0" ];
+          }
+          {
+            name = "itertools";
+            packageId = "itertools 0.13.0";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "log";
+            packageId = "log";
+            optional = true;
+          }
+          {
+            name = "prettyplease";
+            packageId = "prettyplease";
+            optional = true;
+            features = [ "verbatim" ];
+          }
+          {
+            name = "proc-macro2";
+            packageId = "proc-macro2";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "quote";
+            packageId = "quote";
+            usesDefaultFeatures = false;
+          }
+          {
+            name = "regex";
+            packageId = "regex";
+            usesDefaultFeatures = false;
+            features = [ "std" "unicode-perl" ];
+          }
+          {
+            name = "rustc-hash";
+            packageId = "rustc-hash 1.1.0";
+          }
+          {
+            name = "shlex";
+            packageId = "shlex 1.3.0";
+          }
+          {
+            name = "syn";
+            packageId = "syn 2.0.119";
+            features = [ "full" "extra-traits" "visit-mut" ];
+          }
+        ];
+        features = {
+          "default" = [ "logging" "prettyplease" "runtime" ];
+          "experimental" = [ "dep:annotate-snippets" ];
+          "logging" = [ "dep:log" ];
+          "prettyplease" = [ "dep:prettyplease" ];
+          "runtime" = [ "clang-sys/runtime" ];
+          "static" = [ "clang-sys/static" ];
+        };
+        resolvedDefaultFeatures = [ "default" "logging" "prettyplease" "runtime" ];
+      };
       "bindgen 0.72.1" = rec {
         crateName = "bindgen";
         version = "0.72.1";
@@ -7291,6 +7373,52 @@ rec {
           "default" = [ "std" ];
         };
         resolvedDefaultFeatures = [ "default" "std" ];
+      };
+      "cros-libva" = rec {
+        crateName = "cros-libva";
+        version = "0.0.13";
+        edition = "2021";
+        workspace_member = null;
+        src = pkgs.fetchgit {
+          url = "https://github.com/chromeos/cros-libva";
+          rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf";
+          sha256 = "02k4432vc2pn7h6l6bw73vy05dg0r6rdp1xjkrqib5z3jd0hspz9";
+        };
+        libName = "cros_libva";
+        authors = [
+          "The Chromium OS Authors"
+        ];
+        dependencies = [
+          {
+            name = "bitflags";
+            packageId = "bitflags 2.13.2";
+          }
+          {
+            name = "log";
+            packageId = "log";
+            features = [ "release_max_level_debug" ];
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 1.0.69";
+          }
+        ];
+        buildDependencies = [
+          {
+            name = "bindgen";
+            packageId = "bindgen 0.70.1";
+          }
+          {
+            name = "pkg-config";
+            packageId = "pkg-config";
+          }
+          {
+            name = "regex";
+            packageId = "regex";
+          }
+        ];
+        features = {
+        };
       };
       "crossbeam-channel" = rec {
         crateName = "crossbeam-channel";
@@ -21621,7 +21749,7 @@ rec {
           "sval_ref" = [ "dep:sval_ref" ];
           "value-bag" = [ "dep:value-bag" ];
         };
-        resolvedDefaultFeatures = [ "alloc" "kv" "kv_unstable" "serde" "serde_core" "std" "value-bag" ];
+        resolvedDefaultFeatures = [ "alloc" "kv" "kv_unstable" "release_max_level_debug" "serde" "serde_core" "std" "value-bag" ];
       };
       "loop9" = rec {
         crateName = "loop9";
@@ -26839,6 +26967,12 @@ rec {
             target = { target, features }: (target."windows" or false);
           }
           {
+            name = "cros-libva";
+            packageId = "cros-libva";
+            optional = true;
+            target = { target, features }: ("linux" == target."os" or null);
+          }
+          {
             name = "gstreamer";
             packageId = "gstreamer";
             optional = true;
@@ -26877,6 +27011,12 @@ rec {
             name = "nuschl-sandbox-windows";
             packageId = "nuschl-sandbox-windows";
             target = { target, features }: (target."windows" or false);
+          }
+          {
+            name = "nuschl-video-encode";
+            packageId = "nuschl-video-encode";
+            optional = true;
+            target = { target, features }: ("linux" == target."os" or null);
           }
           {
             name = "pipewire";
@@ -26918,9 +27058,10 @@ rec {
           }
         ];
         features = {
+          "va-encoder" = [ "dep:cros-libva" "dep:nuschl-video-encode" ];
           "vaapi" = [ "dep:gstreamer" "dep:gstreamer-app" ];
         };
-        resolvedDefaultFeatures = [ "vaapi" ];
+        resolvedDefaultFeatures = [ "va-encoder" "vaapi" ];
       };
       "nuschl-web-relay" = rec {
         crateName = "nuschl-web-relay";

@@ -34,6 +34,7 @@ nuschl-kt = { path = "crates/kt", version = "0.3.0" }
 nuschl-e2ee = { path = "crates/e2ee", version = "0.3.0" }
 
 nuschl-session = { path = "crates/session", version = "0.3.0" }
+nuschl-video-encode = { path = "crates/video-encode", version = "0.3.0" }
 # Pure-Rust Opus, a libopus port: the owner's fork, its main branch; Cargo.lock pins the commit.
 opus-rs = { version = "0.1.42", git = "https://github.com/ambiso/opus-rs" }
 
