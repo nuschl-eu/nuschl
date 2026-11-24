@@ -1832,7 +1832,7 @@ impl Desktop {
             return;
         }
         if !self.attachments().is_empty() {
-            return self.send_attachments(window, cx);
+            return self.send_attachments(cx);
         }
         let body = self.composer.read(cx).value().to_string();
         if let Err(nuschl_client::SendError::TooLong) = self.client.send_text(body) {
@@ -2118,29 +2118,49 @@ impl Desktop {
         let mut choice = self.choice(&key);
         change(&mut choice);
         self.choices.insert(key.clone(), choice);
-        let images: Vec<u64> = self.attachments.get_mut(&key).map_or(Vec::new(), |tray| {
-            tray.iter()
-                .filter(|attachment| matches!(attachment, Attachment::Image { .. }))
-                .map(Attachment::id)
-                .collect()
-        });
+        let images = crate::attachments::images(self.attachments());
+        let notes = self.prepare_again(&key, images);
+        if !notes.is_empty() {
+            self.attach_note = Some((key, notes.join(" ")));
+        }
+    }
+    /// Prepare images `ids` in `key`'s tray again, as its choice has it now.
+    /// Returns the notes.
+    fn prepare_again(&mut self, key: &(String, u32), ids: Vec<u64>) -> Vec<String> {
         let mut notes = Vec::new();
-        for old in images {
+        for old in ids {
             // A new id: a result for the old choice finds nothing to settle.
             let new = self.next_attachment();
             if let Some(Attachment::Image { id, prepared, .. }) = self
                 .attachments
-                .get_mut(&key)
+                .get_mut(key)
                 .and_then(|tray| tray.iter_mut().find(|attachment| attachment.id() == old))
             {
                 *id = new;
                 *prepared = None;
             }
-            notes.extend(self.prepare(&key, new));
+            notes.extend(self.prepare(key, new));
         }
-        if !notes.is_empty() {
-            self.attach_note = Some((key, notes.join(" ")));
+        notes
+    }
+    /// A sent message that cannot go comes back to its composer, which still
+    /// holds its text (see `flush_outgoing`): its attachments before any
+    /// added since, and its image choice. Where the composer has a choice of
+    /// its own by now, the message's images are prepared again for that one.
+    /// Returns the notes.
+    fn return_to_composer(&mut self, batch: Outgoing) -> Vec<String> {
+        let key = batch.key;
+        let choice = *self.choices.entry(key.clone()).or_insert(batch.choice);
+        let again = if choice == batch.choice {
+            Vec::new()
+        } else {
+            crate::attachments::images(&batch.attachments)
+        };
+        if !batch.attachments.is_empty() {
+            let tray = self.attachments.entry(key.clone()).or_default();
+            tray.splice(0..0, batch.attachments);
         }
+        self.prepare_again(&key, again)
     }
     pub fn remove_attachment(&mut self, id: u64) {
         for tray in self.attachments.values_mut() {
@@ -2158,40 +2178,53 @@ impl Desktop {
         self.choices.remove(&key);
         self.attachments.remove(&key).is_some()
     }
-    /// The content worker prepared an attached image, or could not.
+    /// The content worker prepared an attached image, or could not. A sent
+    /// message whose image cannot go comes back to its composer.
     fn prepared(
         &mut self,
         id: u64,
         result: Result<crate::attachments::Ready, String>,
         cx: &mut Context<Self>,
     ) {
-        // In a composer's tray, or in a sent message waiting for it.
-        let choices = &self.choices;
-        let trays = self.attachments.iter_mut().map(|(key, tray)| {
-            let strip = choices.get(key).is_none_or(|choice| choice.strip_metadata);
-            (key, tray, strip)
-        });
-        let batches = self.outgoing.iter_mut().map(|batch| {
+        let holds = |tray: &[Attachment]| tray.iter().any(|attachment| attachment.id() == id);
+        // In a sent message waiting for it, or in a composer's tray.
+        let mut returned = None;
+        let sent = self
+            .outgoing
+            .iter()
+            .position(|batch| holds(&batch.attachments));
+        let note = if let Some(index) = sent {
+            let batch = &mut self.outgoing[index];
+            let key = batch.key.clone();
             let strip = batch.choice.strip_metadata;
-            (&batch.key, &mut batch.attachments, strip)
-        });
-        let note = trays
-            .chain(batches)
-            .find(|(_, tray, _)| tray.iter().any(|attachment| attachment.id() == id))
-            .and_then(|(key, tray, strip_metadata)| {
-                let note = crate::attachments::settle(tray, id, result, strip_metadata)?;
+            let note = crate::attachments::settle(&mut batch.attachments, id, result, strip);
+            if !holds(&batch.attachments) {
+                returned = self.outgoing.remove(index);
+            }
+            note.map(|note| (key, note))
+        } else {
+            let choices = &self.choices;
+            let tray = self.attachments.iter_mut().find(|(_, tray)| holds(tray));
+            tray.and_then(|(key, tray)| {
+                let strip = choices.get(key).is_none_or(|choice| choice.strip_metadata);
+                let note = crate::attachments::settle(tray, id, result, strip)?;
                 Some((key.clone(), note))
-            });
-        if note.is_some() {
-            self.attach_note = note;
-        }
+            })
+        };
         self.attachments.retain(|_, tray| !tray.is_empty());
+        let again = returned.map_or(Vec::new(), |batch| self.return_to_composer(batch));
         self.flush_outgoing(cx);
+        // After the flush, which clears the notes of the messages it sends.
+        if let Some((key, note)) = note {
+            let notes: Vec<String> = std::iter::once(note).chain(again).collect();
+            self.attach_note = Some((key, notes.join(" ")));
+        }
     }
     /// Send the open conversation's text and attachments once its images are
     /// prepared: text first, then the images one per message (the text with
-    /// the first), then the files offered for transfer.
-    fn send_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// the first), then the files offered for transfer. The composer keeps
+    /// the text until then.
+    fn send_attachments(&mut self, cx: &mut Context<Self>) {
         let (Some((server, channel)), Some(key)) = (self.selected_indices(), self.selected_key())
         else {
             return;
@@ -2266,9 +2299,6 @@ impl Desktop {
                 .unwrap_or_else(|| self.choice(&key)),
         });
         self.attach_note = None;
-        self.drafts.remove(&key);
-        self.composer
-            .update(cx, |input, cx| input.set_value("", window, cx));
         self.flush_outgoing(cx);
         cx.notify();
     }
@@ -2347,6 +2377,13 @@ impl Desktop {
             {
                 self.attach_note = None;
             }
+            // The composer clears the text once it is handed over, unless it
+            // was changed (see `apply_composer_acks`).
+            let conversation = Conversation {
+                server: batch.key.0.clone(),
+                channel: batch.key.1,
+            };
+            let handed = (conversation, batch.text.clone());
             let mut images = Vec::new();
             let mut files = Vec::new();
             for attachment in batch.attachments {
@@ -2389,6 +2426,7 @@ impl Desktop {
                 self.attach_note = Some((batch.key, format!("Not sent: {error}")));
                 continue;
             }
+            self.acknowledged.push(handed);
             if !files.is_empty() {
                 self.offer_files(&batch.key, files, cx);
             }

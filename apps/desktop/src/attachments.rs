@@ -59,6 +59,14 @@ pub enum Source {
     },
 }
 
+/// The ids of the images in `tray`.
+pub fn images(tray: &[Attachment]) -> Vec<u64> {
+    tray.iter()
+        .filter(|attachment| matches!(attachment, Attachment::Image { .. }))
+        .map(Attachment::id)
+        .collect()
+}
+
 /// What an image goes as.
 pub enum Prepared {
     /// An `<img>` element in the message, and its thumbnail.

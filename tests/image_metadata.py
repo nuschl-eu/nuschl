@@ -24,6 +24,8 @@ Settings' image quality is Low. Checks that:
   metadata, with the same scan data and an EXIF that holds only the
   orientation; the next message is at Low with the box ticked again;
 - at Original with the box unticked, the peer downloads the same bytes;
+- an image whose file reads empty after Send brings its message back to
+  the composer with a note, its text and its choice; sent again, it goes;
 - at High, a noisy picture far over the server's limit reaches the peer
   within it.
 
@@ -389,6 +391,51 @@ def main():
         original = download(turned.name)
         assert hashlib.sha256(original).digest() == hashlib.sha256(turned.read_bytes()).digest()
         print("Original, unticked: the peer downloaded the same bytes.", flush=True)
+
+        # Original, ticked, sent with text while its file is read, and the
+        # read finds the file empty (as a document a portal is still
+        # exporting can be): the message comes back to the composer with a
+        # note, its text and its choice. Sent again, it goes.
+        late = turned_photo(root / "IMG_0044.jpg")
+        attach(late)
+        find(lambda _, role, name, __: name.startswith(f"Image {late.name}, ")
+             and not name.endswith("being prepared"), "the photo was not prepared")
+        os.mkfifo(root / "pipe")
+        os.replace(root / "pipe", late)
+        choose("Original")
+        composer = find(lambda _, role, name, __: role in ("text", "entry") and name == "Message",
+                        "no composer")[0]
+        composer.call("Component", "GrabFocus")
+        time.sleep(0.5)
+        shell.type("Look")
+        time.sleep(0.5)
+        send()
+        find(lambda _, __, name, ___: name == "Preparing the image…", "the message is not waiting for its image")
+
+        def reader():
+            try:
+                return os.open(late, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                return None
+        os.close(eventually(reader, "nothing reads the photo"))
+        find(lambda _, __, name, ___: name.startswith(f"Could not attach {late.name}: "),
+             "the image that could not be prepared left no note")
+        assert chosen() == ["Original"], chosen()
+        assert checkbox()[3] & CHECKED, "Strip metadata is not ticked for the returned message"
+        time.sleep(3)
+        assert not any(e.get("body") == "Look" or late.name in e.get("body", "")
+                       for e in peer.events if e["kind"] == "text"), offers()
+        os.remove(late)
+        turned_photo(late)
+        attach(late)
+        find(lambda _, role, name, __: name.startswith(f"File {late.name}, "), "the photo is not in the tray as a file")
+        # Sent again with the text the composer kept. The next message, an
+        # image alone, shows that the composer is clear afterwards.
+        send()
+        peer.wait(lambda e: e["kind"] == "text" and e.get("body") == "Look", timeout=60)
+        assert without_metadata(download(late.name))
+        print("An image that could not be prepared after Send brought its message back with a note; "
+              "sent again, it went.", flush=True)
 
         # High, far over the server's image limit: smaller, within it.
         noisy = root / "noise.png"

@@ -120,10 +120,12 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
 
   With Strip metadata ticked, an image that cannot go so, such as one over
   8 MB or a HEIC, AVIF, TIFF, JPEG XL or SVG file, stays unsent with a note.
-  Unticked, it goes as its original file. The tray shows the size each
-  attachment sends. Each new message starts with the box ticked and the
-  quality from **Settings → Images** (High unless changed); a message keeps
-  its choice until it is sent or cleared.
+  Unticked, it goes as its original file. A message sent while its images
+  are prepared keeps its text in the composer until it goes; when one of
+  them cannot go, the message comes back to the composer with the note.
+  The tray shows the size each attachment sends. Each new message starts
+  with the box ticked and the quality from **Settings → Images** (High
+  unless changed); a message keeps its choice until it is sent or cleared.
 
 - Links in welcome cards, channel descriptions and user comments support clicking,
   Tab/Shift+Tab and Enter, and screen-reader activation. They use the same URL
