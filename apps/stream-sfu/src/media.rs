@@ -1069,6 +1069,7 @@ impl Core {
                             let bound = quality::QUEUE_BOUND;
                             match view.backlog.layered(
                                 frame,
+                                timestamp,
                                 discardable,
                                 queue,
                                 bitrate,

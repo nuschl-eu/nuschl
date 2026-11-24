@@ -80,6 +80,8 @@ pub struct Backlog {
     dropped_through: Option<u64>,
     /// The layered frame left out whole.
     skipping: Option<u16>,
+    /// The timestamp of the last temporal unit with a layered frame out.
+    unit: Option<u64>,
     /// The bytes of the last key picture's temporal unit, and whether more of
     /// it is to come: the queue's bound grows by the time they take.
     key: (u64, bool),
@@ -177,10 +179,13 @@ impl Backlog {
     /// takes. Past `bound` the receiver's target drops a step, and a frame its
     /// target can do without (`discardable`) is left out whole; past twice
     /// `bound` every frame but a key picture is, and the receiver waits for the
-    /// next switch point.
+    /// next switch point. A temporal unit (at `timestamp`) with a frame out
+    /// keeps its later frames: its last one carries the marker.
+    #[allow(clippy::too_many_arguments)]
     pub fn layered(
         &mut self,
         frame: &Frame,
+        timestamp: u64,
         discardable: bool,
         queue: Option<&dyn StreamTxQueueInfo>,
         bitrate: u64,
@@ -205,9 +210,12 @@ impl Backlog {
                 self.key = (0, true);
             } else if delay > bound {
                 self.overloaded(VideoLimit::ForwardingBacklog);
-                if discardable || delay > bound * 2 {
+                if (discardable || delay > bound * 2) && self.unit != Some(timestamp) {
                     self.skipping = Some(frame.number);
                 }
+            }
+            if self.skipping.is_none() {
+                self.unit = Some(timestamp);
             }
         }
         if self.skipping == Some(frame.number) {
@@ -505,10 +513,14 @@ mod tests {
         let later = frame(2, false);
         // 2 Mbit/s: 100 kB wait 400 ms, 200 kB 800 ms.
         let queue = |bytes: usize| Queue { oldest: now, bytes };
-        let admit = |backlog: &mut Backlog, frame: &Frame, discardable, bytes| {
+        // Each frame starts a temporal unit of its own.
+        let mut unit = 0;
+        let mut admit = |backlog: &mut Backlog, frame: &Frame, discardable, bytes| {
             let queue = queue(bytes);
+            unit += 1;
             backlog.layered(
                 frame,
+                unit,
                 discardable,
                 Some(&queue),
                 2_000_000,
@@ -545,6 +557,7 @@ mod tests {
             let queue = sample(bytes);
             backlog.layered(
                 frame,
+                u64::from(frame.number) + 100,
                 discardable,
                 Some(&queue),
                 2_000_000,
@@ -562,6 +575,41 @@ mod tests {
         backlog.tick(now);
         assert_eq!(backlog.tier(3), 2);
         assert_eq!(backlog.limit(), Some(VideoLimit::ForwardingBacklog));
+    }
+
+    /// A key picture and a delta frame referencing the frame before it.
+    fn key_and_delta() -> (Frame, Frame) {
+        let mut layers = Layers::default();
+        let key = layers
+            .packet(
+                &[0xc0, 0, 1, 0x80, 0x00, 0x3a, 0x40, 0x00],
+                1,
+                Duration::ZERO,
+            )
+            .expect("key picture");
+        let delta = layers
+            .packet(&[0xc1, 0, 2], 1, Duration::ZERO)
+            .expect("delta");
+        (key, delta)
+    }
+
+    #[test]
+    fn a_temporal_unit_with_a_frame_out_keeps_its_later_frames() {
+        let now = Instant::now();
+        let (key, delta) = key_and_delta();
+        let mut backlog = Backlog::default();
+        // 2 Mbit/s: 100 kB wait 400 ms.
+        let queue = Queue {
+            oldest: now,
+            bytes: 100_000,
+        };
+        let mut admit = |frame: &Frame, unit| {
+            backlog.layered(frame, unit, true, Some(&queue), 2_000_000, QUEUE_BOUND, now)
+        };
+        assert_eq!(admit(&delta, 1), Layered::Skip);
+        assert_eq!(admit(&key, 2), Layered::Send);
+        assert_eq!(admit(&delta, 2), Layered::Send);
+        assert_eq!(admit(&delta, 3), Layered::Skip);
     }
 
     #[test]
