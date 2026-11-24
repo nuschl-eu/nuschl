@@ -358,8 +358,9 @@ State, per viewer and source, updated once a second:
   without a target until the next such switch point.
 - The queue leaves out a frame the target can do without once the queue's
   delay passes the bound, every frame but a key picture past twice the bound,
-  and keeps a temporal unit with a frame out whole. Each overloaded second
-  adds a step; steps recover one per 10 s.
+  and keeps a temporal unit with a packet out whole: its byte cap passes the
+  rest, and the budgets lend it. Each overloaded second adds a step; steps
+  recover one per 10 s.
 
 Invariants:
 

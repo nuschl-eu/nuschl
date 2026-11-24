@@ -1099,7 +1099,11 @@ impl Core {
                                 bound,
                                 now,
                             ) {
-                                Layered::Send => view.backlog.capped(queue, payload),
+                                // A unit with a packet out goes out whole.
+                                Layered::Send => {
+                                    !view.backlog.out(timestamp)
+                                        && view.backlog.capped(queue, payload)
+                                }
                                 Layered::Skip => {
                                     view.rewrite.skip(*packet.seq_no);
                                     view.selector.dropped(frame);
@@ -1124,11 +1128,19 @@ impl Core {
                 false
             };
             let room_budget = &mut self.rooms.get_mut(&room).expect("room").budget;
+            // The budgets lend a layered unit with a packet out its rest.
+            let lend = layered.is_some() && view.backlog.out(timestamp);
+            let charge = |bucket: &mut Bucket| {
+                if lend {
+                    bucket.lend(cost as f64, now);
+                }
+                lend || bucket.take(cost as f64, now)
+            };
             let limit = if full {
                 Some(VideoLimit::ForwardingBacklog)
-            } else if !peer.budget.take(cost as f64, now) {
+            } else if !charge(&mut peer.budget) {
                 Some(VideoLimit::SfuViewer)
-            } else if !room_budget.take(cost as f64, now) {
+            } else if !charge(room_budget) {
                 Some(VideoLimit::SfuRoom)
             } else {
                 None
@@ -1152,7 +1164,7 @@ impl Core {
                 continue;
             };
             if video {
-                view.backlog.enqueued(payload, cost, marker);
+                view.backlog.enqueued(payload, cost, marker, timestamp);
             }
             stream.write_rtp(
                 RtpWrite::new(
