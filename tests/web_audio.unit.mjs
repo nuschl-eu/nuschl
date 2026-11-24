@@ -82,6 +82,16 @@ test("a stalled transport closes capture instead of growing an unlimited RPC bac
   reply();await turn();assert.equal(audio.txJobs.size,0);await audio.dispose();
 });
 
+test("a codec worker that misses heartbeats for seconds keeps audio; one silent for 30 s has hung",async()=>{
+  let terminated=false;const audio=new BrowserAudio();audio.syncVoice(voice());
+  audio.worker={postMessage:()=>{},terminate:()=>{terminated=true;}};audio.workerReady=true;
+  audio.lastProgress=performance.now()-20000;audio.watch();
+  assert.equal(terminated,false);assert.notEqual(audio.phase,"error");
+  audio.lastProgress=performance.now()-30001;audio.watch();
+  assert.equal(terminated,true);assert.equal(audio.phase,"error");
+  await audio.dispose();
+});
+
 test("packet inbox stays bounded across stalls and rapid RX revoke/reopen until exact ACK",async()=>{
   const output=[],sent=[];const audio=new BrowserAudio();audio.syncVoice(voice());
   audio.ctx={state:"running",currentTime:0};audio.workerReady=true;audio.nodesReady=true;

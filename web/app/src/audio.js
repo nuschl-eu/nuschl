@@ -107,10 +107,14 @@ export class BrowserAudio {
     worker.postMessage({kind:"playout-port", port:channel.port1}, [channel.port1]);
     this.playbackNode.port.postMessage({kind:"wake-port", port:channel.port2}, [channel.port2]);
     this.lastProgress=performance.now();
-    this.watchdog=setInterval(()=>{
-      if(this.worker&&performance.now()-this.lastProgress>(this.workerReady?2500:15000))this.fail(new Error("The audio codec worker stopped responding."));
-    },500);
+    this.watchdog=setInterval(()=>this.watch(),500);
     this.resetMedia();
+  }
+  // The codec worker posts "ready" once its WASM is compiled, then a heartbeat
+  // every 500 ms. A loaded device delays both by seconds while the worker
+  // still works, and frames it is late for expire. Silent for 30 s, it has hung.
+  watch() {
+    if(this.worker&&performance.now()-this.lastProgress>30000)this.fail(new Error("The audio codec worker stopped responding."));
   }
   syncVoice(value) {
     const next=context(value);
