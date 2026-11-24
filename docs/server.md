@@ -666,7 +666,8 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   into linked channels, whispers and shouts), stock text, typing indicators
   and plugin data reach only those who see the sender, and a stock text
   names only the channels and people its receiver sees. Knock notices and
-  admissions name only people their recipient sees. Stored channel messages
+  admissions, the stock text ones included, name only people their recipient
+  sees. Stored channel messages
   reach Nuschl readers of the channel with the author's name, as history
   pages show them. A direct message to someone whose connections the sender
   does not see is allowed as to someone offline: stored, and delivered to

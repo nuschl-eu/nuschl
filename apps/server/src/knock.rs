@@ -299,12 +299,14 @@ impl State {
         self.enter_channel(p.session, p.channel, &mut message);
         self.broadcast_user(&message, None);
         self.resolve_knock(id, Some(grant));
-        let name = self
+        // Named only to a requester who sees the moderator.
+        let by = self
             .users
             .get(&actor)
-            .map(|u| u.name.as_str())
-            .unwrap_or("");
-        self.knock_notice(p.session, format!("Admitted by {name}; access lasts until you leave or disconnect. Earlier history is unavailable."));
+            .filter(|_| self.sees_user(p.session, actor))
+            .map(|u| format!(" by {}", u.name))
+            .unwrap_or_default();
+        self.knock_notice(p.session, format!("Admitted{by}; access lasts until you leave or disconnect. Earlier history is unavailable."));
         Ok(())
     }
 

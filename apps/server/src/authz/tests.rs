@@ -2856,6 +2856,61 @@ fn volume_adjustments_for_a_hidden_channel_are_answered_as_for_a_missing_one() {
     assert_eq!(ask(&mut f, SECRET), ask(&mut f, 999));
 }
 
+/// A requester admitted by a moderator it does not see is told it was
+/// admitted, without the moderator's name.
+#[test]
+fn an_admission_notice_names_only_a_moderator_the_requester_sees() {
+    use prost::Message as _;
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let requester = f.actor("registered");
+    let moderator = f.actor("admin");
+    f.handle(
+        moderator,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    f.state.users.get_mut(&requester).unwrap().extension = None;
+    f.state.users.get_mut(&moderator).unwrap().extension = None;
+    f.handle(
+        requester,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(PRIVATE),
+            ..Default::default()
+        },
+    );
+    f.received(requester);
+    f.handle(
+        moderator,
+        kind::USER_STATE,
+        &proto::UserState {
+            session: Some(requester),
+            channel_id: Some(PRIVATE),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.state.users[&requester].channel, PRIVATE);
+    assert!(!f.state.sees_user(requester, moderator));
+    let texts: Vec<String> = f
+        .received(requester)
+        .into_iter()
+        .filter(|(kind, _)| *kind == kind::TEXT_MESSAGE)
+        .map(|(_, body)| proto::TextMessage::decode(body).unwrap().message)
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.starts_with("Admitted;")),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text.contains("admin")),
+        "{texts:?}"
+    );
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is
