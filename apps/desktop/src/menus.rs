@@ -206,6 +206,17 @@ impl ActionOrigin {
                 .is_none_or(|conversation| selection == Some(conversation)))
         .then_some(index)
     }
+    /// Also covering channel `id` as it is now in `view`.
+    pub(crate) fn with_channel(mut self, view: &crate::state::ServerView, id: u32) -> Self {
+        if let Some(channel) = view
+            .channels
+            .iter()
+            .find(|channel| channel.target == TextTarget::Channel(id))
+        {
+            self.authority.channels.push((id, channel.instance));
+        }
+        self
+    }
     pub(crate) fn with_account(&self, account: [u8; 16]) -> Self {
         let mut origin = self.clone();
         origin.authority.accounts = vec![account];
@@ -1087,21 +1098,26 @@ impl Desktop {
                             },
                         ));
                     }
-                    if let Some(mine) = my_channel.filter(|mine| *mine != channel)
-                        && server.may(mine, perm::MOVE)
-                    {
+                    if let Some(mine) = my_channel.filter(|mine| server.may_move(session, *mine)) {
                         entries.push(
                             item("Move to my channel", "volume", move |this, index, _, _| {
-                                this.run(
-                                    index,
-                                    Command::User {
-                                        session,
-                                        action: UserAction::Move(mine),
-                                        reason: None,
-                                    },
-                                );
+                                if let Err(error) = this.client.move_user(index, session, mine) {
+                                    this.client.servers[index].set_notice(error);
+                                }
                             })
                             .key(format!("move-user:{session}:{mine}")),
+                        );
+                    }
+                    if server.may(channel, perm::MOVE) {
+                        entries.push(
+                            item(
+                                "Move to channel…",
+                                "volume",
+                                move |this, index, window, cx| {
+                                    this.begin_keyboard_move(index, session, window, cx);
+                                },
+                            )
+                            .key(format!("move-user-to:{session}")),
                         );
                     }
                 }

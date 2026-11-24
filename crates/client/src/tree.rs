@@ -84,6 +84,15 @@ impl ServerState {
     /// a closed branch counts the people inside it. One pass over channels
     /// and users, so it is cheap enough to run every frame.
     pub fn tree_rows(&self) -> Vec<TreeRow> {
+        self.tree_rows_moving(None)
+    }
+    /// The tree with one person shown in another channel: `(session,
+    /// channel)`, the preview of moving them there.
+    pub fn tree_rows_moving(&self, moving: Option<(u32, u32)>) -> Vec<TreeRow> {
+        let channel_of = |user: &User| match moving {
+            Some((session, channel)) if session == user.session => channel,
+            _ => user.channel,
+        };
         // One entry per channel id; direct conversations are listed apart.
         let mut index_of = HashMap::with_capacity(self.channels.len());
         for (index, channel) in self.channels.iter().enumerate() {
@@ -99,7 +108,8 @@ impl ServerState {
         children.sort_unstable();
         let family = |parent| run(&children, parent, |&(parent, _)| parent);
         let mut people = self.users.values().collect::<Vec<_>>();
-        people.sort_by_cached_key(|user| (user.channel, user.name.to_lowercase(), user.session));
+        people
+            .sort_by_cached_key(|user| (channel_of(user), user.name.to_lowercase(), user.session));
         let mut listeners = self
             .users
             .values()
@@ -163,7 +173,7 @@ impl ServerState {
                 },
                 parent,
                 visible,
-                people: run(&people, channel.id, |user| user.channel),
+                people: run(&people, channel.id, |user| channel_of(user)),
             });
         }
         // Children before parents: everyone inside adds up towards the roots.
@@ -409,6 +419,20 @@ mod tests {
             .collect();
         // Case and accents count after letters, punctuation before them.
         assert_eq!(names, ["_AFK", "admin", "Ärger", "Lobby", "Zebra", "Music"]);
+    }
+
+    #[test]
+    fn a_move_preview_is_the_tree_after_the_move() {
+        let server = sample();
+        // bob into Development, Zed into the closed Gaming, Ada to the root.
+        for (session, channel) in [(6, 3), (7, 4), (2, 0)] {
+            let mut moved = sample();
+            moved.users.get_mut(&session).unwrap().channel = channel;
+            assert_eq!(
+                server.tree_rows_moving(Some((session, channel))),
+                moved.tree_rows()
+            );
+        }
     }
 
     #[test]

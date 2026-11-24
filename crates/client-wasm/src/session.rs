@@ -474,6 +474,23 @@ impl Session {
         );
     }
 
+    /// Move someone else to a channel; the server decides.
+    pub fn move_user(&mut self, session: u32, channel: u32) {
+        if self.own_session().is_some_and(|own| own != session)
+            && self.users.contains_key(&session)
+            && self.channels.contains_key(&channel)
+        {
+            self.send(
+                kind::USER_STATE,
+                &proto::UserState {
+                    session: Some(session),
+                    channel_id: Some(channel),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
     /// Send local policy in full; sparse/delayed echoes cannot undo it.
     pub fn set_self(&mut self, muted: bool, deafened: bool) {
         self.desired_muted = muted || deafened;
@@ -1142,10 +1159,19 @@ impl Session {
                 }
             }
             kind::PERMISSION_DENIED => {
+                let text = match proto::PermissionDenied::decode(payload) {
+                    Ok(denied) => match denied.reason {
+                        Some(reason) => reason.chars().take(1024).collect(),
+                        None => nuschl_core::model::denial_text(
+                            denied.r#type,
+                            denied.permission,
+                            denied.name.as_deref(),
+                        ),
+                    },
+                    Err(_) => "The server refused this action.".into(),
+                };
                 self.events
-                    .push_back(Event::Server(ServerEvent::PermissionDenied(
-                        "The server refused this action.".into(),
-                    )));
+                    .push_back(Event::Server(ServerEvent::PermissionDenied(text)));
             }
             kind::PLUGIN_DATA_TRANSMISSION if self.phase == Phase::LoggedIn => {
                 let Ok(data) =
@@ -2872,6 +2898,25 @@ mod tests {
         assert_ne!(before, second.users[&7].instance);
         first.control(kind::USER_STATE, update("different"));
         assert_ne!(before, first.users[&7].instance);
+    }
+
+    #[test]
+    fn a_denial_names_the_refused_permission() {
+        let mut session = session();
+        session.events.clear();
+        session.control(
+            kind::PERMISSION_DENIED,
+            proto::PermissionDenied {
+                permission: Some(nuschl_core::model::permission::MOVE),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        );
+        assert!(session.events.iter().any(|event| matches!(
+            event,
+            Event::Server(ServerEvent::PermissionDenied(text)) if text == "Permission denied: Move"
+        )));
     }
 
     #[test]

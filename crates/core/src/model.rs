@@ -8,6 +8,29 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 
 /// Mumble permission bits (`ChanACL::Perm`).
+/// A server's PermissionDenied without a reason, in words: by its type,
+/// else the permission it names (Mumble.proto's DenyType).
+pub fn denial_text(kind: Option<i32>, permission: Option<u32>, name: Option<&str>) -> String {
+    match kind {
+        Some(2) => "Only the SuperUser may do that.".into(),
+        Some(3) => "That channel name is not allowed.".into(),
+        Some(4) => "That message is too long for this server.".into(),
+        Some(6) => "Temporary channels cannot have children or be edited that way.".into(),
+        Some(7) => "You need a certificate to do that.".into(),
+        Some(8) => format!("The name \"{}\" is not allowed.", name.unwrap_or_default()),
+        Some(9) => "That channel is full.".into(),
+        Some(10) => "Channels cannot be nested that deeply.".into(),
+        Some(11) => "This server has reached its channel limit.".into(),
+        Some(12 | 13) => "The listener limit was reached.".into(),
+        _ => {
+            let permission = permission
+                .and_then(|bit| permission::NAMED.iter().find(|(value, _)| *value == bit))
+                .map_or("that action", |(_, name)| *name);
+            format!("Permission denied: {permission}")
+        }
+    }
+}
+
 pub mod permission {
     pub const WRITE: u32 = 0x1;
     pub const TRAVERSE: u32 = 0x2;

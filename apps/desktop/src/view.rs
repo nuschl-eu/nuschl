@@ -13,6 +13,7 @@ use crate::{
     state::{ChannelRow, Desktop, ServerView, Status, TreeRow},
     theme::{self, *},
     unread::{self, Lane},
+    user_move::{DragUser, RowKey},
 };
 use gpui_kit::{base::input::Textarea, prelude::*, *};
 use nuschl_client::{
@@ -144,6 +145,7 @@ impl Render for Desktop {
         self.apply_composer_acks(window, cx);
         self.reconcile_selection(window, cx);
         self.animate_server_rail(window, cx);
+        self.animate_user_move(window, cx);
         self.animate_voice(window, cx);
         self.settle_timeline();
         self.mark_read();
@@ -214,6 +216,11 @@ impl Render for Desktop {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && this.rail.dragged().is_some() {
                     this.cancel_server_drag(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.keystroke.key == "escape" && this.user_move.picked() {
+                    this.cancel_user_move(window, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -737,20 +744,24 @@ fn sidebar(
         .iter()
         .map(|candidate| (candidate.slot, candidate))
         .collect();
+    let mut listened = 0;
     let rows = server
-        .tree_rows()
+        .tree_rows_moving(this.user_move.preview(&server.id))
         .into_iter()
         .enumerate()
         .map(|(position, row)| match row {
-            TreeRow::Channel(row) => channel_row(
-                this,
-                server_index,
-                row,
-                row.index == selected_channel,
-                voice_channel,
-                folded.get(&(position + 1)).copied(),
-                cx,
-            ),
+            TreeRow::Channel(row) => {
+                listened = server.channels[row.index].id;
+                channel_row(
+                    this,
+                    server_index,
+                    row,
+                    row.index == selected_channel,
+                    voice_channel,
+                    folded.get(&(position + 1)).copied(),
+                    cx,
+                )
+            }
             TreeRow::User { session, depth } => match server.users.get(&session) {
                 Some(user) => user_row(this, server, server_index, user, depth, cx),
                 None => div().into_any_element(),
@@ -758,6 +769,10 @@ fn sidebar(
             TreeRow::Listener { session, depth } => match server.users.get(&session) {
                 Some(user) => div()
                     .id(("listener-row", session as usize))
+                    .relative()
+                    .top(px(this
+                        .user_move
+                        .offset(RowKey::Listener(session, listened))))
                     .flex_shrink_0()
                     .role(Role::TreeItem)
                     .aria_label(format!(
@@ -973,6 +988,14 @@ fn sidebar(
                         .on_scroll(cx.listener(|this, event, window, cx| {
                             this.smooth_scroll(true, event, window, cx)
                         }))
+                        .on_drag_move(cx.listener(
+                            |this, event: &DragMoveEvent<DragUser>, _, cx| {
+                                this.move_user_drag(event, cx)
+                            },
+                        ))
+                        .on_drop(cx.listener(|this, item: &DragUser, window, cx| {
+                            this.drop_user_drag(item, window, cx)
+                        }))
                         .child(section_label("channels-heading", "VOICE CHANNELS"))
                         .children(rows)
                         .when(!directs.is_empty(), |list| {
@@ -1116,8 +1139,16 @@ fn channel_row(
     let full_name = entry.name.clone();
     let unread_count = unread.map_or(entry.unread, |unread| unread.count);
     let mention = unread.map_or(entry.unread_mention, |unread| unread.mention);
+    // While someone is moved: where they may go, and where they would.
+    let takes = this
+        .user_move
+        .choosing(&server.id)
+        .is_some_and(|session| server.may_move(session, id));
+    let target = this.user_move.target(&server.id) == Some(id);
     let row = div()
         .id(("channel-row", id as usize))
+        .relative()
+        .top(px(this.user_move.offset(RowKey::Channel(id))))
         .role(Role::TreeItem)
         .tab_index(0)
         .aria_label(entry.name.clone())
@@ -1141,6 +1172,13 @@ fn channel_row(
         }))
         .when(selected, |row| row.bg(color(SELECTED)))
         .hover(|style| style.bg(color(HOVER)).text_color(color(TEXT)))
+        .when(takes, |row| row.bg(tint(ACCENT, 0x1c)))
+        .when(target, |row| {
+            row.bg(tint(ACCENT, 0x4a))
+                .text_color(color(TEXT))
+                .border_1()
+                .border_color(color(ACCENT))
+        })
         .when(this.menu.is_none(), |row| {
             row.tooltip(move |_, cx| cx.new(|_| Tooltip(full_name.clone().into())).into())
         })
@@ -1396,7 +1434,7 @@ impl Desktop {
 /// People sit under their channel's name, further in than its sub-channels'
 /// icons: `depth` is the channel's depth plus one. The constant is the
 /// channel row's inset, chevron, gap, speaker icon and gap.
-fn user_indent(depth: usize) -> f32 {
+pub(crate) fn user_indent(depth: usize) -> f32 {
     50. + depth.saturating_sub(1).min(10) as f32 * 14.
 }
 
@@ -1410,6 +1448,14 @@ fn user_row(
 ) -> AnyElement {
     let session = user.session;
     let own = server.own_session == Some(session);
+    // Someone else, where we hold Move: dragging their row moves them.
+    let movable = !own && server.may(user.channel, nuschl_core::model::permission::MOVE);
+    let moving = this
+        .user_move
+        .moving(&server.id)
+        .filter(|(moved, _)| *moved == session);
+    let keyboard = this.user_move.keyboard(&server.id) == Some(session);
+    let server_id = server.id.clone();
     let talking = server.talking.contains(&session);
     let muted = user.muted || user.self_muted || user.suppressed;
     let deafened = user.deafened || user.self_deafened;
@@ -1426,11 +1472,16 @@ fn user_row(
                 format!("Friend, added as {added}")
             })
         });
-    div()
-        .id(("user-row", session as usize))
-        .role(Role::TreeItem)
-        .tab_index(0)
-        .aria_label(format!(
+    let label = if keyboard {
+        match this.user_move.target(&server.id) {
+            Some(target) => format!(
+                "Move {full_name} to {}: Enter moves, Escape cancels",
+                crate::panels::channel_name(server, target)
+            ),
+            None => format!("Move {full_name}: Up or Down chooses a channel"),
+        }
+    } else {
+        format!(
             "{full_name}{}{}{}{}",
             if friend.is_some() { ", friend" } else { "" },
             if talking { ", talking" } else { "" },
@@ -1442,7 +1493,15 @@ fn user_row(
                 ""
             },
             if deafened { ", deafened" } else { "" }
-        ))
+        )
+    };
+    div()
+        .id(("user-row", session as usize))
+        .relative()
+        .top(px(this.user_move.offset(RowKey::User(session))))
+        .role(Role::TreeItem)
+        .tab_index(0)
+        .aria_label(label)
         .when(full_name != name, |row| {
             row.tooltip(move |_, cx| cx.new(|_| Tooltip(full_name.clone().into())).into())
         })
@@ -1459,15 +1518,62 @@ fn user_row(
         .cursor_pointer()
         .text_color(color(if own { TEXT } else { TEXT_MUTED }))
         .hover(|style| style.bg(color(HOVER)).text_color(color(TEXT)))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_direct(server_index, session, window, cx);
+        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            if !(event.is_keyboard() && std::mem::take(&mut this.user_move.keyboard_sent)) {
+                this.open_direct(server_index, session, window, cx);
+            }
         }))
+        .when(movable, |row| {
+            let owner = cx.entity().downgrade();
+            row.on_drag(
+                DragUser {
+                    server: server_id.clone(),
+                    session,
+                },
+                move |item, _, _, cx| crate::user_move::drag_view(&owner, item, cx),
+            )
+        })
+        .when_some(moving, |row, (_, sent)| {
+            row.opacity(if sent { 0.7 } else { 0.4 })
+        })
         .when(
             this.tree_cursor == Some((server_index, TreeFocus::User(session))),
             |row| row.track_focus(&this.tree_focus),
         )
         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-            if let Some(right) = arrow_key(event) {
+            let key = event.keystroke.key.as_str();
+            let plain = !event.keystroke.modifiers.modified();
+            if this
+                .user_move
+                .keyboard(&this.client.servers[server_index].id)
+                == Some(session)
+                && plain
+                && matches!(key, "up" | "down" | "enter")
+            {
+                match key {
+                    "up" => this.step_user_move(-1),
+                    "down" => this.step_user_move(1),
+                    _ => {
+                        // Enter moves; its key-up click opens no conversation.
+                        this.user_move.keyboard_sent = true;
+                        this.send_user_move(window, cx);
+                    }
+                }
+                cx.stop_propagation();
+                cx.notify();
+            } else if key == "menu" || (key == "f10" && event.keystroke.modifiers.shift) {
+                // The context menu from the keyboard, below the row.
+                let handle = &this.channel_scroll;
+                let row = this.user_move.row(RowKey::User(session));
+                let at = row
+                    .and_then(|row| handle.bounds_for_item(row + 1))
+                    .map_or(handle.bounds().origin, |bounds| {
+                        bounds.bottom_left() + point(px(24.), handle.offset().y)
+                    });
+                this.open_menu(server_index, MenuTarget::User(session), at);
+                cx.stop_propagation();
+                cx.notify();
+            } else if let Some(right) = arrow_key(event) {
                 this.tree_arrow(server_index, TreeFocus::User(session), right, window, cx);
             }
         }))

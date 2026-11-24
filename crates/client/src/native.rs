@@ -1513,6 +1513,11 @@ impl Driver {
 fn request_command(request: Request) -> Command {
     match request {
         Request::Join(channel) => Command::Join(channel),
+        Request::MoveUser { session, channel } => Command::User {
+            session,
+            action: nuschl_session::model::UserAction::Move(channel),
+            reason: None,
+        },
         Request::OpenEncrypted {
             conversation,
             channel,
@@ -4281,6 +4286,10 @@ mod action_scope_tests {
                     expires_at: 0,
                     access_token: String::new(),
                 },
+                Request::MoveUser {
+                    session: 2,
+                    channel: 5,
+                },
             ] {
                 assert!(wrap(10, "a", request_command(request)).unwrap().is_some());
             }
@@ -4304,6 +4313,17 @@ mod action_scope_tests {
                     request_command(Request::ReadMarker {
                         conversation: [6; 16],
                         seq: 4
+                    })
+                )
+                .is_err()
+            );
+            assert!(
+                wrap(
+                    10,
+                    "a",
+                    request_command(Request::MoveUser {
+                        session: 2,
+                        channel: 6
                     })
                 )
                 .is_err()

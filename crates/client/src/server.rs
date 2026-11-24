@@ -434,6 +434,17 @@ impl ServerState {
             .is_some_and(|permissions| permissions & bits == bits)
     }
 
+    /// Whether the server granted us Move where `session` is and in `channel`,
+    /// so we may drag someone else there. The server still decides.
+    pub fn may_move(&self, session: u32, channel: u32) -> bool {
+        self.own_session != Some(session)
+            && self.users.get(&session).is_some_and(|user| {
+                user.channel != channel
+                    && self.may(user.channel, perm::MOVE)
+                    && self.may(channel, perm::MOVE)
+            })
+    }
+
     /// Like `may`, but optimistic while permissions are still unknown.
     pub fn may_try(&self, channel: u32, bits: u32) -> bool {
         self.permissions
@@ -831,6 +842,11 @@ impl ServerState {
     /// Replace a notice, invalidating any previous send-refusal lease even
     /// when the new text is identical. Frontends may read `notice` directly;
     /// production writers use these helpers to preserve its lifetime.
+    /// Counts notices set, such as the server's denials.
+    pub fn notice_revision(&self) -> u64 {
+        self.notice_revision
+    }
+
     pub fn set_notice(&mut self, notice: String) {
         self.notice_revision = self.notice_revision.wrapping_add(1);
         self.notice = Some(notice);

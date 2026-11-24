@@ -234,6 +234,8 @@ pub struct App {
     requests: u64,
     /// The requested voice bitrate (`/bitrate`).
     pub bitrate: Bitrate,
+    /// Someone picked up with M to move to another channel: server id, session.
+    pub moving: Option<(String, u32)>,
 }
 
 impl App {
@@ -255,6 +257,7 @@ impl App {
             quit: false,
             tz: jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC),
             tree_cursor: (None, 0),
+            moving: None,
             recent: finder::Recent::default(),
             drafts: BTreeMap::new(),
             servers_dirty: false,
@@ -1159,6 +1162,9 @@ impl App {
     /// direct messages with a person. `join`: join a channel's voice, or a
     /// person's channel.
     pub fn activate(&mut self, join: bool) {
+        if self.moving.is_some() && !join {
+            return self.drop_move();
+        }
         let Some(row) = self.rows().get(self.tree_index()).copied() else {
             return;
         };
@@ -1200,6 +1206,78 @@ impl App {
                 self.browse(server, id);
                 self.pane = Pane::Composer;
             }
+        }
+    }
+
+    /// M on a person: pick them up to move to another channel, where the
+    /// server granted Move (Mumble's permission).
+    pub fn pick_move(&mut self) {
+        let Some(Row::User {
+            server,
+            session,
+            listener: false,
+            ..
+        }) = self.rows().get(self.tree_index()).copied()
+        else {
+            return self.warn("Choose a person to move.");
+        };
+        let view = &self.client.servers[server];
+        let Some(user) = view.users.get(&session) else {
+            return;
+        };
+        let (name, channel) = (user.name.clone(), user.channel);
+        if view.own_session == Some(session) {
+            return self.warn("That is you: join a channel instead (J).");
+        }
+        if !view.permissions.contains_key(&channel) {
+            self.client.query_permissions(server, channel);
+            return self.say("Checking your permissions; press M again.");
+        }
+        if !view.may(channel, nuschl_core::model::permission::MOVE) {
+            return self.warn(format!("You may not move {name}."));
+        }
+        let channels: Vec<u32> = view
+            .channels
+            .iter()
+            .filter(|entry| matches!(entry.target, TextTarget::Channel(_)))
+            .map(|entry| entry.id)
+            .take(128)
+            .collect();
+        let id = view.id.clone();
+        for channel in channels {
+            self.client.query_permissions(server, channel);
+        }
+        self.moving = Some((id, session));
+        self.say(format!(
+            "Moving {name}: choose a channel and press Enter; Esc cancels."
+        ));
+    }
+
+    /// Enter while moving someone: move them to the channel under the cursor.
+    fn drop_move(&mut self) {
+        let Some((id, session)) = self.moving.clone() else {
+            return;
+        };
+        let Some(Row::Channel { server, row }) = self.rows().get(self.tree_index()).copied() else {
+            return self.warn("Choose a channel, or Esc to cancel the move.");
+        };
+        let view = &self.client.servers[server];
+        if view.id != id {
+            return self.warn("Choose a channel on their server.");
+        }
+        let channel = &view.channels[row.index];
+        let (target, place) = (channel.id, channel.name.clone());
+        let name = view
+            .users
+            .get(&session)
+            .map(|user| user.name.clone())
+            .unwrap_or_default();
+        match self.client.move_user(server, session, target) {
+            Ok(()) => {
+                self.moving = None;
+                self.say(format!("Moving {name} to {place}."));
+            }
+            Err(error) => self.warn(error),
         }
     }
 

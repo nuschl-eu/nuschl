@@ -17,6 +17,11 @@ pub struct Murmur {
 impl Murmur {
     /// Starts Murmur and waits until it accepts connections.
     pub fn start() -> Self {
+        Self::start_with_superuser(None)
+    }
+
+    /// Starts Murmur with this SuperUser password (`-supw`), if any.
+    pub fn start_with_superuser(password: Option<&str>) -> Self {
         let binary = crate::program("mumble-server");
         let directory = crate::temp_dir();
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -36,6 +41,21 @@ impl Murmur {
             ),
         )
         .expect("murmur.ini");
+        if let Some(password) = password {
+            let status = Command::new(&binary)
+                .args([
+                    "-ini".as_ref(),
+                    ini.as_os_str(),
+                    "-supw".as_ref(),
+                    password.as_ref(),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("set the SuperUser password");
+            assert!(status.success(), "-supw failed: {}", log(root));
+        }
         let process = Command::new(binary)
             .args(["-ini".as_ref(), ini.as_os_str(), "-fg".as_ref()])
             .stdin(Stdio::null())

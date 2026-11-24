@@ -2587,7 +2587,13 @@ impl State {
                 UserAction::Ban => may(0, p::BAN),
                 UserAction::Register => may(0, p::REGISTER),
                 UserAction::ResetComment | UserAction::ResetAvatar => may(0, p::RESET_USER_CONTENT),
-                UserAction::Move(channel) => may(*channel, p::MOVE),
+                UserAction::Move(channel) => {
+                    may(*channel, p::MOVE)
+                        && self
+                            .users
+                            .get(session)
+                            .is_some_and(|user| may(user.channel, p::MOVE))
+                }
                 _ => self
                     .users
                     .get(session)
@@ -4447,34 +4453,12 @@ impl State {
                 let text = denied
                     .reason
                     .map(|reason| bounded(reason, 1024))
-                    .unwrap_or_else(|| match denied.r#type {
-                        Some(2) => "Only the SuperUser may do that.".into(),
-                        Some(3) => "That channel name is not allowed.".into(),
-                        Some(4) => "That message is too long for this server.".into(),
-                        Some(6) => {
-                            "Temporary channels cannot have children or be edited that way.".into()
-                        }
-                        Some(7) => "You need a certificate to do that.".into(),
-                        Some(8) => format!(
-                            "The name \"{}\" is not allowed.",
-                            denied.name.unwrap_or_default()
-                        ),
-                        Some(9) => "That channel is full.".into(),
-                        Some(10) => "Channels cannot be nested that deeply.".into(),
-                        Some(11) => "This server has reached its channel limit.".into(),
-                        Some(12 | 13) => "The listener limit was reached.".into(),
-                        _ => {
-                            let permission = denied
-                                .permission
-                                .and_then(|bit| {
-                                    crate::model::permission::NAMED
-                                        .iter()
-                                        .find(|(value, _)| *value == bit)
-                                })
-                                .map(|(_, name)| *name)
-                                .unwrap_or("that action");
-                            format!("Permission denied: {permission}")
-                        }
+                    .unwrap_or_else(|| {
+                        crate::model::denial_text(
+                            denied.r#type,
+                            denied.permission,
+                            denied.name.as_deref(),
+                        )
                     });
                 emit(events, SessionEvent::PermissionDenied(text)).await?;
             }
@@ -8045,6 +8029,29 @@ mod delayed_action_authority_tests {
         );
         state.channels.get_mut(&5).unwrap().instance = 450;
         assert!(state.authorize(scoped(lease, Command::Join(5))).is_none());
+    }
+    #[test]
+    fn moving_someone_rechecks_move_where_they_are_and_where_they_go() {
+        use crate::model::permission::{ENTER, MOVE};
+        let mut state = observed();
+        let command = || Command::User {
+            session: 2,
+            action: UserAction::Move(6),
+            reason: None,
+        };
+        let lease = snapshot().for_command(&command()).unwrap();
+        let moves = |state: &mut State| state.authorize(scoped(lease.clone(), command())).is_some();
+        assert!(
+            moves(&mut state),
+            "unknown permissions are the server's to judge"
+        );
+        state.permissions.insert(6, MOVE);
+        state.permissions.insert(5, ENTER);
+        assert!(!moves(&mut state), "a known lack of Move where they are");
+        state.permissions.insert(5, MOVE);
+        assert!(moves(&mut state));
+        state.permissions.insert(6, ENTER);
+        assert!(!moves(&mut state), "a known lack of Move where they go");
     }
     #[test]
     fn incomplete_nested_oversized_and_wrong_semantic_envelopes_fail_closed() {

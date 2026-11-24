@@ -338,7 +338,7 @@ def main():
     parser.add_argument("--gnome-shell", type=Path)
     parser.add_argument("--size", default="1280x800")
     parser.add_argument("--settle", type=float, default=4.0)
-    parser.add_argument("--scenes", default="all", help="comma-separated: select,multiline,links,rich,friends,runs,unread,dialog,settings,shortcuts,server,menus,long,search,finder,emoji,toggles,clipping,viewer,notify,scroll,paste,attach,transfer,appearance,maximize; not in all: layout (long migration paths/voice names and zoom matrix, needs --at-spi), layout-controls (dialog/nested-control focus), layout-performance (matched frame timings), native-spacing (rail bottom/footer gaps; requires --pulse-bin and --at-spi), voice-status (two-server voice facts, consent/reconnect and visible zoom layout; requires --pulse-bin and --at-spi), rail-layout (first/last paint gutters and animated contours, needs --at-spi), resize (measures resizing), managed, math (formulas; run it with --theme light and --zoom 1.25 too), devices (wheel over Settings' device lists, checked over AT-SPI; needs --pulse-bin and --at-spi), notice-zoom (real Mumble failures and Dismiss bounds at 100–200%%, needs --at-spi), notice-heading (a certificate prompt: a notice with a heading, needs --at-spi), dialog-overscroll (Settings and Details end at their content at 100%% and 200%%, needs --at-spi)")
+    parser.add_argument("--scenes", default="all", help="comma-separated: select,multiline,links,rich,friends,runs,unread,dialog,settings,shortcuts,server,menus,long,search,finder,emoji,toggles,clipping,viewer,notify,scroll,paste,attach,transfer,appearance,maximize; not in all: layout (long migration paths/voice names and zoom matrix, needs --at-spi), layout-controls (dialog/nested-control focus), layout-performance (matched frame timings), native-spacing (rail bottom/footer gaps; requires --pulse-bin and --at-spi), voice-status (two-server voice facts, consent/reconnect and visible zoom layout; requires --pulse-bin and --at-spi), rail-layout (first/last paint gutters and animated contours, needs --at-spi), resize (measures resizing), managed, math (formulas; run it with --theme light and --zoom 1.25 too), devices (wheel over Settings' device lists, checked over AT-SPI; needs --pulse-bin and --at-spi), notice-zoom (real Mumble failures and Dismiss bounds at 100–200%%, needs --at-spi), notice-heading (a certificate prompt: a notice with a heading, needs --at-spi), dialog-overscroll (Settings and Details end at their content at 100%% and 200%%, needs --at-spi), user-move (drag people between channels, the keyboard path and a denial, needs --at-spi)")
     parser.add_argument("--dragon-drop", type=Path, help="dragon-drop, to drop files on the conversation (attach scene)")
     # Dark by default, as the scenes were drawn; the private shell has no
     # settings portal, so "system" means GPUI's fallback (light).
@@ -386,6 +386,10 @@ def main():
                 database.executemany(
                     "INSERT OR IGNORE INTO channels (server_id, channel_id, parent_id, name, inheritacl)"
                     " VALUES (1, ?, 6, ?, 1)", [(100 + n, f"Room {n:02}") for n in range(40)])
+        if "user-move" in args.scenes.split(","):
+            from user_move import seed as seed_user_move
+            with sqlite3.connect(murmur.database) as database:
+                seed_user_move(database)
         murmur.start()
         rail_murmur = None
         if rail_scene:
@@ -598,6 +602,9 @@ def main():
             if "server-order" in scenes:
                 from server_order import run as run_order
                 run_order(args, root, shell, registry, bots, profile, port, pin, shot, app)
+            if "user-move" in scenes:
+                from user_move import run as run_user_move
+                run_user_move(args, root, shell, registry, bots, profile, port, pin, shot, app)
             if "rail-layout" in scenes:
                 from rail_layout import run as run_rail
                 run_rail(args, shell, registry, profile, shot)

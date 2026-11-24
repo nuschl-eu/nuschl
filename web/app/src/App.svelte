@@ -54,6 +54,11 @@
   let membersOpen = $state(false), selectedFallback = $state(null);
   let arrangeServers = $state(false), orderPending = $state(false), previewIds = $state(null), draggingId = $state(null), pointerGhost = $state(null), orderStatus = $state(""), reducedMotion = $state(false);
   let orderDrag = null, orderFrame = 0, orderTime = 0, suppressBrowseUntil = 0;
+  // Moving someone to another channel (Mumble's Move permission, 0x20).
+  let userMove = $state(null), moveGhost = $state(null), moveChooser = $state(null), moveStatus = $state("");
+  let moveFrame = 0, moveTime = 0, suppressDirectUntil = 0;
+  const may = (server, channel, bits) => ((server?.permissions?.[channel] ?? 0) & bits) === bits;
+  const mayMove = (server, user, channel) => !!user && user.session !== server.own_session && user.channel !== channel && may(server, user.channel, 0x20) && may(server, channel, 0x20);
   const railServers = $derived.by(() => {
     if (!previewIds) return servers;
     const byId = new Map(servers.map(server => [server.id, server]));
@@ -109,8 +114,19 @@
   const canSend = $derived(loaded && !!timeline && selected?.status === "connected" && !timeline.sending);
   const usersByChannel = $derived.by(() => {
     const groups = new Map();
-    for (const user of selected?.users || []) { const group = groups.get(user.channel) || []; group.push(user); groups.set(user.channel, group); }
+    const moved = userMove?.server === selected?.id && userMove.target != null ? userMove : null;
+    for (const user of selected?.users || []) { const channel = moved?.session === user.session ? moved.target : user.channel; const group = groups.get(channel) || []; group.push(user); groups.set(channel, group); }
     return groups;
+  });
+  // One keyed list, so a person moved between channels slides to their place.
+  const treeEntries = $derived(rows.flatMap(row => [{key:`c${row.id}`,row}, ...(usersByChannel.get(row.id) || []).map(user => ({key:`u${user.session}`,row,user}))]));
+  // Whether people may be dragged: our permissions where they are.
+  $effect(() => { if (selected?.status === "connected") askMovePermissions([...new Set(selected.users.map(user => user.channel))].map(id => ({id}))); });
+  // A move ends when the server shows it, refuses it (a new notice), or the person leaves.
+  $effect(() => {
+    if (!userMove) return;
+    const server = servers.find(server => server.id === userMove.server), user = server?.users.find(user => user.session === userMove.session);
+    if (!user || user.channel !== userMove.source || (userMove.sent && server.notice !== userMove.notice)) cancelMove();
   });
   const labels = { connected:"Connected", connecting:"Connecting…", disconnected:"Disconnected", unavailable:"Unavailable" };
   const icons = {
@@ -258,6 +274,8 @@
     const escapeOrder = event => {
       if (event.key === "Escape" && (orderDrag || arrangeServers)) {
         cancelOrder(); arrangeServers = false; event.preventDefault(); event.stopPropagation();
+      } else if (event.key === "Escape" && userMove && !userMove.sent) {
+        cancelMove(); event.preventDefault(); event.stopPropagation();
       }
     };
     window.addEventListener("keydown", escapeOrder, true);
@@ -594,12 +612,102 @@
       event.preventDefault(); event.stopPropagation(); void moveOrderKey(id,event.key === "ArrowUp" ? -1 : 1);
     }
   }
+  function cancelMove() {
+    if (moveFrame) cancelAnimationFrame(moveFrame);
+    moveFrame = 0; moveTime = 0; userMove = null; moveGhost = null;
+  }
+  // Where we may move people: ask for the channels' permissions we lack.
+  // Once per channel and connection; the SDK bounds retries.
+  const permissionsAsked = new Set();
+  function askMovePermissions(channels) {
+    const key = id => `${selected.id}\n${selected.generation}\n${id}`;
+    const unknown = channels.filter(channel => !channel.direct && selected.permissions?.[channel.id] === undefined && !permissionsAsked.has(key(channel.id))).map(channel => channel.id).slice(0, 128);
+    if (permissionsAsked.size > 4096) permissionsAsked.clear();
+    for (const id of unknown) permissionsAsked.add(key(id));
+    if (unknown.length) void command("query_permissions", selectedIndex, unknown).catch(() => {});
+  }
+  function beginMove(event, user, pointer = false) {
+    if (!selected || !channelScroll || user.session === selected.own_session || !may(selected, user.channel, 0x20)) { if (!pointer) event.preventDefault(); return; }
+    if (pointer && event.button !== 0) return;
+    cancelMove();
+    userMove = {server:selected.id, index:selectedIndex, session:user.session, name:user.name, source:user.channel, target:null, pointer, pointerId:event.pointerId, point:{x:event.clientX,y:event.clientY}, sent:false, notice:null};
+    askMovePermissions(rows);
+    if (pointer) { event.preventDefault(); event.stopPropagation(); channelScroll.setPointerCapture(event.pointerId); moveGhost = {...userMove.point}; }
+    else { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("application/x-nuschl-user", "1"); }
+    moveStatus = `Moving ${user.name}. Release over a channel; Escape cancels.`;
+  }
+  // The channel under the pointer they may go to; where they are is no move.
+  function moveTargetAt(point) {
+    const node = document.elementFromPoint(point.x, point.y)?.closest?.("[data-tree-channel]");
+    if (!node || !channelScroll?.contains(node)) return userMove.target;
+    const channel = Number(node.dataset.treeChannel), user = selected.users.find(user => user.session === userMove.session);
+    return channel !== userMove.source && mayMove(selected, user, channel) ? channel : null;
+  }
+  function retargetMove() { const target = moveTargetAt(userMove.point); if (target !== userMove.target) userMove.target = target; }
+  function scheduleMoveScroll() {
+    if (moveFrame || !userMove?.pointer) return;
+    const step = now => {
+      moveFrame = 0;
+      if (!userMove?.pointer || userMove.sent || !channelScroll) return;
+      const rect = channelScroll.getBoundingClientRect(), {x,y} = userMove.point;
+      const speed = edgeSpeed(y - rect.top, rect.height, x >= rect.left && x <= rect.right), before = channelScroll.scrollTop;
+      channelScroll.scrollBy({top:speed * Math.min(.05, moveTime ? (now - moveTime) / 1000 : .016), behavior:"instant"});
+      moveTime = now;
+      if (speed && channelScroll.scrollTop !== before) { retargetMove(); moveFrame = requestAnimationFrame(step); }
+    };
+    moveFrame = requestAnimationFrame(step);
+  }
+  function dragMove(event, pointer = false) {
+    if (!userMove || userMove.sent || userMove.pointer !== pointer || (pointer && event.pointerId !== userMove.pointerId)) return;
+    event.preventDefault();
+    userMove.point = {x:event.clientX, y:event.clientY};
+    if (pointer) moveGhost = {...userMove.point};
+    retargetMove();
+    if (!pointer && event.dataTransfer) event.dataTransfer.dropEffect = userMove.target == null ? "none" : "move";
+    scheduleMoveScroll();
+  }
+  function dropMove(event, pointer = false) {
+    if (!userMove || userMove.sent || userMove.pointer !== pointer || (pointer && event.pointerId !== userMove.pointerId)) return;
+    event.preventDefault(); event.stopPropagation();
+    if (pointer && channelScroll?.hasPointerCapture(event.pointerId)) channelScroll.releasePointerCapture(event.pointerId);
+    moveGhost = null; suppressDirectUntil = performance.now() + 250;
+    void sendMove();
+  }
+  function cancelPointerMove(event) {
+    if (!userMove?.pointer || userMove.sent || event.pointerId !== userMove.pointerId) return;
+    if (event.type === "lostpointercapture" && event.target !== channelScroll) return;
+    cancelMove();
+  }
+  // The preview holds until the server shows the move or refuses it.
+  async function sendMove() {
+    const move = userMove;
+    if (!move || move.target == null) { cancelMove(); moveStatus = ""; return; }
+    move.sent = true; move.notice = selected?.notice ?? null;
+    moveStatus = `Moving ${move.name}…`;
+    try { await command("move_user", move.index, move.session, move.target); }
+    catch (reason) { setError(String(reason?.message || reason)); if (userMove === move) cancelMove(); return; }
+    setTimeout(() => { if (userMove === move) cancelMove(); }, 3000);
+  }
+  function openMoveChooser(user) {
+    if (!selected || user.session === selected.own_session || !may(selected, user.channel, 0x20)) return;
+    moveChooser = {server:selected.id, session:user.session, name:user.name};
+    askMovePermissions(selected.channels);
+  }
+  function chooseMove(channel) {
+    const user = selected?.users.find(user => user.session === moveChooser?.session);
+    moveChooser = null;
+    if (!user || !mayMove(selected, user, channel)) return;
+    cancelMove();
+    userMove = {server:selected.id, index:selectedIndex, session:user.session, name:user.name, source:user.channel, target:channel, pointer:false, sent:false, notice:null};
+    void sendMove();
+  }
   async function searchMessages() { showSearch = !showSearch; if (!showSearch) search = ""; else { await tick(); searchElement?.focus(); } }
 </script>
 
 <!-- With `struck` (true or false) the icon carries a strike line that draws in and out. -->
 {#snippet icon(name, struck = null)}<svg class="icon" class:struck width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={icons[name] || icons.hash}/>{#if struck !== null}<line class="strike" x1="3" y1="3" x2="21" y2="21" pathLength="1"/>{/if}</svg>{/snippet}
 {#snippet navigation()}
+  {#if moveGhost && userMove}<div class="user-move-ghost" aria-hidden="true" style:left={`${moveGhost.x}px`} style:top={`${moveGhost.y}px`}><span class={`mini-avatar ${avatarColor(userMove.name)}`}>{initials(userMove.name)}</span><span>{userMove.name}</span></div>{/if}
   {#if pointerGhost && draggingId}<div class="server-order-ghost" aria-hidden="true" style:left={`${pointerGhost.x - 23}px`} style:top={`${pointerGhost.y - 23}px`}>{initials(servers.find(server=>server.id===draggingId)?.name || "")}</div>{/if}
   <nav class="servers" class:server-order-enabled={capabilities.includes("server_order")} aria-label="Servers">
     <div class="server-scroll" role="presentation" bind:this={serverScroll} use:observeScroll ondragover={event => moveOrder(event)} ondrop={event => dropOrder(event)} onpointermove={event=>moveOrder(event,true)} onpointerup={event=>dropOrder(event,true)} onpointercancel={cancelPointerOrder} onlostpointercapture={cancelPointerOrder}>
@@ -627,16 +735,24 @@
       {#if selected.certificate}<div class="certificate" role="alert"><strong>{selected.pin ? "Certificate changed" : "Verify server identity"}</strong><p>Compare this fingerprint with the server owner before trusting it.</p><code>{selected.certificate}</code><button class="primary" onclick={() => act("accept_certificate",selectedIndex,selected.certificate)}>Trust this certificate</button></div>{/if}
       <div class="section-label"><span>CHANNELS</span><span>{selected.channels.length}</span></div>
       {#if channelUnread.above}<button class="unread-jump" onclick={() => scrollUnread(channelScroll,"above")}>↑ Unread channels above</button>{/if}
-      <nav class="channel-tree" aria-label="Channels" bind:this={channelScroll} use:observeScroll>
-        {#each rows as row (row.id)}
-          <div class="channel-row" style:--depth={Math.min(row.depth,8)}>
+      <nav class="channel-tree" aria-label="Channels" bind:this={channelScroll} use:observeScroll ondragover={event => dragMove(event)} ondrop={event => dropMove(event)} onpointermove={event => dragMove(event,true)} onpointerup={event => dropMove(event,true)} onpointercancel={cancelPointerMove} onlostpointercapture={cancelPointerMove}>
+        {#each treeEntries as entry (entry.key)}
+          {@const row = entry.row}
+          <div class="tree-entry" data-tree-channel={row.id} animate:flip={{duration:reducedMotion ? 0 : 180}}>
+          {#if !entry.user}
+          <div class="channel-row" class:move-takes={userMove && !userMove.sent && userMove.server === selected.id && mayMove(selected, selected.users.find(user => user.session === userMove.session), row.id)} class:move-target={userMove?.server === selected.id && userMove.target === row.id} style:--depth={Math.min(row.depth,8)}>
             {#if row.hasChildren}<button class="expand" aria-label={`${row.open ? "Collapse" : "Expand"} ${row.name}`} aria-expanded={row.open} onclick={() => toggle(row)}>{row.open ? "▾" : "▸"}</button>{:else}<span class="spacer"></span>{/if}
             <button class:current={timeline?.channel === row.id} class:voice-current={ownUser?.channel === row.id && selected.status === "connected"} class="channel" onpointerdown={(event) => lastChannelPointer = event.pointerType} data-unread={unreadCount(row) > 0} title={`${row.name || "Root"} — click for chat, double-click to join voice`} aria-label={row.name || "Root"} aria-current={timeline?.channel === row.id ? "page" : undefined} onclick={() => openChannel(row.id)} ondblclick={() => lastChannelPointer !== "touch" && !row.direct && joinVoice(row.id)}><span class="channel-symbol" aria-hidden="true">{row.direct ? "@" : "#"}</span><span class="channel-name">{row.name || "Root"}</span>{#if ownUser?.channel === row.id && !row.direct && selected.status === "connected"}<span class="voice-marker" title="Your voice channel">{@render icon("voice")}</span>{/if}{#if unreadCount(row)}<span class="badge">{Math.min(99,unreadCount(row))}</span>{/if}</button>
             {#if row.hiddenUsers}{@const people = `${row.hiddenUsers} ${row.hiddenUsers === 1 ? "person" : "people"}`}<span class="member-count" class:talking={row.hiddenTalking} role="img" aria-label={`${people} inside`} title={`${people} in collapsed channels`}>{@render icon("user")}{row.hiddenUsers}</span>{/if}
           </div>
-          {#each usersByChannel.get(row.id) || [] as user (user.session)}<button class:talking={user.talking} class:own-user={user.session === selected.own_session} class="user" title={user.name} aria-label={user.session === selected.own_session ? `${user.name} (you)` : `Private message ${user.name}`} style:--depth={Math.min(row.depth,8)} disabled={user.session === selected.own_session} onclick={async () => { rememberDraft(); await act("open_direct",selectedIndex,user.session); if (mobile) drawer = false; }}><span class={`mini-avatar ${avatarColor(user.name)}`}>{initials(user.name)}</span><span class="user-name">{user.name}</span>{#if user.self_deaf || user.deafened}<span title="Deafened">{@render icon("headphones", true)}</span>{:else if user.self_mute || user.muted}<span title="Muted">{@render icon("mic", true)}</span>{/if}</button>{/each}
+          {:else}
+          {@const user = entry.user}{@const movable = user.session !== selected.own_session && may(selected, user.channel, 0x20)}
+          <div class="user-slot" class:movable class:moving={userMove?.server === selected.id && userMove.session === user.session} class:sent={userMove?.sent}><button class:talking={user.talking} class:own-user={user.session === selected.own_session} class="user" title={user.name} aria-label={user.session === selected.own_session ? `${user.name} (you)` : `Private message ${user.name}`} style:--depth={Math.min(row.depth,8)} disabled={user.session === selected.own_session} draggable={movable} ondragstart={event => beginMove(event,user)} ondragend={() => { if (userMove && !userMove.sent) cancelMove(); }} oncontextmenu={event => { if (movable) { event.preventDefault(); openMoveChooser(user); } }} onclick={async () => { if (performance.now() < suppressDirectUntil || userMove) return; rememberDraft(); await act("open_direct",selectedIndex,user.session); if (mobile) drawer = false; }}><span class={`mini-avatar ${avatarColor(user.name)}`}>{initials(user.name)}</span><span class="user-name">{user.name}</span>{#if user.self_deaf || user.deafened}<span title="Deafened">{@render icon("headphones", true)}</span>{:else if user.self_mute || user.muted}<span title="Muted">{@render icon("mic", true)}</span>{/if}</button>{#if movable}<button class="user-move-handle" aria-label={`Move ${user.name}`} title="Drag to move, or choose a channel" onpointerdown={event => beginMove(event,user,true)} onclick={() => { if (!userMove) openMoveChooser(user); }}>⋮⋮</button>{/if}</div>
+          {/if}
+          </div>
         {/each}
       </nav>
+      <span class="sr-only" role="status" aria-live="polite">{moveStatus}</span>
       {#if channelUnread.below}<button class="unread-jump" onclick={() => scrollUnread(channelScroll,"below")}>↓ Unread channels below</button>{/if}
       <p class="navigation-hint">Click to read · double-click for voice</p>
       <div class="profile"><span class={`avatar ${avatarColor(selected.username)}`} aria-hidden="true">{initials(selected.username)}</span><div><strong>{selected.username}</strong><small>{selected.status === "connected" ? selectedVoiceChannel?.name || "Connected" : "Offline"}</small></div><button class="icon-button" aria-label="Settings" onclick={() => { showSettings = true; drawer = false; }}>{@render icon("settings")}</button></div>
@@ -726,4 +842,5 @@
   </div>
   <p class="finder-hints" aria-hidden="true"><span>↑↓ choose</span><span>Enter open</span><span>Shift+Enter join voice</span><span>Esc close</span></p>
 </dialog>{/if}
+{#if moveChooser}{@const user = selected?.users.find(user => user.session === moveChooser.session)}<dialog class="modal move-chooser" use:modal aria-labelledby="move-title" oncancel={() => moveChooser = null} onclose={() => moveChooser = null}><header class="modal-header"><h2 id="move-title">Move {moveChooser.name}</h2><button class="icon-button" aria-label="Close" onclick={() => moveChooser = null}>{@render icon("close")}</button></header><div class="move-choices">{#each (selected?.channels || []).filter(channel => !channel.direct && mayMove(selected, user, channel.id)) as channel (channel.id)}<button onclick={() => chooseMove(channel.id)}><span class="channel-symbol" aria-hidden="true">#</span>{channel.name || "Root"}</button>{:else}<p class="muted">No channel to move them to.</p>{/each}</div></dialog>{/if}
 {#if showSettings}<dialog class="modal settings-modal" use:modal onclose={() => showSettings = false} oncancel={() => showSettings = false} aria-labelledby="settings-title"><header class="modal-header"><div><p class="eyebrow">MAKE IT YOURS</p><h2 id="settings-title">Settings</h2></div><button class="icon-button" aria-label="Close settings" onclick={() => showSettings = false}>{@render icon("close")}</button></header><section class="settings-section"><h3>Appearance</h3><label for="theme-choice">Theme</label><select id="theme-choice" bind:value={settings.theme} onchange={persistSettings}><option value="system">Match device</option><option value="dark">Dark</option><option value="light">Light</option></select><label for="density-choice">Message spacing</label><select id="density-choice" bind:value={settings.density} onchange={persistSettings}><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select><label for="size-choice">Text size</label><select id="size-choice" bind:value={settings.fontSize} onchange={persistSettings}><option value={14}>Small · 14px</option><option value={16}>Default · 16px</option><option value={18}>Large · 18px</option><option value={20}>Larger · 20px</option></select></section><section class="settings-section voice-quality"><h3>Voice quality</h3><label for="voice-bitrate-choice">Voice bitrate</label><select id="voice-bitrate-choice" bind:value={voiceBitrate} onchange={chooseVoiceBitrate}>{#each VOICE_BITRATES as choice (choice)}<option value={choice}>{kbps(choice)}{choice === 128000 ? " · default" : ""}</option>{/each}</select><p>Mono Opus, 64 to 256 kb/s. A server's bandwidth limit can lower it, never raise it.</p>{#if voice}<p class="voice-bitrate" role="status">{voiceServer?.name}: {voice.bitrate_why}</p>{/if}</section><section class="settings-section"><h3>Privacy & storage</h3><p>Bookmarks, trusted certificates and observed chat history are stored locally in this browser. Legacy servers can read chat; the relay only forwards encrypted traffic.</p><p>Links and received images never cause automatic requests to another site.</p></section>{@render voiceProcessingSettings()}{#if selected}<section class="settings-section"><h3>{selected.name}</h3><p class="muted">{selected.host}:{selected.port} · {selected.username}</p><button onclick={() => { showSettings = false; editServer(); }}>Edit server bookmark</button>{#if capabilities.includes("server_order")}<div class="server-order-actions"><button disabled={orderPending || servers[0]?.id === selected.id} onclick={()=>moveOrderKey(selected.id,-1)}>Move server earlier</button><button disabled={orderPending || servers.at(-1)?.id === selected.id} onclick={()=>moveOrderKey(selected.id,1)}>Move server later</button></div>{/if}{#if capabilities.includes("remove_server")}<button class="danger" onclick={async () => { await act("remove_server",selectedIndex); showSettings = false; }}>Remove server</button>{/if}</section>{/if}<footer class="settings-footer"><span class="brand-word">nuschl<span>web</span></span><small>Built for conversations.</small></footer></dialog>{/if}

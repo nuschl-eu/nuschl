@@ -1133,3 +1133,53 @@ fn bitrate_arguments_name_one_of_the_offered_choices() {
         assert_eq!(parse_bitrate(text), bitrate, "{text}");
     }
 }
+
+/// #317: M picks a person up where we hold Move, Enter on a channel moves
+/// them there, and Esc puts them back.
+#[test]
+fn m_then_enter_moves_a_person_to_the_channel_under_the_cursor() {
+    let (mut app, recorder, _) = connected();
+    app.pane = Pane::Tree;
+    let go = |app: &mut App, wanted: &dyn Fn(&App, &Row) -> bool| {
+        app.tree_home(false);
+        while !wanted(app, &app.rows()[app.tree_index()]) {
+            app.move_tree(1);
+        }
+    };
+    let bob = |_: &App, row: &Row| matches!(row, Row::User { session: 2, .. });
+    let gaming = |app: &App, row: &Row| matches!(row, Row::Channel { server, row } if app.client.servers[*server].channels[row.index].id == 2);
+    let moves = |recorder: &Recorder| {
+        recorder
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| matches!(request, Request::MoveUser { .. }))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    go(&mut app, &bob);
+    press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+    assert!(app.moving.is_none(), "permissions are still unknown");
+    let move_bit = nuschl_core::model::permission::MOVE;
+    app.client.servers[0].permissions = [(1, move_bit), (2, move_bit)].into();
+    press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.moving.is_none());
+    go(&mut app, &gaming);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(moves(&recorder).is_empty(), "Esc cancelled the move");
+    app.pane = Pane::Tree;
+    go(&mut app, &bob);
+    press(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+    go(&mut app, &gaming);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        moves(&recorder),
+        [Request::MoveUser {
+            session: 2,
+            channel: 2
+        }]
+    );
+    assert!(app.moving.is_none());
+}

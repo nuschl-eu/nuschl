@@ -50,6 +50,7 @@ mod transfer;
 mod typing;
 mod unread;
 mod update;
+mod user_move;
 mod version_notice;
 mod view;
 mod viewer;

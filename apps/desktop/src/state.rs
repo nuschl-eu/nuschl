@@ -219,6 +219,8 @@ pub struct Desktop {
     pub channel_scroll: ScrollHandle,
     pub server_scroll: ScrollHandle,
     pub rail: crate::rail::Rail,
+    /// Someone being moved to another channel (user_move.rs).
+    pub user_move: crate::user_move::UserMove,
     pub unread: crate::unread::Navigation,
     chat_motion: SmoothScroll,
     channel_motion: SmoothScroll,
@@ -553,6 +555,7 @@ impl Desktop {
             channel_scroll: ScrollHandle::new(),
             server_scroll: ScrollHandle::new(),
             rail: Default::default(),
+            user_move: Default::default(),
             unread: Default::default(),
             chat_motion: SmoothScroll::default(),
             channel_motion: SmoothScroll::default(),
