@@ -34,13 +34,32 @@ const element = (document, name, attributes = {}, ...children) => {
 
 const pin = (track) => `${track.peer}/${track.screen ? "screen" : "camera"}`;
 
+/** A speaker icon, crossed out when `silent`, as the native client draws it. */
+const speaker = (document, silent) => {
+  const svg = "http://www.w3.org/2000/svg";
+  const icon = document.createElementNS(svg, "svg");
+  for (const [key, value] of Object.entries({ viewBox: "0 0 24 24", fill: "none", stroke: "currentColor",
+    "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" })) {
+    icon.setAttribute(key, value);
+  }
+  for (const d of ["M4 9.5h3.5L12 5.5v13l-4.5-4H4z", silent ? "M16 9.5l5 5M21 9.5l-5 5" : "M15.5 9a4 4 0 0 1 0 6M18.5 6a8 8 0 0 1 0 12"]) {
+    const path = document.createElementNS(svg, "path");
+    path.setAttribute("d", d);
+    icon.append(path);
+  }
+  return icon;
+};
+
 export class View {
   /** The pinned source, "peer/camera" or "peer/screen": it keeps its place when its
    * publisher restarts the encoder on a new media section. */
   pinned = null;
   /** A tile per video track mid, kept while the track lasts. */
   tiles = new Map();
+  /** A player per shared audio track mid; they play out of sight. */
   audio = new Map();
+  /** Each publisher's shared audio as this viewer set it, for the rest of the call. */
+  levels = new Map();
   /** Explicit viewer choices survive a publisher's encoder restart. */
   tiers = new Map();
   sentTiers = new WeakMap();
@@ -137,6 +156,7 @@ export class View {
     const featured = pinned ?? videos.find(([, track]) => track.screen && !track.own)?.[0] ?? null;
     for (const [mid, track] of videos) {
       const tile = this.tiles.get(mid) ?? this.tile(mid, track);
+      this.audioControl(tile, track.peer);
       const parent = mid === featured ? large : grid;
       if (tile.parentNode !== parent) {
         parent.append(tile);
@@ -155,23 +175,87 @@ export class View {
   }
 
   sharedAudio(tracks) {
-    const { audio } = this.nodes;
-    for (const [mid, { track, player, row }] of this.audio) {
+    for (const [mid, { track, player }] of this.audio) {
       if (tracks.get(mid) === track) continue;
       player.srcObject = null;
-      row.remove();
+      player.remove();
       this.audio.delete(mid);
     }
     for (const [mid, track] of tracks) {
       if (track.kind !== "audio" || this.audio.has(mid)) continue;
-      const label = `${this.name(track.peer)} · Shared audio`;
-      const player = element(this.document, "audio", { controls: "", "aria-label": label });
+      const player = element(this.document, "audio", { "data-peer": String(track.peer) });
       player.srcObject = track.stream;
-      const row = element(this.document, "div", {}, element(this.document, "span", {}, label), player);
-      audio.append(row);
-      this.audio.set(mid, { track, player, row });
+      this.nodes.audio.append(player);
+      this.audio.set(mid, { track, player });
+      this.play(track.peer);
     }
-    audio.hidden = this.audio.size === 0;
+  }
+
+  level(peer) {
+    if (!this.levels.has(peer)) this.levels.set(peer, { volume: 1, muted: false });
+    return this.levels.get(peer);
+  }
+
+  /** Applies `peer`'s level to their players. A browser that refuses to play
+   * before a click on the page shows the audio as muted until the viewer unmutes. */
+  play(peer) {
+    const level = this.level(peer);
+    for (const { track, player } of this.audio.values()) {
+      if (track.peer !== peer) continue;
+      player.muted = level.muted;
+      player.volume = level.volume;
+      if (!level.muted) {
+        player.play().catch(() => {
+          level.muted = true;
+          player.muted = true;
+          this.render();
+        });
+      }
+    }
+  }
+
+  /** The speaker and volume on someone else's screen tile; greyed out while
+   * their share carries no audio. */
+  audioControl(tile, peer) {
+    const control = tile.querySelector(".shared-audio");
+    if (!control) return;
+    const available = [...this.audio.values()].some(({ track }) => track.peer === peer);
+    const level = this.level(peer);
+    const silent = !available || level.muted || level.volume === 0;
+    const [button, volume] = control.children;
+    button.disabled = !available;
+    button.setAttribute("aria-label", !available ? "No shared audio" : silent ? "Unmute shared audio" : "Mute shared audio");
+    if (button.dataset.silent !== String(silent)) {
+      button.dataset.silent = String(silent);
+      button.replaceChildren(speaker(this.document, silent));
+    }
+    volume.hidden = !available;
+    volume.value = String(Math.round((level.muted ? 0 : level.volume) * 100));
+  }
+
+  sharedAudioControl(peer) {
+    const doc = this.document;
+    const volume = element(doc, "input", { type: "range", min: "0", max: "100", step: "5", "aria-label": "Shared audio volume" });
+    const button = element(doc, "button", { type: "button" });
+    button.addEventListener("click", () => {
+      const level = this.level(peer);
+      if (level.muted || level.volume === 0) {
+        level.muted = false;
+        if (level.volume === 0) level.volume = 1;
+      } else {
+        level.muted = true;
+      }
+      this.play(peer);
+      this.render();
+    });
+    volume.addEventListener("input", () => {
+      const level = this.level(peer);
+      level.volume = Number(volume.value) / 100;
+      level.muted = false;
+      this.play(peer);
+      this.render();
+    });
+    return element(doc, "div", { class: "shared-audio" }, button, volume);
   }
 
   tile(mid, track) {
@@ -186,8 +270,9 @@ export class View {
       this.render();
     });
     const tile = element(this.document, "figure", { class: "tile", "data-state": "waiting", "data-peer": String(track.peer) },
-      video, element(this.document, "figcaption", {}, label), toggle);
+      video, element(this.document, "figcaption", { title: label }, label), toggle);
     if (track.screen) tile.dataset.screen = "";
+    if (track.screen && !track.own) tile.append(this.sharedAudioControl(track.peer));
     if (track.own) {
       tile.dataset.own = "";
       const kind = track.screen ? "screen" : "camera";

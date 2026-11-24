@@ -102,7 +102,11 @@ enum Action {
     /// protocol on this process's standard input and output (audio tests).
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
-    MediaSandbox,
+    MediaSandbox {
+        /// The call audio worker (shared audio) in place of live voice.
+        #[arg(long)]
+        call_audio: bool,
+    },
     /// Run the transfer worker in the sandbox an offer (`--file`) or a
     /// download gives it, speaking its protocol on this process's standard
     /// input and output (transfer tests).
@@ -153,9 +157,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
     }
     #[cfg(target_os = "linux")]
-    if let Some(Action::MediaSandbox) = arguments.command {
+    if let Some(Action::MediaSandbox { call_audio }) = arguments.command {
         let worker = nuschl_sandbox::sibling("nuschl-media-worker")?;
-        let mut command = nuschl_sandbox::command(&worker, nuschl_sandbox::Role::Media)?;
+        let role = if call_audio {
+            nuschl_sandbox::Role::CallAudio
+        } else {
+            nuschl_sandbox::Role::Media
+        };
+        let mut command = nuschl_sandbox::command(&worker, role)?;
         let status = runtime.block_on(async { command.status().await })?;
         std::process::exit(status.code().unwrap_or(1));
     }

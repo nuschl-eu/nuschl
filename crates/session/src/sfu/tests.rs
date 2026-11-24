@@ -304,7 +304,16 @@ async fn native_publisher_in_call_page_vm() {
         .await
         .unwrap();
     media.switch_source(Purpose::ScreenVideo).unwrap();
+    media.set_source(Purpose::SystemAudio, true).unwrap();
     fs::write(state.join("peer"), peer.to_string()).unwrap();
+    // One 20 ms stereo Opus frame (CELT, 64 kbit/s) of a 600 Hz tone from
+    // reference libopus: twelve whole periods, so repeating it is the tone.
+    let tone = hex::decode(
+        "fcb02ec29c587f554c71d4da56bde304b19e281c4870e38338338336be766ac8d8d843ccccaee6fcf87d9eff298e3ec5df9dc65de5de2294b8e178be8d4ce429148fe1c94d254f7d4cf3f15d622c14da8f987df3d395cf6491d4bbebcdb68cc125b05f232c2c15f6e63bb40d79e2b1d03f2344879f2f6ad1fb899fffe16a57f50b07326e2afadfb5a5c43c4d7c93b7fc0001c60aaa007afe664467bb54efffd1",
+    )
+    .unwrap();
+    let mut audio = tokio::time::interval(Duration::from_millis(20));
+    let mut played = 0;
 
     let mut tick = tokio::time::interval(Duration::from_millis(34));
     let mut timestamp = 0;
@@ -327,6 +336,10 @@ async fn native_publisher_in_call_page_vm() {
                         timestamp += 3_060;
                         media.send_keyframe(timestamp, red.clone()).unwrap();
                     }
+                }
+                _ = audio.tick() => {
+                    played += 960;
+                    let _ = media.send_source_frame(Purpose::SystemAudio, played, false, tone.clone());
                 }
                 event = media.next() => {
                     ready |= matches!(event.expect("publisher remains live").expect("RTC publisher"), MediaEvent::SourceReady { .. });
@@ -657,6 +670,186 @@ async fn native_video_for_policy(relay_only: bool) {
     playback.unwrap_or_else(|_| {
         panic!("native video timed out during {phase}; relay-only={relay_only}")
     });
+}
+
+/// A publisher shares its screen and desktop audio; the viewer receives the
+/// audio track's Opus packets, unchanged and in order, beside the video.
+#[tokio::test]
+async fn shared_audio_crosses_the_sfu_as_its_own_track() {
+    let _media = MEDIA_TEST.lock().await;
+    shared_audio(false).await;
+}
+
+/// A viewer that joins while screen and audio are already shared gets both.
+#[tokio::test]
+async fn a_late_viewer_receives_shared_audio() {
+    let _media = MEDIA_TEST.lock().await;
+    shared_audio(true).await;
+}
+
+async fn shared_audio(late: bool) {
+    nuschl_testkit::sandbox();
+    let crypto = fixture("nuschl-crypto-worker");
+    let rtc = fixture("nuschl-rtc-worker");
+    let sfu = nuschl_testkit::sfu::start(fixture("nuschl-stream-sfu"), "");
+    let (host, roots) = tls_proxy(&sfu).await;
+    let directory = nuschl_testkit::temp_dir();
+    let posted = format!("https://{host}/call#{LINK}");
+    let owner = format!("{posted}&p={OWNER}");
+    let connect = |link| Connect {
+        generation: 1,
+        host: &host,
+        link,
+        codecs: &[Codec::Av1],
+        policy: PeerPolicy::default(),
+    };
+    let mut alice = Connection::connect_with_roots(
+        CryptoHandle::start(crypto.clone(), directory.path().join("alice")),
+        connect(&owner),
+        roots.clone(),
+    )
+    .await
+    .unwrap();
+    let join = async || {
+        Connection::connect_with_roots(
+            CryptoHandle::start(crypto.clone(), directory.path().join("bob")),
+            connect(&posted),
+            roots.clone(),
+        )
+        .await
+        .unwrap()
+    };
+    let early = if late { None } else { Some(join().await) };
+    if !late {
+        timeout(HANDSHAKE, async {
+            while alice.welcome().peers.is_empty() {
+                alice.poll_idle().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let publisher = alice.welcome().peer;
+    let mut alice = alice
+        .into_media(MediaOptions {
+            executable: rtc.clone(),
+            sfu_port: sfu.media.port(),
+            publish: Some(Purpose::ScreenVideo),
+        })
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .send_source_frame(Purpose::SystemAudio, 960, false, vec![1])
+            .is_err(),
+        "shared audio is off until the publisher turns it on"
+    );
+    alice.set_source(Purpose::SystemAudio, true).unwrap();
+    // Distinct packets: the n-th carries n, as 20 ms frames on a 48 kHz clock.
+    let packet = |n: u64| [nuschl_core::audio::SILENT_OPUS.as_slice(), &n.to_be_bytes()].concat();
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut sent = 0_u64;
+    if late {
+        // The publisher sends for a second before anyone else is in the room.
+        timeout(HANDSHAKE, async {
+            while sent < 50 {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        sent += 1;
+                        let _ = alice.send_source_frame(Purpose::SystemAudio, sent * 960, false, packet(sent));
+                    }
+                    event = alice.next() => {
+                        event.expect("publisher remains live").expect("RTC publisher");
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let bob = match early {
+        Some(bob) => bob,
+        None => join().await,
+    };
+    let mut bob = bob
+        .into_media(MediaOptions {
+            executable: rtc.clone(),
+            sfu_port: sfu.media.port(),
+            publish: None,
+        })
+        .await
+        .unwrap();
+    let mut available = false;
+    let mut received = Vec::new();
+    // Two packets at once every 40 ms, as an encoder fed by an audio graph's
+    // quantum delivers them.
+    let mut burst = tokio::time::interval(Duration::from_millis(40));
+    timeout(HANDSHAKE, async {
+        while received.len() < 30 {
+            tokio::select! {
+                _ = burst.tick() => {
+                    for _ in 0..2 {
+                        sent += 1;
+                        alice.send_source_frame(Purpose::SystemAudio, sent * 960, false, packet(sent)).unwrap();
+                    }
+                }
+                event = alice.next() => {
+                    event.expect("publisher remains live").expect("RTC publisher");
+                }
+                event = bob.next() => match event.expect("viewer remains live").expect("RTC viewer") {
+                    MediaEvent::SourceAvailable { publisher: from, purpose: Purpose::SystemAudio } => {
+                        assert_eq!(from, publisher);
+                        available = true;
+                    }
+                    MediaEvent::Frame { publisher: from, purpose, timestamp, key_frame, data, .. } => {
+                        assert_eq!((from, purpose, key_frame), (publisher, Purpose::SystemAudio, false));
+                        let number = u64::from_be_bytes(data[3..].try_into().unwrap());
+                        assert_eq!(data, packet(number));
+                        assert!(received.last().is_none_or(|&(previous, _)| previous < number));
+                        received.push((number, timestamp));
+                    }
+                    _ => {}
+                },
+            }
+        }
+    })
+    .await
+    .expect("shared audio reaches the viewer");
+    assert!(available, "the viewer subscribes to the audio track");
+    // Every packet arrives, and the receiver's clock advances 960 ticks per
+    // packet, as the sender's did.
+    let (first, start) = received[0];
+    for (index, &(number, timestamp)) in received.iter().enumerate() {
+        assert_eq!(
+            number,
+            first + index as u64,
+            "a packet was dropped: {received:?}"
+        );
+        assert_eq!(timestamp - start, (number - first) * 960);
+    }
+    alice.set_source(Purpose::SystemAudio, false).unwrap();
+    timeout(HANDSHAKE, async {
+        loop {
+            tokio::select! {
+                event = alice.next() => {
+                    event.expect("publisher remains live").expect("RTC publisher");
+                }
+                event = bob.next() => {
+                    if let MediaEvent::SourceEnded { publisher: from, purpose: Purpose::SystemAudio } =
+                        event.expect("viewer remains live").expect("RTC viewer")
+                    {
+                        assert_eq!(from, publisher);
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("the viewer learns that shared audio stopped");
+    bob.stop().await.unwrap();
+    alice.stop().await.unwrap();
+    nuschl_testkit::none_running(&rtc, Duration::from_secs(3)).await;
 }
 
 async fn relay_datagrams(credentials: &nuschl_protocol::sfu::TurnCredentials) {

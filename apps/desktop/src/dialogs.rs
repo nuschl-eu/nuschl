@@ -19,7 +19,7 @@ pub enum Tone {
     Ghost,
 }
 
-fn activation(event: &KeyDownEvent) -> bool {
+pub(crate) fn activation(event: &KeyDownEvent) -> bool {
     event.keystroke.key == "enter" || event.keystroke.key == "space"
 }
 

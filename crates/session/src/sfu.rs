@@ -166,11 +166,31 @@ impl Drop for CallScope {
     }
 }
 
+#[cfg(not(feature = "call-test-roots"))]
+fn roots() -> rustls::RootCertStore {
+    rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+}
+
+/// The public roots and, for local GUI tests, the CA that
+/// `NUSCHL_CALL_TEST_CA` names.
+#[cfg(feature = "call-test-roots")]
+fn roots() -> rustls::RootCertStore {
+    use rustls::pki_types::{CertificateDer, pem::PemObject as _};
+    let mut roots =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = std::env::var_os("NUSCHL_CALL_TEST_CA")
+        && let Ok(certificates) = CertificateDer::pem_file_iter(path)
+    {
+        for certificate in certificates.flatten() {
+            let _ = roots.add(certificate);
+        }
+    }
+    roots
+}
+
 impl Connection {
     pub async fn connect(crypto: CryptoHandle, options: Connect<'_>) -> Result<Self, Error> {
-        let roots =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Self::connect_with_roots(crypto, options, roots).await
+        Self::connect_with_roots(crypto, options, roots()).await
     }
 
     async fn connect_with_roots(

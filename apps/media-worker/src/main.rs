@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 mod adaptive;
 mod bench;
+mod call_audio;
 mod capture;
 mod capture_queue;
 mod dsp;
@@ -32,6 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     nuschl_sandbox_windows::launch_if_requested();
     if std::env::args().any(|argument| argument == "--live") {
         return live::run();
+    }
+    if std::env::args().any(|argument| argument == "--call-audio") {
+        return call_audio::run();
     }
     let mut bench = std::env::args().skip_while(|argument| argument != "--bench");
     if bench.next().is_some() {

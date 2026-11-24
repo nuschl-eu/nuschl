@@ -53,6 +53,8 @@ embed-resource = "3.0"
 [features]
 # Log GPUI's frame phases for measuring (see src/frame_timing.rs).
 frame-timing = ["dep:gpui-profiler"]
+# Trust a test CA for call hosts (tests/shared_audio_desktop.py).
+call-test-roots = ["nuschl-session/call-test-roots"]
 
 [lints]
 workspace = true

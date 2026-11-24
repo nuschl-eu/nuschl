@@ -19,6 +19,7 @@ let
     pipewireRecovery = ../tests/pipewire_recovery.py;
     protocolFeatures = ../tests/protocol_features.py;
     rtcProbe = ../tests/rtc_probe.py;
+    shareAudio = ../tests/share_audio.py;
     stockClient = ../tests/stock_client.py;
     udpVoice = ../tests/udp_voice.py;
     workers = ../tests/workers.py;
@@ -147,6 +148,8 @@ pkgs.testers.runNixOSTest {
     # Private PipeWire session (virtual nodes only): restarts, host pinning, echo-cancel reuse.
     client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.pipewireRecovery} ${nuschl}/bin --pipewire ${pkgs.pipewire} --wireplumber ${pkgs.wireplumber} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-pipewire-artifacts'")
     client.copy_from_machine("/tmp/nuschl-pipewire-artifacts", "pipewire")
+    # Desktop audio sharing in a private PipeWire session: applications only, never Nuschl's own playback.
+    client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.shareAudio} ${nuschl}/bin --pipewire ${pkgs.pipewire} --wireplumber ${pkgs.wireplumber} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-share-audio-artifacts'")
     # Pure-Rust Opus against reference libopus: decoder conformance, interop, hostile packets.
     client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.opusEval} ${nuschl}/bin --opus-library ${pkgs.libopus}/lib/libopus.so'")
     client.succeed("su - tester -c 'xvfb-run -a -s \"-screen 0 1280x800x24\" ${pkgs.python3}/bin/python3 ${tests.stockClient} ${nuschl}/bin --mumble ${pkgs.mumble}/bin/mumble --host server --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-stock-artifacts'")

@@ -935,6 +935,9 @@ const CHANNELS_FILE: &str = "channels.json";
 const ICONS_FILE: &str = "icons.json";
 /// In the state folder: the channel last joined on each server.
 const LAST_CHANNELS_FILE: &str = "last-channels.json";
+/// In the state folder: how loud each person's shared audio plays.
+const SHARED_AUDIO_FILE: &str = "shared-audio.json";
+const MAX_SHARED_AUDIO: usize = 4096;
 const MAX_SETTINGS_FILE: u64 = 1024 * 1024;
 const MAX_SERVERS: usize = 100;
 const MAX_SERVERS_FILE: usize = 8 * 1024 * 1024;
@@ -1117,6 +1120,49 @@ fn fitting<T: Serialize>(
             .map(|(id, _)| id.clone())
             .ok_or_else(|| io::Error::other("the cache exceeds its size limit"))?;
         map.remove(&largest);
+    }
+}
+
+/// How loud a person's shared audio plays, by certificate hash; apart from
+/// their voice volume.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedAudio {
+    /// From 0 to 1, also while muted.
+    pub volume: f32,
+    pub muted: bool,
+}
+
+impl Profile {
+    /// The shared-audio choices this profile remembers. A missing or
+    /// unreadable file holds none.
+    pub fn shared_audio(&self) -> BTreeMap<String, SharedAudio> {
+        let mut choices: BTreeMap<String, SharedAudio> = read_bounded(
+            &self.layout.state.join(SHARED_AUDIO_FILE),
+            MAX_CACHE_FILE as u64,
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+        choices.retain(|hash, choice| hash.len() <= 128 && choice.volume.is_finite());
+        for choice in choices.values_mut() {
+            choice.volume = choice.volume.clamp(0., 1.);
+        }
+        while choices.len() > MAX_SHARED_AUDIO {
+            choices.pop_first();
+        }
+        choices
+    }
+
+    /// Remember `choice` for the person with certificate `hash`.
+    pub fn remember_shared_audio(&self, hash: &str, choice: SharedAudio) -> io::Result<()> {
+        let mut choices = self.shared_audio();
+        if !choices.contains_key(hash) && choices.len() >= MAX_SHARED_AUDIO {
+            choices.pop_first();
+        }
+        choices.insert(hash.to_owned(), choice);
+        let bytes = serde_json::to_vec_pretty(&choices)?;
+        write_changed(&self.layout.state, SHARED_AUDIO_FILE, &bytes)
     }
 }
 
@@ -3309,6 +3355,34 @@ mod tests {
         settings.image_quality = nuschl_core::ImageQuality::High;
         profile.save_settings(&settings, &loaded.managed).unwrap();
         assert!(settings_keys(&profile).is_subset(&released_keys()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_audio_choices_are_kept_apart_from_settings() {
+        let (root, profile) = temporary_profile("shared-audio");
+        assert!(profile.shared_audio().is_empty());
+        let quiet = SharedAudio {
+            volume: 0.25,
+            muted: true,
+        };
+        profile.remember_shared_audio("ada", quiet).unwrap();
+        profile
+            .remember_shared_audio(
+                "bob",
+                SharedAudio {
+                    volume: 7.,
+                    muted: false,
+                },
+            )
+            .unwrap();
+        let reopened = Profile::open(Some(root.clone())).unwrap();
+        let choices = reopened.shared_audio();
+        assert_eq!(choices["ada"], quiet);
+        assert_eq!(choices["bob"].volume, 1.);
+        // In the state folder: settings.json keeps the keys earlier versions read.
+        assert!(profile.layout.state.join(SHARED_AUDIO_FILE).is_file());
+        assert!(!profile.config_dir.join(SETTINGS_FILE).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

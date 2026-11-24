@@ -39,6 +39,14 @@ const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
 // A subscription accepts 48 SDP sections, including its control channel and first source.
 const MAX_SOURCE_CHANGES: u8 = 46;
 const VIDEO: [Purpose; 2] = [Purpose::Camera, Purpose::ScreenVideo];
+/// Shared desktop audio packets queued for the RTC worker, and received ones.
+const AUDIO_QUEUE: usize = 8;
+/// Direct admission counts the system-audio reservation of `nuschl_rtc`.
+const AUDIO_BITRATE: u64 = 256_000;
+/// The RTC transport admits one audio packet per track every 2.5 ms
+/// (`nuschl_rtc::Peer::write`, its bound on the packet rate). Packets that
+/// reach the publisher together wait in its queue and leave this far apart.
+const AUDIO_SPACING: Duration = Duration::from_micros(2500);
 
 pub struct MediaOptions {
     /// Path of the installed `nuschl-rtc-worker`.
@@ -144,6 +152,8 @@ type SourceCaps = [Option<EncoderCaps>; 2];
 #[derive(Clone, Copy, Default)]
 struct Sources {
     tracks: [Option<u8>; 2],
+    /// The shared desktop audio track's revision.
+    audio: Option<u8>,
     revision: u8,
 }
 
@@ -153,11 +163,12 @@ impl Sources {
             .iter()
             .zip(VIDEO)
             .filter_map(|(revision, purpose)| revision.map(|_| purpose))
+            .chain(self.audio.map(|_| Purpose::SystemAudio))
             .collect()
     }
 
-    fn update(&mut self, tracks: [bool; 2]) -> Result<(), Error> {
-        if self.tracks.map(|slot| slot.is_some()) == tracks {
+    fn update(&mut self, tracks: [bool; 2], audio: bool) -> Result<(), Error> {
+        if self.tracks.map(|slot| slot.is_some()) == tracks && self.audio.is_some() == audio {
             return Ok(());
         }
         if self.revision == MAX_SOURCE_CHANGES {
@@ -167,6 +178,7 @@ impl Sources {
         for (slot, active) in self.tracks.iter_mut().zip(tracks) {
             *slot = active.then(|| slot.unwrap_or(self.revision));
         }
+        self.audio = audio.then(|| self.audio.unwrap_or(self.revision));
         Ok(())
     }
 }
@@ -177,6 +189,13 @@ enum Input {
     LoseDirect,
     #[cfg(test)]
     ThrottleDirect(u64),
+}
+
+struct Audio {
+    revision: u8,
+    queued: Instant,
+    timestamp: u64,
+    data: Vec<u8>,
 }
 
 struct Video {
@@ -191,6 +210,8 @@ struct Video {
 pub struct Media {
     input: mpsc::Sender<Input>,
     frames: [mpsc::Sender<Video>; 2],
+    audio: mpsc::Sender<Audio>,
+    audio_frames: mpsc::Receiver<MediaEvent>,
     sequence: [AtomicU64; 2],
     quality: watch::Sender<QualityRequests>,
     sources: watch::Sender<Sources>,
@@ -215,7 +236,13 @@ impl Media {
         key_frame: bool,
         data: Vec<u8>,
     ) -> Result<bool, Error> {
-        let sources = self.sources.borrow().active();
+        let sources: Vec<_> = self
+            .sources
+            .borrow()
+            .active()
+            .into_iter()
+            .filter(|purpose| video_kind(*purpose).is_some())
+            .collect();
         let [purpose] = sources.as_slice() else {
             return Err(Error::Protocol("select an active video source"));
         };
@@ -224,6 +251,8 @@ impl Media {
 
     /// Submit a frame on a camera or screen track after its `SourceReady` event.
     /// Each source has a separate one-frame queue and a 90 kHz timestamp clock.
+    /// Shared desktop audio takes Opus packets on a 48 kHz clock, which wait
+    /// in a short queue of their own; the publisher drops them until it sends.
     pub fn send_source_frame(
         &self,
         purpose: Purpose,
@@ -231,6 +260,27 @@ impl Media {
         key_frame: bool,
         data: Vec<u8>,
     ) -> Result<bool, Error> {
+        if purpose == Purpose::SystemAudio {
+            let revision = self
+                .sources
+                .borrow()
+                .audio
+                .ok_or(Error::Protocol("shared audio is off"))?;
+            if data.is_empty() || data.len() > purpose.frame_limit() {
+                return Err(Error::Protocol("invalid encoded frame size"));
+            }
+            let audio = Audio {
+                revision,
+                queued: Instant::now(),
+                timestamp,
+                data,
+            };
+            return match self.audio.try_send(audio) {
+                Ok(()) => Ok(true),
+                Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Protocol("media ended")),
+            };
+        }
         let index = video_index(purpose)?;
         let revision =
             self.sources.borrow().tracks[index].ok_or(Error::Protocol("video source is off"))?;
@@ -260,12 +310,21 @@ impl Media {
         !self.sources.is_closed()
     }
 
-    /// Change one granted source while keeping the other source and signaling live.
+    /// Change one granted source while keeping the other sources and signaling live.
     pub fn set_source(&mut self, purpose: Purpose, active: bool) -> Result<(), Error> {
-        let index = video_index(purpose)?;
-        let mut tracks = self.sources.borrow().tracks.map(|slot| slot.is_some());
-        tracks[index] = active;
-        self.set_sources(tracks)
+        let current = *self.sources.borrow();
+        let mut tracks = current.tracks.map(|slot| slot.is_some());
+        let mut audio = current.audio.is_some();
+        if purpose == Purpose::SystemAudio {
+            audio = active;
+        } else {
+            tracks[video_index(purpose)?] = active;
+        }
+        let mut sources = current;
+        sources.update(tracks, audio)?;
+        self.sources
+            .send(sources)
+            .map_err(|_| Error::Protocol("media ended"))
     }
 
     #[cfg(test)]
@@ -274,9 +333,10 @@ impl Media {
         self.set_sources(std::array::from_fn(|i| i == index))
     }
 
+    #[cfg(test)]
     fn set_sources(&self, tracks: [bool; 2]) -> Result<(), Error> {
         let mut sources = *self.sources.borrow();
-        sources.update(tracks)?;
+        sources.update(tracks, sources.audio.is_some())?;
         self.sources
             .send(sources)
             .map_err(|_| Error::Protocol("media ended"))
@@ -397,6 +457,7 @@ impl Media {
             let event = tokio::select! {
                 biased;
                 event = self.events.recv() => event,
+                Some(frame) = self.audio_frames.recv() => return Some(Ok(frame)),
                 (index, requested) = next_source(&mut self.keyframes) => {
                     if requested.is_some() {
                         return Some(Ok(MediaEvent::SourceKeyframeRequired { purpose: VIDEO[index] }));
@@ -439,6 +500,7 @@ impl Media {
     pub async fn stop(self) -> Result<(), Error> {
         drop(self.input);
         drop(self.frames);
+        drop(self.audio);
         drop(self.events);
         drop(self.keyframes);
         self.task
@@ -472,6 +534,7 @@ impl Connection {
         };
         let initial = Sources {
             tracks: VIDEO.map(|purpose| (options.publish == Some(purpose)).then_some(0)),
+            audio: None,
             revision: 0,
         };
         let (input, control) = mpsc::channel(rtc::MAX_TRACKS);
@@ -480,6 +543,8 @@ impl Connection {
         let (sources, changes) = watch::channel(initial);
         let (output, events) = mpsc::channel(4);
         let (requests, keyframes) = frame_channels();
+        let (audio, audio_in) = mpsc::channel(AUDIO_QUEUE);
+        let (received_audio, audio_frames) = mpsc::channel(AUDIO_QUEUE);
         let (encoder_caps, limits) = watch::channel([None; 2]);
         let (upload_estimate, bandwidth) = watch::channel(None);
         let task = tokio::spawn(async move {
@@ -492,12 +557,14 @@ impl Connection {
                 Inputs {
                     control,
                     frames,
+                    audio: audio_in,
                     changes,
                     wanted,
                 },
                 Output {
                     events: &output,
                     keyframes: &requests,
+                    audio: &received_audio,
                     limits: &encoder_caps,
                     bandwidth: &upload_estimate,
                 },
@@ -512,6 +579,8 @@ impl Connection {
         Ok(Media {
             input,
             frames: [camera, screen],
+            audio,
+            audio_frames,
             sequence: Default::default(),
             quality,
             sources,
@@ -579,6 +648,8 @@ struct Leg {
     bandwidth: Option<(Instant, u64)>,
     last_packet: Option<Instant>,
     video_gates: HashMap<(u64, Purpose), FrameGate>,
+    /// Publishers whose shared desktop audio this leg receives.
+    audio: HashSet<u64>,
     #[cfg(test)]
     throttle: Option<Shaper>,
 }
@@ -621,7 +692,13 @@ impl Shaper {
 }
 
 impl Leg {
+    /// Gate each video track on its keyframes, and admit shared audio tracks.
     fn set_video_tracks(&mut self, tracks: &[Track]) {
+        self.audio = tracks
+            .iter()
+            .filter(|track| track.purpose == Purpose::SystemAudio)
+            .filter_map(|track| track.publisher)
+            .collect();
         self.video_gates.retain(|&(publisher, purpose), _| {
             tracks
                 .iter()
@@ -690,6 +767,7 @@ impl Leg {
             bandwidth: None,
             last_packet: None,
             video_gates: HashMap::new(),
+            audio: HashSet::new(),
             #[cfg(test)]
             throttle: None,
         })
@@ -754,6 +832,7 @@ async fn describe(worker: &mut Worker, command: Command) -> Result<Description, 
 struct Output<'a> {
     events: &'a mpsc::Sender<Result<QueuedEvent, Error>>,
     keyframes: &'a [mpsc::Sender<()>; 2],
+    audio: &'a mpsc::Sender<MediaEvent>,
     // Feedback updates carry the latest value without holding up media I/O.
     limits: &'a watch::Sender<SourceCaps>,
     bandwidth: &'a watch::Sender<Option<u64>>,
@@ -821,6 +900,7 @@ type QualityRequests = Vec<QualityRequest>;
 struct Inputs {
     control: mpsc::Receiver<Input>,
     frames: [mpsc::Receiver<Video>; 2],
+    audio: mpsc::Receiver<Audio>,
     changes: watch::Receiver<Sources>,
     wanted: watch::Receiver<QualityRequests>,
 }
@@ -960,6 +1040,10 @@ async fn run(
     let mut pub_buffer = [0; rtc::MAX_DATAGRAM + 1];
     let mut sub_buffer = [0; rtc::MAX_DATAGRAM + 1];
     let mut sending = [None; 2];
+    let mut audio_sending = None;
+    // The next packet to send, and when the transport admits it.
+    let mut held_audio: Option<Audio> = None;
+    let mut audio_turn = Instant::now();
     let mut send_gates = std::array::from_fn::<_, 2, _>(|_| FrameGate::new());
     let mut sequence = [0_u64; 2];
     loop {
@@ -1024,7 +1108,8 @@ async fn run(
                     }).collect::<Result<Vec<_>, _>>()?;
                     let mut seen = HashSet::new();
                     let next = tracks.iter().filter(|track| {
-                        video_kind(track.purpose).is_some() && seen.insert((track.publisher, track.purpose))
+                        (video_kind(track.purpose).is_some() || track.purpose == Purpose::SystemAudio)
+                            && seen.insert((track.publisher, track.purpose))
                     }).cloned().collect::<Vec<_>>();
                     let description = Description { id: signaling_id(connection, SUBSCRIBE), sdp, tracks };
                     let answer = describe(worker, Command::AcceptOffer { leg: SUBSCRIBE, description }).await?;
@@ -1169,6 +1254,36 @@ async fn run(
                 }
                 None => return Ok(()),
             },
+            frame = inputs.audio.recv(), if held_audio.is_none() => {
+                let Some(frame) = frame else { return Ok(()); };
+                held_audio = Some(frame);
+            }
+            () = wake(held_audio.as_ref().map(|_| audio_turn)) => {
+                if let Some(frame) = held_audio.take()
+                    && Some(frame.revision) == inputs.changes.borrow().audio
+                    && Some(frame.revision) == audio_sending
+                    && frame.queued.elapsed() <= MAX_PENDING_FRAME_AGE
+                    && (sending_direct || publish.is_some())
+                {
+                    let command = Command::Write { purpose: Purpose::SystemAudio, timestamp: frame.timestamp, key_frame: false };
+                    match worker.exchange(command, frame.data).await?.kind {
+                        Reply::Done => {
+                            let now = Some(Instant::now());
+                            if sending_direct {
+                                for attempt in direct.iter_mut().flat_map(|direct| &mut direct.legs) {
+                                    attempt.transport.wake = now;
+                                }
+                            } else if let Some(leg) = &mut publish {
+                                leg.wake = now;
+                            }
+                            audio_turn = Instant::now() + AUDIO_SPACING;
+                        }
+                        // Over the bandwidth budget: dropped, as video is.
+                        Reply::Rejected => {}
+                        _ => return Err(Error::Protocol("invalid RTC write reply")),
+                    }
+                }
+            }
             (index, frame) = next_source(&mut inputs.frames) => {
                 let Some(frame) = frame else { return Ok(()); };
                 let allowed = Some(frame.revision) == inputs.changes.borrow().tracks[index];
@@ -1263,7 +1378,7 @@ async fn run(
         }
         if offered.is_none()
             && let Some(next) = pending_source.take()
-            && source.tracks != next.tracks
+            && (source.tracks, source.audio) != (next.tracks, next.audio)
         {
             let update = publish.is_some();
             if publish.is_none() {
@@ -1301,10 +1416,13 @@ async fn run(
                     output.limits.send_modify(|limits| limits[index] = None);
                 }
             }
+            if source.audio != next.audio {
+                audio_sending = None;
+            }
             source = next;
         }
         if offered.is_none()
-            && source.tracks != sending
+            && (source.tracks != sending || source.audio != audio_sending)
             && publish.as_ref().is_some_and(|leg| leg.connected)
         {
             // The crypto worker delivers the epoch on a separate private channel.
@@ -1342,12 +1460,13 @@ async fn run(
                 }
             }
             sending = source.tracks;
+            audio_sending = source.audio;
         }
 
         let Some(direct) = &mut direct else {
             continue;
         };
-        let publishing = source.tracks.iter().any(Option::is_some);
+        let publishing = source.tracks.iter().any(Option::is_some) || source.audio.is_some();
         let next_role = direct::role(&peers, publishing, &subscribed);
         if next_role != role {
             retreat = true;
@@ -1364,6 +1483,7 @@ async fn run(
                     Some(sum)
                 }
             })
+            .map(|sum| sum + source.audio.map_or(0, |_| AUDIO_BITRATE))
             .filter(|desired| *desired != 0);
         // Each direct leg carries the whole stream.
         if let Some(desired) = desired
@@ -1656,6 +1776,24 @@ async fn drain(
                 Event::Keyframe { purpose } if sending => {
                     if let Ok(index) = video_index(purpose) {
                         output.keyframe(index);
+                    }
+                }
+                Event::Frame {
+                    publisher,
+                    purpose: Purpose::SystemAudio,
+                    timestamp,
+                    contiguous,
+                    ..
+                } if receiving => {
+                    if leg.audio.contains(&publisher) {
+                        let _ = output.audio.try_send(MediaEvent::Frame {
+                            publisher,
+                            purpose: Purpose::SystemAudio,
+                            timestamp,
+                            contiguous,
+                            key_frame: false,
+                            data: packet.data,
+                        });
                     }
                 }
                 Event::Frame {

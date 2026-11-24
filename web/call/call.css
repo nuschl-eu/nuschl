@@ -52,9 +52,6 @@ body.standalone-call {
 }
 .video-session #large:not([hidden]) + #grid { flex: none; grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: 12rem; overflow-x: auto; }
 .video-session #empty { margin: auto; color: var(--muted); }
-.video-session #shared-audio { max-height: 25%; overflow: auto; }
-.video-session #shared-audio > div { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
-.video-session #shared-audio audio { max-width: 100%; }
 .video-session .tile { position: relative; margin: 0; aspect-ratio: 16 / 9; background: var(--tile, #000); border-radius: 8px; overflow: hidden; }
 .video-session .tile video { width: 100%; height: 100%; object-fit: contain; display: block; }
 .video-session .tile figcaption {
@@ -65,6 +62,21 @@ body.standalone-call {
   content: "Waiting for video"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
 }
 .video-session .tile .pin { position: absolute; top: 8px; right: 8px; opacity: 0.8; }
+.video-session .shared-audio { position: absolute; right: 8px; bottom: 8px; border-radius: 6px; background: rgb(0 0 0 / 0.6); }
+.video-session .shared-audio button { display: grid; place-items: center; padding: 4px; border: none; background: none; }
+.video-session .shared-audio svg { width: 20px; height: 20px; }
+/* The volume opens above the speaker while the pointer or the keyboard is on
+   the control, clear of the name beside it. */
+.video-session .shared-audio input {
+  position: absolute; right: 0; bottom: 100%; width: 6rem; margin: 0; padding: 6px; border-radius: 6px;
+  background: rgb(0 0 0 / 0.6); accent-color: var(--accent); opacity: 0; pointer-events: none; transition: opacity 0.15s;
+}
+.video-session .shared-audio:hover input, .video-session .shared-audio:focus-within input { opacity: 1; pointer-events: auto; }
+/* The name ends 8px before the speaker; a name longer than that ends in an
+   ellipsis and keeps its full text as the caption's title. */
+.video-session .tile[data-screen]:not([data-own]) figcaption {
+  max-width: calc(100% - 52px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .video-session .tile .pin[aria-pressed="true"] { background: var(--accent); color: var(--accent-text, #0e1220); }
 .video-session .video-stats {
   position: absolute; z-index: 1; top: 8px; left: 8px;
@@ -93,7 +105,8 @@ body.standalone-call {
   border-radius: 6px; padding: 4px 10px; cursor: pointer;
 }
 .video-session #end-call { color: var(--danger, var(--bad)); }
-.video-session a:focus-visible, .video-session button:focus-visible, .video-session select:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.video-session a:focus-visible, .video-session button:focus-visible, .video-session select:focus-visible,
+.video-session input:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 .video-session #ending { height: 100%; display: grid; place-content: center; text-align: center; gap: 8px; padding: 16px; }
 .video-session #ending h1 { margin: 0; font-size: 1.4rem; }
 .video-session #ending p { margin: 0; color: var(--muted); }

@@ -76,6 +76,9 @@ pub enum Role<'a> {
     /// Audio devices and the sound server, with a trusted Linux namespace-init
     /// receipt on standard error.
     Media,
+    /// A call's shared audio: the desktop's audio out, received shared audio
+    /// in. The media role's grants, with the same receipt; Linux only.
+    CallAudio,
     /// magic-wormhole: the network and, when offering, `file` read-only.
     Transfer { file: Option<&'a Path> },
 }
@@ -153,6 +156,7 @@ impl<'a> Role<'a> {
             Role::Storage { directory } => Capabilities { name: "storage", writable: Some(directory), ..NOTHING },
             Role::Crypto { directory } => Capabilities { name: "crypto", writable: Some(directory), ..NOTHING },
             Role::Media => Capabilities { name: "media", audio: true, lpac: false, ..NOTHING },
+            Role::CallAudio => Capabilities { name: "call-audio", audio: true, lpac: false, linux_only: true, ..NOTHING },
             Role::Transfer { file } => Capabilities { name: "transfer", network: true, readable: file, lpac: false, ..NOTHING },
         }
     }
@@ -180,6 +184,7 @@ impl<'a> Role<'a> {
             Role::Storage { .. } => vec!["--database".into(), data.join("history.sqlite3").into()],
             Role::Crypto { .. } => vec!["--data".into(), data.into()],
             Role::Media => vec!["--live".into()],
+            Role::CallAudio => vec!["--call-audio".into()],
             Role::Transfer { .. } => {
                 input.map_or_else(Vec::new, |input| vec!["--file".into(), input.into()])
             }
