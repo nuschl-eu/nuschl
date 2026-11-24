@@ -5,9 +5,9 @@ import {UI_METHODS,projectedAction,actionProof,serverReference} from "./action-c
 const server={runtime_index:3,id:"original",catalog_instance:"9",generation:"15",own_instance:"21",muted:true,deafened:true,channels:[{id:7,instance:"24",peer:null}],users:[{session:4,instance:"32"}]};
 const timeline={server:"original",channel:7,instance:"24",peer:null};
 test("every allowed UI method has an explicit fixed argument/guard classification",()=>{
- const args={add_server:["","127.0.0.1",64738,"fixture",null],connect:[3],disconnect:[3],accept_certificate:[3,"a".repeat(64)],open:[3,7],browse_server:[3],open_direct:[3,4],send_text:["draft"],start_video_call:["link"],end_video_call:["link"],older:[],join:[3,7],toggle_mute:[3],toggle_deaf:[3],audio_ready:[{}],voice_packet:[{}],remove_server:[3],dismiss_notice:[3],dismiss_welcome:[3,"ticket"],connect_with_password:[3,"not-a-real-secret"],stop_audio:[],edit_server:[3,"","127.0.0.1",64738,"fixture",null],set_server_order:[["original"]],set_voice_bitrate:[128000],content_complete:["1",""],content_request:["1"],content_retire:["undelivered"],image_begin:[{}],image_send:[{}],image_cancel:["1"],find:["lob"]};
+ const args={add_server:["","127.0.0.1",64738,"fixture",null],connect:[3],disconnect:[3],accept_certificate:[3,"a".repeat(64)],open:[3,7],browse_server:[3],open_direct:[3,4],send_text:["draft"],start_video_call:["link"],end_video_call:["link"],older:[],join:[3,7],move_user:[3,4,7],query_permissions:[3,7],toggle_mute:[3],toggle_deaf:[3],audio_ready:[{}],voice_packet:[{}],remove_server:[3],dismiss_notice:[3],dismiss_welcome:[3,"ticket"],connect_with_password:[3,"not-a-real-secret"],stop_audio:[],edit_server:[3,"","127.0.0.1",64738,"fixture",null],set_server_order:[["original"]],set_voice_bitrate:[128000],content_complete:["1",""],content_request:["1"],content_retire:["undelivered"],image_begin:[{}],image_send:[{}],image_cancel:["1"],find:["lob"]};
  assert.deepEqual([...UI_METHODS].sort(),Object.keys(args).sort());
- const exempt=new Set(["add_server","set_server_order","set_voice_bitrate","stop_audio","audio_ready","voice_packet","content_complete","content_request","content_retire","image_begin","image_send","image_cancel","find","end_video_call"]);
+ const exempt=new Set(["add_server","set_server_order","set_voice_bitrate","stop_audio","audio_ready","voice_packet","content_complete","content_request","content_retire","image_begin","image_send","image_cancel","find","end_video_call","query_permissions"]);
  for(const [method,values] of Object.entries(args)){
   const projection=projectedAction(method,values);assert.equal(projection===null,exempt.has(method),method);
   assert.throws(()=>projectedAction(method,[...values,0]));
@@ -22,6 +22,14 @@ test("proof captures visible exact scalar references and never follows later sel
  assert.equal(proof.server.generation,"15");assert.equal(target.target.instance,"24");
  assert.equal(actionProof("join",[3,7],[changed],timeline,null).target.instance,"99");
  assert.throws(()=>actionProof("join",[0,7],[server],timeline,null));
+});
+test("a move names the person and the channel exactly as shown",()=>{
+ assert.deepEqual(projectedAction("move_user",[3,4,7]),{method:"move_user",index:3,target:7,user:4});
+ const proof=actionProof("move_user",[3,4,7],[server],timeline,null);
+ assert.deepEqual(proof.target,{kind:"channel",id:7,instance:"24",peer:null});
+ assert.deepEqual(proof.user,{session:4,instance:"32"});
+ assert.throws(()=>actionProof("move_user",[3,5,7],[server],timeline,null));
+ assert.throws(()=>actionProof("move_user",[3,4,8],[server],timeline,null));
 });
 test("newly configured form chain uses only its explicit returned local reference",()=>{
  const reference=serverReference(server);

@@ -474,6 +474,23 @@ impl Session {
         );
     }
 
+    /// Move someone else to a channel; the server decides.
+    pub fn move_user(&mut self, session: u32, channel: u32) {
+        if self.own_session().is_some_and(|own| own != session)
+            && self.users.contains_key(&session)
+            && self.channels.contains_key(&channel)
+        {
+            self.send(
+                kind::USER_STATE,
+                &proto::UserState {
+                    session: Some(session),
+                    channel_id: Some(channel),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
     /// Send local policy in full; sparse/delayed echoes cannot undo it.
     pub fn set_self(&mut self, muted: bool, deafened: bool) {
         self.desired_muted = muted || deafened;

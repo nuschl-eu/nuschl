@@ -137,6 +137,9 @@ pkgs.testers.runNixOSTest {
         "systemctl stop murmur",
         "sqlite3 /var/lib/murmur/murmur.sqlite \"INSERT INTO channels (server_id, channel_id, parent_id, name, inheritacl)"
         " VALUES (1, 1, 0, 'Lobby', 1), (1, 2, 0, 'Music', 1), (1, 3, 0, 'AFK', 1), (1, 4, 1, 'Games', 1)\"",
+        # Move (0x20) for everyone in Lobby's branch and AFK, not in the root or Music.
+        "sqlite3 /var/lib/murmur/murmur.sqlite \"INSERT INTO acl (server_id, channel_id, priority, user_id, group_name,"
+        " apply_here, apply_sub, grantpriv, revokepriv) VALUES (1, 1, 10, NULL, 'all', 1, 1, 32, 0), (1, 3, 10, NULL, 'all', 1, 1, 32, 0)\"",
         "systemctl start murmur",
     )
     murmur.wait_for_open_port(64738)
@@ -206,6 +209,10 @@ pkgs.testers.runNixOSTest {
     client.succeed("mkdir -p /tmp/shots")
     print(client.succeed("node ${../tests/web_tree.browser.mjs} ${pkgs.chromium}/bin/chromium ${pkgs.playwright-driver} /tmp/shots"))
     client.copy_from_machine("/tmp/shots", "screenshots")
+
+    # People with Move drag others between channels, by mouse, touch and keyboard (#317).
+    print(client.succeed("node ${../tests/web_move_user.browser.mjs} ${pkgs.chromium}/bin/chromium ${pkgs.playwright-driver} /tmp/shots"))
+    client.copy_from_machine("/tmp/shots", "move-screenshots")
 
     # When the browser ends or mutes capture, the app mutes and opens nothing (#447).
     print(client.succeed("node ${../tests/web_mic_stopped.browser.mjs} ${pkgs.chromium}/bin/chromium ${pkgs.playwright-driver} ${tone}"))

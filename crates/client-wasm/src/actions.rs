@@ -117,6 +117,8 @@ struct Proof {
     server: ServerRef,
     selected: Option<Selected>,
     target: Option<Target>,
+    /// The person a move is for.
+    user: Option<PeerRef>,
     voice: Option<Voice>,
 }
 #[derive(Deserialize)]
@@ -126,6 +128,7 @@ struct Call {
     index: Option<usize>,
     target: Option<u32>,
     subject: Option<String>,
+    user: Option<u32>,
 }
 fn counter(value: &str) -> Option<u64> {
     if value.is_empty() || value.len() > 20 {
@@ -294,6 +297,41 @@ pub fn validate(
                 _ => return Err(STALE.into()),
             }
         }
+        "move_user" => {
+            require(call.subject.is_none())?;
+            let current = server(
+                servers,
+                catalog,
+                call.index.ok_or(STALE)?,
+                &proof.server,
+                true,
+                true,
+            )?;
+            let (id, session) = (call.target.ok_or(STALE)?, call.user.ok_or(STALE)?);
+            let Some(Target::Channel {
+                id: expected,
+                instance,
+                peer: None,
+            }) = proof.target
+            else {
+                return Err(STALE.into());
+            };
+            let channel = current
+                .channels
+                .iter()
+                .find(|channel| channel.target == TextTarget::Channel(id))
+                .ok_or(STALE)?;
+            let user = proof.user.ok_or(STALE)?;
+            let moved = current.users.get(&session).ok_or(STALE)?;
+            require(
+                expected == id
+                    && channel.instance != 0
+                    && counter(&instance) == Some(channel.instance)
+                    && user.session == session
+                    && moved.instance != 0
+                    && counter(&user.instance) == Some(moved.instance),
+            )?;
+        }
         "toggle_mute" | "toggle_deaf" => {
             require(call.target.is_none() && call.subject.is_none())?;
             let current = server(
@@ -458,6 +496,24 @@ mod tests {
             ),
             "offline history does not need a live own presence"
         );
+    }
+    #[test]
+    fn a_move_needs_the_person_and_the_channel_as_shown() {
+        let (mut servers, catalog) = model();
+        let mut p = proof(&servers, &catalog);
+        p["user"] = json!({"session":2,"instance":"22"});
+        let call = json!({"method":"move_user","index":0,"target":7,"user":2});
+        assert!(guard(&servers, &catalog, None, call.clone(), &p));
+        let other = json!({"method":"move_user","index":0,"target":7,"user":1});
+        assert!(!guard(&servers, &catalog, None, other, &p));
+        let mut missing = p.clone();
+        missing.as_object_mut().unwrap().remove("user");
+        assert!(!guard(&servers, &catalog, None, call.clone(), &missing));
+        servers[0].channels[1].instance += 1;
+        assert!(!guard(&servers, &catalog, None, call.clone(), &p));
+        servers[0].channels[1].instance -= 1;
+        servers[0].users.get_mut(&2).unwrap().instance += 1;
+        assert!(!guard(&servers, &catalog, None, call, &p));
     }
     #[test]
     fn numeric_channel_and_user_commands_require_complete_exact_lifetimes() {

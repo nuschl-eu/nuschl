@@ -477,6 +477,9 @@ impl Platform for BrowserPlatform {
         let connection = connections.get(server).ok_or("Not connected.")?;
         match request {
             Request::Join(channel) => connection.session.borrow_mut().join(channel),
+            Request::MoveUser { session, channel } => {
+                connection.session.borrow_mut().move_user(session, channel)
+            }
             Request::SetSelf { muted, deafened } => {
                 connection.session.borrow_mut().set_self(muted, deafened)
             }
@@ -768,6 +771,23 @@ impl WebClient {
         }
         self.reconcile_voice();
         Ok(())
+    }
+
+    /// Move someone else to a channel where the server granted Move.
+    pub fn move_user(&mut self, index: usize, session: u32, channel: u32) -> Result<(), String> {
+        if index >= self.client.servers.len() {
+            return Err("Unknown server.".into());
+        }
+        self.client.move_user(index, session, channel)
+    }
+
+    /// Ask for our permissions in these channels (at most 128) unless known.
+    pub fn query_permissions(&mut self, index: usize, channels: Vec<u32>) {
+        if index < self.client.servers.len() {
+            for channel in channels.into_iter().take(128) {
+                self.client.query_permissions(index, channel);
+            }
+        }
     }
 
     pub fn toggle_mute(&mut self, index: usize) -> Result<(), String> {
