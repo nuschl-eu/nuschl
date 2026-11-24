@@ -227,6 +227,17 @@ class Scenes:
             " return [b.x, b.y]; })())"))
         return origin[0] + x, origin[1] + y
 
+    def reveal(self, node):
+        """Turn the wheel over Settings until `node` lies whole in its visible part."""
+        def shown():
+            _, top, _, height = node.extents()
+            x, y, width, dialog_height = self.find("dialog", "Settings").extents()
+            if y <= top and top + height <= y + dialog_height - 8:
+                return True
+            self.shell.wheel(*self.screen(x + width // 2, y + dialog_height // 2), 1 if top > y else -1)
+            time.sleep(0.2)
+        eventually(shown, f"{node.name} did not scroll into view in Settings")
+
     @staticmethod
     def value(node):
         return node.bus("get-property", node.destination, node.path, "org.a11y.atspi.Value", "CurrentValue")
@@ -389,8 +400,10 @@ class Scenes:
         self.shot("05-meter-silence-again")
         print(f"Silence again: level {after[0]}, speech {after[1]}; Voice gate closed.", flush=True)
 
-        # A pointer drag: heard while held, one write after the release.
+        # A pointer drag: heard while held, one write after the release. The
+        # meter has pushed the slider below the dialog's visible part.
         slider = self.wait_for("slider", "Voice activity sensitivity", "no sensitivity slider")
+        self.reveal(slider)
         start = time.monotonic()
         begin, middle, end = self.thumb(slider, 0.5), self.thumb(slider, 0.65), self.thumb(slider, 0.8)
         self.shell.move(*begin)
