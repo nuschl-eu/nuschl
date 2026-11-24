@@ -48,8 +48,23 @@ pub mod capability {
     pub const SHARE: &str = "share/1";
     pub const PRIVACY: &str = "privacy/1";
     pub const KNOCK: &str = "knock/1";
-    pub const ALL: [&str; 10] = [
-        HISTORY, SUBSCRIBE, TYPING, KT, MLS, E2EE, KT_WITNESS, SHARE, PRIVACY, KNOCK,
+    /// The server sends a client only the channels it may traverse or an
+    /// access token would open, and the people in them (#341), and a
+    /// client's channel create may carry the new channel's rules
+    /// (`ChannelInfo.rules`).
+    pub const HIDDEN_CHANNELS: &str = "hidden-channels/1";
+    pub const ALL: [&str; 11] = [
+        HISTORY,
+        SUBSCRIBE,
+        TYPING,
+        KT,
+        MLS,
+        E2EE,
+        KT_WITNESS,
+        SHARE,
+        PRIVACY,
+        KNOCK,
+        HIDDEN_CHANNELS,
     ];
 }
 
@@ -419,6 +434,13 @@ pub fn channel_state_frame(state: &proto::ChannelState, info: v1::ChannelInfo) -
     )
 }
 
+/// The rules a client's channel create carries (`hidden-channels/1`); `None`
+/// when its extension field is malformed.
+pub fn create_rules(body: &[u8]) -> Option<Vec<v1::Rule>> {
+    let extension = v1::ChannelStateExtension::decode(body).ok()?;
+    Some(extension.nuschl.map(|info| info.rules).unwrap_or_default())
+}
+
 /// The extension properties in a `ChannelState` body, if valid.
 pub fn channel_info(body: &[u8]) -> Option<v1::ChannelInfo> {
     let info = v1::ChannelStateExtension::decode(body).ok()?.nuschl?;
@@ -585,6 +607,38 @@ mod tests {
         assert_eq!(proto::ChannelState::decode(body).unwrap(), state);
         assert_eq!(channel_info(body).unwrap().conversation, vec![7; 16]);
         assert!(channel_info(&state.encode_to_vec()).is_none());
+    }
+
+    #[test]
+    fn a_create_carries_its_rules_and_a_malformed_extension_is_refused() {
+        let state = proto::ChannelState {
+            parent: Some(0),
+            name: Some("Plans".into()),
+            ..Default::default()
+        };
+        let rule = v1::Rule {
+            apply_here: true,
+            apply_subs: true,
+            group: "all".into(),
+            deny: 2,
+            ..Default::default()
+        };
+        let mut body = state.encode_to_vec();
+        v1::ChannelStateExtension {
+            nuschl: Some(v1::ChannelInfo {
+                rules: vec![rule.clone()],
+                ..Default::default()
+            }),
+        }
+        .encode(&mut body)
+        .unwrap();
+        assert_eq!(proto::ChannelState::decode(&body[..]).unwrap(), state);
+        assert_eq!(create_rules(&body), Some(vec![rule]));
+        assert_eq!(create_rules(&state.encode_to_vec()), Some(Vec::new()));
+        // Field 7200 announcing five bytes that never come.
+        let mut truncated = state.encode_to_vec();
+        truncated.extend([0x82, 0xc2, 0x03, 0x05]);
+        assert_eq!(create_rules(&truncated), None);
     }
 
     #[test]

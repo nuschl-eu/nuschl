@@ -37,6 +37,11 @@ const OWNED: u32 = 2;
 const PRIVATE: u32 = 3;
 /// A temporary channel the owner made.
 const TEMP: u32 = i32::MAX as u32;
+/// A Private channel ([`Fixture::add_secret`]) and its subchannel.
+const SECRET: u32 = 5;
+const INNER: u32 = 6;
+/// A channel with Mumble's password `letmein` ([`Fixture::add_door`]).
+const DOOR: u32 = 7;
 
 const ADMIN: u32 = 2;
 const OWNER: u32 = 3;
@@ -359,14 +364,10 @@ fn admission_fences_pending_pages_and_live_edits_of_old_messages() {
             source: moderator,
             conversation,
             message: old,
-            fallback: nuschl_protocol::encode_control(
-                kind::TEXT_MESSAGE,
-                &proto::TextMessage {
-                    message: "secret".into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+            fallback: proto::TextMessage {
+                message: "secret".into(),
+                ..Default::default()
+            },
         },
         None,
     );
@@ -1886,6 +1887,1286 @@ fn a_listener_ends_when_unregistering_takes_its_listen_away() {
     assert!(!f.state.registry.users.contains_key(&REGISTERED));
     assert!(listening(&f, registered).is_empty());
     assert_eq!(told(&mut f, guest, registered), (vec![PRIVATE], vec![]));
+}
+
+// ---- what each client sees (#341) ----
+
+impl Fixture {
+    /// A Private channel below the root, as the channel type stores it
+    /// (`@all` denied and `@admin` allowed Traverse, Enter, Listen, Speak,
+    /// Whisper, Text message, here and in subchannels), with the member's row
+    /// and Write for the owner, and a subchannel; each comes with its rules,
+    /// as a create that carries a type's rules (`hidden-channels/1`) makes it.
+    fn add_secret(&mut self) {
+        let access = perm::TRAVERSE
+            | perm::ENTER
+            | perm::LISTEN
+            | perm::SPEAK
+            | perm::WHISPER
+            | perm::TEXT_MESSAGE;
+        let mut secret = Channel::new(SECRET, Some(0), "Secret".into());
+        secret.node.acls = vec![
+            entry("all", None, 0, access),
+            entry("admin", None, access, 0),
+            entry("", Some(MEMBER), access, 0),
+            entry("", Some(OWNER), perm::WRITE, 0),
+        ];
+        secret.children.push(INNER);
+        let inner = Channel::new(INNER, Some(SECRET), "Inner".into());
+        for channel in [secret, inner] {
+            self.state
+                .conversations
+                .add_channel(channel.conversation_id, channel.id);
+            self.state.channels.0.insert(channel.id, channel);
+        }
+        if let Some(root) = self.state.channels.get_mut(0) {
+            root.children.push(SECRET);
+        }
+        self.state.invalidate();
+        self.state.channel_added(SECRET);
+        self.state.channel_added(INNER);
+    }
+
+    /// A channel below the root with Mumble's channel password rules: `@all`
+    /// denied and `#letmein` granted Traverse, Enter, Speak, Whisper, Text
+    /// message and Link channel, in the channel only.
+    fn add_door(&mut self) {
+        let password = perm::TRAVERSE
+            | perm::ENTER
+            | perm::SPEAK
+            | perm::WHISPER
+            | perm::TEXT_MESSAGE
+            | perm::LINK_CHANNEL;
+        let here = |group: &str, grant, deny| AclEntry {
+            apply_subs: false,
+            ..entry(group, None, grant, deny)
+        };
+        let mut door = Channel::new(DOOR, Some(0), "Door".into());
+        door.node.acls = vec![here("all", 0, password), here("#letmein", password, 0)];
+        self.state
+            .conversations
+            .add_channel(door.conversation_id, DOOR);
+        self.state.channels.0.insert(DOOR, door);
+        if let Some(root) = self.state.channels.get_mut(0) {
+            root.children.push(DOOR);
+        }
+        self.state.invalidate();
+        self.state.channel_added(DOOR);
+    }
+
+    fn hidden(&self, kind: &str) -> Vec<u32> {
+        self.state.users[&self.actor(kind)]
+            .hidden
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+/// What a client heard about channels and people: added or changed channels,
+/// removed channels, users shown, users removed (each in order).
+#[derive(Debug, Default, PartialEq)]
+struct Heard {
+    channels: Vec<u32>,
+    removed_channels: Vec<u32>,
+    users: Vec<u32>,
+    removed_users: Vec<u32>,
+}
+
+impl Heard {
+    fn of(frames: &[(u16, Bytes)]) -> Self {
+        use prost::Message as _;
+        let mut heard = Self::default();
+        for (kind, payload) in frames {
+            match *kind {
+                kind::CHANNEL_STATE => heard.channels.extend(
+                    proto::ChannelState::decode(payload.clone())
+                        .unwrap()
+                        .channel_id,
+                ),
+                kind::CHANNEL_REMOVE => heard.removed_channels.push(
+                    proto::ChannelRemove::decode(payload.clone())
+                        .unwrap()
+                        .channel_id,
+                ),
+                kind::USER_STATE => heard
+                    .users
+                    .extend(proto::UserState::decode(payload.clone()).unwrap().session),
+                kind::USER_REMOVE => heard
+                    .removed_users
+                    .push(proto::UserRemove::decode(payload.clone()).unwrap().session),
+                _ => {}
+            }
+        }
+        heard
+    }
+}
+
+#[test]
+fn a_private_channel_and_its_subtree_reach_only_those_who_may_traverse_it() {
+    let mut f = Fixture::new(Config::default());
+    for session in f.actors {
+        f.received(session);
+    }
+    f.add_secret();
+    assert_eq!(f.state.guarded_channels(), [SECRET, INNER]);
+    // SuperUser and the administrators (Write at the root), the owner (Write
+    // in the channel) and the member (allowed by name) see both.
+    for kind in ["superuser", "admin", "owner", "member"] {
+        assert_eq!(f.hidden(kind), [] as [u32; 0], "{kind}");
+        let session = f.actor(kind);
+        assert_eq!(
+            Heard::of(&f.received(session)).channels,
+            [SECRET, INNER],
+            "{kind}"
+        );
+    }
+    // Nobody else hears of them.
+    for kind in ["registered", "guest", "anonymous"] {
+        assert_eq!(f.hidden(kind), [SECRET, INNER], "{kind}");
+        let session = f.actor(kind);
+        assert_eq!(Heard::of(&f.received(session)), Heard::default(), "{kind}");
+        assert!(!f.state.sees_channel(session, SECRET));
+        assert!(!f.state.sees_channel(session, INNER));
+    }
+    // Write at the root sees a channel that denies the administrators.
+    f.state
+        .channels
+        .get_mut(SECRET)
+        .unwrap()
+        .node
+        .acls
+        .push(entry("admin", None, 0, perm::TRAVERSE | perm::WRITE));
+    f.state.authz_changed(crate::conversations::Scope::All);
+    f.state.invalidate();
+    f.state.finish();
+    assert_eq!(f.hidden("admin"), [] as [u32; 0]);
+}
+
+#[test]
+fn a_channel_a_password_opens_stays_listed_and_only_the_password_enters() {
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    for session in f.actors {
+        f.received(session);
+    }
+    f.add_door();
+    let registered = f.actor("registered");
+    // Everyone sees it; the Private channel without a token rule stays hidden.
+    for kind in KINDS {
+        let session = f.actor(kind);
+        assert_eq!(Heard::of(&f.received(session)).channels, [DOOR], "{kind}");
+        assert!(!f.state.users[&session].hidden.contains(&DOOR), "{kind}");
+    }
+    for kind in ["registered", "guest", "anonymous"] {
+        assert_eq!(f.hidden(kind), [SECRET, INNER], "{kind}");
+    }
+    // Seeing it is not entering it.
+    assert_eq!(
+        f.state
+            .authorize(registered, Action::Enter { channel: DOOR }),
+        Err(Denial::Permission {
+            session: registered,
+            channel: DOOR,
+            permission: perm::ENTER
+        })
+    );
+    // With the password, as a temporary access token, it enters.
+    f.handle(
+        registered,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(DOOR),
+            temporary_access_tokens: vec!["letmein".into()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.state.users[&registered].channel, DOOR);
+    assert_eq!(f.hidden("registered"), [SECRET, INNER]);
+}
+
+#[test]
+fn people_in_a_private_channel_come_and_go_as_seen_from_outside() {
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, anonymous] = f.actors;
+    for session in f.actors {
+        f.received(session);
+    }
+    // The member goes in: outside, it leaves.
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.state.users[&member].channel, SECRET);
+    assert_eq!(Heard::of(&f.received(anonymous)).removed_users, [member]);
+    assert!(!f.state.sees_user(anonymous, member));
+    assert_eq!(Heard::of(&f.received(admin)).users, [member]);
+    // And comes back.
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(LOBBY),
+            ..Default::default()
+        },
+    );
+    let back = f.received(anonymous);
+    assert!(
+        Heard::of(&back)
+            .users
+            .iter()
+            .all(|session| *session == member)
+    );
+    let state = back
+        .iter()
+        .find(|(kind, _)| *kind == kind::USER_STATE)
+        .map(|(_, payload)| {
+            use prost::Message as _;
+            proto::UserState::decode(payload.clone()).unwrap()
+        })
+        .unwrap();
+    assert_eq!(
+        (state.name.as_deref(), state.channel_id),
+        (Some("member"), Some(LOBBY)),
+        "the whole user, as for someone who connects"
+    );
+
+    // Moved in by an administrator, a registered user sees the channel it is
+    // in (before it hears of the move) without its subchannel, and loses it
+    // again after leaving.
+    f.received(registered);
+    f.handle(
+        admin,
+        kind::USER_STATE,
+        &proto::UserState {
+            session: Some(registered),
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.hidden("registered"), [INNER]);
+    let heard = Heard::of(&f.received(registered));
+    assert_eq!(heard.channels, [SECRET]);
+    assert_eq!(heard.users, [registered]);
+    assert_eq!(
+        Heard::of(&f.received(anonymous)).removed_users,
+        [registered]
+    );
+    f.handle(
+        registered,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(LOBBY),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.hidden("registered"), [SECRET, INNER]);
+    let heard = f.received(registered);
+    let kinds: Vec<u16> = heard.iter().map(|(kind, _)| *kind).collect();
+    let moved = kinds.iter().position(|kind| *kind == kind::USER_STATE);
+    let removed = kinds.iter().position(|kind| *kind == kind::CHANNEL_REMOVE);
+    assert!(moved < removed, "its move first, then the channel goes");
+    assert_eq!(Heard::of(&heard).removed_channels, [SECRET]);
+}
+
+#[test]
+fn group_membership_shows_and_hides_a_private_channel_with_its_people() {
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(INNER),
+            ..Default::default()
+        },
+    );
+    // SuperUser may not speak: suppressed once permissions are evaluated.
+    f.state.permissions_changed(None);
+    f.received(registered);
+    let acl = |members: Vec<u32>| {
+        let access = perm::TRAVERSE
+            | perm::ENTER
+            | perm::LISTEN
+            | perm::SPEAK
+            | perm::WHISPER
+            | perm::TEXT_MESSAGE;
+        let rule = |group: &str, user_id: Option<u32>, grant, deny| proto::acl::ChanAcl {
+            apply_here: Some(true),
+            apply_subs: Some(true),
+            group: user_id.is_none().then(|| group.to_owned()),
+            user_id,
+            grant: Some(grant),
+            deny: Some(deny),
+            ..Default::default()
+        };
+        proto::Acl {
+            channel_id: SECRET,
+            inherit_acls: Some(true),
+            groups: vec![proto::acl::ChanGroup {
+                name: "admin".into(),
+                inherit: Some(true),
+                inheritable: Some(true),
+                add: members,
+                ..Default::default()
+            }],
+            acls: vec![
+                rule("all", None, 0, access),
+                rule("admin", None, access, 0),
+                rule("", Some(MEMBER), access, 0),
+            ],
+            ..Default::default()
+        }
+    };
+    // Added to the channel's admin group: the channel, its subchannel and
+    // the member in it appear, parents first, then the people.
+    f.handle(admin, kind::ACL, &acl(vec![REGISTERED]));
+    assert_eq!(f.hidden("registered"), [] as [u32; 0]);
+    let heard = Heard::of(&f.received(registered));
+    assert_eq!(heard.channels, [SECRET, INNER]);
+    assert_eq!(heard.users, [member]);
+    // Removed: the people first, then the channels, children first.
+    f.handle(admin, kind::ACL, &acl(Vec::new()));
+    assert_eq!(f.hidden("registered"), [SECRET, INNER]);
+    let heard = Heard::of(&f.received(registered));
+    assert_eq!(heard.removed_users, [member]);
+    assert_eq!(heard.removed_channels, [INNER, SECRET]);
+}
+
+/// The private ACL [`Fixture::add_secret`] stores, with `members` allowed by
+/// name.
+fn secret_acl(members: &[u32]) -> proto::Acl {
+    let access = perm::TRAVERSE
+        | perm::ENTER
+        | perm::LISTEN
+        | perm::SPEAK
+        | perm::WHISPER
+        | perm::TEXT_MESSAGE;
+    let rule = |group: Option<&str>, user_id: Option<u32>, grant, deny| proto::acl::ChanAcl {
+        apply_here: Some(true),
+        apply_subs: Some(true),
+        group: group.map(str::to_owned),
+        user_id,
+        grant: Some(grant),
+        deny: Some(deny),
+        ..Default::default()
+    };
+    let mut acls = vec![
+        rule(Some("all"), None, 0, access),
+        rule(Some("admin"), None, access, 0),
+    ];
+    acls.extend(members.iter().map(|id| rule(None, Some(*id), access, 0)));
+    proto::Acl {
+        channel_id: SECRET,
+        inherit_acls: Some(true),
+        acls,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_channel_created_with_private_rules_is_never_shown_to_others() {
+    use prost::Message as _;
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    let [_, admin, _, member, _, _, anonymous] = f.actors;
+    for session in f.actors {
+        f.received(session);
+    }
+    let create = |f: &mut Fixture, name: &str, rules: Vec<v1::Rule>| {
+        let mut body = proto::ChannelState {
+            parent: Some(0),
+            name: Some(name.into()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        v1::ChannelStateExtension {
+            nuschl: Some(v1::ChannelInfo {
+                rules,
+                ..Default::default()
+            }),
+        }
+        .encode(&mut body)
+        .unwrap();
+        f.state.handle(
+            admin,
+            ControlFrame {
+                kind: kind::CHANNEL_STATE,
+                payload: Bytes::from(body),
+            },
+            &mut Datagrams::default(),
+        );
+        f.state
+            .channels
+            .0
+            .values()
+            .find(|channel| channel.name == name)
+            .map(|channel| channel.id)
+    };
+    let rules: Vec<v1::Rule> = secret_acl(&[MEMBER])
+        .acls
+        .into_iter()
+        .map(|acl| v1::Rule {
+            apply_here: acl.apply_here(),
+            apply_subs: acl.apply_subs(),
+            user_id: acl.user_id,
+            group: acl.group.clone().unwrap_or_default(),
+            grant: acl.grant(),
+            deny: acl.deny(),
+        })
+        .collect();
+    let layoffs = create(&mut f, "Layoffs", rules.clone()).unwrap();
+    assert!(!f.state.sees_channel(anonymous, layoffs));
+    assert_eq!(Heard::of(&f.received(anonymous)), Heard::default());
+    assert_eq!(Heard::of(&f.received(member)).channels, [layoffs]);
+    // Rules past the editor's limits make no channel.
+    assert_eq!(create(&mut f, "Many", vec![rules[0].clone(); 513]), None);
+}
+
+#[test]
+fn a_new_channel_reaches_only_those_who_see_it() {
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, anonymous] = f.actors;
+    for session in f.actors {
+        f.received(session);
+    }
+    f.handle(
+        admin,
+        kind::CHANNEL_STATE,
+        &proto::ChannelState {
+            parent: Some(INNER),
+            name: Some("Deeper".into()),
+            ..Default::default()
+        },
+    );
+    let deeper = Heard::of(&f.received(member)).channels;
+    assert_eq!(deeper.len(), 1);
+    assert!(f.state.channels.get(deeper[0]).is_some());
+    assert_eq!(Heard::of(&f.received(registered)), Heard::default());
+    assert!(f.state.users[&registered].hidden.contains(&deeper[0]));
+    // Removed again: only those who knew it hear of it.
+    f.handle(
+        admin,
+        kind::CHANNEL_REMOVE,
+        &proto::ChannelRemove {
+            channel_id: deeper[0],
+        },
+    );
+    assert_eq!(Heard::of(&f.received(member)).removed_channels, deeper);
+    assert_eq!(Heard::of(&f.received(registered)), Heard::default());
+    assert!(!f.state.users[&registered].hidden.contains(&deeper[0]));
+
+    // A temporary channel in view: everyone who sees it sees the creator
+    // move in, nobody sees it leave.
+    f.received(anonymous);
+    f.handle(
+        registered,
+        kind::CHANNEL_STATE,
+        &proto::ChannelState {
+            parent: Some(LOBBY),
+            name: Some("Talk".into()),
+            temporary: Some(true),
+            ..Default::default()
+        },
+    );
+    let talk = f.state.users[&registered].channel;
+    assert!(f.state.channels.get(talk).is_some_and(|c| c.temporary));
+    let heard = Heard::of(&f.received(anonymous));
+    assert_eq!(
+        (heard.channels, heard.users, heard.removed_users),
+        (vec![talk], vec![registered], vec![])
+    );
+}
+
+#[test]
+fn requests_naming_a_hidden_channel_or_person_are_answered_as_for_missing_ones() {
+    use prost::Message as _;
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, anonymous] = f.actors;
+    f.state
+        .channels
+        .get_mut(SECRET)
+        .unwrap()
+        .set_description("behind the door".into());
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            comment: Some("inside".into()),
+            ..Default::default()
+        },
+    );
+    assert!(!f.state.sees_user(registered, member));
+    const MISSING_CHANNEL: u32 = 999;
+    const MISSING_USER: u32 = 9999;
+    type Request = (u16, Vec<u8>);
+    let requests = |channel: u32, user: u32| -> Vec<Request> {
+        let state = |message: proto::UserState| (kind::USER_STATE, message.encode_to_vec());
+        let text = |message: proto::TextMessage| (kind::TEXT_MESSAGE, message.encode_to_vec());
+        let named = |message: proto::ChannelState| (kind::CHANNEL_STATE, message.encode_to_vec());
+        vec![
+            (
+                kind::PERMISSION_QUERY,
+                proto::PermissionQuery {
+                    channel_id: Some(channel),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            (
+                kind::REQUEST_BLOB,
+                proto::RequestBlob {
+                    channel_description: vec![channel],
+                    session_comment: vec![user],
+                    session_texture: vec![user],
+                }
+                .encode_to_vec(),
+            ),
+            state(proto::UserState {
+                channel_id: Some(channel),
+                ..Default::default()
+            }),
+            state(proto::UserState {
+                listening_channel_add: vec![channel],
+                ..Default::default()
+            }),
+            state(proto::UserState {
+                session: Some(user),
+                mute: Some(true),
+                ..Default::default()
+            }),
+            state(proto::UserState {
+                session: Some(user),
+                channel_id: Some(LOBBY),
+                ..Default::default()
+            }),
+            (
+                kind::USER_STATS,
+                proto::UserStats {
+                    session: Some(user),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            (
+                kind::USER_REMOVE,
+                proto::UserRemove {
+                    session: user,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+            text(proto::TextMessage {
+                channel_id: vec![channel],
+                message: "hello".into(),
+                ..Default::default()
+            }),
+            text(proto::TextMessage {
+                tree_id: vec![channel],
+                message: "hello".into(),
+                ..Default::default()
+            }),
+            text(proto::TextMessage {
+                session: vec![user],
+                message: "hello".into(),
+                ..Default::default()
+            }),
+            named(proto::ChannelState {
+                channel_id: Some(channel),
+                name: Some("Renamed".into()),
+                ..Default::default()
+            }),
+            named(proto::ChannelState {
+                parent: Some(channel),
+                name: Some("Below".into()),
+                temporary: Some(true),
+                ..Default::default()
+            }),
+            named(proto::ChannelState {
+                channel_id: Some(LOBBY),
+                links_add: vec![channel],
+                ..Default::default()
+            }),
+            (
+                kind::CHANNEL_REMOVE,
+                proto::ChannelRemove {
+                    channel_id: channel,
+                }
+                .encode_to_vec(),
+            ),
+            (
+                kind::ACL,
+                proto::Acl {
+                    channel_id: channel,
+                    query: Some(true),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ),
+        ]
+    };
+    let answers = |f: &mut Fixture, requests: Vec<Request>| -> Vec<Vec<(u16, Bytes)>> {
+        requests
+            .into_iter()
+            .map(|(kind, body)| {
+                f.state.handle(
+                    registered,
+                    ControlFrame {
+                        kind,
+                        payload: Bytes::from(body),
+                    },
+                    &mut Datagrams::default(),
+                );
+                f.received(registered)
+            })
+            .collect()
+    };
+    f.received(registered);
+    let hidden = answers(&mut f, requests(SECRET, member));
+    let missing = answers(&mut f, requests(MISSING_CHANNEL, MISSING_USER));
+    assert_eq!(hidden, missing);
+    assert_eq!(f.state.users[&member].channel, SECRET);
+    assert!(!f.state.users[&member].mute);
+    assert!(f.state.channels.get(SECRET).is_some());
+    assert_eq!(
+        f.state
+            .authorize(registered, Action::Knock { channel: SECRET }),
+        Err(Denial::NotFound)
+    );
+
+    // Whisper targets keep only what the client sees.
+    f.handle(
+        registered,
+        kind::VOICE_TARGET,
+        &proto::VoiceTarget {
+            id: Some(1),
+            targets: vec![
+                proto::voice_target::Target {
+                    session: vec![member, anonymous],
+                    ..Default::default()
+                },
+                proto::voice_target::Target {
+                    channel_id: Some(SECRET),
+                    ..Default::default()
+                },
+            ],
+        },
+    );
+    let target = &f.state.users[&registered].targets[&1];
+    assert_eq!(
+        (target.sessions.as_slice(), target.channels.len()),
+        ([anonymous].as_slice(), 0)
+    );
+    // A message to someone seen and someone hidden reaches the one seen.
+    f.received(anonymous);
+    f.received(member);
+    f.handle(
+        registered,
+        kind::TEXT_MESSAGE,
+        &proto::TextMessage {
+            session: vec![member, anonymous],
+            message: "hello".into(),
+            ..Default::default()
+        },
+    );
+    assert!(
+        f.received(anonymous)
+            .iter()
+            .any(|(kind, _)| *kind == kind::TEXT_MESSAGE)
+    );
+    assert!(f.received(member).is_empty());
+
+    // A hidden sibling's name is taken, as Murmur has it: the same answer as
+    // for a sibling in view.
+    f.received(registered);
+    let create = |f: &mut Fixture, name: &str| {
+        f.handle(
+            registered,
+            kind::CHANNEL_STATE,
+            &proto::ChannelState {
+                parent: Some(0),
+                name: Some(name.into()),
+                temporary: Some(true),
+                ..Default::default()
+            },
+        );
+        f.received(registered)
+    };
+    let hidden = create(&mut f, "Secret");
+    assert_eq!(hidden, create(&mut f, "Lobby"));
+    let denied = hidden
+        .into_iter()
+        .find(|(kind, _)| *kind == kind::PERMISSION_DENIED)
+        .map(|(_, body)| proto::PermissionDenied::decode(body).unwrap())
+        .unwrap();
+    assert_eq!(denied.r#type(), DenyType::ChannelName);
+    assert_eq!(f.state.users[&registered].channel, LOBBY);
+
+    // The registration list leaves out a last channel the reader does not see.
+    f.state
+        .registry
+        .users
+        .get_mut(&MEMBER)
+        .unwrap()
+        .last_channel = Some(SECRET);
+    f.state.channels.get_mut(0).unwrap().node.acls.push(entry(
+        "",
+        Some(REGISTERED),
+        perm::REGISTER,
+        0,
+    ));
+    f.state.invalidate();
+    let last_channel = |f: &mut Fixture, session: u32| {
+        f.received(session);
+        f.handle(session, kind::USER_LIST, &proto::UserList::default());
+        f.received(session)
+            .into_iter()
+            .find(|(kind, _)| *kind == kind::USER_LIST)
+            .map(|(_, body)| proto::UserList::decode(body).unwrap())
+            .unwrap()
+            .users
+            .into_iter()
+            .find(|user| user.user_id == MEMBER)
+            .unwrap()
+            .last_channel
+    };
+    assert_eq!(last_channel(&mut f, admin), Some(SECRET));
+    assert_eq!(last_channel(&mut f, registered), None);
+}
+
+#[test]
+fn nobody_hears_or_reads_someone_they_do_not_see() {
+    use prost::Message as _;
+    // Packets microseconds apart stay within the bandwidth limit.
+    let mut f = Fixture::new(Config::from_toml("max_bandwidth = 1000000000\n").unwrap());
+    f.add_secret();
+    let [_, admin, _, member, registered, _, anonymous] = f.actors;
+    let into = |channel: u32| proto::UserState {
+        channel_id: Some(channel),
+        ..Default::default()
+    };
+    f.handle(member, kind::USER_STATE, &into(SECRET));
+    f.handle(admin, kind::USER_STATE, &into(LOBBY));
+    for channel in [(SECRET, LOBBY), (LOBBY, SECRET)] {
+        f.state
+            .channels
+            .get_mut(channel.0)
+            .unwrap()
+            .links
+            .insert(channel.1);
+    }
+    f.state.invalidate();
+    let heard = |f: &mut Fixture, session: u32, wanted: u16| {
+        f.received(session)
+            .into_iter()
+            .filter(|(kind, _)| *kind == wanted)
+            .map(|(_, body)| body)
+            .collect::<Vec<_>>()
+    };
+    for session in f.actors {
+        f.received(session);
+    }
+
+    // Voice into a linked channel, and a whisper by name, reach only those
+    // who see the speaker.
+    let voice = Bytes::from_static(&[0, 4 << 3, 1, (5 << 3) | 2, 3, 1, 2, 3]);
+    let speak = |f: &mut Fixture, voice: &Bytes| {
+        f.state.handle(
+            member,
+            ControlFrame {
+                kind: kind::UDP_TUNNEL,
+                payload: voice.clone(),
+            },
+            &mut Datagrams::default(),
+        );
+    };
+    speak(&mut f, &voice);
+    assert_eq!(heard(&mut f, admin, kind::UDP_TUNNEL).len(), 1);
+    assert!(heard(&mut f, anonymous, kind::UDP_TUNNEL).is_empty());
+    assert!(heard(&mut f, registered, kind::UDP_TUNNEL).is_empty());
+    f.handle(
+        member,
+        kind::VOICE_TARGET,
+        &proto::VoiceTarget {
+            id: Some(1),
+            targets: vec![proto::voice_target::Target {
+                session: vec![anonymous, admin],
+                ..Default::default()
+            }],
+        },
+    );
+    speak(
+        &mut f,
+        &Bytes::from_static(&[0, 1 << 3, 1, 4 << 3, 2, (5 << 3) | 2, 1, 9]),
+    );
+    assert_eq!(heard(&mut f, admin, kind::UDP_TUNNEL).len(), 1);
+    assert!(heard(&mut f, anonymous, kind::UDP_TUNNEL).is_empty());
+
+    // Typing in the lobby's conversation.
+    let lobby = f.conversation(LOBBY);
+    f.handle(
+        member,
+        nuschl::kind::TYPING,
+        &v1::Typing {
+            conversation: lobby.to_vec(),
+            session: 0,
+        },
+    );
+    assert_eq!(heard(&mut f, admin, nuschl::kind::TYPING).len(), 1);
+    assert!(heard(&mut f, registered, nuschl::kind::TYPING).is_empty());
+
+    // Plugin data.
+    f.handle(
+        member,
+        kind::PLUGIN_DATA_TRANSMISSION,
+        &proto::PluginDataTransmission {
+            receiver_sessions: vec![anonymous, admin],
+            data: Some(b"x".to_vec()),
+            data_id: Some("game".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        heard(&mut f, admin, kind::PLUGIN_DATA_TRANSMISSION).len(),
+        1
+    );
+    assert!(heard(&mut f, anonymous, kind::PLUGIN_DATA_TRANSMISSION).is_empty());
+
+    // Stock text: from someone hidden, to people seen, and naming a hidden
+    // channel.
+    for session in [admin, anonymous] {
+        f.state.users.get_mut(&session).unwrap().extension = None;
+    }
+    let text = |channel_id: Vec<u32>, session: Vec<u32>| proto::TextMessage {
+        channel_id,
+        session,
+        message: "hello".into(),
+        ..Default::default()
+    };
+    f.handle(
+        member,
+        kind::TEXT_MESSAGE,
+        &text(vec![LOBBY], vec![anonymous]),
+    );
+    assert_eq!(heard(&mut f, admin, kind::TEXT_MESSAGE).len(), 1);
+    assert!(heard(&mut f, anonymous, kind::TEXT_MESSAGE).is_empty());
+    f.handle(
+        admin,
+        kind::TEXT_MESSAGE,
+        &text(vec![LOBBY, SECRET], vec![]),
+    );
+    let seen = heard(&mut f, anonymous, kind::TEXT_MESSAGE);
+    assert_eq!(seen.len(), 1);
+    let seen = proto::TextMessage::decode(seen[0].clone()).unwrap();
+    assert_eq!(
+        (seen.actor, seen.channel_id),
+        (Some(admin), vec![LOBBY]),
+        "the hidden channel is left out"
+    );
+
+    // Someone hidden who mutes someone seen is not named.
+    f.state
+        .channels
+        .get_mut(LOBBY)
+        .unwrap()
+        .node
+        .acls
+        .push(entry("", Some(MEMBER), perm::MUTE_DEAFEN, 0));
+    f.state.invalidate();
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            session: Some(registered),
+            mute: Some(true),
+            ..Default::default()
+        },
+    );
+    let muted = |f: &mut Fixture, session: u32| {
+        heard(f, session, kind::USER_STATE)
+            .into_iter()
+            .map(|body| proto::UserState::decode(body).unwrap())
+            .find(|state| state.session == Some(registered))
+            .map(|state| (state.mute, state.actor))
+    };
+    assert_eq!(muted(&mut f, admin), Some((Some(true), Some(member))));
+    assert_eq!(muted(&mut f, anonymous), Some((Some(true), None)));
+}
+
+/// A direct message to someone whose only connection is in a hidden channel
+/// is allowed as when they are offline: stored, and delivered to their
+/// connections.
+#[test]
+fn a_direct_message_to_someone_in_a_hidden_channel_is_answered_as_when_they_are_offline() {
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let [_, _, _, member, registered, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    assert!(!f.state.sees_user(registered, member));
+    let hidden = f.state.authorize(registered, Action::Send(&DIRECT));
+    f.state.disconnect(member, true);
+    let offline = f.state.authorize(registered, Action::Send(&DIRECT));
+    assert_eq!(offline, Ok(()));
+    assert_eq!(hidden, offline);
+}
+
+/// A volume adjustment for a hidden channel comes back as one for a missing
+/// channel: left out of the echo.
+#[test]
+fn volume_adjustments_for_a_hidden_channel_are_answered_as_for_a_missing_one() {
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let registered = f.actor("registered");
+    let ask = |f: &mut Fixture, channel: u32| {
+        f.received(registered);
+        f.handle(
+            registered,
+            kind::USER_STATE,
+            &proto::UserState {
+                self_mute: Some(true),
+                listening_volume_adjustment: vec![proto::user_state::VolumeAdjustment {
+                    listening_channel: Some(channel),
+                    volume_adjustment: Some(0.5),
+                }],
+                ..Default::default()
+            },
+        );
+        f.received(registered)
+    };
+    assert!(!f.state.sees_channel(registered, SECRET));
+    assert_eq!(ask(&mut f, SECRET), ask(&mut f, 999));
+}
+
+/// A requester admitted by a moderator it does not see is told it was
+/// admitted, without the moderator's name.
+#[test]
+fn an_admission_notice_names_only_a_moderator_the_requester_sees() {
+    use prost::Message as _;
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let requester = f.actor("registered");
+    let moderator = f.actor("admin");
+    f.handle(
+        moderator,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    f.state.users.get_mut(&requester).unwrap().extension = None;
+    f.state.users.get_mut(&moderator).unwrap().extension = None;
+    f.handle(
+        requester,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(PRIVATE),
+            ..Default::default()
+        },
+    );
+    f.received(requester);
+    f.handle(
+        moderator,
+        kind::USER_STATE,
+        &proto::UserState {
+            session: Some(requester),
+            channel_id: Some(PRIVATE),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.state.users[&requester].channel, PRIVATE);
+    assert!(!f.state.sees_user(requester, moderator));
+    let texts: Vec<String> = f
+        .received(requester)
+        .into_iter()
+        .filter(|(kind, _)| *kind == kind::TEXT_MESSAGE)
+        .map(|(_, body)| proto::TextMessage::decode(body).unwrap().message)
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.starts_with("Admitted;")),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text.contains("admin")),
+        "{texts:?}"
+    );
+}
+
+/// Someone seen who starts listening to a hidden channel: those who do not
+/// see the channel hear nothing, as for a missing channel.
+#[test]
+fn listening_to_a_hidden_channel_sends_nothing_to_those_who_do_not_see_it() {
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let [_, admin, _, _, registered, _, _] = f.actors;
+    let listen = |f: &mut Fixture, channel: u32| {
+        f.received(registered);
+        f.handle(
+            admin,
+            kind::USER_STATE,
+            &proto::UserState {
+                listening_channel_add: vec![channel],
+                ..Default::default()
+            },
+        );
+        f.received(registered)
+    };
+    let missing = listen(&mut f, 999);
+    let hidden = listen(&mut f, SECRET);
+    assert!(f.state.users[&admin].listening.contains_key(&SECRET));
+    assert!(f.state.sees_user(registered, admin));
+    assert_eq!(hidden, missing);
+}
+
+/// After a client lost a channel it asked permissions for, a later flush of
+/// its permission cache names a channel it sees.
+#[test]
+fn a_permission_flush_never_names_a_channel_the_client_no_longer_sees() {
+    use prost::Message as _;
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let [_, admin, _, member, _, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::PERMISSION_QUERY,
+        &proto::PermissionQuery {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    // The member loses the channel.
+    f.handle(admin, kind::ACL, &secret_acl(&[]));
+    assert!(!f.state.sees_channel(member, SECRET));
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(LOBBY),
+            ..Default::default()
+        },
+    );
+    f.received(member);
+    // A later change to the member's permissions elsewhere.
+    f.handle(
+        admin,
+        kind::ACL,
+        &proto::Acl {
+            channel_id: LOBBY,
+            inherit_acls: Some(true),
+            acls: vec![
+                proto::acl::ChanAcl {
+                    apply_here: Some(true),
+                    apply_subs: Some(true),
+                    group: Some("all".into()),
+                    grant: Some(perm::MAKE_TEMP_CHANNEL),
+                    deny: Some(0),
+                    ..Default::default()
+                },
+                proto::acl::ChanAcl {
+                    apply_here: Some(true),
+                    apply_subs: Some(true),
+                    user_id: Some(MEMBER),
+                    grant: Some(0),
+                    deny: Some(perm::SPEAK),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let named: Vec<u32> = f
+        .received(member)
+        .into_iter()
+        .filter(|(kind, _)| *kind == kind::PERMISSION_QUERY)
+        .filter_map(|(_, body)| proto::PermissionQuery::decode(body).unwrap().channel_id)
+        .collect();
+    assert!(!named.is_empty());
+    assert!(!named.contains(&SECRET), "PermissionQuery names {named:?}");
+}
+
+/// The registration list leaves out when someone whose last channel is
+/// hidden was last seen, so it does not follow their moves there.
+#[test]
+fn the_registration_list_does_not_follow_people_in_hidden_channels() {
+    use prost::Message as _;
+    let mut f = Fixture::new(Config::default());
+    f.add_secret();
+    let [_, _, _, member, registered, _, _] = f.actors;
+    f.state.channels.get_mut(0).unwrap().node.acls.push(entry(
+        "",
+        Some(REGISTERED),
+        perm::REGISTER,
+        0,
+    ));
+    f.state.invalidate();
+    let into = |channel: u32| proto::UserState {
+        channel_id: Some(channel),
+        ..Default::default()
+    };
+    f.handle(member, kind::USER_STATE, &into(SECRET));
+    f.state.registry.users.get_mut(&MEMBER).unwrap().last_active = Some(0);
+    let listed = |f: &mut Fixture| {
+        f.received(registered);
+        f.handle(registered, kind::USER_LIST, &proto::UserList::default());
+        f.received(registered)
+            .into_iter()
+            .find(|(kind, _)| *kind == kind::USER_LIST)
+            .map(|(_, body)| proto::UserList::decode(body).unwrap())
+            .unwrap()
+            .users
+            .into_iter()
+            .find(|user| user.user_id == MEMBER)
+            .unwrap()
+    };
+    let before = listed(&mut f);
+    assert_eq!(
+        (before.last_channel, before.last_seen.as_deref()),
+        (None, None)
+    );
+    f.handle(member, kind::USER_STATE, &into(INNER));
+    assert!(!f.state.sees_user(registered, member));
+    assert_eq!(listed(&mut f), before);
+}
+
+/// With `archive_stock_direct_messages`, a stock message naming a session
+/// the sender does not see archives nothing: no direct conversation with
+/// that session's account appears.
+#[test]
+fn a_stock_message_to_a_hidden_session_archives_nothing() {
+    let mut config = Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap();
+    config.history.archive_stock_direct_messages = true;
+    let mut f = Fixture::new(config);
+    f.add_secret();
+    let [_, _, _, member, registered, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    assert!(!f.state.sees_user(registered, member));
+    // Only the channels' conversations, without the fixture's direct one.
+    f.state.conversations = Default::default();
+    for channel in f.state.channels.0.values() {
+        f.state
+            .conversations
+            .add_channel(channel.conversation_id, channel.id);
+    }
+    f.handle(
+        registered,
+        kind::TEXT_MESSAGE,
+        &proto::TextMessage {
+            session: vec![member],
+            message: "who are you".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        f.state
+            .conversations
+            .direct(account(REGISTERED), account(MEMBER)),
+        None
+    );
+}
+
+/// When a registered user was last seen moves on disconnect only where its
+/// channel would be recorded: a temporary channel leaves it as it was.
+#[test]
+fn leaving_from_a_temporary_channel_keeps_when_last_seen() {
+    let mut f = Fixture::new(Config::default());
+    let [_, _, _, member, registered, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(TEMP),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.state.users[&member].channel, TEMP);
+    for id in [MEMBER, REGISTERED] {
+        f.state.registry.users.get_mut(&id).unwrap().last_active = Some(0);
+    }
+    f.state.disconnect(member, true);
+    f.state.disconnect(registered, true);
+    assert_eq!(f.state.registry.users[&MEMBER].last_active, Some(0));
+    assert_ne!(f.state.registry.users[&REGISTERED].last_active, Some(0));
+}
+
+/// Rules a create carries cannot lock the creator out: it keeps Write (and
+/// so could have set the same rules with an ACL edit), and nobody else sees
+/// the channel.
+#[test]
+fn rules_a_create_carries_keep_the_creator_able_to_edit() {
+    use prost::Message as _;
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    let [_, _, _, _, registered, guest, anonymous] = f.actors;
+    let mut body = proto::ChannelState {
+        parent: Some(LOBBY),
+        name: Some("Den".into()),
+        temporary: Some(true),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    v1::ChannelStateExtension {
+        nuschl: Some(v1::ChannelInfo {
+            rules: vec![v1::Rule {
+                apply_here: true,
+                apply_subs: true,
+                group: "all".into(),
+                deny: perm::ALL,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    }
+    .encode(&mut body)
+    .unwrap();
+    for session in f.actors {
+        f.received(session);
+    }
+    f.state.handle(
+        guest,
+        ControlFrame {
+            kind: kind::CHANNEL_STATE,
+            payload: Bytes::from(body),
+        },
+        &mut Datagrams::default(),
+    );
+    let den = f.state.users[&guest].channel;
+    assert!(f.state.channels.get(den).is_some_and(|c| c.name == "Den"));
+    assert!(f.state.allowed(guest, Action::EditAcl { channel: den }));
+    for other in [registered, anonymous] {
+        assert!(!f.state.sees_channel(other, den));
+        assert!(
+            !Heard::of(&f.received(other)).channels.contains(&den),
+            "{other}"
+        );
+    }
 }
 
 // ---- nothing else decides ----

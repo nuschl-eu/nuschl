@@ -92,6 +92,7 @@ const CLIENT_CAPABILITIES: &[&str] = &[
     nuschl::capability::KT_WITNESS,
     nuschl::capability::SHARE,
     nuschl::capability::PRIVACY,
+    nuschl::capability::HIDDEN_CHANNELS,
 ];
 
 /// Budgets against a hostile server. Stock Murmur defaults to 1,000 channels
@@ -349,6 +350,11 @@ pub enum Command {
         parent: u32,
         name: String,
         temporary: bool,
+        /// The new channel's own rules, sent with the create to a server that
+        /// negotiated `hidden-channels/1`, which applies them before anyone
+        /// hears of the channel. Elsewhere a create with rules is refused, so
+        /// the channel never starts without them.
+        rules: Vec<AclEntry>,
     },
     EditChannel {
         channel: u32,
@@ -2993,17 +2999,55 @@ impl State {
                 parent,
                 name,
                 temporary,
+                rules,
             } => {
                 if self.channels.contains_key(&parent) && valid_name(&name) {
-                    self.queue(
-                        kind::CHANNEL_STATE,
-                        &proto::ChannelState {
-                            parent: Some(parent),
-                            name: Some(name),
-                            temporary: Some(temporary),
-                            ..Default::default()
-                        },
-                    );
+                    let state = proto::ChannelState {
+                        parent: Some(parent),
+                        name: Some(name),
+                        temporary: Some(temporary),
+                        ..Default::default()
+                    };
+                    let hides = self.extension.as_ref().is_some_and(|capabilities| {
+                        capabilities
+                            .iter()
+                            .any(|c| c == nuschl::capability::HIDDEN_CHANNELS)
+                    });
+                    if !hides && !rules.is_empty() {
+                        return emit(
+                            events,
+                            SessionEvent::Notice(
+                                "The channel was not created: this server cannot give it its \
+                                 type at once."
+                                    .into(),
+                            ),
+                        )
+                        .await;
+                    }
+                    let mut payload = state.encode_to_vec();
+                    if !rules.is_empty() {
+                        let rules = rules
+                            .into_iter()
+                            .map(|rule| nuschl::v1::Rule {
+                                apply_here: rule.apply_here,
+                                apply_subs: rule.apply_subs,
+                                user_id: rule.user_id,
+                                group: rule.group.unwrap_or_default(),
+                                grant: rule.grant,
+                                deny: rule.deny,
+                            })
+                            .collect();
+                        nuschl::v1::ChannelStateExtension {
+                            nuschl: Some(nuschl::v1::ChannelInfo {
+                                rules,
+                                ..Default::default()
+                            }),
+                        }
+                        .encode(&mut payload)
+                        .ok();
+                    }
+                    self.outbox.charge(Instant::now());
+                    self.outbound.push((kind::CHANNEL_STATE, payload));
                 }
             }
             Command::EditChannel { channel, edit } => {
@@ -5619,6 +5663,61 @@ mod tests {
                 }
             )
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_with_rules_goes_only_to_a_server_with_hidden_channels() {
+        let mut state = State {
+            own_session: Some(7),
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        state
+            .handle(
+                frame(
+                    kind::CHANNEL_STATE,
+                    proto::ChannelState {
+                        channel_id: Some(0),
+                        ..Default::default()
+                    },
+                ),
+                &tx,
+            )
+            .await
+            .unwrap();
+        drain(&mut rx).await;
+        let create = || Command::CreateChannel {
+            parent: 0,
+            name: "Plans".into(),
+            temporary: false,
+            rules: vec![AclEntry {
+                apply_here: true,
+                apply_subs: true,
+                inherited: false,
+                user_id: None,
+                group: Some("all".into()),
+                grant: 0,
+                deny: crate::model::permission::TRAVERSE,
+            }],
+        };
+        // Without the capability: refused, and nothing goes out.
+        state.outbound.clear();
+        state.command(create(), &tx).await.unwrap();
+        assert!(state.outbound.is_empty());
+        assert!(matches!(
+            drain(&mut rx).await.as_slice(),
+            [SessionEvent::Notice(_)]
+        ));
+        // With it: one create that carries the rules.
+        state.extension = Some(vec![nuschl::capability::HIDDEN_CHANNELS.to_owned()]);
+        state.command(create(), &tx).await.unwrap();
+        let (kind, body) = state.outbound.pop().unwrap();
+        assert_eq!(kind, kind::CHANNEL_STATE);
+        let rules = nuschl::create_rules(&body).unwrap();
+        assert_eq!(
+            (rules.len(), rules[0].group.as_str(), rules[0].deny),
+            (1, "all", crate::model::permission::TRAVERSE)
         );
     }
 

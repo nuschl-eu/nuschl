@@ -250,15 +250,21 @@ impl Kind {
         }
     }
 
-    /// What the type does, on a Nuschl server (`nuschl`) or a Mumble server.
-    /// nuschld lists every channel to everyone, as Murmur does, so Private
-    /// reads the same on both until nuschld hides channels.
-    pub fn help(self, _nuschl: bool) -> &'static str {
+    /// What the type does, on a server that sends clients only the channels
+    /// they may traverse or an access token would open (`hidden`, nuschld's
+    /// `hidden-channels/1`) or on one that sends every channel to everyone,
+    /// as Murmur does.
+    pub fn help(self, hidden: bool) -> &'static str {
         match self {
             Kind::Open => "Anyone may join, speak and write.",
             Kind::Members => "Registered users may join, speak and write.",
-            Kind::Password => "People with the password may join, speak and write.",
+            Kind::Password => {
+                "People with the password may join, speak and write. Others see the channel."
+            }
             Kind::Announcements => "Only @admin may speak. Everyone may listen and write.",
+            Kind::Private if hidden => {
+                "Only @admin and people you add may join. Others don't see the channel."
+            }
             Kind::Private => "Only @admin and people you add may join. Others see the channel.",
         }
     }
@@ -878,6 +884,23 @@ mod tests {
         assert_eq!(
             describe(&order, name, 8)[1],
             "But nobody may speak here and in subchannels."
+        );
+    }
+
+    #[test]
+    fn only_private_reads_differently_where_hidden_channels_stay_hidden() {
+        for kind in Kind::ALL {
+            assert_eq!(kind.help(true) == kind.help(false), kind != Kind::Private);
+        }
+        assert!(
+            Kind::Private
+                .help(true)
+                .ends_with("Others don't see the channel.")
+        );
+        assert!(
+            Kind::Password
+                .help(true)
+                .ends_with("Others see the channel.")
         );
     }
 

@@ -227,6 +227,18 @@ fn channel_types_compile_to_mumble_rules_and_read_back() {
         AclDraft::new(new_channel()).set_kind(Kind::Password, ""),
         Err("Type a password first.")
     );
+    // A create that carries the rules starts with the same ones.
+    for kind in Kind::ALL {
+        assert_eq!(
+            super::new_channel_rules(kind, "door"),
+            Ok(expected(kind)),
+            "{kind:?}"
+        );
+    }
+    assert_eq!(
+        super::new_channel_rules(Kind::Password, ""),
+        Err("Type a password first.")
+    );
 }
 
 #[test]

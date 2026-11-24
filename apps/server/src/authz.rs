@@ -16,8 +16,9 @@
 //! effective-permission cache and the lookups built on it. What this module
 //! also owns: reporting effective permissions to clients (`PermissionQuery`,
 //! `ServerSync`), keeping `suppress` in step with Speak after a change
-//! (Murmur's `clearACLCache`) and listeners in step with Listen, and which
-//! part of a conversation a reader may see (`since_access`).
+//! (Murmur's `clearACLCache`) and listeners in step with Listen, which
+//! channels a client sees ([`State::hidden_channels`]; visibility.rs sends
+//! them), and which part of a conversation a reader may see (`since_access`).
 //!
 //! What is not decided here: limits and validation (sizes, counts, rate
 //! limits, name rules, a channel's user limit), which depend on the request
@@ -27,12 +28,15 @@
 use crate::{
     config::{GuestHistory, KtHistoryAccess},
     conversations::{Id, Kind},
-    state::{Registered, State, User},
+    state::{Channel, Registered, State, User},
 };
 use nuschl_ipc::server::HistoryVisibility;
 use nuschl_protocol::{control as proto, kind, nuschl::v1::error::Code};
 use proto::permission_denied::DenyType;
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::{BTreeSet, HashMap, HashSet},
+};
 
 pub use nuschl_core::acl;
 
@@ -329,7 +333,7 @@ impl State {
         };
         match action {
             A::Knock { channel } => found(
-                self.channels.get(channel).is_some()
+                self.sees_channel(actor, channel)
                     && user.channel != channel
                     && !self.has(actor, channel, perm::ENTER),
             ),
@@ -644,9 +648,14 @@ impl State {
         }
     }
 
-    /// Tell `to` why it was refused, as Murmur would.
+    /// Tell `to` why it was refused, as Murmur would; a refusal that would
+    /// name a channel or someone `to` does not see says nothing.
     pub fn refuse(&self, to: u32, denial: Denial) {
         match denial {
+            Denial::Permission {
+                session, channel, ..
+            } if !self.sees_channel(to, channel) || !self.sees_user(to, session) => {}
+            Denial::MissingCertificate { session } if !self.sees_user(to, session) => {}
             Denial::Permission {
                 session,
                 channel,
@@ -791,8 +800,7 @@ impl State {
                 if let Some(user) = self.users.get_mut(&session) {
                     user.suppress = !may_speak;
                 }
-                self.broadcast(
-                    kind::USER_STATE,
+                self.broadcast_user(
                     &proto::UserState {
                         session: Some(session),
                         suppress: Some(!may_speak),
@@ -842,8 +850,7 @@ impl State {
             for &channel in channels {
                 self.forget_listener(*session, channel);
             }
-            self.broadcast(
-                kind::USER_STATE,
+            self.broadcast_user(
                 &proto::UserState {
                     session: Some(*session),
                     listening_channel_remove: channels.clone(),
@@ -912,6 +919,86 @@ impl State {
                 },
             );
         }
+    }
+
+    // ---- what each client sees (#341) ----
+
+    /// The channels `session` does not see: of `guarded`
+    /// ([`State::guarded_channels`]), those it may not traverse (a rule
+    /// denies Traverse on the way down and it holds no Write there) and no
+    /// access token named on the way down would let it traverse, except its
+    /// own channel, the channels it listens to and the channels above one it
+    /// sees. A channel with a password thus stays listed, so it can be entered
+    /// with the password. Write at the root sees every channel, as it may edit
+    /// every channel's ACL.
+    pub fn hidden_channels(&self, session: u32, guarded: &[u32]) -> BTreeSet<u32> {
+        let Some(user) = self.users.get(&session) else {
+            return BTreeSet::new();
+        };
+        if guarded.is_empty() || self.has(session, 0, perm::WRITE) {
+            return BTreeSet::new();
+        }
+        let reached = guarded.iter().copied().filter(|&channel| {
+            self.has(session, channel, perm::TRAVERSE) || self.token_opens(user, channel)
+        });
+        let mut seen = BTreeSet::new();
+        for channel in reached
+            .chain([user.channel])
+            .chain(user.listening.keys().copied())
+        {
+            let mut current = Some(channel);
+            while let Some(id) = current
+                && seen.insert(id)
+            {
+                current = self.channels.get(id).and_then(Channel::parent);
+            }
+        }
+        guarded
+            .iter()
+            .copied()
+            .filter(|channel| !seen.contains(channel))
+            .collect()
+    }
+
+    /// Whether `user` could traverse `channel` holding every access token the
+    /// rules on the way down name; its permissions stay what its own tokens
+    /// give.
+    fn token_opens(&self, user: &User, channel: u32) -> bool {
+        let named = acl::path_tokens(&self.channels, channel);
+        if named.is_empty() {
+            return false;
+        }
+        let tokens: Vec<[u8; 32]> = user.tokens.iter().copied().chain(named).collect();
+        let subject = Subject {
+            tokens: &tokens,
+            ..subject(user)
+        };
+        acl::effective_permissions(&self.channels, &subject, channel) & perm::TRAVERSE != 0
+    }
+
+    /// The channels at or below one with a rule that denies Traverse, parents
+    /// first: everywhere else everybody may traverse.
+    pub fn guarded_channels(&self) -> Vec<u32> {
+        let mut guarded = HashSet::new();
+        let mut order = Vec::new();
+        for id in self.channels.subtree(0) {
+            let Some(channel) = self.channels.get(id) else {
+                continue;
+            };
+            if channel
+                .parent()
+                .is_some_and(|parent| guarded.contains(&parent))
+                || channel
+                    .node
+                    .acls
+                    .iter()
+                    .any(|acl| acl.deny & perm::TRAVERSE != 0)
+            {
+                guarded.insert(id);
+                order.push(id);
+            }
+        }
+        order
     }
 
     // ---- conversations (docs/extension.md §5) ----
@@ -1002,7 +1089,8 @@ impl State {
     /// Whether `session` may message account `peer` directly: both registered
     /// and different, the peer not deleted (its conversations are frozen), and
     /// Murmur's rule for a message to a user (TextMessage in their channel) for
-    /// each of the peer's connections.
+    /// each of the peer's connections that `session` sees; one in a hidden
+    /// channel counts as offline.
     fn may_message(&self, session: u32, peer: &Id) -> bool {
         let Some(user) = self.users.get(&session) else {
             return false;
@@ -1012,7 +1100,9 @@ impl State {
             && self
                 .users
                 .values()
-                .filter(|other| other.account == Some(*peer))
+                .filter(|other| {
+                    other.account == Some(*peer) && self.sees_user(session, other.session)
+                })
                 .all(|other| self.has(session, other.channel, perm::TEXT_MESSAGE))
     }
 

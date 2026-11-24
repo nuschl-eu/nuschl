@@ -390,6 +390,17 @@ fn complete(
         }
         None => 0,
     };
+    // What the client will see, from its first channel, before anything is
+    // sent to it.
+    if let Some(user) = state.users.get_mut(&session) {
+        user.channel = channel;
+    }
+    state.invalidate();
+    let guarded = state.guarded_channels();
+    let hidden = state.hidden_channels(session, &guarded);
+    if let Some(user) = state.users.get_mut(&session) {
+        user.hidden = hidden;
+    }
 
     if let Some((old, _, _)) = ghost {
         tracing::info!(user = %state.log_name(old), "disconnecting ghost");
@@ -488,9 +499,9 @@ fn restore_listeners(state: &mut State, session: u32, listeners: Vec<(u32, f32)>
     };
     if broadcast_volumes {
         message.listening_volume_adjustment = volumes;
-        state.broadcast(kind::USER_STATE, &message, None);
+        state.broadcast_user(&message, None);
     } else {
-        state.broadcast(kind::USER_STATE, &message, Some(session));
+        state.broadcast_user(&message, Some(session));
         message.listening_volume_adjustment = volumes;
         state.send(session, kind::USER_STATE, &message);
     }
@@ -532,48 +543,18 @@ fn send_initial_state(
              won't be able to talk or hear anyone. Please upgrade to a client with Opus support.",
         );
     }
-    // The channel tree, parents first, then the links. Nuschl connections
-    // also get each channel's conversation id and history properties.
-    let order = state.channels.subtree(0);
+    // The channel tree the client sees, parents first, then the links.
     let nuschl = state
         .users
         .get(&session)
         .is_some_and(|user| user.extension.is_some());
-    for &id in &order {
-        if let Some(channel) = state.channels.get(id) {
-            let message = state.channel_state(channel, session);
-            match nuschl
-                .then(|| {
-                    nuschl_protocol::nuschl::channel_state_frame(
-                        &message,
-                        state.channel_info(channel),
-                    )
-                })
-                .flatten()
-            {
-                Some(frame) => {
-                    if let Some(user) = state.users.get(&session) {
-                        user.link.send(frame);
-                    }
-                }
-                None => state.send(session, kind::CHANNEL_STATE, &message),
-            }
-        }
-    }
-    for &id in &order {
-        if let Some(channel) = state
-            .channels
-            .get(id)
-            .filter(|channel| !channel.links.is_empty())
-        {
-            let message = proto::ChannelState {
-                channel_id: Some(id),
-                links: channel.links.iter().copied().collect(),
-                ..Default::default()
-            };
-            state.send(session, kind::CHANNEL_STATE, &message);
-        }
-    }
+    let tree: Vec<u32> = state
+        .channels
+        .subtree(0)
+        .into_iter()
+        .filter(|channel| state.sees_channel(session, *channel))
+        .collect();
+    state.send_channels(session, &tree);
     let mut entering = proto::UserState::default();
     // A new user starts nowhere; entering the channel computes suppression.
     if let Some(user) = state.users.get_mut(&session) {
@@ -586,13 +567,13 @@ fn send_initial_state(
     let mut announcement = user.state_message();
     announcement.listening_channel_add.clear();
     announcement.suppress = entering.suppress.or(announcement.suppress);
-    state.broadcast(kind::USER_STATE, &announcement, None);
+    state.broadcast_user(&announcement, None);
     let others: Vec<proto::UserState> = state
         .users
         .values()
-        .filter(|other| other.session != session)
+        .filter(|other| other.session != session && !user.hidden.contains(&other.channel))
         .map(|other| {
-            let mut message = other.state_message();
+            let mut message = State::user_state_for(user, other);
             if other.channel == 0 {
                 message.channel_id = None;
             }
@@ -763,6 +744,7 @@ pub(crate) fn new_user(
         plugin_context: Vec::new(),
         plugin_identity: String::new(),
         listening: Default::default(),
+        hidden: Default::default(),
         targets: HashMap::new(),
         target_cache: RefCell::new(HashMap::new()),
         voice: Voice {

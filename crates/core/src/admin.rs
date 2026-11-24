@@ -420,6 +420,22 @@ pub fn group_has_local_definition(group: &AclGroup) -> bool {
         || !group.remove.is_empty()
 }
 
+/// The own rules a new channel of `kind` starts with, for a create that
+/// carries them (`hidden-channels/1`); Password needs `password`.
+pub fn new_channel_rules(
+    kind: crate::access::Kind,
+    password: &str,
+) -> Result<Vec<AclEntry>, &'static str> {
+    let mut draft = AclDraft::new(Acl {
+        channel: 0,
+        inherit_acls: true,
+        groups: Vec::new(),
+        entries: Vec::new(),
+    });
+    draft.set_kind(kind, password)?;
+    Ok(draft.snapshot().entries)
+}
+
 /// Whether a new channel's `acl` names this account or certificate as its
 /// creator: Murmur and nuschld add a registered creator to the channel's own
 /// `admin` group, and give a creator without Write a rule granting it.

@@ -858,6 +858,9 @@ pub struct Create {
     deadline: std::time::Instant,
     /// The new channel, once seen.
     channel: Option<u32>,
+    /// The create carried the type's rules (`hidden-channels/1`): the editor
+    /// opens with nothing to save.
+    typed: bool,
 }
 
 /// The type to give a new channel, and who asked for it.
@@ -869,7 +872,8 @@ struct Applied {
 }
 
 /// Waits for the channel `name` that the connection behind `origin` asked to
-/// create under `parent`. Murmur refuses a name a sibling already has.
+/// create under `parent`, `typed` when the create carried the type's rules.
+/// Murmur refuses a name a sibling already has.
 pub fn created(
     this: &mut Desktop,
     origin: ActionOrigin,
@@ -877,6 +881,7 @@ pub fn created(
     name: &str,
     kind: Kind,
     password: String,
+    typed: bool,
 ) {
     this.acl_create = None;
     let Some(view) = origin
@@ -898,6 +903,7 @@ pub fn created(
         password,
         deadline: std::time::Instant::now() + std::time::Duration::from_secs(15),
         channel: None,
+        typed,
     });
 }
 
@@ -965,7 +971,9 @@ fn open_created(this: &mut Desktop, window: &mut Window, cx: &mut Context<Deskto
         hash: own.and_then(|user| user.certificate_hash.clone()),
     };
     open(this, index, channel, window, cx);
-    if let Some(Panel::Acl { editor, .. }) = this.panel.as_mut() {
+    if let Some(Panel::Acl { editor, .. }) = this.panel.as_mut()
+        && !create.typed
+    {
         editor.create = Some(applied);
     }
 }

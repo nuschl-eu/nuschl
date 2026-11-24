@@ -1615,6 +1615,283 @@ async fn a_murmur_database_imports_with_its_passwords_and_acls() {
     login("alice", "hunter2", leak(identity())).await.unwrap();
 }
 
+/// Mumble's permission bits a Private channel denies everyone else (#341).
+const PRIVATE_ACCESS: u32 = 0x2 | 0x4 | 0x800 | 0x8 | 0x100 | 0x200;
+
+/// Rules of the Private channel type: `@all` denied, `@admin` and the
+/// listed registered users allowed, here and in subchannels.
+fn private_acl(channel: u32, members: &[u32]) -> proto::Acl {
+    let rule = |group: Option<&str>, user_id: Option<u32>, grant, deny| proto::acl::ChanAcl {
+        apply_here: Some(true),
+        apply_subs: Some(true),
+        group: group.map(str::to_owned),
+        user_id,
+        grant: Some(grant),
+        deny: Some(deny),
+        ..Default::default()
+    };
+    let mut acls = vec![
+        rule(Some("all"), None, 0, PRIVATE_ACCESS),
+        rule(Some("admin"), None, PRIVATE_ACCESS, 0),
+    ];
+    acls.extend(
+        members
+            .iter()
+            .map(|member| rule(None, Some(*member), PRIVATE_ACCESS, 0)),
+    );
+    proto::Acl {
+        channel_id: channel,
+        inherit_acls: Some(true),
+        acls,
+        ..Default::default()
+    }
+}
+
+/// Mumble's channel password rules: `@all` denied and `#<password>`
+/// granted Traverse, Enter, Speak, Whisper, Text message and Link channel, in
+/// the channel only.
+fn password_acl(channel: u32, password: &str) -> proto::Acl {
+    let bits = 0x2 | 0x4 | 0x8 | 0x80 | 0x100 | 0x200;
+    let rule = |group: String, grant, deny| proto::acl::ChanAcl {
+        apply_here: Some(true),
+        apply_subs: Some(false),
+        group: Some(group),
+        grant: Some(grant),
+        deny: Some(deny),
+        ..Default::default()
+    };
+    proto::Acl {
+        channel_id: channel,
+        inherit_acls: Some(true),
+        acls: vec![
+            rule("all".into(), 0, bits),
+            rule(format!("#{password}"), bits, 0),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Channels and sessions named in `frames` (channel and user states and
+/// removals).
+fn named(frames: &[ControlFrame]) -> (Vec<u32>, Vec<u32>) {
+    let mut channels = Vec::new();
+    let mut sessions = Vec::new();
+    for frame in frames {
+        match frame.kind {
+            kind::CHANNEL_STATE => {
+                let state = proto::ChannelState::decode(frame.payload.clone()).unwrap();
+                channels.extend(state.channel_id);
+                channels.extend(state.parent);
+                channels.extend(state.links);
+            }
+            kind::CHANNEL_REMOVE => channels.push(
+                proto::ChannelRemove::decode(frame.payload.clone())
+                    .unwrap()
+                    .channel_id,
+            ),
+            kind::USER_STATE => {
+                let state = proto::UserState::decode(frame.payload.clone()).unwrap();
+                sessions.extend(state.session);
+                channels.extend(state.channel_id);
+                channels.extend(state.listening_channel_add);
+            }
+            kind::USER_REMOVE => sessions.push(
+                proto::UserRemove::decode(frame.payload.clone())
+                    .unwrap()
+                    .session,
+            ),
+            _ => {}
+        }
+    }
+    (channels, sessions)
+}
+
+#[tokio::test]
+async fn private_channels_and_the_people_in_them_reach_only_those_who_may_enter() {
+    let fixture = Fixture::start("").await;
+    let (admin_key, member_key, guest_key) = (identity(), identity(), identity());
+    let mut admin = superuser(fixture.address(), &admin_key).await;
+    let mut member = Client::connect(fixture.address(), Options::new("Member", &member_key))
+        .await
+        .unwrap();
+    member
+        .send(
+            kind::USER_STATE,
+            &proto::UserState {
+                session: Some(member.session),
+                user_id: Some(0),
+                ..Default::default()
+            },
+        )
+        .await;
+    let member_id = member
+        .expect::<proto::UserState>(kind::USER_STATE, |s| s.user_id.is_some())
+        .await
+        .user_id
+        .unwrap();
+    let create = |parent: u32, name: &str| proto::ChannelState {
+        parent: Some(parent),
+        name: Some(name.into()),
+        ..Default::default()
+    };
+    admin.send(kind::CHANNEL_STATE, &create(0, "Private")).await;
+    let private = admin
+        .expect::<proto::ChannelState>(kind::CHANNEL_STATE, |c| {
+            c.name.as_deref() == Some("Private")
+        })
+        .await
+        .channel_id
+        .unwrap();
+    admin
+        .send(kind::ACL, &private_acl(private, &[member_id]))
+        .await;
+    admin
+        .send(kind::CHANNEL_STATE, &create(private, "Inner"))
+        .await;
+    let inner = member
+        .expect::<proto::ChannelState>(kind::CHANNEL_STATE, |c| c.name.as_deref() == Some("Inner"))
+        .await
+        .channel_id
+        .unwrap();
+    admin.send(kind::CHANNEL_STATE, &create(0, "Door")).await;
+    let door = admin
+        .expect::<proto::ChannelState>(kind::CHANNEL_STATE, |c| c.name.as_deref() == Some("Door"))
+        .await
+        .channel_id
+        .unwrap();
+    admin.send(kind::ACL, &password_acl(door, "letmein")).await;
+    let into = |channel: u32| proto::UserState {
+        channel_id: Some(channel),
+        ..Default::default()
+    };
+    member.send(kind::USER_STATE, &into(private)).await;
+    {
+        let me = member.session;
+        member
+            .expect::<proto::UserState>(kind::USER_STATE, move |s| {
+                s.session == Some(me) && s.channel_id == Some(private)
+            })
+            .await;
+    }
+
+    // A guest connecting now gets neither channel nor the member in them,
+    // and gets the channel its password would open.
+    let mut guest = Client::connect(fixture.address(), Options::new("Guest", &guest_key))
+        .await
+        .unwrap();
+    let (channels, sessions) = named(&guest.seen);
+    assert!(channels.contains(&0) && channels.contains(&door));
+    assert!(!channels.contains(&private) && !channels.contains(&inner));
+    assert!(sessions.contains(&admin.session) && !sessions.contains(&member.session));
+
+    // The member's moves out and in: outside it arrives as someone who
+    // connects (with its name) and leaves as someone who disconnects.
+    member.send(kind::USER_STATE, &into(0)).await;
+    let arrived = guest
+        .expect::<proto::UserState>(kind::USER_STATE, |s| s.session == Some(member.session))
+        .await;
+    assert_eq!(arrived.name.as_deref(), Some("Member"));
+    member.send(kind::USER_STATE, &into(private)).await;
+    let left = guest
+        .expect::<proto::UserRemove>(kind::USER_REMOVE, |_| true)
+        .await;
+    assert_eq!((left.session, left.actor), (member.session, None));
+    member.sync().await;
+    guest.seen.clear();
+    guest.sync().await;
+    let (channels, _) = named(&guest.seen);
+    assert!(!channels.contains(&private) && !channels.contains(&inner));
+
+    // Opened to everyone: both channels appear, parents first, then the
+    // member in them.
+    admin
+        .send(
+            kind::ACL,
+            &proto::Acl {
+                channel_id: private,
+                inherit_acls: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+    let first = guest
+        .expect::<proto::ChannelState>(kind::CHANNEL_STATE, |_| true)
+        .await;
+    assert_eq!(
+        (first.channel_id, first.parent, first.name.as_deref()),
+        (Some(private), Some(0), Some("Private"))
+    );
+    let second = guest
+        .expect::<proto::ChannelState>(kind::CHANNEL_STATE, |_| true)
+        .await;
+    assert_eq!(
+        (second.channel_id, second.parent),
+        (Some(inner), Some(private))
+    );
+    let shown = guest
+        .expect::<proto::UserState>(kind::USER_STATE, |_| true)
+        .await;
+    assert_eq!(
+        (shown.session, shown.channel_id, shown.name.as_deref()),
+        (Some(member.session), Some(private), Some("Member"))
+    );
+
+    // Private again: the member, then the channels go, children first.
+    admin
+        .send(kind::ACL, &private_acl(private, &[member_id]))
+        .await;
+    let removed = guest
+        .expect::<proto::UserRemove>(kind::USER_REMOVE, |_| true)
+        .await;
+    assert_eq!(removed.session, member.session);
+    let gone = guest
+        .expect::<proto::ChannelRemove>(kind::CHANNEL_REMOVE, |_| true)
+        .await;
+    assert_eq!(gone.channel_id, inner);
+    let gone = guest
+        .expect::<proto::ChannelRemove>(kind::CHANNEL_REMOVE, |_| true)
+        .await;
+    assert_eq!(gone.channel_id, private);
+    // The member and the administrator still see both.
+    admin.sync().await;
+    assert!(
+        admin
+            .receives(kind::CHANNEL_REMOVE, Duration::from_millis(200))
+            .await
+            .is_none()
+    );
+
+    // The guest may not enter the password channel without the password,
+    // and enters with it.
+    guest.send(kind::USER_STATE, &into(door)).await;
+    let denied = guest
+        .expect::<proto::PermissionDenied>(kind::PERMISSION_DENIED, |_| true)
+        .await;
+    assert_eq!(
+        (denied.permission, denied.channel_id),
+        (Some(0x4), Some(door))
+    );
+    guest
+        .send(
+            kind::USER_STATE,
+            &proto::UserState {
+                channel_id: Some(door),
+                temporary_access_tokens: vec!["letmein".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+    {
+        let me = guest.session;
+        guest
+            .expect::<proto::UserState>(kind::USER_STATE, move |s| {
+                s.session == Some(me) && s.channel_id == Some(door)
+            })
+            .await;
+    }
+    fixture.running.shutdown().await;
+}
+
 /// Murmur keeps registered users' listeners (`channel_listeners`): they come
 /// back on reconnect and after a restart, with their volume; removing one
 /// forgets it; an unregistered user's listeners end with the connection.

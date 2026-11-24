@@ -624,10 +624,64 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   the UDP path takes the lock per packet, which an immutable routing snapshot
   (review §3 item 2) would avoid; that is a performance question, not a
   correctness one.
+- **What each client sees** (visibility.rs, #341). A client receives the
+  channels it may traverse and the people in them: `effective_permissions`
+  with Traverse, so a channel where a rule denies Traverse on the way down is
+  hidden from everyone who holds no Write there. A channel that an access
+  token named on the way down (a `#token` rule, as Mumble's channel password
+  stores it) would let the client traverse is shown as well, so a password
+  channel stays listed and its password can be entered; the client's
+  permissions stay what its own tokens give. Its own channel, the channels it
+  listens to and the channels above one it sees are always shown; Write at
+  the root shows every channel, as it may edit every channel's ACL. Only
+  channels at or below a rule that denies Traverse are evaluated
+  (`State::guarded_channels`); everywhere else everybody sees everything, as
+  on Murmur. Each user keeps the channels its client was not told about, and
+  the client knows a user exactly when it knows that user's channel. Every
+  `ChannelState`, `ChannelRemove`, `UserState` and `UserRemove` to more than
+  one client goes through visibility.rs, which leaves out channels and people
+  the client does not see and the links and listeners naming them. When an
+  ACL, a group, tokens, a registration, a move, a listener or the tree changes
+  (`authz_pending`), the connections concerned get the difference before the
+  lock is released: added channels parents first, then their links, the people
+  in them and the listeners elsewhere; removed ones people first (`UserRemove`
+  without an actor, as for a disconnect), then the channels, children first.
+  A user who moves gets the channels of its new place before anyone hears of
+  the move, and is seen arriving (its whole `UserState`, as on login) or
+  leaving (`UserRemove`) by those who see only one of the two channels. A
+  new channel reaches only those who see it, under the rules its create
+  carries from a client with `hidden-channels/1` (`ChannelInfo.rules`,
+  applied before anyone hears of the channel; a create with malformed or too
+  many rules is refused); a stock client's create and its ACL arrive one
+  after the other, and the channel shows in between. A channel moving under a parent
+  a client did not know brings that parent first. A change sends a client at
+  most the channel tree it sees, as at login. A request that names a channel
+  or someone the client does not see gets the answer for one that does not
+  exist: moves, listeners and their volumes, text, whisper targets, permission queries,
+  descriptions, comments, statistics, kicks, channel edits, links, ACLs,
+  knocks and share links; no `PermissionDenied` names them, the registration
+  list leaves out a last channel the reader does not see and when that user
+  was last seen; a disconnect from a temporary channel or with a temporary
+  admission leaves that time as it was, as their moves there do. A hidden channel's
+  name stays taken among its siblings, as on Murmur, so someone allowed to
+  create channels there can find that a sibling of that name exists. Voice (speech
+  into linked channels, whispers and shouts), stock text, typing indicators
+  and plugin data reach only those who see the sender, and a stock text
+  names only the channels and people its receiver sees. Knock notices and
+  admissions, the stock text ones included, name only people their recipient
+  sees. A stock client therefore misses a channel message from someone it
+  does not see; the message stays in the channel's history, and Nuschl
+  readers of the channel get it live with the author's name, as history
+  pages show it. A direct message to someone whose connections the sender
+  does not see is allowed as to someone offline: stored, and delivered to
+  those connections. Removing a channel removes its subchannels, as on
+  Murmur, hidden ones included: Write on a parent can remove a subchannel the
+  remover does not see.
 - **Output.** Each connection has a queue bounded in bytes (`max_queued_bytes`).
   Control frames are never dropped: a client that lets the limit fill is
   disconnected. Voice frames are dropped once 64 KiB are waiting. Broadcasts
-  encode once and share the bytes.
+  encode once and share the bytes; a client that must not see part of one
+  gets its own copy without it.
 - **Voice.** The UDP task decrypts (OCB2-AES128, `crates/protocol/src/crypt.rs`),
   parses without copying (`relay.rs`), routes, and re-encodes per receiver
   (legacy or protobuf, sender, context, volume, positional data) into reused
@@ -691,8 +745,8 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
 
 Handlers follow `Messages.cpp` and `Server.cpp`: the same permission checks in the
 same order, the same `PermissionDenied` types and `Reject` reasons, the same
-initial state on login (CryptSetup, CodecVersion, the channel tree and links, user
-states, ServerSync, ServerConfig, SuggestConfig), the ACL engine of `ACL.cpp` and
+initial state on login (CryptSetup, CodecVersion, the channel tree and links the
+client sees, user states, ServerSync, ServerConfig, SuggestConfig), the ACL engine of `ACL.cpp` and
 `Group.cpp` (ordered evaluation, Traverse/Write abort, root-only permissions,
 Write's implications, meta groups `all auth strong in out none sub,a,b,c`, the
 `~ ! # $` prefixes), Murmur's default root ACLs, temporary channels counted down
@@ -706,6 +760,12 @@ Deliberate differences:
 - **Listeners end when Listen goes** (see "Listeners follow Listen" above);
   Murmur keeps them, so on Murmur a listener keeps hearing a channel its user
   may no longer listen to.
+- **Hidden channels** (see "What each client sees" above). Murmur sends every
+  channel and everyone in it to every client; nuschld sends a channel only to
+  those who may traverse it. Stock clients show what they receive: someone
+  entering a hidden channel leaves as if disconnected, and arrives as if
+  connected when back in view. A channel an access token opens (Mumble's
+  channel password, any `#token` rule) stays listed for everyone.
 - **Ghost takeover.** An unregistered name in use is only taken over by the same
   certificate (or, both without certificates, the same address). Murmur lets any
   connection from the same address take it.

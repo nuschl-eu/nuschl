@@ -23,6 +23,7 @@ use nuschl_core::{
     admin,
     model::{Acl, permission},
 };
+use nuschl_protocol::nuschl::capability;
 use std::{collections::HashMap, ops::Range, rc::Rc, time::Instant};
 
 fn label(view: &ServerView, who: &Who) -> String {
@@ -104,7 +105,9 @@ pub(super) fn kinds(view: &ServerView, editor: &Editor, cx: &mut Context<Desktop
     ))
     .child(note(
         "acl-kind-help",
-        current.map_or("Custom", |kind| kind.help(!view.capabilities.is_empty())),
+        current.map_or("Custom", |kind| {
+            kind.help(view.has(capability::HIDDEN_CHANNELS))
+        }),
     ))
     .into_any_element()
 }

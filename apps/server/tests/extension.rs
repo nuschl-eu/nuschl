@@ -814,7 +814,8 @@ async fn the_session_negotiates_the_extension_with_nuschld() {
             "kt/1",
             "kt-witness/1",
             "share/1",
-            "privacy/1"
+            "privacy/1",
+            "hidden-channels/1"
         ]
     );
     // The key-transparency log comes with `kt/1`.
@@ -1117,6 +1118,53 @@ impl Fixture {
         state.authz_changed(nuschld::conversations::Scope::All);
         state.finish();
     }
+}
+
+/// A channel created as Private through the session, as the desktop creates
+/// one on a server with `hidden-channels/1`, never reaches anyone else.
+#[tokio::test]
+async fn a_channel_created_private_through_the_session_reaches_nobody_else() {
+    let fixture = Fixture::start("").await;
+    fixture.edit_channel(0, |root| {
+        root.node
+            .acls
+            .push(entry("all", None, perm::MAKE_CHANNEL, 0))
+    });
+    let mut guest = nuschl(&fixture, "Guest", 1).await;
+    let mut creator = nuschl(&fixture, "Creator", 0).await;
+    creator
+        .command(Command::CreateChannel {
+            parent: 0,
+            name: "Plans".into(),
+            temporary: false,
+            rules: nuschl_core::admin::new_channel_rules(nuschl_core::access::Kind::Private, "")
+                .unwrap(),
+        })
+        .await;
+    let plans = creator
+        .wait(|event| match event {
+            SessionEvent::Channel(channel) if channel.name == "Plans" => Some(channel.id),
+            _ => None,
+        })
+        .await;
+    assert!(
+        !guest
+            .arrives(Duration::from_millis(500), |event| {
+                matches!(event, SessionEvent::Channel(channel) if channel.id == plans)
+            })
+            .await
+    );
+    let state = fixture.running.server.lock();
+    assert!(
+        state
+            .channels
+            .get(plans)
+            .unwrap()
+            .node
+            .acls
+            .iter()
+            .any(|acl| { acl.group == "all" && acl.deny & perm::TRAVERSE != 0 })
+    );
 }
 
 fn entry(group: &str, user: Option<u32>, grant: u32, deny: u32) -> nuschld::acl::AclEntry {
@@ -1583,7 +1631,7 @@ async fn a_listener_that_loses_listen_ends_for_stock_and_nuschl_clients() {
         let state = fixture.running.server.lock();
         state.persist_channel(radio);
         let message = state.channel_state(state.channels.get(radio).unwrap(), 0);
-        state.broadcast_channel_state(&message);
+        state.broadcast_channel_state(&message, true);
     }
     for client in [&mut alice, &mut carol] {
         client
@@ -2146,6 +2194,7 @@ async fn temporary_history_goes_with_its_channel_and_deleted_channels_are_archiv
             parent: 0,
             name: "Temp".into(),
             temporary: true,
+            rules: Vec::new(),
         })
         .await;
     let (channel, conversation) = alice

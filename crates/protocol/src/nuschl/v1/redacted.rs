@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! `Debug` for extension messages that carry message text or idempotency
 //! keys: only their lengths are shown.
-use super::{ChatEdit, ChatSend, Message, ShareLink, ShareLinkCreate};
+use super::{ChatEdit, ChatSend, Message, Rule, ShareLink, ShareLinkCreate};
 use std::fmt;
 
 struct Length(usize);
@@ -78,6 +78,20 @@ impl fmt::Debug for ShareLink {
             .field("expires_at", &self.expires_at)
             .field("access_token", &Length(self.access_token.len()))
             .field("web_host", &self.web_host)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Rule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A group of "#name" is an access token, i.e. a channel password.
+        f.debug_struct("Rule")
+            .field("apply_here", &self.apply_here)
+            .field("apply_subs", &self.apply_subs)
+            .field("user_id", &self.user_id)
+            .field("group", &Length(self.group.len()))
+            .field("grant", &self.grant)
+            .field("deny", &self.deny)
             .finish()
     }
 }

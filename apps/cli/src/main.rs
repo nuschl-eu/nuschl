@@ -627,6 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     parent,
                     name,
                     temporary,
+                    rules: Vec::new(),
                 },
                 Ok(Input::Register) => Command::RegisterSelf,
                 Ok(Input::IdentityCheck {

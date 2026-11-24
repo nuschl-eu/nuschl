@@ -152,6 +152,22 @@ pub fn token_digest(token: &str) -> [u8; 32] {
     Sha256::digest(token.to_lowercase().as_bytes()).into()
 }
 
+/// The digests of the access tokens that rules on the way down to `channel`
+/// name (`#token` groups, as Mumble's channel passwords store them).
+pub fn path_tokens(tree: &impl Tree, channel: u32) -> Vec<[u8; 32]> {
+    path_from_root(tree, channel)
+        .into_iter()
+        .filter_map(|id| tree.node(id))
+        .flat_map(|node| &node.acls)
+        .filter(|acl| acl.user_id.is_none())
+        .filter_map(|acl| {
+            let name = acl.group.trim_start_matches(['!', '~', '#', '$']);
+            let prefixes = &acl.group[..acl.group.len() - name.len()];
+            (prefixes.contains('#') && !name.is_empty()).then(|| token_digest(name))
+        })
+        .collect()
+}
+
 fn equal_constant_time(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let difference = a
         .iter()
@@ -592,6 +608,22 @@ mod tests {
             tokens: &[],
             strong: false,
         }
+    }
+
+    #[test]
+    fn tokens_named_on_the_way_down() {
+        let mut tree = tree();
+        tree.get_mut(&1).unwrap().acls.push(acl("#Door", ENTER, 0));
+        tree.get_mut(&2)
+            .unwrap()
+            .acls
+            .push(acl("!~#gate", 0, ENTER));
+        tree.get_mut(&3).unwrap().acls.push(acl("$cafe", ENTER, 0));
+        assert_eq!(
+            path_tokens(&tree, 3),
+            [token_digest("door"), token_digest("gate")]
+        );
+        assert_eq!(path_tokens(&tree, 4), [] as [[u8; 32]; 0]);
     }
 
     #[test]

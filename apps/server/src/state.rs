@@ -272,6 +272,10 @@ pub struct User {
     pub plugin_identity: String,
     /// Channel → volume adjustment.
     pub listening: BTreeMap<u32, f32>,
+    /// Channels this client was not told about, or was told are gone: those
+    /// it may not traverse ([`State::hidden_channels`]). It knows a user
+    /// exactly when it knows the user's channel (visibility.rs).
+    pub hidden: BTreeSet<u32>,
     pub targets: HashMap<u8, WhisperTarget>,
     pub target_cache: RefCell<HashMap<u8, TargetCache>>,
     pub voice: Voice,
@@ -957,22 +961,7 @@ impl State {
         limit != 0 && channel.users.len() >= limit as usize
     }
 
-    // ---- sending ----
-
-    /// Encode once and queue for every authenticated user (except one).
-    /// Phase 2: connections that negotiated the Nuschl extension may get a
-    /// second encoding with extension fields; stock clients never do.
-    pub fn broadcast(&self, kind: u16, message: &impl prost::Message, except: Option<u32>) {
-        let Some(frame) = encode_control(kind, message) else {
-            tracing::warn!(kind, "dropped a broadcast larger than clients accept");
-            return;
-        };
-        for user in self.users.values() {
-            if Some(user.session) != except {
-                user.link.send(frame.clone());
-            }
-        }
-    }
+    // ---- sending (what goes to everyone is in visibility.rs) ----
 
     pub fn send(&self, session: u32, kind: u16, message: &impl prost::Message) {
         if let Some(user) = self.users.get(&session) {
@@ -1004,6 +993,7 @@ impl State {
             ),
             position: Some(channel.position),
             max_users: Some(channel.max_users),
+            temporary: channel.temporary.then_some(true),
             is_enter_restricted: Some(channel.is_enter_restricted()),
             can_enter: Some(self.allowed(
                 viewer,
@@ -1042,28 +1032,27 @@ impl State {
 
     /// Remember a registered user's channel (Murmur's `setLastChannel`).
     pub fn remember_channel(&mut self, session: u32) {
-        // Temporary admission must not become the persisted reconnect target.
-        if self.knocks.grants.contains_key(&session) {
-            return;
-        }
-        let Some(user) = self.users.get(&session) else {
+        let Some((id, channel)) = self.remembered(session) else {
             return;
         };
-        let (Some(id), channel) = (user.user_id, user.channel) else {
-            return;
-        };
-        if self
-            .channels
-            .get(channel)
-            .is_some_and(|channel| channel.temporary)
-        {
-            return;
-        }
         if let Some(registered) = self.registry.users.get_mut(&id) {
             registered.last_channel = Some(channel);
             registered.last_active = Some(now_unix());
         }
         self.persist_registration(id);
+    }
+
+    /// The registration and channel a registered user's presence is recorded
+    /// with: none in a temporary channel, and none with a temporary admission,
+    /// which must not become the persisted reconnect target.
+    pub(crate) fn remembered(&self, session: u32) -> Option<(u32, u32)> {
+        let user = self.users.get(&session)?;
+        let temporary = self
+            .channels
+            .get(user.channel)
+            .is_some_and(|channel| channel.temporary);
+        (!temporary && !self.knocks.grants.contains_key(&session))
+            .then_some((user.user_id?, user.channel))
     }
 
     pub fn log_name(&self, session: u32) -> String {
