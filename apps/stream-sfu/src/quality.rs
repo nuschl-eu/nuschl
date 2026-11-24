@@ -36,8 +36,8 @@ const MAX_QUEUE_BYTES: u64 = 2 * 1024 * 1024;
 /// leaves frames out.
 pub const QUEUE_BOUND: Duration = Duration::from_millis(300);
 /// The largest frame a publisher sends, an 8 MiB screen frame: a key picture's
-/// temporal unit up to this size goes out whole.
-const MAX_KEY_BYTES: u64 = 8 * 1024 * 1024;
+/// temporal unit, and a recovery picture, up to this size goes out whole.
+pub const MAX_KEY_BYTES: u64 = 8 * 1024 * 1024;
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// A video source: its kind and the demand last sent to its publisher.
@@ -151,6 +151,8 @@ impl Backlog {
             .saturating_add(self.unsampled_bytes)
     }
 
+    /// Whether `payload` more bytes take the queue of a source without a
+    /// descriptor past about 300 ms, beyond the last recovery picture.
     pub fn full(
         &mut self,
         queue: Option<&dyn StreamTxQueueInfo>,
@@ -159,9 +161,15 @@ impl Backlog {
         now: Instant,
     ) -> bool {
         let limit = (bitrate / 8 * 3 / 10).clamp(MIN_QUEUE_BYTES, MAX_QUEUE_BYTES);
-        let oldest = queue.and_then(StreamTxQueueInfo::first_unsent);
-        self.queued_bytes(queue).saturating_add(payload) as u64 > limit
-            || oldest.is_some_and(|at| now.saturating_duration_since(at) >= QUEUE_AGE)
+        let age = queue
+            .and_then(StreamTxQueueInfo::first_unsent)
+            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        let queued = self.queued_bytes(queue) as u64;
+        if queued <= limit && age < QUEUE_AGE && !self.key.1 {
+            self.key.0 = 0;
+        }
+        let picture = Duration::from_secs_f64(self.key.0 as f64 * 8.0 / bitrate.max(1) as f64);
+        queued + payload as u64 > limit + self.key.0 || age >= QUEUE_AGE + picture
     }
 
     /// Admits a packet of the layered `frame` by how long a frame starting now
@@ -260,6 +268,7 @@ impl Backlog {
                     timestamp,
                     bytes: 0,
                 };
+                self.key = (0, true);
                 VideoAdmission::Burst(0)
             }
             Recovery::Picture {
@@ -277,14 +286,10 @@ impl Backlog {
         }
     }
 
-    pub fn burst_full(
-        &mut self,
-        queue: Option<&dyn StreamTxQueueInfo>,
-        cost: u64,
-        burst: u64,
-    ) -> bool {
-        let burst = burst.min(MAX_QUEUE_BYTES);
-        cost > burst || self.queued_bytes(queue) as u64 > burst
+    /// Whether a recovery picture of `cost` bytes so far outgrows
+    /// [`MAX_KEY_BYTES`].
+    pub fn burst_full(&mut self, queue: Option<&dyn StreamTxQueueInfo>, cost: u64) -> bool {
+        cost > MAX_KEY_BYTES || self.queued_bytes(queue) as u64 > MAX_KEY_BYTES
     }
 
     pub fn tick(&mut self, now: Instant) {
@@ -618,8 +623,8 @@ mod tests {
             backlog.admission(15, None, true, ready),
             VideoAdmission::Burst(0)
         ));
-        assert!(!backlog.burst_full(None, 125_000, 125_000));
-        assert!(backlog.burst_full(None, 125_001, 125_000));
+        assert!(!backlog.burst_full(None, MAX_KEY_BYTES));
+        assert!(backlog.burst_full(None, MAX_KEY_BYTES + 1));
         backlog.enqueued(1200, 1248, false);
         assert!(matches!(
             backlog.admission(15, None, true, ready),

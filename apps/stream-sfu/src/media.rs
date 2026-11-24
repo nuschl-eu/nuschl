@@ -1002,7 +1002,6 @@ impl Core {
         let can_request = source
             .keyframe_asked
             .is_none_or(|at| now.saturating_duration_since(at) >= KEYFRAME_INTERVAL);
-        let recovery_burst = self.config.receiver_bitrate.min(self.config.room_bitrate) / 8;
         let receivers: Vec<PeerId> = self.rooms.get(&room).map_or_else(Vec::new, |r| {
             r.peers
                 .iter()
@@ -1086,9 +1085,7 @@ impl Core {
                             }
                         }
                     },
-                    VideoAdmission::Burst(bytes) => {
-                        view.backlog.burst_full(queue, bytes + cost, recovery_burst)
-                    }
+                    VideoAdmission::Burst(bytes) => view.backlog.burst_full(queue, bytes + cost),
                     VideoAdmission::Pause => {
                         view.rewrite.skip(*packet.seq_no);
                         continue;

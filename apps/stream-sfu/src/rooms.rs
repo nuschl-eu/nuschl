@@ -118,11 +118,12 @@ impl Bucket {
     }
 }
 
-/// A media budget in bytes for `bits_per_second`, with one second of burst so a
-/// large key frame fits.
+/// A media budget in bytes for `bits_per_second`, with a burst of one second,
+/// or of the largest frame a publisher sends up to three seconds.
 pub fn media_budget(bits_per_second: u64, now: Instant) -> Bucket {
     let bytes = bits_per_second as f64 / 8.0;
-    Bucket::new(bytes, bytes, now)
+    let key = (crate::quality::MAX_KEY_BYTES as f64).min(3.0 * bytes);
+    Bucket::new(bytes, bytes.max(key), now)
 }
 
 pub struct Room {
