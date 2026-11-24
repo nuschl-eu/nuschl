@@ -269,8 +269,14 @@ impl Backlog {
     pub fn enqueued(&mut self, payload: usize, cost: u64, marker: bool, timestamp: u64) {
         dd::push(&mut self.units, timestamp);
         self.unsampled_bytes += payload;
-        if self.key.1 == Some(timestamp) {
-            self.key = (self.key.0 + payload as u64, (!marker).then_some(timestamp));
+        match self.key.1 {
+            Some(key) if key == timestamp => {
+                self.key = (self.key.0 + payload as u64, (!marker).then_some(key));
+            }
+            // A packet of a later unit, or of a new stream, ends the key
+            // picture's unit, also without its marker.
+            Some(key) if timestamp > key || key - timestamp > 90_000 => self.key.1 = None,
+            _ => {}
         }
         if let Recovery::Picture { timestamp, bytes } = self.recovery {
             self.recovery = if marker {
@@ -661,6 +667,29 @@ mod tests {
         assert_eq!(admit(&mut backlog, &delta, 4, 150_000), Layered::Send);
         assert_eq!(admit(&mut backlog, &delta, 5, 30_000), Layered::Send);
         assert_eq!(admit(&mut backlog, &delta, 6, 150_000), Layered::Skip);
+    }
+
+    #[test]
+    fn a_key_allowance_ends_without_its_marker() {
+        let now = Instant::now();
+        let (key, delta) = key_and_delta();
+        let mut backlog = Backlog::default();
+        // 2 Mbit/s: 100 kB wait 400 ms. Each unit samples the queue anew.
+        let admit = |backlog: &mut Backlog, frame: &Frame, unit, bytes| {
+            let oldest = now + Duration::from_millis(unit);
+            let queue = Queue { oldest, bytes };
+            backlog.layered(frame, unit, true, Some(&queue), 2_000_000, QUEUE_BOUND, now)
+        };
+        // A 100 kB key picture at unit 1 whose last packet never goes out,
+        // then delta units through an empty queue.
+        assert_eq!(admit(&mut backlog, &key, 1, 0), Layered::Send);
+        backlog.enqueued(100_000, 100_000, false, 1);
+        for unit in 2..10 {
+            assert_eq!(admit(&mut backlog, &delta, unit, 0), Layered::Send);
+            backlog.enqueued(1000, 1000, true, unit);
+        }
+        // 600 ms queued is twice the bound.
+        assert_eq!(admit(&mut backlog, &delta, 10, 150_000), Layered::Skip);
     }
 
     #[test]
