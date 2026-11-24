@@ -316,6 +316,111 @@ pub fn kind(table: &Table, password: bool) -> Option<Kind> {
         .find(|kind| (*kind == Kind::Password) == password && kind.rows() == access)
 }
 
+/// What the columns let people do, for the effect summary.
+const VERBS: [&str; 5] = ["join", "speak", "write", "moderate", "manage"];
+
+/// How a change alters one column for one row (#341): `who` may now, or no
+/// longer, do all of the column's permissions, here and in `below`
+/// subchannels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Effect {
+    pub who: Who,
+    pub column: usize,
+    pub allowed: bool,
+    pub here: bool,
+    pub below: usize,
+}
+
+/// What changes for each of `rows` in `channel` and its subchannels `below`;
+/// `permissions` gives a row's effective permissions in a channel before and
+/// after the change.
+pub fn effects(
+    rows: &[Who],
+    channel: u32,
+    below: &[u32],
+    permissions: impl Fn(&Who, u32) -> (u32, u32),
+) -> Vec<Effect> {
+    let mut effects: Vec<Effect> = Vec::new();
+    for who in rows {
+        for id in std::iter::once(channel).chain(below.iter().copied()) {
+            let (before, after) = permissions(who, id);
+            for (column, (_, bits, _)) in COLUMNS.iter().enumerate() {
+                let allowed = after & bits == *bits;
+                if allowed == (before & bits == *bits) {
+                    continue;
+                }
+                let index = effects
+                    .iter()
+                    .position(|effect| {
+                        effect.who == *who && effect.column == column && effect.allowed == allowed
+                    })
+                    .unwrap_or_else(|| {
+                        effects.push(Effect {
+                            who: who.clone(),
+                            column,
+                            allowed,
+                            here: false,
+                            below: 0,
+                        });
+                        effects.len() - 1
+                    });
+                if id == channel {
+                    effects[index].here = true;
+                } else {
+                    effects[index].below += 1;
+                }
+            }
+        }
+    }
+    effects
+}
+
+/// `effects` in short lines, one per row, direction and place, at most
+/// `limit` of them and then "and N more".
+pub fn summary(effects: &[Effect], label: impl Fn(&Who) -> String, limit: usize) -> Vec<String> {
+    let mut lines: Vec<(&Effect, Vec<&str>)> = Vec::new();
+    for effect in effects {
+        let same = |(first, _): &&mut (&Effect, Vec<&str>)| {
+            (&first.who, first.allowed, first.here, first.below)
+                == (&effect.who, effect.allowed, effect.here, effect.below)
+        };
+        match lines.iter_mut().find(same) {
+            Some((_, verbs)) => verbs.push(VERBS[effect.column]),
+            None => lines.push((effect, vec![VERBS[effect.column]])),
+        }
+    }
+    let subchannels = |count| match count {
+        1 => "1 subchannel".to_owned(),
+        _ => format!("{count} subchannels"),
+    };
+    let mut text: Vec<String> = lines
+        .iter()
+        .take(limit)
+        .map(|(effect, verbs)| {
+            let verbs = match verbs.split_last() {
+                Some((last, [])) => (*last).to_owned(),
+                Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+                None => String::new(),
+            };
+            let place = match (effect.here, effect.below) {
+                (true, 0) => "here".to_owned(),
+                (true, below) => format!("here and in {}", subchannels(below)),
+                (false, below) => format!("in {}", subchannels(below)),
+            };
+            let may = if effect.allowed {
+                "may now"
+            } else {
+                "may no longer"
+            };
+            format!("{} {may} {verbs} {place}", label(&effect.who))
+        })
+        .collect();
+    if lines.len() > limit {
+        text.push(format!("and {} more", lines.len() - limit));
+    }
+    text
+}
+
 /// What each target inherits from the parent channels: `entries` is the
 /// channel's rule list, inherited rules first; a later rule overrides an
 /// earlier one for the permissions it sets. Rules with group expressions are
@@ -441,6 +546,127 @@ mod tests {
                 }
             )]
         );
+    }
+
+    /// Root(0) ─ Edited(1) ─ Sub(2) ─ Deeper(3); Edited ─ Own(4), whose own
+    /// rule lets registered users speak. Account 7 is in @guests.
+    fn subtree(
+        edited: Vec<crate::acl::AclEntry>,
+    ) -> std::collections::HashMap<u32, crate::acl::Node> {
+        use crate::acl::{AclEntry, Group, Node};
+        let mut guests = Group::new();
+        guests.add.insert(7);
+        let node = |parent, acls| Node {
+            parent,
+            inherit_acl: true,
+            acls,
+            groups: Default::default(),
+        };
+        let mut root = node(None, Vec::new());
+        root.groups.insert("guests".into(), guests);
+        let own = AclEntry {
+            apply_here: true,
+            apply_subs: true,
+            user_id: None,
+            group: "auth".into(),
+            grant: SPEAK | WHISPER,
+            deny: 0,
+        };
+        [
+            (0, root),
+            (1, node(Some(0), edited)),
+            (2, node(Some(1), Vec::new())),
+            (3, node(Some(2), Vec::new())),
+            (4, node(Some(1), vec![own])),
+        ]
+        .into()
+    }
+
+    fn compare(before: Vec<crate::acl::AclEntry>, after: Vec<crate::acl::AclEntry>) -> Vec<Effect> {
+        use crate::acl::{Subject, effective_permissions};
+        let (before, after) = (subtree(before), subtree(after));
+        let rows = [
+            Who::Everyone,
+            Who::Group("auth".into()),
+            Who::Group("guests".into()),
+        ];
+        effects(&rows, 1, &[2, 3, 4], |who, channel| {
+            let subject = Subject {
+                user_id: match who {
+                    Who::Everyone => None,
+                    Who::Group(group) if group == "auth" => Some(3),
+                    _ => Some(7),
+                },
+                channel,
+                hash: None,
+                tokens: &[],
+                strong: false,
+            };
+            (
+                effective_permissions(&before, &subject, channel),
+                effective_permissions(&after, &subject, channel),
+            )
+        })
+    }
+
+    fn entry(group: &str, grant: u32, deny: u32) -> crate::acl::AclEntry {
+        crate::acl::AclEntry {
+            apply_here: true,
+            apply_subs: true,
+            user_id: None,
+            group: group.into(),
+            grant,
+            deny,
+        }
+    }
+
+    #[test]
+    fn effects_follow_inheritance_into_subchannels() {
+        let label = |who: &Who| match who {
+            Who::Everyone => "Everyone".to_owned(),
+            Who::Group(group) => format!("@{group}"),
+            Who::Person(id) => format!("#{id}"),
+        };
+        // Denying registered users Speak reaches Sub and Deeper; Own allows it.
+        let denied = compare(vec![], vec![entry("auth", 0, SPEAK | WHISPER)]);
+        assert_eq!(
+            summary(&denied, label, 3),
+            [
+                "@auth may no longer speak here and in 2 subchannels",
+                "@guests may no longer speak here and in 2 subchannels",
+            ]
+        );
+        // Without Traverse, Everyone loses everything here and below; @guests
+        // keep it.
+        let everyone = entry("all", 0, ENTER | TRAVERSE | LISTEN | TEXT_MESSAGE);
+        let closed = compare(
+            vec![],
+            vec![
+                everyone.clone(),
+                entry("guests", ENTER | TRAVERSE | LISTEN | TEXT_MESSAGE, 0),
+            ],
+        );
+        assert_eq!(
+            summary(&closed, label, 1),
+            [
+                "Everyone may no longer join, speak and write here and in 3 subchannels",
+                "and 1 more",
+            ]
+        );
+        let lines = summary(&closed, label, 3);
+        assert_eq!(
+            lines[1..],
+            ["@auth may no longer join, speak and write here and in 3 subchannels"]
+        );
+        // A change confined to the channel itself names only it.
+        let mut here_only = entry("guests", MUTE_DEAFEN | MOVE, 0);
+        here_only.apply_subs = false;
+        let moderators = compare(vec![], vec![here_only]);
+        assert_eq!(
+            summary(&moderators, label, 3),
+            ["@guests may now moderate here"]
+        );
+        assert_eq!(compare(vec![everyone.clone()], vec![everyone]), []);
     }
 
     #[test]

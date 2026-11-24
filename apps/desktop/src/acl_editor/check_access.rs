@@ -169,7 +169,7 @@ pub(super) fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Deskto
             ))
             .into_any_element();
     }
-    let tree = parents::tree(&parents.acls, &draft.snapshot(), who);
+    let tree = parents::tree(&parents.acls, &draft.snapshot(), &[], who);
     let hash = match who {
         Who::Person(id) => view
             .users

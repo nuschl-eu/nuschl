@@ -129,6 +129,10 @@ impl AclDraft {
     pub fn groups(&self) -> &[Row<AclGroup>] {
         &self.groups
     }
+    /// The server's rules the draft started from.
+    pub fn baseline(&self) -> &Acl {
+        &self.baseline
+    }
     pub fn baseline_matches(&self, current: &Acl) -> bool {
         canonical_acl(&self.baseline) == canonical_acl(current)
     }
