@@ -30,6 +30,7 @@ pub const KEYS: &[&str] = &[
     "  c, x             connect, disconnect the server",
     "  t                trust the server's certificate (first connection)",
     "  m, d             mute, deafen",
+    "  M                move a person: then Enter on a channel (Move permission)",
     "Messages",
     "  Up, Down         previous, next message",
     "  Home, End        oldest loaded (older load), newest",
@@ -110,6 +111,7 @@ impl App {
             KeyCode::BackTab => self.cycle(false),
             KeyCode::PageUp => self.scroll(true),
             KeyCode::PageDown => self.scroll(false),
+            KeyCode::Esc if self.moving.take().is_some() => self.say("Move cancelled."),
             KeyCode::Esc => {
                 if !self.cancel_edit() {
                     self.pane = Pane::Composer;
@@ -214,6 +216,7 @@ impl App {
             KeyCode::End => self.tree_home(true),
             KeyCode::Enter => self.activate(alt),
             KeyCode::Char('J') => self.activate(true),
+            KeyCode::Char('M') => self.pick_move(),
             KeyCode::Left => self.expand(Some(false)),
             KeyCode::Right => self.expand(Some(true)),
             KeyCode::Char(' ') => self.expand(None),
