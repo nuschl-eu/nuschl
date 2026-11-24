@@ -372,6 +372,16 @@ impl Layers {
         self.structure.is_some()
     }
 
+    /// The tier of `kind`'s ladder that the source's picture belongs to, when the
+    /// source sends one spatial layer and its size: every receiver gets that
+    /// picture.
+    pub fn picture_tier(&self, kind: Kind) -> Option<usize> {
+        match self.structure.as_ref()?.heights[..] {
+            [height] => Some(kind.tier_of(height)),
+            _ => None,
+        }
+    }
+
     /// The active decode targets that fit tier `tier` of `kind`'s ladder, one per
     /// layer pair, lowest first; the lowest active target when none fits. A target
     /// fits when its spatial layer belongs to the tier or a lower one (when the
@@ -1084,9 +1094,13 @@ mod tests {
         assert_eq!(spatial(2), 2);
         assert_eq!(spatial(1), 1);
         assert_eq!(spatial(0), 0);
+        assert_eq!(layers.picture_tier(Kind::Camera), None, "three pictures");
         // A screen tier is taller than every layer.
         layers.structure.as_mut().expect("structure").heights = vec![1440, 2160, 4320];
         assert_eq!(layers.choices(Kind::Screen, 0).len(), 1);
+        layers.structure.as_mut().expect("structure").heights = vec![1080];
+        assert_eq!(layers.picture_tier(Kind::Screen), Some(1));
+        assert_eq!(Layers::default().picture_tier(Kind::Screen), None);
     }
 
     #[test]
