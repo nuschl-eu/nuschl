@@ -300,6 +300,9 @@ pub struct Layers {
     interval: Option<u64>,
     /// The median interval of the latest slow window, until an active one.
     slow: Option<u64>,
+    /// Counts the target lists the source sent: a receiver's target indices
+    /// belong to one.
+    generation: u32,
     /// The newest frame a packet came for, and whether its start came.
     newest: Option<(u16, bool)>,
 }
@@ -456,6 +459,7 @@ impl Layers {
                 .as_ref()
                 .is_none_or(|old| old.targets != new.targets)
             {
+                self.generation = self.generation.wrapping_add(1);
                 self.rates = [0; 32];
                 self.bytes = [0; 32];
                 self.measured = false;
@@ -477,6 +481,20 @@ impl Layers {
     /// Whether a full second of the source has measured its rates.
     pub fn measured(&self) -> bool {
         self.measured
+    }
+
+    /// Which target list the source's target indices belong to.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The lowest active target.
+    pub fn lowest(&self) -> Option<Wanted> {
+        let structure = self.structure.as_ref()?;
+        (0..structure.targets.len())
+            .filter(|t| structure.active >> t & 1 == 1)
+            .min_by_key(|&t| (structure.targets[t].spatial, structure.targets[t].temporal))
+            .map(|t| (t, structure.targets[t].spatial))
     }
 
     /// How many layer pairs the source's active targets have.
@@ -1730,11 +1748,16 @@ mod tests {
         let at = Duration::from_secs;
         assert_eq!(pick(&choices, 2, false, true, &mut pace, at(3)).0, 2);
         // The same structure again keeps the rates; another one does not.
+        let generation = layers.generation();
         l1t3_at(&mut layers, 0, 2034);
         assert!(layers.measured());
+        assert_eq!(layers.generation(), generation);
         let descriptor = l2t2_key(0, 2, true);
         layers.packet(&descriptor, 1000, 2067 * 90, Duration::from_millis(2067));
         assert!(!layers.measured());
+        // Its target indices name other layers: viewers take the lowest.
+        assert_ne!(layers.generation(), generation);
+        assert_eq!(layers.lowest(), Some((0, 0)));
         // The pace waits for the new rates.
         let lowest = layers.choices(Kind::Screen, 1, false, 0);
         assert_eq!(pick(&lowest, 0, false, false, &mut pace, at(4)).0, 0);

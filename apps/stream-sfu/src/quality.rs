@@ -85,6 +85,8 @@ pub struct View {
     pub selector: Selector,
     /// Paces moves toward the receiver's share of the budgets.
     pub pace: Option<Pace>,
+    /// The source's target list its selector's targets belong to.
+    pub generation: Option<u32>,
     pub rewrite: Rewrite,
     pub backlog: Backlog,
     pub reported_limit: Option<VideoLimit>,

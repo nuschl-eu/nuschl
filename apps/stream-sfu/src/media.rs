@@ -1010,6 +1010,10 @@ impl Core {
             )),
             _ => None,
         };
+        let targets = source
+            .video
+            .as_ref()
+            .map(|video| (video.layers.generation(), video.layers.lowest()));
         // Q1 hook: per-receiver layer choice (docs/video-plan.md §5.3) replaces
         // this. Today every receiver gets the first layer a source sends, and
         // all of a single stream's packets, including every temporal layer.
@@ -1061,6 +1065,17 @@ impl Core {
                 continue;
             };
             let view = &mut forward.view;
+            // A new target list gives the indices other layers: the lowest
+            // target until the next second's choice.
+            if let Some((generation, lowest)) = targets
+                && view
+                    .generation
+                    .replace(generation)
+                    .is_some_and(|g| g != generation)
+            {
+                view.selector.meanwhile(None);
+                view.selector.want(lowest);
+            }
             let layered = frame.flatten();
             // The rest of a frame that went out goes out whole, also late, and
             // so does a late frame that frames out reference.
@@ -1311,6 +1326,7 @@ impl Core {
                         .selector
                         .current()
                         .and_then(|c| video.layers.base(c)),
+                    generation: video.layers.generation(),
                     mode: video.mode,
                     ceiling: probe,
                     limit,
@@ -1479,6 +1495,7 @@ impl Core {
             }
             view.selector.meanwhile(planned.meanwhile);
             view.selector.want(target);
+            view.generation = Some(planned.generation);
         }
         for (id, desired) in desired {
             let peer = self.peers.get_mut(&id).expect("listed");
@@ -1588,6 +1605,8 @@ struct Planned {
     /// The target to forward while a spatial downswitch waits for a key
     /// picture: the current spatial layer's lowest temporal layer.
     meanwhile: Option<dd::Wanted>,
+    /// The source's target list the choices index.
+    generation: u32,
     mode: Mode,
     /// The most its tier needs, bits per second.
     ceiling: u64,
