@@ -3116,6 +3116,59 @@ fn leaving_from_a_temporary_channel_keeps_when_last_seen() {
     assert_ne!(f.state.registry.users[&REGISTERED].last_active, Some(0));
 }
 
+/// Rules a create carries cannot lock the creator out: it keeps Write (and
+/// so could have set the same rules with an ACL edit), and nobody else sees
+/// the channel.
+#[test]
+fn rules_a_create_carries_keep_the_creator_able_to_edit() {
+    use prost::Message as _;
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    let [_, _, _, _, registered, guest, anonymous] = f.actors;
+    let mut body = proto::ChannelState {
+        parent: Some(LOBBY),
+        name: Some("Den".into()),
+        temporary: Some(true),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    v1::ChannelStateExtension {
+        nuschl: Some(v1::ChannelInfo {
+            rules: vec![v1::Rule {
+                apply_here: true,
+                apply_subs: true,
+                group: "all".into(),
+                deny: perm::ALL,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    }
+    .encode(&mut body)
+    .unwrap();
+    for session in f.actors {
+        f.received(session);
+    }
+    f.state.handle(
+        guest,
+        ControlFrame {
+            kind: kind::CHANNEL_STATE,
+            payload: Bytes::from(body),
+        },
+        &mut Datagrams::default(),
+    );
+    let den = f.state.users[&guest].channel;
+    assert!(f.state.channels.get(den).is_some_and(|c| c.name == "Den"));
+    assert!(f.state.allowed(guest, Action::EditAcl { channel: den }));
+    for other in [registered, anonymous] {
+        assert!(!f.state.sees_channel(other, den));
+        assert!(
+            !Heard::of(&f.received(other)).channels.contains(&den),
+            "{other}"
+        );
+    }
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is
