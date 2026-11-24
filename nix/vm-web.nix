@@ -14,6 +14,10 @@
 }:
 let
   mediaPort = 40010;
+  # The browser test's microphone: every captured frame carries sound.
+  tone = pkgs.runCommand "synthetic-997hz.wav" { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
+    ffmpeg -loglevel error -f lavfi -i sine=frequency=997:sample_rate=48000 -t 10 -ac 1 -f wav "$out"
+  '';
   certificate =
     pkgs.runCommand "web-video-test-certificate" { nativeBuildInputs = [ pkgs.openssl ]; }
       ''
@@ -204,7 +208,7 @@ pkgs.testers.runNixOSTest {
     client.copy_from_machine("/tmp/shots", "screenshots")
 
     # When the browser ends or mutes capture, the app mutes and opens nothing (#447).
-    print(client.succeed("node ${../tests/web_mic_stopped.browser.mjs} ${pkgs.chromium}/bin/chromium ${pkgs.playwright-driver}"))
+    print(client.succeed("node ${../tests/web_mic_stopped.browser.mjs} ${pkgs.chromium}/bin/chromium ${pkgs.playwright-driver} ${tone}"))
 
     # The packaged app: Ctrl+K switches channels, Ctrl+F finds a sent message.
     client.succeed("node ${../tests/web_shortcuts.browser.mjs} http://web/app/ murmur 64738")

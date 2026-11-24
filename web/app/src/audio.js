@@ -107,10 +107,14 @@ export class BrowserAudio {
     worker.postMessage({kind:"playout-port", port:channel.port1}, [channel.port1]);
     this.playbackNode.port.postMessage({kind:"wake-port", port:channel.port2}, [channel.port2]);
     this.lastProgress=performance.now();
-    this.watchdog=setInterval(()=>{
-      if(this.worker&&performance.now()-this.lastProgress>(this.workerReady?2500:15000))this.fail(new Error("The audio codec worker stopped responding."));
-    },500);
+    this.watchdog=setInterval(()=>this.watch(),500);
     this.resetMedia();
+  }
+  // The codec worker posts "ready" once its WASM is compiled, then a heartbeat
+  // every 500 ms. A loaded device delays both by seconds while the worker
+  // still works, and frames it is late for expire. Silent for 30 s, it has hung.
+  watch() {
+    if(this.worker&&performance.now()-this.lastProgress>30000)this.fail(new Error("The audio codec worker stopped responding."));
   }
   syncVoice(value) {
     const next=context(value);
@@ -281,6 +285,9 @@ export class BrowserAudio {
     }
   }
 
+  // Six unacknowledged sends bound the queue; frames beyond them are dropped.
+  // A loaded SDK worker answers late and catches up, and one that stops
+  // answering retires after the SDK request deadline, revoking audio.
   sendPacket(sequence,opus,end) {
     if(!this.voice||this.txJobs.size>=MAX_CAPTURE||sequence<0n||sequence>=(1n<<64n))return;
     this.sequence=sequence+2n;
@@ -288,21 +295,16 @@ export class BrowserAudio {
     const pending={epoch};this.txJobs.set(job,pending);
     const packet={server_id:this.voice.server_id,connection_generation:this.voice.connection_generation,
       voice_generation:this.voice.voice_generation,sequence:String(sequence),opus,end};
-    const timeout=setTimeout(()=>{
-      if(this.epoch!==epoch||this.txJobs.get(job)!==pending)return;
-      this.transportStalled=true;this.stopCapture(true);this.resetMedia({preservePlayback:true});this.applyPolicy();
-      this.status("transport-error","The voice connection stopped accepting audio. Unmute to retry.");
-    },250);
     let result;try{result=this.onPacket(packet);}catch(error){result=Promise.reject(error);}
     if(!result||typeof result.then!=="function") {
-      clearTimeout(timeout);this.transportStalled=true;
+      this.transportStalled=true;
       this.stopCapture(true);this.resetMedia({preservePlayback:true});this.applyPolicy();
       this.status("transport-error","The voice bridge must acknowledge queued audio packets.");return;
     }
     Promise.resolve(result).catch(()=>{
       if(this.epoch===epoch)this.status("transport-error","Voice could not be sent.");
     }).finally(()=>{
-      clearTimeout(timeout);if(this.txJobs.get(job)===pending)this.txJobs.delete(job);
+      if(this.txJobs.get(job)===pending)this.txJobs.delete(job);
     });
   }
   // The native Disconnected sound (apps/media-worker/src/sounds.rs): falling
