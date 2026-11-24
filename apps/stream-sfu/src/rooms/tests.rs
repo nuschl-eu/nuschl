@@ -264,11 +264,13 @@ fn buckets() {
         !bucket.take(25.0, now + Duration::from_secs(100)),
         "capped at the burst"
     );
-    // A credit is paid back before the next take.
+    // A credit is paid back before the next take, and reaches one burst.
     let later = now + Duration::from_secs(200);
-    bucket.lend(25.0, later);
+    assert!(bucket.lend(25.0, later));
     assert!(!bucket.take(1.0, later));
     assert!(bucket.take(1.0, later + Duration::from_millis(600)));
+    assert!(bucket.lend(20.0, later + Duration::from_millis(600)));
+    assert!(!bucket.lend(10.0, later + Duration::from_millis(600)));
 }
 
 #[test]

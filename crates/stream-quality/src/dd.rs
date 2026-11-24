@@ -1025,6 +1025,12 @@ impl Selector {
         }
     }
 
+    /// Releases the temporal unit at `timestamp`, which the queue shed: its
+    /// later frames follow the current target.
+    pub fn release(&mut self, timestamp: u64) {
+        self.units.retain(|unit| unit.timestamp != timestamp);
+    }
+
     /// Whether the decode target forwarded now can do without `frame`.
     pub fn discardable(&self, frame: &Frame) -> bool {
         self.current

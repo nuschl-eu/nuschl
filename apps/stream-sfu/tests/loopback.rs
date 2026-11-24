@@ -436,6 +436,8 @@ struct Peer {
     replay: Option<Replay>,
     keyframe_requests: usize,
     messages: Vec<Value>,
+    /// Sends every frame in one temporal unit.
+    frozen: bool,
 }
 
 async fn connect(
@@ -533,6 +535,7 @@ async fn join_decoding(
         replay: None,
         keyframe_requests: 0,
         messages: Vec::new(),
+        frozen: false,
     };
     (peer, answer)
 }
@@ -744,7 +747,7 @@ impl Peer {
         } else {
             0
         };
-        let timestamp = self.frame * 3000;
+        let timestamp = if self.frozen { 3000 } else { self.frame * 3000 };
         let mut api = leg.rtc.direct_api();
         let stream = api.stream_tx_by_mid(*mid, None).expect("stream");
         for index in 0..self.frame_packets {
@@ -1740,4 +1743,43 @@ async fn a_low_latency_stream_stays_within_its_budget() {
     assert!(p95 <= Duration::from_millis(50), "95th percentile {p95:?}");
     assert!(max <= Duration::from_millis(200), "longest {max:?}");
     recent_rate(&viewer.received[&host.id]);
+}
+
+/// A publisher that sends every frame in one temporal unit from 10 s on: the
+/// unit takes at most one burst of the room's budget on credit and is shed,
+/// and the other publisher in the room keeps reaching the viewer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_endless_temporal_unit_stays_within_its_bound() {
+    let sfu = start("room_bitrate = 2000000");
+    let url = sfu.url.as_str();
+    let (mut a, _) = join(url, &ADMIT, true, true).await;
+    let (mut b, _) = join(url, &ADMIT, false, false).await;
+    a.start_publishing(Codec::Av1);
+    b.start_publishing(Codec::Av1);
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
+    let start = Instant::now();
+    // Packets at the viewer from a and from b, every 5 s.
+    let mut counts = vec![(0, 0)];
+    while counts.len() <= 5 {
+        if start.elapsed() >= Duration::from_secs(10) && !a.frozen {
+            a.frozen = true;
+            a.frame_packets = 24;
+        }
+        a.step();
+        b.step();
+        viewer.step();
+        a.send_frame();
+        b.send_frame();
+        if counts.len() <= (start.elapsed().as_secs() / 5) as usize {
+            counts.push((viewer.count(a.id), viewer.count(b.id)));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let per = |i: usize| (counts[i].0 - counts[i - 1].0, counts[i].1 - counts[i - 1].1);
+    let (before, last) = (per(2), per(5));
+    assert!(
+        last.1 * 2 >= before.1,
+        "b: {before:?} before, {last:?} in the last 5 s"
+    );
+    assert!(last.0 <= 24, "a's endless unit is shed: {counts:?}");
 }

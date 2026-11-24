@@ -22,7 +22,7 @@ use crate::{
 };
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
-    dd::{self, Frame, Layers, Pace, Selector, Wanted},
+    dd::{Frame, Layers, Pace, Selector, Wanted},
     receive,
 };
 use std::{
@@ -152,26 +152,37 @@ impl View {
             self.selector.want(lowest);
         }
         let layered = frame.flatten();
-        // The rest of a frame that went out goes out whole, also late, and so
-        // does a late frame that frames out reference.
-        let rest = layered
-            .as_ref()
-            .is_some_and(|f| self.selector.sent(f) || self.selector.owes(f));
+        // A temporal unit with a packet out goes out whole past the queue's cap
+        // and the budgets, up to MAX_KEY_BYTES: the rest of a frame that went
+        // out, also late, a late frame that frames out reference, and the
+        // unit's later frames.
+        let whole = self.backlog.whole(timestamp, payload);
+        let rest = whole
+            && layered
+                .as_ref()
+                .is_some_and(|f| self.selector.sent(f) || self.selector.owes(f));
         let carried = layered.is_some() && self.backlog.out(timestamp);
         // Leaves the packet out; whether the receiver now waits for a key frame.
-        let skip = |view: &mut Self, shed: Option<VideoLimit>| {
+        let skip = |view: &mut Self, shed: Option<VideoLimit>, release: bool| {
             view.rewrite.skip(seq);
             if let Some(limit) = shed {
                 view.backlog
                     .shed(timestamp, frame.is_none().then_some(now), limit);
+            }
+            if release {
+                view.selector.release(timestamp);
             }
             if let Some(frame) = &layered {
                 view.selector.dropped(frame);
             }
             view.selector.needs_keyframe()
         };
+        // Past that the queue sheds the unit and releases its target.
+        if carried && !whole {
+            return (None, skip(self, Some(VideoLimit::ForwardingBacklog), true));
+        }
         if video && self.backlog.dropped(timestamp) && !rest {
-            return (None, skip(self, None));
+            return (None, skip(self, None, false));
         }
         let marker = match &frame {
             None => Some(packet.marker),
@@ -202,7 +213,7 @@ impl View {
                             now,
                         );
                         if admitted == Layered::Skip {
-                            return (None, skip(self, None) || keyframe);
+                            return (None, skip(self, None, false) || keyframe);
                         }
                         !rest && !carried && self.backlog.capped(queue, payload)
                     }
@@ -220,15 +231,18 @@ impl View {
         } else {
             false
         };
-        // The budgets lend a unit with a packet out its rest.
-        let lend = rest || carried;
+        // The budgets lend what the unit carries, down to one burst, and each
+        // unit at most one burst.
+        let [viewer, room] = budgets;
+        let credit = viewer.burst().min(room.burst());
+        let lend = (rest || carried) && self.backlog.lendable(timestamp, cost, credit);
         let charge = |bucket: &mut Bucket| {
             if lend {
-                bucket.lend(cost as f64, now);
+                bucket.lend(cost as f64, now)
+            } else {
+                bucket.take(cost as f64, now)
             }
-            lend || bucket.take(cost as f64, now)
         };
-        let [viewer, room] = budgets;
         let limit = if full {
             Some(VideoLimit::ForwardingBacklog)
         } else if !charge(viewer) {
@@ -240,9 +254,12 @@ impl View {
         };
         if let Some(limit) = limit {
             if video {
-                return (None, skip(self, Some(limit)) || keyframe);
+                return (None, skip(self, Some(limit), rest || carried) || keyframe);
             }
             return (None, keyframe);
+        }
+        if lend {
+            self.backlog.lent(timestamp, cost);
         }
         let Some(seq) = self.rewrite.forward(seq) else {
             if let Some(frame) = &layered {
@@ -263,8 +280,9 @@ pub struct Backlog {
     dropped_through: Option<u64>,
     /// The layered frame left out whole.
     skipping: Option<u16>,
-    /// The timestamps of the latest temporal units with a packet out.
-    units: VecDeque<u64>,
+    /// The latest temporal units with a packet out, by timestamp, their bytes
+    /// out and the bytes the budgets lent them.
+    units: VecDeque<(u64, u64, f64)>,
     /// The bytes of the last key picture's temporal unit, and its timestamp
     /// while more of it is to come: the queue's bound grows by the time they
     /// take.
@@ -425,12 +443,48 @@ impl Backlog {
     /// Whether a packet of the temporal unit at `timestamp` is out: the
     /// unit's later packets go out too, the last one with the marker.
     pub fn out(&self, timestamp: u64) -> bool {
-        self.units.contains(&timestamp)
+        self.units.iter().any(|&(unit, ..)| unit == timestamp)
+    }
+
+    /// Whether the temporal unit at `timestamp` takes `payload` more bytes past
+    /// the queue's cap: at most [`MAX_KEY_BYTES`] in all.
+    pub fn whole(&self, timestamp: u64, payload: usize) -> bool {
+        let unit = self.units.iter().find(|&&(unit, ..)| unit == timestamp);
+        unit.map_or(0, |&(_, bytes, _)| bytes) + payload as u64 <= MAX_KEY_BYTES
+    }
+
+    /// Whether the budgets lend the temporal unit at `timestamp` `cost` more,
+    /// at most `credit` in all.
+    pub fn lendable(&self, timestamp: u64, cost: u64, credit: f64) -> bool {
+        let unit = self.units.iter().find(|&&(unit, ..)| unit == timestamp);
+        unit.map_or(0.0, |&(.., lent)| lent) + cost as f64 <= credit
+    }
+
+    /// The unit at `timestamp`, which takes a packet: `payload` bytes, or a
+    /// loan of `lent`.
+    fn unit(&mut self, timestamp: u64, payload: usize, lent: f64) {
+        match self.units.iter_mut().find(|(unit, ..)| *unit == timestamp) {
+            Some((_, bytes, loan)) => {
+                *bytes += payload as u64;
+                *loan += lent;
+            }
+            None => {
+                self.units.push_back((timestamp, payload as u64, lent));
+                if self.units.len() > 8 {
+                    self.units.pop_front();
+                }
+            }
+        }
+    }
+
+    /// The budgets lent the temporal unit at `timestamp` `cost`.
+    pub fn lent(&mut self, timestamp: u64, cost: u64) {
+        self.unit(timestamp, 0, cost as f64);
     }
 
     /// A packet of the temporal unit at `timestamp` went out.
     pub fn enqueued(&mut self, payload: usize, cost: u64, marker: bool, timestamp: u64) {
-        dd::push(&mut self.units, timestamp);
+        self.unit(timestamp, payload, 0.0);
         self.unsampled_bytes += payload;
         match self.key.1 {
             Some(key) if key == timestamp => {
@@ -876,6 +930,65 @@ mod tests {
         assert!(!backlog.dropped(0));
     }
 
+    #[test]
+    fn one_unit_takes_at_most_its_bound_past_the_cap_and_budgets() {
+        let now = Instant::now();
+        let queue = Queue {
+            oldest: now,
+            bytes: 0,
+        };
+        // A source stuck in one temporal unit: a key picture, then delta
+        // frames of 1000 bytes at its timestamp, all at once.
+        let run = |rate: u64| {
+            let mut layers = Layers::default();
+            let mut view = View::default();
+            view.selector.want(Some((0, 0)));
+            let mut viewer = crate::rooms::media_budget(rate, now);
+            let mut room = crate::rooms::media_budget(rate, now);
+            let mut sent = 0;
+            for number in 1..20_000u16 {
+                let [high, low] = number.to_be_bytes();
+                let descriptor = if number == 1 {
+                    vec![0xc0, high, low, 0x80, 0x00, 0x3a, 0x40, 0x00]
+                } else {
+                    vec![0xc1, high, low]
+                };
+                let frame = layers.packet(&descriptor, 1000, 3000, Duration::ZERO);
+                let arrival = Arrival {
+                    frame: Some(frame),
+                    video: true,
+                    seq: u64::from(number),
+                    timestamp: 3000,
+                    marker: true,
+                    payload: 1000,
+                    cost: 1000,
+                    bound: QUEUE_BOUND,
+                    can_request: true,
+                    targets: None,
+                };
+                let budgets = [&mut viewer, &mut room];
+                if view
+                    .admit(&arrival, Some(&queue), u64::MAX, budgets, now)
+                    .0
+                    .is_some()
+                {
+                    sent += 1000;
+                }
+            }
+            sent
+        };
+        // Wide budgets: the queue sheds the unit at MAX_KEY_BYTES.
+        let wide = run(10_000_000_000);
+        assert!(wide > MAX_KEY_BYTES / 2 && wide <= MAX_KEY_BYTES, "{wide}");
+        // 2 Mbit/s: the budgets lend it one burst past what they hold.
+        let burst = crate::rooms::media_budget(2_000_000, now).burst() as u64;
+        let narrow = run(2_000_000);
+        assert!(
+            narrow > burst && narrow <= 2 * burst,
+            "{narrow} for {burst}"
+        );
+    }
+
     /// A queue sampled at `at`, as str0m reports it between polls.
     struct Sample {
         at: Instant,
@@ -1022,7 +1135,7 @@ mod tests {
                             5 * source > 2 * rate,
                             "seed {seed}: left out on a wide link"
                         );
-                        dd::push(&mut left, frame.number);
+                        nuschl_stream_quality::dd::push(&mut left, frame.number);
                         skipped += 1;
                         continue;
                     }

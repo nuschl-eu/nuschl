@@ -117,10 +117,19 @@ impl Bucket {
         true
     }
 
-    /// Takes `amount` on credit: later takes wait until it is paid back.
-    pub fn lend(&mut self, amount: f64, now: Instant) {
+    pub fn burst(&self) -> f64 {
+        self.burst
+    }
+
+    /// Takes `amount` on credit, down to minus one burst: later takes wait
+    /// until it is paid back. False past that.
+    pub fn lend(&mut self, amount: f64, now: Instant) -> bool {
         self.take(0.0, now);
+        if self.tokens - amount < -self.burst {
+            return false;
+        }
         self.tokens -= amount;
+        true
     }
 }
 
