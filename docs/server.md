@@ -668,11 +668,14 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   and plugin data reach only those who see the sender, and a stock text
   names only the channels and people its receiver sees. Knock notices and
   admissions, the stock text ones included, name only people their recipient
-  sees. Stored channel messages
-  reach Nuschl readers of the channel with the author's name, as history
-  pages show them. A direct message to someone whose connections the sender
+  sees. A stock client therefore misses a channel message from someone it
+  does not see; the message stays in the channel's history, and Nuschl
+  readers of the channel get it live with the author's name, as history
+  pages show it. A direct message to someone whose connections the sender
   does not see is allowed as to someone offline: stored, and delivered to
-  those connections.
+  those connections. Removing a channel removes its subchannels, as on
+  Murmur, hidden ones included: Write on a parent can remove a subchannel the
+  remover does not see.
 - **Output.** Each connection has a queue bounded in bytes (`max_queued_bytes`).
   Control frames are never dropped: a client that lets the limit fill is
   disconnected. Voice frames are dropped once 64 KiB are waiting. Broadcasts
