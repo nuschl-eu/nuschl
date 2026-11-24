@@ -1225,6 +1225,7 @@ impl Core {
                         limit
                     };
                 demand.request(tier, publisher_limit);
+                demand.wanted = demand.wanted.max(requested);
                 let raised = video.kind == Kind::Screen && publisher.screen_rate;
                 let single_layer = (raised || backlog.limited())
                     && video
@@ -1477,7 +1478,8 @@ impl Core {
                 if let Some(demand) = demands.get(&(id, source.mid)) {
                     let (tier, bitrate, limit) = demand.cap(video.kind);
                     let limit = peer.video_limits.then_some(limit);
-                    let cap = Some((tier, bitrate, limit));
+                    let (height, fps) = demand.picture(video.kind, tier, video.smooth());
+                    let cap = Some((tier, height, fps, bitrate, limit));
                     if cap != video.demand && video.throttle.allow(since) {
                         video.demand = cap;
                         let request = QualityRequest {
@@ -1485,14 +1487,13 @@ impl Core {
                             kind: video.kind,
                             tier: tier as u8,
                         };
-                        let cap = video.kind.ladder()[tier];
                         messages.push((
                             id,
                             ServerMessage::Quality {
                                 request: hex::encode(request.to_bytes()),
                                 source: source.mid.to_string(),
-                                max_height: cap.height,
-                                max_fps: cap.fps,
+                                max_height: height,
+                                max_fps: fps,
                                 max_bitrate: bitrate,
                                 limit,
                             },
@@ -1574,6 +1575,8 @@ struct Planned {
 /// Maximum receiver demand with a shared cap when the publisher sends one layer.
 struct Demand {
     requested: (usize, VideoLimit),
+    /// The highest tier a receiver asks for and decodes, before the budgets.
+    wanted: usize,
     shared_cap: (usize, VideoLimit),
     screen_rate: Option<(u64, VideoLimit)>,
 }
@@ -1594,6 +1597,18 @@ impl Demand {
                 previous.max(cap)
             }
         }));
+    }
+
+    /// The picture height and frame rate of `tier`. Below the tier receivers
+    /// want, a Sharp source keeps that tier's height and a Smooth one its frame
+    /// rate.
+    fn picture(&self, kind: Kind, tier: usize, smooth: bool) -> (u16, u8) {
+        let (wanted, cap) = (kind.ladder()[self.wanted.max(tier)], kind.ladder()[tier]);
+        if smooth {
+            (cap.height, wanted.fps)
+        } else {
+            (wanted.height, cap.fps)
+        }
     }
 
     fn cap(&self, kind: Kind) -> (usize, u64, VideoLimit) {
@@ -1618,6 +1633,7 @@ impl Default for Demand {
     fn default() -> Self {
         Self {
             requested: (0, VideoLimit::ForwardingBacklog),
+            wanted: 0,
             shared_cap: (usize::MAX, VideoLimit::WithinTarget),
             screen_rate: None,
         }
@@ -1705,6 +1721,17 @@ mod tests {
             layered.cap(Kind::Screen),
             (2, 23_000_000, VideoLimit::SfuViewer)
         );
+    }
+
+    #[test]
+    fn a_lowered_demand_keeps_what_the_mode_keeps() {
+        let mut demand = Demand::default();
+        demand.request(0, VideoLimit::ForwardingBacklog);
+        demand.wanted = 3;
+        assert_eq!(demand.picture(Kind::Screen, 0, false), (2160, 15));
+        assert_eq!(demand.picture(Kind::Screen, 0, true), (720, 60));
+        demand.wanted = 0;
+        assert_eq!(demand.picture(Kind::Screen, 0, false), (720, 15));
     }
 
     fn av1(pt: u8, profile: u8, level_idx: u8) -> PayloadParams {

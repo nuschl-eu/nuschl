@@ -46,7 +46,8 @@ const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 pub struct Video {
     pub kind: Kind,
     pub mode: Mode,
-    pub demand: Option<(usize, u64, Option<VideoLimit>)>,
+    /// The tier, height, frame rate, bitrate and limit last asked of it.
+    pub demand: Option<(usize, u16, u8, u64, Option<VideoLimit>)>,
     pub throttle: Throttle,
     pub layers: Layers,
 }

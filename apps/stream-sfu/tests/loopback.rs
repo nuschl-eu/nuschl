@@ -1190,7 +1190,11 @@ async fn an_overloaded_single_layer_publisher_receives_lower_encoder_limits() {
             let tier = usize::from(demand.tier);
             let cap = demand.kind.ladder()[tier];
             assert_eq!(message["max_height"], cap.height);
-            assert_eq!(message["max_fps"], cap.fps);
+            // A Smooth camera keeps the frame rate of the tier its viewer wants.
+            assert_eq!(
+                message["max_fps"],
+                demand.kind.ladder()[demand.kind.top()].fps
+            );
             assert_eq!(message["max_bitrate"], cap.ceiling);
             if began && tier < demand.kind.top() {
                 assert!((1..host.sent.len()).contains(&viewer.count(host.id)));
