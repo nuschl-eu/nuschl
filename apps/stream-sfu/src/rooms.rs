@@ -121,6 +121,12 @@ impl Bucket {
         self.burst
     }
 
+    /// The tokens left and the burst.
+    #[cfg(test)]
+    pub fn level(&self) -> (f64, f64) {
+        (self.tokens, self.burst)
+    }
+
     /// Takes `amount` on credit, down to minus one burst: later takes wait
     /// until it is paid back. False past that.
     pub fn lend(&mut self, amount: f64, now: Instant) -> bool {

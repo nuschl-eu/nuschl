@@ -714,6 +714,8 @@ pub fn forwarded(received: &ExtensionValues) -> ExtensionValues {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rooms;
+    use std::collections::{HashMap, HashSet};
 
     struct Queue {
         oldest: Instant,
@@ -1154,6 +1156,385 @@ mod tests {
             }
         }
         assert!(skipped > 0);
+    }
+
+    /// One recorded frame of a fixture: its RTP timestamp increase, packets,
+    /// payload bytes, the publisher's marker, and its first and later
+    /// packets' descriptors.
+    type Recorded = (u64, usize, usize, bool, Vec<u8>, Option<Vec<u8>>);
+
+    fn recorded(text: &str) -> Vec<Recorded> {
+        let hex = |text: &str| -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let lines = text.lines().filter(|line| !line.starts_with('#'));
+        lines
+            .map(|line| {
+                let f: Vec<&str> = line.split(' ').collect();
+                let number = |i: usize| f[i].parse::<usize>().expect("a number");
+                let rest = (f[6] != "-").then(|| hex(f[6]));
+                (
+                    number(1) as u64,
+                    number(2),
+                    number(3),
+                    f[4] == "1",
+                    hex(f[5]),
+                    rest,
+                )
+            })
+            .collect()
+    }
+
+    /// A replayed Chromium source: its fixture looped with frame numbers and
+    /// timestamps running on, or numbered anew as from a reopened encoder,
+    /// or stuck in one endless temporal unit.
+    struct Replayed {
+        frames: Vec<Recorded>,
+        next: usize,
+        offset: u16,
+        timestamp: u64,
+        kind: Kind,
+        bound: Duration,
+        frozen: bool,
+        layers: Layers,
+        /// Parses each frame's first packet in order, for its references.
+        parser: Layers,
+        /// The id of the latest frame with each number.
+        ids: HashMap<u16, u64>,
+    }
+
+    /// A packet on its way to the SFU: its source, frame and index in the
+    /// frame, its descriptor, timestamp, marker and payload, and when it was
+    /// sent.
+    #[derive(Clone)]
+    struct Sent {
+        source: usize,
+        frame: u64,
+        index: usize,
+        descriptor: Vec<u8>,
+        timestamp: u64,
+        marker: bool,
+        payload: usize,
+        at: Instant,
+    }
+
+    /// The real selector, queue and budgets over random calls: replayed
+    /// Chromium L3T3_KEY cameras and L2T2_KEY screens to viewers that share a
+    /// room budget and get audio charged to the same budgets, with reordered,
+    /// repaired and lost packets, key units that lose their marker packet,
+    /// encoders that number frames anew, and sources stuck in one endless
+    /// temporal unit. Each viewer gets every whole frame with its references,
+    /// at most one marker per unit and at most MAX_KEY_BYTES per unit; the
+    /// budgets lend at most one burst; and audio keeps flowing.
+    #[test]
+    fn views_hold_their_invariants_over_random_calls() {
+        let camera = recorded(include_str!("../tests/fixtures/chrome-l3t3-key.txt"));
+        let screen = recorded(include_str!("../tests/fixtures/chrome-l2t2-key.txt"));
+        let start = Instant::now();
+        let mut totals = [0usize; 3];
+        for seed in 1..=120u64 {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut below = |n: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % n
+            };
+            let mut sources: Vec<Replayed> = (0..1 + below(2))
+                .map(|_| {
+                    let (frames, kind) = if below(2) == 0 {
+                        (camera.clone(), Kind::Camera)
+                    } else {
+                        (screen.clone(), Kind::Screen)
+                    };
+                    let bound = [QUEUE_BOUND, LOW_LATENCY_BOUND][below(2) as usize];
+                    let (layers, parser) = (Layers::default(), Layers::default());
+                    let ids = HashMap::new();
+                    let (next, offset, timestamp, frozen) = (0, 0, 1 << 32, false);
+                    Replayed {
+                        frames,
+                        next,
+                        offset,
+                        timestamp,
+                        kind,
+                        bound,
+                        frozen,
+                        layers,
+                        parser,
+                        ids,
+                    }
+                })
+                .collect();
+            let room_rate = [1_000_000, 2_000_000, 6_000_000, 50_000_000][below(4) as usize];
+            let mut room = rooms::media_budget(room_rate, start);
+            // Per viewer: its budget, link rate, views (the audio one last),
+            // queues, and what it got.
+            struct Viewer {
+                budget: Bucket,
+                rate: u64,
+                views: Vec<View>,
+                queues: Vec<VecDeque<(Instant, usize)>>,
+                got: HashMap<u64, HashSet<usize>>,
+                marks: HashMap<(usize, u64), HashSet<u64>>,
+                bytes: HashMap<(usize, u64), u64>,
+                seqs: HashSet<(usize, u64)>,
+                audio: Option<Instant>,
+            }
+            let mut viewers: Vec<Viewer> = (0..1 + below(3))
+                .map(|_| Viewer {
+                    budget: rooms::media_budget(
+                        [2_000_000, 6_000_000, 50_000_000][below(3) as usize],
+                        start,
+                    ),
+                    rate: [500_000, 3_000_000, 20_000_000][below(3) as usize],
+                    views: (0..=sources.len()).map(|_| View::default()).collect(),
+                    queues: vec![VecDeque::new(); sources.len()],
+                    got: HashMap::new(),
+                    marks: HashMap::new(),
+                    bytes: HashMap::new(),
+                    seqs: HashSet::new(),
+                    audio: None,
+                })
+                .collect();
+            // Per frame: packets, references, and whether a packet was lost
+            // upstream or unreadable at the SFU.
+            let mut frames: HashMap<u64, (usize, Vec<u64>, bool)> = HashMap::new();
+            let mut pending: Vec<(u64, Sent)> = Vec::new();
+            let mut now = start;
+            let mut second = start;
+            let mut audio = start;
+            for step in 0..3000u64 {
+                let count_of_sources = sources.len() as u64;
+                let index = (step % count_of_sources) as usize;
+                let source = &mut sources[index];
+                if source.next == source.frames.len() {
+                    // The fixture again from its key picture: numbers run on,
+                    // or start anew as from a reopened encoder.
+                    let first = &source.frames[0].4;
+                    let last = source.offset.wrapping_add(u16::from_be_bytes([
+                        source.frames[source.frames.len() - 1].4[1],
+                        source.frames[source.frames.len() - 1].4[2],
+                    ]));
+                    let back = if below(4) == 0 {
+                        2 + below(100) as u16
+                    } else {
+                        0
+                    };
+                    source.offset = last
+                        .wrapping_add(1)
+                        .wrapping_sub(back)
+                        .wrapping_sub(u16::from_be_bytes([first[1], first[2]]));
+                    source.next = 0;
+                    source.timestamp += 3000;
+                }
+                if !source.frozen && step > 1000 && below(3000) == 0 {
+                    source.frozen = true;
+                }
+                let (dt, count, bytes, marker, first, rest) = source.frames[source.next].clone();
+                source.next += 1;
+                if !source.frozen {
+                    source.timestamp += dt;
+                }
+                now += Duration::from_micros(dt * 100 / 9 / count_of_sources + 10);
+                let number = u16::from_be_bytes([first[1], first[2]]).wrapping_add(source.offset);
+                let id = step;
+                let mut parsed = first.clone();
+                parsed[1..3].copy_from_slice(&number.to_be_bytes());
+                let parse = source
+                    .parser
+                    .packet(&parsed, 0, source.timestamp, now - start);
+                let references = parse.map_or_else(Vec::new, |frame| {
+                    frame
+                        .references()
+                        .filter_map(|r| source.ids.get(&r).copied())
+                        .collect()
+                });
+                source.ids.insert(number, id);
+                // A key unit loses its marker packet now and then.
+                let key = references.is_empty() && dt == 0 || source.next == 1;
+                let lost = marker && below(if key { 3 } else { 50 }) == 0;
+                frames.insert(id, (count, references, lost));
+                for packet in 0..count {
+                    let (first_packet, last) = (packet == 0, packet + 1 == count);
+                    let mut descriptor = match (&rest, first_packet) {
+                        (_, true) => first.clone(),
+                        (Some(rest), false) => rest.clone(),
+                        (None, false) => first[..3].to_vec(),
+                    };
+                    descriptor[0] =
+                        (descriptor[0] & 0x3f) | u8::from(first_packet) << 7 | u8::from(last) << 6;
+                    descriptor[1..3].copy_from_slice(&number.to_be_bytes());
+                    if lost && last {
+                        continue;
+                    }
+                    let sent = Sent {
+                        source: index,
+                        frame: id,
+                        index: packet,
+                        descriptor,
+                        timestamp: sources[index].timestamp,
+                        marker: marker && last,
+                        payload: (bytes / count).max(1),
+                        at: now,
+                    };
+                    let order = step * 64 + packet as u64 + below(4) * 32;
+                    if below(50) == 0 {
+                        pending.push((order + 64 * (1 + below(30)), sent.clone()));
+                    }
+                    pending.push((order, sent));
+                }
+                pending.sort_by_key(|(order, _)| *order);
+                let ready = pending.partition_point(|(order, _)| *order < step * 64);
+                for (_, sent) in pending.drain(..ready).collect::<Vec<_>>() {
+                    if now - sent.at > Duration::from_secs(2) {
+                        continue;
+                    }
+                    let source = &mut sources[sent.source];
+                    let frame = source.layers.packet(
+                        &sent.descriptor,
+                        sent.payload,
+                        sent.timestamp,
+                        now - start,
+                    );
+                    if frame.is_none() {
+                        frames.get_mut(&sent.frame).expect("a frame").2 = true;
+                    }
+                    let arrival = Arrival {
+                        frame: Some(frame),
+                        video: true,
+                        seq: sent.frame * 64 + sent.index as u64,
+                        timestamp: sent.timestamp,
+                        marker: sent.marker,
+                        payload: sent.payload,
+                        cost: sent.payload as u64 + 50,
+                        bound: source.bound,
+                        can_request: true,
+                        targets: Some((source.layers.generation(), source.layers.lowest())),
+                    };
+                    for viewer in &mut viewers {
+                        let queue = &mut viewer.queues[sent.source];
+                        let rate = viewer.rate;
+                        while queue.front().is_some_and(|&(leaves, _)| leaves <= now) {
+                            queue.pop_front();
+                        }
+                        let sample = Sample {
+                            at: now,
+                            oldest: queue.front().map(|_| now),
+                            bytes: queue.iter().map(|&(_, bytes)| bytes).sum(),
+                        };
+                        let budgets = [&mut viewer.budget, &mut room];
+                        let view = &mut viewer.views[sent.source];
+                        let (out, _) = view.admit(&arrival, Some(&sample), rate, budgets, now);
+                        for bucket in [&viewer.budget, &room] {
+                            let (tokens, burst) = bucket.level();
+                            assert!(tokens >= -burst - 1.0, "seed {seed}: {tokens} past {burst}");
+                        }
+                        // A repeated packet goes out with its first sequence
+                        // number: the receiver drops the copy.
+                        let Some((seq, marker)) = out else {
+                            continue;
+                        };
+                        if !viewer.seqs.insert((sent.source, seq)) {
+                            continue;
+                        }
+                        totals[0] += 1;
+                        let free = queue.back().map_or(now, |&(leaves, _)| leaves.max(now));
+                        let time = Duration::from_nanos(sent.payload as u64 * 8_000_000_000 / rate);
+                        queue.push_back((free + time, sent.payload));
+                        viewer.got.entry(sent.frame).or_default().insert(sent.index);
+                        let unit = (sent.source, sent.timestamp);
+                        let bytes = viewer.bytes.entry(unit).or_default();
+                        *bytes += sent.payload as u64;
+                        assert!(
+                            *bytes <= MAX_KEY_BYTES,
+                            "seed {seed}: unit of {bytes} bytes"
+                        );
+                        // A source stuck in one unit marks each of its
+                        // frames' ends itself.
+                        if marker && !sources[sent.source].frozen {
+                            totals[1] += 1;
+                            let marks = viewer.marks.entry(unit).or_default();
+                            marks.insert(seq);
+                            assert_eq!(marks.len(), 1, "seed {seed}: two markers in {unit:?}");
+                        }
+                    }
+                }
+                // Audio every 20 ms, charged to the same budgets.
+                while audio <= now {
+                    audio += Duration::from_millis(20);
+                    let arrival = Arrival {
+                        frame: None,
+                        video: false,
+                        seq: audio.duration_since(start).as_millis() as u64,
+                        timestamp: 0,
+                        marker: true,
+                        payload: 120,
+                        cost: 170,
+                        bound: QUEUE_BOUND,
+                        can_request: false,
+                        targets: None,
+                    };
+                    for viewer in &mut viewers {
+                        let view = viewer.views.last_mut().expect("audio");
+                        let budgets = [&mut viewer.budget, &mut room];
+                        if view
+                            .admit(&arrival, None, viewer.rate, budgets, now)
+                            .0
+                            .is_some()
+                        {
+                            let gap = viewer.audio.map_or(Duration::ZERO, |at| now - at);
+                            assert!(
+                                gap <= Duration::from_secs(10),
+                                "seed {seed}: audio stopped {gap:?}"
+                            );
+                            viewer.audio = Some(now);
+                            totals[2] += 1;
+                        }
+                    }
+                }
+                // Once a second each viewer's targets, as the SFU plans them.
+                if now >= second {
+                    second = now + Duration::from_secs(1);
+                    for viewer in &mut viewers {
+                        for (source, view) in sources.iter().zip(&mut viewer.views) {
+                            let tier = below(4) as usize;
+                            let choices =
+                                source.layers.choices(source.kind, tier, below(2) == 0, 0);
+                            let choice = (!choices.is_empty() && below(8) != 0)
+                                .then(|| choices[below(choices.len() as u64) as usize]);
+                            let base = view.selector.current().and_then(|c| source.layers.base(c));
+                            view.selector.meanwhile(base);
+                            view.selector
+                                .want(choice.map(|c| (c.target, c.layer.spatial)));
+                            view.generation = Some(source.layers.generation());
+                        }
+                    }
+                }
+            }
+            // Every whole frame a viewer got has its references whole, but for
+            // a reference lost upstream or unreadable at the SFU.
+            for viewer in &viewers {
+                let whole = |id: &u64| {
+                    let packets = viewer.got.get(id).map_or(0, HashSet::len);
+                    packets == frames[id].0
+                };
+                for (id, (_, references, _)) in &frames {
+                    if whole(id) {
+                        for reference in references.iter().filter(|r| !frames[r].2) {
+                            assert!(
+                                whole(reference),
+                                "seed {seed}: frame {id} lacks {reference}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Forwarded packets, markers and audio packets.
+        assert!(totals.iter().all(|&n| n > 1000), "{totals:?}");
     }
 
     /// A key picture and a delta frame referencing the frame before it.
