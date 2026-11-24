@@ -65,16 +65,11 @@ pub struct CapturePipeline {
 /// channels fall silent together now and then (music, games) only ever reaches
 /// the suppressor. With two speaker models the delay is estimated on the
 /// channels' downmix, which holds the echo of both speakers.
-///
-/// The delay is the matched filter's highest peak. AEC3's pre-echo search
-/// moves the estimate ahead of that peak on harmonic sound such as music, and
-/// each move restarts the linear filter.
 fn canceller_config() -> EchoCanceller3Config {
     let mut config = EchoCanceller3Config::default();
     config.multi_channel.stereo_detection_hysteresis_seconds = 0.;
     config.delay.render_alignment_mixing.downmix = true;
     config.delay.render_alignment_mixing.adaptive_selection = false;
-    config.delay.detect_pre_echo = false;
     config
 }
 
