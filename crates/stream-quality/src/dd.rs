@@ -228,6 +228,9 @@ pub struct Frame {
     pub end: bool,
     pub number: u16,
     pub layer: Target,
+    /// Whether the packet came after a packet of a later frame, or repeats
+    /// its frame's start.
+    pub late: bool,
     dtis: Dtis,
     fdiffs: Fdiffs,
     /// Per decode target, the frame diff to the previous frame of the chain
@@ -297,6 +300,8 @@ pub struct Layers {
     interval: Option<u64>,
     /// The median interval of the latest slow window, until an active one.
     slow: Option<u64>,
+    /// The newest frame a packet came for, and whether its start came.
+    newest: Option<(u16, bool)>,
 }
 
 impl Layers {
@@ -311,7 +316,7 @@ impl Layers {
         timestamp: u64,
         now: Duration,
     ) -> Option<Frame> {
-        let frame = self.parse(descriptor)?;
+        let mut frame = self.parse(descriptor)?;
         self.paused |= self
             .last
             .is_some_and(|last| now.saturating_sub(last) > WINDOW);
@@ -344,6 +349,16 @@ impl Layers {
             .is_some_and(|&last| timestamp + CLOCK < last)
         {
             self.units.clear();
+        }
+        // A jump back of more than the history in frame numbers, as from a new
+        // stream, starts them over.
+        frame.late = self.newest.is_some_and(|(newest, started)| {
+            let behind = newest.wrapping_sub(frame.number);
+            (1..HISTORY as u16).contains(&behind) || behind == 0 && started && frame.start
+        });
+        if !frame.late {
+            let started = self.newest == Some((frame.number, true));
+            self.newest = Some((frame.number, frame.start || started));
         }
         if frame.start && self.units.back().is_none_or(|&last| timestamp > last) {
             self.units.push_back(timestamp);
@@ -429,6 +444,7 @@ impl Layers {
             end,
             number,
             layer: template.layer,
+            late: false,
             dtis,
             fdiffs,
             chains,
@@ -635,6 +651,20 @@ pub fn pick(
 /// A decode target and its spatial layer, the highest in the target.
 pub type Wanted = (usize, u8);
 
+/// The spatial layer of a late frame that went out for no target.
+const NO_LAYER: u8 = u8::MAX;
+
+/// Keeps the latest eight distinct items in `recent`, as frame numbers or
+/// temporal units.
+pub fn push<T: PartialEq>(recent: &mut VecDeque<T>, item: T) {
+    if !recent.contains(&item) {
+        recent.push_back(item);
+        if recent.len() > 8 {
+            recent.pop_front();
+        }
+    }
+}
+
 /// One receiver's view of one source: forwards the frames of its decode target
 /// and ends each temporal unit it forwards with the marker.
 #[derive(Clone, Debug, Default)]
@@ -642,16 +672,30 @@ pub struct Selector {
     current: Option<Wanted>,
     wanted: Option<Wanted>,
     /// Per frame number modulo [`HISTORY`]: the number of a frame forwarded
-    /// whole and the decode targets whose chains it kept intact.
-    history: Vec<(u16, u32)>,
+    /// whole, the decode targets whose chains it kept intact, and the spatial
+    /// layer of the target it went out for, until it is left out.
+    history: Vec<(u16, u32, Option<u8>)>,
     newest: Option<u16>,
-    /// The RTP timestamp of the last temporal unit forwarded with the marker.
-    ended: Option<u64>,
+    /// The latest temporal units with a packet forwarded, by RTP timestamp,
+    /// and the target each went out for: a unit's later frames go out for its
+    /// target, and a switch waits for a unit with none.
+    units: VecDeque<(u64, Wanted)>,
     /// Whether the receiver lacks the wanted target's chain.
     broken: bool,
     /// The target to forward while a switch to a lower spatial layer waits
     /// for a key picture.
     meanwhile: Option<Wanted>,
+    /// The latest frame whose start came by, and recent frames with a packet
+    /// left out before their start came.
+    started: Option<u16>,
+    early: VecDeque<u16>,
+    /// Frames that forwarded frames reference and that are still to come:
+    /// they go out when they come, late.
+    owed: VecDeque<u16>,
+    /// The frame the current target began at: earlier frames stay out.
+    since: Option<u16>,
+    /// Per frame number modulo [`HISTORY`], a frame whose start came by.
+    seen: Vec<Option<u16>>,
 }
 
 impl Selector {
@@ -698,26 +742,64 @@ impl Selector {
             || self
                 .history
                 .get(usize::from(number) % HISTORY)
-                .is_some_and(|&(n, targets)| n == number && targets >> target & 1 == 1)
+                .is_some_and(|&(n, targets, _)| n == number && targets >> target & 1 == 1)
     }
 
     /// Whether to forward a packet of `frame` in the temporal unit at
     /// `timestamp`, and with which marker: `marker` is the publisher's, set at
     /// the end of its temporal unit.
     pub fn forward(&mut self, frame: &Frame, timestamp: u64, marker: bool) -> Option<bool> {
-        if frame.start && self.current != self.wanted {
+        let passed = self.passed(frame.number);
+        if frame.start {
+            if self.seen.is_empty() {
+                self.seen = vec![None; HISTORY];
+            }
+            self.seen[usize::from(frame.number) % HISTORY] = Some(frame.number);
+        }
+        // The rest of a frame that went out goes out too, also late, repeated
+        // and for an earlier target, with its unit's marker.
+        if let Some(spatial) = self.went(frame) {
+            return Some(Self::end(frame, marker, spatial));
+        }
+        // A late frame that forwarded frames reference goes out, with the
+        // publisher's marker alone.
+        if self.owed.contains(&frame.number) {
+            if frame.start {
+                self.owed.retain(|&n| n != frame.number);
+                self.record(frame, NO_LAYER);
+            }
+            return Some(Self::end(frame, marker, NO_LAYER));
+        }
+        // A frame with a packet left out before its start would arrive
+        // incomplete: it counts as left out.
+        if frame.start && self.early.contains(&frame.number) {
+            self.dropped(frame);
+            return None;
+        }
+        // A frame whose start came and stayed out stays out, with its later
+        // and repeated packets.
+        if passed {
+            return None;
+        }
+        // A temporal unit with a packet out keeps its target. A late or
+        // repeated frame start starts no switch, nor does a frame in such a
+        // unit.
+        let unit = self
+            .units
+            .iter()
+            .find(|&&(at, _)| at == timestamp)
+            .map(|&(_, target)| target);
+        if frame.start && !frame.late && unit.is_none() && self.current != self.wanted {
             match self.wanted {
                 None => self.current = None,
                 Some((target, spatial)) => {
                     let intact = self.intact(frame, target);
                     self.broken = !intact;
-                    let switch = |target| {
-                        self.intact(frame, target)
-                            && frame.dti(target) == Dti::Switch
-                            && self.ended != Some(timestamp)
-                    };
+                    let switch =
+                        |target| self.intact(frame, target) && frame.dti(target) == Dti::Switch;
                     if intact && switch(target) {
                         self.current = self.wanted;
+                        self.since = Some(frame.number);
                     } else if let (Some(base), Some(current)) = (self.meanwhile, self.current)
                         && !intact
                         && spatial < current.1
@@ -726,30 +808,96 @@ impl Selector {
                         && switch(base.0)
                     {
                         self.current = Some(base);
+                        self.since = Some(frame.number);
                     }
                 }
             }
         }
-        let (target, spatial) = self.current?;
-        if frame.dti(target) == Dti::NotPresent {
+        let ahead = |of: u16| frame.number.wrapping_sub(of).wrapping_sub(1) < 0x7fff;
+        if frame.start && self.started.is_none_or(ahead) {
+            self.started = Some(frame.number);
+        }
+        let before = self
+            .since
+            .is_some_and(|since| since != frame.number && !ahead(since));
+        let target = unit
+            .or(self.current.filter(|_| !before))
+            .filter(|&(target, _)| frame.dti(target) != Dti::NotPresent);
+        let Some(target @ (_, spatial)) = target else {
+            if !frame.start && self.started.is_none_or(ahead) {
+                push(&mut self.early, frame.number);
+            }
+            return None;
+        };
+        // A frame whose reference came by and stayed out cannot be decoded.
+        if frame.start && frame.references().any(|r| self.passed(r)) {
+            self.dropped(frame);
             return None;
         }
+        if unit.is_none() {
+            self.units.push_back((timestamp, target));
+            if self.units.len() > 8 {
+                self.units.pop_front();
+            }
+        }
         if frame.start {
-            self.record(frame);
+            self.record(frame, spatial);
         }
-        let marker = marker || frame.end && frame.layer.spatial == spatial;
-        if marker {
-            self.ended = Some(timestamp);
-        }
-        Some(marker)
+        Some(Self::end(frame, marker, spatial))
     }
 
-    fn record(&mut self, frame: &Frame) {
+    /// Whether frame `number` came by and stayed out.
+    fn passed(&self, number: u16) -> bool {
+        let index = usize::from(number) % HISTORY;
+        let sent = self
+            .history
+            .get(index)
+            .is_some_and(|&(n, _, s)| n == number && s.is_some());
+        !sent && self.seen.get(index).is_some_and(|&n| n == Some(number))
+    }
+
+    /// Owes the receiver the frames `frame` references that are still to come.
+    fn owe(&mut self, frame: &Frame) {
+        for reference in frame.references() {
+            let entry = self.history.get(usize::from(reference) % HISTORY);
+            if entry.is_none_or(|&(n, ..)| n != reference) && !self.owed.contains(&reference) {
+                self.owed.push_back(reference);
+                if self.owed.len() > 16 {
+                    self.owed.pop_front();
+                }
+            }
+        }
+    }
+
+    /// The marker of a forwarded packet: the publisher's `marker`, or the end
+    /// of the frame on the target's top spatial layer.
+    fn end(frame: &Frame, marker: bool, spatial: u8) -> bool {
+        marker || frame.end && frame.layer.spatial == spatial
+    }
+
+    /// The spatial layer of the target `frame` went out for, when its start
+    /// went out.
+    fn went(&self, frame: &Frame) -> Option<u8> {
+        let &(number, _, spatial) = self.history.get(usize::from(frame.number) % HISTORY)?;
+        spatial.filter(|_| number == frame.number)
+    }
+
+    /// Whether `frame`'s start went out: its other packets go out too.
+    pub fn sent(&self, frame: &Frame) -> bool {
+        self.went(frame).is_some()
+    }
+
+    /// Whether forwarded frames reference `frame` and owe it to the receiver.
+    pub fn owes(&self, frame: &Frame) -> bool {
+        self.owed.contains(&frame.number)
+    }
+
+    fn record(&mut self, frame: &Frame, spatial: u8) {
         let targets = (0..MAX_TARGETS)
             .filter(|&target| self.intact(frame, target))
             .fold(0, |mask, target| mask | 1 << target);
         if self.history.is_empty() {
-            self.history = vec![(0, 0); HISTORY];
+            self.history = vec![(0, 0, None); HISTORY];
         }
         // Numbers skipped since the newest frame lose their entries, so none
         // outlives the history.
@@ -759,11 +907,12 @@ impl Selector {
         if skipped < 0x8000 {
             for n in 1..skipped.min(HISTORY as u16) {
                 let number = frame.number.wrapping_sub(n);
-                self.history[usize::from(number) % HISTORY] = (0, 0);
+                self.history[usize::from(number) % HISTORY] = (0, 0, None);
             }
             self.newest = Some(frame.number);
         }
-        self.history[usize::from(frame.number) % HISTORY] = (frame.number, targets);
+        self.history[usize::from(frame.number) % HISTORY] = (frame.number, targets, Some(spatial));
+        self.owe(frame);
     }
 
     /// Whether the decode target forwarded now can do without `frame`.
@@ -779,10 +928,16 @@ impl Selector {
         if let Some(entry) = self.history.get_mut(usize::from(frame.number) % HISTORY)
             && entry.0 == frame.number
         {
-            entry.1 = 0;
+            *entry = (frame.number, 0, None);
         }
+        // A frame from before the current target began leaves it.
+        let before = self.since.is_some_and(|since| {
+            let behind = since.wrapping_sub(frame.number);
+            behind != 0 && behind < 0x8000
+        });
         if let Some((target, _)) = self.current
             && matches!(frame.dti(target), Dti::Switch | Dti::Required)
+            && !before
         {
             self.current = None;
         }
@@ -1330,6 +1485,88 @@ mod tests {
         assert_eq!(forwarded, [14, 15]);
     }
 
+    /// `descriptor` as a packet after the first of its frame.
+    fn rest(descriptor: &[u8]) -> Vec<u8> {
+        let mut rest = descriptor[..3].to_vec();
+        rest[0] &= 0x7f;
+        rest
+    }
+
+    #[test]
+    fn layers_mark_late_and_repeated_packets() {
+        let mut layers = Layers::default();
+        let mut late = |descriptor: &[u8], timestamp: u64| {
+            let frame = layers.packet(descriptor, 1, timestamp, Duration::ZERO);
+            frame.expect("valid").late
+        };
+        assert!(!late(&l2t2_key(0, 0, true), 0));
+        assert!(!late(&l2t2_key(3, 1, false), 0));
+        // Frame 2's later packet before its start, then the start twice.
+        let two = l2t2_key(2, 2, false);
+        assert!(!late(&rest(&two), 3000));
+        assert!(!late(&two, 3000));
+        assert!(late(&two, 3000));
+        assert!(!late(&rest(&two), 3000));
+        // Frame 1 after frame 2.
+        assert!(late(&l2t2_key(3, 1, false), 0));
+        // A jump back of more than the history in frame numbers starts over.
+        assert!(!late(&l2t2_key(1, 1002, false), 6000));
+        assert!(!late(&l2t2_key(1, 2, false), 9000));
+        assert!(late(&l2t2_key(1, 1, false), 12_000));
+    }
+
+    #[test]
+    fn a_temporal_unit_goes_out_for_one_target() {
+        let mut layers = Layers::default();
+        let mut frame = |descriptor: Vec<u8>| layers.packet(&descriptor, 1, 0, Duration::ZERO);
+        let mut selector = Selector::default();
+        selector.want(Some((3, 1)));
+        // An S1T1 viewer gets the key picture's S0 frame, then wants S0T1 and
+        // switches at unit 2's S0T0 frame, before the key picture's S1 frame
+        // comes: that frame still goes out, with its unit's marker.
+        let key = frame(l2t2_key(0, 0, true)).expect("valid");
+        assert_eq!(selector.forward(&key, 0, false), Some(false));
+        selector.want(Some((1, 0)));
+        let t0 = frame(l2t2_key(1, 4, false)).expect("valid");
+        assert_eq!(selector.forward(&t0, 2, false), Some(true));
+        assert_eq!(selector.current(), Some(1));
+        let top = frame(l2t2_key(3, 1, false)).expect("valid");
+        assert_eq!(selector.forward(&top, 0, true), Some(true));
+        // A switch waits for a unit with no packet out.
+        selector.want(Some((3, 1)));
+        let s1 = frame(l2t2_key(4, 5, false)).expect("valid");
+        assert_eq!(selector.forward(&s1, 2, true), None);
+        assert_eq!(selector.current(), Some(1));
+    }
+
+    #[test]
+    fn a_frame_that_stayed_out_stays_out_whole() {
+        let mut layers = Layers::default();
+        let mut frame = |descriptor: &[u8]| {
+            let frame = layers.packet(descriptor, 1, 0, Duration::ZERO);
+            frame.expect("valid")
+        };
+        let mut selector = Selector::default();
+        // A key picture's S0 frame in two packets: its start passes a viewer
+        // that wants nothing yet, and it wants S0T0 before the rest comes.
+        let mut start = l2t2_key(0, 0, true);
+        start[0] &= !0x40;
+        let rest = rest(&start);
+        assert_eq!(selector.forward(&frame(&start), 0, false), None);
+        selector.want(Some((0, 0)));
+        assert_eq!(selector.forward(&frame(&rest), 0, false), None);
+        // A repeated start stays out too, and the S0T0 frames after it lack
+        // their chain: the viewer waits for the next key picture.
+        assert_eq!(selector.forward(&frame(&start), 0, false), None);
+        assert_eq!(
+            selector.forward(&frame(&l2t2_key(1, 2, false)), 1, true),
+            None
+        );
+        assert!(selector.needs_keyframe());
+        let key = frame(&l2t2_key(0, 4, false));
+        assert_eq!(selector.forward(&key, 2, false), Some(true));
+    }
+
     /// Frame `number` of an L1T3 source (T0 T2 T1 T2), 1000 bytes, at `millis`
     /// of media and wall time.
     fn l1t3_at(layers: &mut Layers, number: u16, millis: u64) -> Option<Frame> {
@@ -1754,10 +1991,14 @@ mod tests {
     }
 }
 
-/// The selection model of docs/video-plan.md §5.3 over seeded random calls: an
-/// L2T2_KEY camera that goes active and static, key pictures, and viewers that
-/// join, leave, lose frames and change tier, budget, queue steps and mode. The
-/// invariants are checked on every frame and every second.
+/// The selection model of docs/video-plan.md §5.3 over seeded random calls
+/// (proptest is not in the lock file). The source is an L1T2 or L1T3 screen,
+/// or an L2T2_KEY or L3T3_KEY camera, with key pictures, new structures and
+/// active targets, frame-rate changes and static stretches, frames of up to
+/// three packets that arrive reordered, repaired late or repeated, frame
+/// numbers that wrap and timestamps that jump back. Viewers join, leave, lose
+/// frames at the SFU and change tier, budget, queue steps and mode. Every
+/// frame, every second and the end of each run check the invariants.
 #[cfg(test)]
 mod model {
     use super::tests::{l2t2_key, l2t2_unit};

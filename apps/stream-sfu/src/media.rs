@@ -1062,7 +1062,12 @@ impl Core {
             };
             let view = &mut forward.view;
             let layered = frame.flatten();
-            if video && view.backlog.dropped(timestamp) {
+            // The rest of a frame that went out goes out whole, also late, and
+            // so does a late frame that frames out reference.
+            let rest = layered
+                .as_ref()
+                .is_some_and(|f| view.selector.sent(f) || view.selector.owes(f));
+            if video && view.backlog.dropped(timestamp) && !rest {
                 view.rewrite.skip(*packet.seq_no);
                 if let Some(frame) = &layered {
                     view.selector.dropped(frame);
@@ -1101,7 +1106,8 @@ impl Core {
                             ) {
                                 // A unit with a packet out goes out whole.
                                 Layered::Send => {
-                                    !view.backlog.out(timestamp)
+                                    !rest
+                                        && !view.backlog.out(timestamp)
                                         && view.backlog.capped(queue, payload)
                                 }
                                 Layered::Skip => {
@@ -1129,7 +1135,7 @@ impl Core {
             };
             let room_budget = &mut self.rooms.get_mut(&room).expect("room").budget;
             // The budgets lend a layered unit with a packet out its rest.
-            let lend = layered.is_some() && view.backlog.out(timestamp);
+            let lend = rest || layered.is_some() && view.backlog.out(timestamp);
             let charge = |bucket: &mut Bucket| {
                 if lend {
                     bucket.lend(cost as f64, now);
