@@ -506,6 +506,34 @@ def actions(args, root, shell, application, bot, murmur):
         mark("change_preview_ends_with_the_draft")
         return {"change_preview": cases, "server": args.server}
 
+    if args.advanced_description:
+        # Rules the table cannot show read as sentences, in their order: a
+        # here-only @admin rule, Everyone denied Enter, then a certificate.
+        admin = operator(root, pin)
+        try:
+            music = query_channel(admin, 6)
+            music[3] = []
+            music[4] = [
+                encode({1: [1], 2: [0], 3: [0], 5: [b"admin"], 6: [0x20], 7: [0]}),
+                encode({1: [1], 2: [1], 3: [0], 5: [b"all"], 6: [0], 7: [0x4]}),
+                encode({1: [1], 2: [1], 3: [0], 5: [b"$0123456789abcdef"], 6: [0x4], 7: [0]}),
+            ]
+            music[5] = [0]
+            admin.send(13, encode(music))
+            assert len(local_rules(query_channel(admin, 6))) == 3
+        finally:
+            admin.close()
+        open_acl("Music", expand=False)
+        for line in (
+            "Members of @admin may move people here.",
+            "Nobody may enter here and in subchannels.",
+            "But certificate 01234567… may enter here and in subchannels.",
+        ):
+            eventually(lambda line=line: text_contains(line), f"missing {line!r}")
+        shell.screenshot(args.output / "advanced-description.png")
+        mark("advanced_rules_read_as_sentences")
+        return {"advanced_description": cases, "server": args.server}
+
     if args.geometry:
         admin = operator(root, pin)
         try:
@@ -1102,6 +1130,7 @@ def main():
     parser.add_argument("--pending-input", action="store_true")
     parser.add_argument("--channel-types", action="store_true")
     parser.add_argument("--change-preview", action="store_true")
+    parser.add_argument("--advanced-description", action="store_true")
     parser.add_argument("--server", choices=("stock", "nuschld"), default="stock")
     parser.add_argument(
         "--high-admin-limit",

@@ -71,9 +71,16 @@ Each edit rewrites the channel's own rules in one order:
 Everyone, group denies, group allows, people; the password rules stay last. So
 a person beats their groups, groups beat Everyone, and among groups allow beats
 deny. The table reads existing rules when that order decides the same as
-theirs, as with Murmur's default root rules; otherwise it says the channel's
-rules depend on their order and leaves them to **Advanced rules**, the
-rule list the server applies top to bottom. While the table shows the channel,
+theirs, as with Murmur's default root rules; otherwise it describes the
+channel's own rules in short sentences and leaves editing them to **Advanced
+rules**, the rule list the server applies top to bottom. Each sentence says
+whom a rule covers (Mumble's built-in and dynamic groups such as `in`, `out`
+and `sub`, `!` for everyone except a group, `~` for a group as this channel
+defines it, access tokens, certificates by the start of their hash, people),
+what it allows and denies, and where; a deny for Everyone reads "Nobody may".
+"But" starts a rule that reverses an earlier rule's setting; the later rule
+wins where both apply. Eight sentences
+show, then "and N more". While the table shows the channel,
 that list stays collapsed behind **Show advanced rules**. Every cell shows
 the result for a member of its row in this channel (Yes, No or Partly),
 evaluated with `nuschl_core::acl` over the channel's whole rule list. Cells set
@@ -237,6 +244,8 @@ Custom, saves Members only, Password and Open and compares the server's rules,
 then creates a channel as Announcements and checks the rules saved for it.
 `--change-preview` denies Registered users Speak in Music and waits for the
 effect line counting its subchannel, then reloads and checks the line goes.
+`--advanced-description` stores order-dependent rules in Music and reads their
+sentences in the editor.
 [acl_e2ee_bootstrap.py](../tests/acl_e2ee_bootstrap.py) separately starts nuschld
 in E2EE-only mode and uses the native SuperUser password form and group editor
 to promote an offline account, without changing security policy or using a raw

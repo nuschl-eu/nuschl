@@ -533,12 +533,27 @@ pub(super) fn render(view: &ServerView, editor: &Editor, cx: &mut Context<Deskto
         return section.into_any_element();
     };
     let Some(mut table) = draft.table() else {
-        return section
-            .child(note(
-                "acl-table-advanced",
-                "This channel's rules depend on their order in ways the table cannot show. Edit them under Advanced rules.",
-            ))
-            .into_any_element();
+        // The channel's own rules, in words.
+        let rules: Vec<_> = draft
+            .entries()
+            .iter()
+            .filter(|row| !row.value.inherited)
+            .map(|row| row.value.clone())
+            .collect();
+        let mut section = section.child(note(
+            "acl-table-advanced",
+            "The table cannot show these rules. Edit them under Advanced rules.",
+        ));
+        for (number, line) in access::describe(&rules, |id| name(view, id), 8)
+            .into_iter()
+            .enumerate()
+        {
+            section = section.child(note(
+                SharedString::from(format!("acl-table-rule-{token}-{number}")),
+                line,
+            ));
+        }
+        return section.into_any_element();
     };
     for who in &editor.table_rows {
         table.row(who.clone());

@@ -421,6 +421,154 @@ pub fn summary(effects: &[Effect], label: impl Fn(&Who) -> String, limit: usize)
     text
 }
 
+/// What a permission lets people do, for descriptions of rules.
+fn verb(bit: u32) -> &'static str {
+    match bit {
+        WRITE => "edit permissions",
+        TRAVERSE => "pass through",
+        ENTER => "enter",
+        SPEAK => "speak",
+        MUTE_DEAFEN => "mute and deafen people",
+        MOVE => "move people",
+        MAKE_CHANNEL => "make channels",
+        LINK_CHANNEL => "link channels",
+        WHISPER => "whisper",
+        TEXT_MESSAGE => "write messages",
+        MAKE_TEMP_CHANNEL => "make temporary channels",
+        LISTEN => "listen",
+        KICK => "kick people",
+        BAN => "ban people",
+        REGISTER => "register people",
+        SELF_REGISTER => "register",
+        RESET_USER_CONTENT => "reset people's content",
+        _ => "use a newer permission",
+    }
+}
+
+/// `items` as "a, b and c" (or "or c").
+fn list(items: &[&str], last: &str) -> String {
+    match items.split_last() {
+        Some((only, [])) => (*only).to_owned(),
+        Some((final_item, rest)) => format!("{} {last} {final_item}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// Whom a rule's group expression means, as Mumble evaluates it
+/// (`acl::group_applies`).
+fn whom(specification: &str) -> String {
+    let (mut name, mut invert, mut here, mut token, mut hash) =
+        (specification, false, false, false, false);
+    loop {
+        let flag = match name.chars().next() {
+            Some('!') => &mut invert,
+            Some('~') => &mut here,
+            Some('#') => &mut token,
+            Some('$') => &mut hash,
+            _ => break,
+        };
+        *flag = true;
+        name = &name[1..];
+    }
+    if name.is_empty() {
+        return "nobody".to_owned();
+    }
+    let people = if token {
+        format!("people with the access token \u{201c}{name}\u{201d}")
+    } else if hash {
+        format!("certificate {}…", name.get(..8).unwrap_or(name))
+    } else {
+        match name {
+            "all" => "everyone".to_owned(),
+            "auth" => "registered users".to_owned(),
+            "strong" => "people with a verified certificate".to_owned(),
+            "none" => "nobody".to_owned(),
+            "in" if here => "people in this channel".to_owned(),
+            "in" => "people in the channel".to_owned(),
+            "out" if here => "people outside this channel".to_owned(),
+            "out" => "people outside the channel".to_owned(),
+            "sub" if here => "people in this channel's subchannels".to_owned(),
+            "sub" => "people in the channel's subchannels".to_owned(),
+            _ if name.starts_with("sub,") => {
+                format!(
+                    "people in subchannels ({}{name})",
+                    if here { "~" } else { "" }
+                )
+            }
+            _ if here => format!("members of @{name} as defined here"),
+            _ => format!("members of @{name}"),
+        }
+    };
+    if invert {
+        format!("everyone except {people}")
+    } else {
+        people
+    }
+}
+
+/// A channel's own rules (#341) in short sentences, in their order. "But"
+/// starts a rule that reverses an earlier one for the people both cover; a
+/// deny for Everyone reads "Nobody may". `name` names an account; at most
+/// `limit` lines, then "and N more".
+pub fn describe(rules: &[AclEntry], name: impl Fn(u32) -> String, limit: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (index, rule) in rules.iter().enumerate() {
+        let deny = rule.deny;
+        let grant = rule.grant & !deny;
+        if grant | deny == 0 {
+            continue;
+        }
+        let verbs = |bits: u32| {
+            (0..32)
+                .map(|shift| 1u32 << shift)
+                .filter(|bit| bits & bit != 0)
+                .map(verb)
+                .collect::<Vec<_>>()
+        };
+        let everyone = rule.user_id.is_none() && rule.group.as_deref() == Some("all");
+        let what = match (grant, deny) {
+            (0, _) if everyone => format!("may {}", list(&verbs(deny), "or")),
+            (0, _) => format!("may not {}", list(&verbs(deny), "or")),
+            (_, 0) => format!("may {}", list(&verbs(grant), "and")),
+            _ => format!(
+                "may {} but not {}",
+                list(&verbs(grant), "and"),
+                list(&verbs(deny), "or")
+            ),
+        };
+        let place = match (rule.apply_here, rule.apply_subs) {
+            (true, true) => "here and in subchannels",
+            (true, false) => "here",
+            (false, true) => "in subchannels",
+            (false, false) => "nowhere",
+        };
+        let who = match rule.user_id {
+            Some(id) => name(id),
+            None if everyone && grant == 0 => "nobody".to_owned(),
+            None => whom(rule.group.as_deref().unwrap_or_default()),
+        };
+        let reverses = rules[..index]
+            .iter()
+            .any(|earlier| earlier.grant & deny != 0 || earlier.deny & grant != 0);
+        let sentence = if reverses {
+            format!("But {who} {what} {place}.")
+        } else {
+            let mut who = who;
+            if let Some(first) = who.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!("{who} {what} {place}.")
+        };
+        lines.push(sentence);
+    }
+    if lines.len() > limit {
+        let more = lines.len() - limit;
+        lines.truncate(limit);
+        lines.push(format!("and {more} more"));
+    }
+    lines
+}
+
 /// What each target inherits from the parent channels: `entries` is the
 /// channel's rule list, inherited rules first; a later rule overrides an
 /// earlier one for the permissions it sets. Rules with group expressions are
@@ -667,6 +815,70 @@ mod tests {
             ["@guests may now moderate here"]
         );
         assert_eq!(compare(vec![everyone.clone()], vec![everyone]), []);
+    }
+
+    #[test]
+    fn advanced_rules_read_as_sentences_in_their_order() {
+        let mut admin = rule_for(&Who::Group("admin".into()), MOVE, 0);
+        admin.apply_subs = false;
+        let mut certificate = rule_for(&Who::Everyone, ENTER, 0);
+        certificate.group = Some("$0123456789abcdef".into());
+        let name = |id: u32| format!("Ada (#{id})");
+        let lines = describe(
+            &[admin, rule_for(&Who::Everyone, 0, ENTER), certificate],
+            name,
+            8,
+        );
+        assert_eq!(
+            lines,
+            [
+                "Members of @admin may move people here.",
+                "Nobody may enter here and in subchannels.",
+                "But certificate 01234567… may enter here and in subchannels.",
+            ]
+        );
+        // Dynamic groups, negation and `~`, a person, both directions.
+        let expression = |group: &str, grant, deny| {
+            let mut rule = rule_for(&Who::Everyone, grant, deny);
+            rule.group = Some(group.into());
+            rule
+        };
+        let rules = [
+            expression("in", SPEAK, 0),
+            expression("~out", 0, TEXT_MESSAGE),
+            expression("!~admin", 0, MUTE_DEAFEN | MOVE),
+            expression("~sub,0,1", LISTEN, 0),
+            expression("#door", ENTER | SPEAK, LINK_CHANNEL),
+            rule_for(&Who::Person(5), WRITE, 0),
+        ];
+        assert_eq!(
+            describe(&rules, name, 8),
+            [
+                "People in the channel may speak here and in subchannels.",
+                "People outside this channel may not write messages here and in subchannels.",
+                "Everyone except members of @admin as defined here may not mute and deafen people or move people here and in subchannels.",
+                "People in subchannels (~sub,0,1) may listen here and in subchannels.",
+                "People with the access token \u{201c}door\u{201d} may enter and speak but not link channels here and in subchannels.",
+                "Ada (#5) may edit permissions here and in subchannels.",
+            ]
+        );
+        // A later rule that reverses an earlier one says so; the list is bounded.
+        let order = [
+            rule_for(&Who::Group("guests".into()), SPEAK, 0),
+            rule_for(&Who::Everyone, 0, SPEAK),
+            rule_for(&Who::Group("auth".into()), 0, 0),
+        ];
+        assert_eq!(
+            describe(&order, name, 1),
+            [
+                "Members of @guests may speak here and in subchannels.",
+                "and 1 more"
+            ]
+        );
+        assert_eq!(
+            describe(&order, name, 8)[1],
+            "But nobody may speak here and in subchannels."
+        );
     }
 
     #[test]
