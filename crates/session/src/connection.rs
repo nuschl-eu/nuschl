@@ -4453,34 +4453,12 @@ impl State {
                 let text = denied
                     .reason
                     .map(|reason| bounded(reason, 1024))
-                    .unwrap_or_else(|| match denied.r#type {
-                        Some(2) => "Only the SuperUser may do that.".into(),
-                        Some(3) => "That channel name is not allowed.".into(),
-                        Some(4) => "That message is too long for this server.".into(),
-                        Some(6) => {
-                            "Temporary channels cannot have children or be edited that way.".into()
-                        }
-                        Some(7) => "You need a certificate to do that.".into(),
-                        Some(8) => format!(
-                            "The name \"{}\" is not allowed.",
-                            denied.name.unwrap_or_default()
-                        ),
-                        Some(9) => "That channel is full.".into(),
-                        Some(10) => "Channels cannot be nested that deeply.".into(),
-                        Some(11) => "This server has reached its channel limit.".into(),
-                        Some(12 | 13) => "The listener limit was reached.".into(),
-                        _ => {
-                            let permission = denied
-                                .permission
-                                .and_then(|bit| {
-                                    crate::model::permission::NAMED
-                                        .iter()
-                                        .find(|(value, _)| *value == bit)
-                                })
-                                .map(|(_, name)| *name)
-                                .unwrap_or("that action");
-                            format!("Permission denied: {permission}")
-                        }
+                    .unwrap_or_else(|| {
+                        crate::model::denial_text(
+                            denied.r#type,
+                            denied.permission,
+                            denied.name.as_deref(),
+                        )
                     });
                 emit(events, SessionEvent::PermissionDenied(text)).await?;
             }
