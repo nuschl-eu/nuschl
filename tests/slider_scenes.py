@@ -218,9 +218,14 @@ class Scenes:
         return eventually(lambda: self.find(role, name, prefix), message, timeout=timeout)
 
     def screen(self, x, y):
-        """Screen coordinates of a point in AT-SPI window coordinates."""
-        window = self.shell.window("Nuschl")
-        return window["x"] + x, window["y"] + y
+        """Screen coordinates of a point in AT-SPI window coordinates. These
+        start at the window's buffer, which includes GPUI's client-side shadow;
+        the compositor's frame starts inside it."""
+        origin = json.loads(self.shell.eval(
+            "JSON.stringify((() => { const b = global.get_window_actors().map(a => a.meta_window)"
+            ".find(w => (w.get_title() || '').startsWith('Nuschl')).get_buffer_rect();"
+            " return [b.x, b.y]; })())"))
+        return origin[0] + x, origin[1] + y
 
     @staticmethod
     def value(node):

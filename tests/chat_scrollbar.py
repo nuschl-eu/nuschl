@@ -36,14 +36,6 @@ class ScrollbarScenes(Scenes):
                       'host_devices_or_clipboard': False}
         self.stopped = []
 
-    def screen(self, x, y):
-        # AccessKit window coordinates include GPUI's client-side shadow. The
-        # compositor frame excludes it; thin scrollbar hitboxes need the buffer.
-        rect = json.loads(self.shell.eval("JSON.stringify((()=>{const w=global.get_window_actors()"
-            ".map(a=>a.meta_window).find(w=>(w.get_title()||'').startsWith('Nuschl'));"
-            "const r=w.get_buffer_rect();return{x:r.x,y:r.y,width:r.width,height:r.height};})())"))
-        return rect['x'] + x, rect['y'] + y
-
     def timeline(self):
         return self.wait_for('list', 'Messages in #Development', 'missing timeline')
 
