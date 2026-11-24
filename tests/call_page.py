@@ -482,10 +482,15 @@ try:
     screen_stats.find_element(By.TAG_NAME, "summary").click()
     quality = Select(screen_stats.find_element(By.TAG_NAME, "select"))
     assert quality.first_selected_option.text == "Auto"
-    quality.select_by_value("2")
-    request = f"01{c:016x}0102"
-    wait(chrome, f"return window.qualityRequests.includes('{request}')", "explicit receive quality")
+    # In a larger window Auto fits the large tile above 720p15; a limit caps it.
+    chrome.set_window_size(2560, 1600)
+    lowest = f"01{c:016x}0100"
+    latest = f"return window.qualityRequests.filter(r => r.startsWith('{lowest[:-2]}')).at(-1)"
+    wait(chrome, f"{latest} !== '{lowest}'", "receive quality fits the tile")
+    quality.select_by_value("0")
+    wait(chrome, f"{latest} === '{lowest}'", "receive limit")
     quality.select_by_value("")
+    chrome.set_window_size(1280, 800)
     wait(chrome, """
       const panel = document.querySelector('#large .video-stats[open]');
       if (!panel) return false;
