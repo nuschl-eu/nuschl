@@ -17,6 +17,7 @@ nuschl-core.workspace = true
 nuschl-ipc.workspace = true
 nuschl-sandbox.workspace = true
 nuschl-session.workspace = true
+nuschl-version.workspace = true
 # The full-screen view on crossterm (re-exported by ratatui), without the
 # calendar widget and macros.
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "underline-color"] }

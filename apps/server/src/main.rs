@@ -7,7 +7,7 @@ use nuschld::{
 use std::{io::Read, net::IpAddr, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
-#[command(version, about = "Nuschl's Mumble-compatible server")]
+#[command(version = nuschl_version::version(), about = "Nuschl's Mumble-compatible server")]
 struct Arguments {
     /// TOML configuration file (see nuschld.example.toml).
     #[arg(long)]
@@ -172,6 +172,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         println!("erased {erased} messages by {name}");
         return Ok(());
     }
+    tracing::info!(version = nuschl_version::version(), "starting");
     let running = server::start(settings, backend).await?;
     use tokio::signal::unix::{SignalKind, signal};
     let mut terminate = signal(SignalKind::terminate())?;

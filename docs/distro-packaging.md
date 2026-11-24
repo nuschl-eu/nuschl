@@ -25,8 +25,9 @@ Linux Nix package also includes VA-API hardware acceleration.
 
 `/usr/bin/nuschl` links to the executable. The stage adds the desktop entry,
 which registers `mumble://` and `nuschl://`, the hicolor icons, the AppStream
-file and the license notices in `/usr/share/licenses/nuschl/`. The in-app updater
-is off on Linux; APT and pacman update the package.
+file, the license notices in `/usr/share/licenses/nuschl/` and the release's commit
+in `/usr/share/nuschl/commit`. The in-app updater is off on Linux; APT and pacman
+update the package.
 
 The sandbox runs the `bwrap` beside the executable before the one on the `PATH`.
 In the stage it is a launcher script that runs `/usr/bin/bwrap`, and the
@@ -54,7 +55,7 @@ compiler runtime and the unwinder, is linked statically.
 
 - `linux-portable` has the programs above plus `nuschl-cli` and `nuschl-tui`
   side by side in `lib/nuschl/`, links to the three clients in `bin/`, the desktop
-  entry, icons and licences.
+  entry, icons, licences and `share/nuschl/commit`.
 - `server-static` has `nuschld` and its storage worker in `bin/`, and the music bot
   in `bin/` with its codec and content workers in `libexec/nuschl-musicbot/`.
 

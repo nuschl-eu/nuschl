@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// The companion SFU for calls and screen sharing (docs/video-plan.md).
 #[derive(Parser)]
-#[command(version)]
+#[command(version = nuschl_version::version())]
 struct Arguments {
     /// Settings (nuschl-stream-sfu.toml).
     #[arg(long)]

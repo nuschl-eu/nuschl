@@ -7444,6 +7444,7 @@ dependencies = [
  "nuschl-stream",
  "nuschl-testkit",
  "nuschl-update",
+ "nuschl-version",
  "serde_json",
  "tokio",
  "tracing",
@@ -7499,6 +7500,7 @@ dependencies = [
  "nuschl-protocol",
  "nuschl-sandbox",
  "nuschl-session",
+ "nuschl-version",
  "nuschld",
  "serde",
  "serde_json",
@@ -7796,6 +7798,7 @@ dependencies = [
  "nuschl-legacy-html",
  "nuschl-protocol",
  "nuschl-session",
+ "nuschl-version",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -8001,6 +8004,7 @@ dependencies = [
  "nuschl-protocol",
  "nuschl-stream-quality",
  "nuschl-testkit",
+ "nuschl-version",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -8061,6 +8065,7 @@ dependencies = [
  "nuschl-ipc",
  "nuschl-sandbox",
  "nuschl-session",
+ "nuschl-version",
  "ratatui",
  "ratatui-image",
  "tokio",
@@ -8106,6 +8111,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuschl-version"
+version = "0.3.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "nuschl-video-encode"
 version = "0.3.0"
 dependencies = [
@@ -8147,6 +8159,7 @@ dependencies = [
  "futures-util",
  "hex",
  "nuschl-protocol",
+ "nuschl-version",
  "prost",
  "rand 0.9.5",
  "rcgen",
@@ -8172,6 +8185,7 @@ dependencies = [
  "httparse",
  "nuschl-kt",
  "nuschl-protocol",
+ "nuschl-version",
  "rcgen",
  "rustls",
  "sha2 0.10.9",
@@ -8202,6 +8216,7 @@ dependencies = [
  "nuschl-legacy-html",
  "nuschl-protocol",
  "nuschl-session",
+ "nuschl-version",
  "prost",
  "rcgen",
  "regex",

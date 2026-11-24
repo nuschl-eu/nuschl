@@ -1351,8 +1351,9 @@ pub fn dialog(
             cx,
         ),
     ));
-    if crate::update::supported() {
-        use crate::update::UpdateState;
+    use crate::update::UpdateState;
+    let updates = crate::update::supported();
+    if updates {
         let check = settings.check_updates;
         general.push(managed(
             this,
@@ -1368,43 +1369,49 @@ pub fn dialog(
                 cx,
             ),
         ));
-        let status = match &this.update {
-            UpdateState::Idle => format!("Nuschl {}", env!("CARGO_PKG_VERSION")),
-            UpdateState::Checking => "Checking…".into(),
-            UpdateState::UpToDate => {
-                format!("Nuschl {} is up to date.", env!("CARGO_PKG_VERSION"))
-            }
-            UpdateState::Available(update) => format!("Nuschl {} is available.", update.version),
-            UpdateState::Installing { .. } => "Installing the update…".into(),
-            UpdateState::Installed => "Update installed; restart to use it.".into(),
-            UpdateState::Failed(error) => format!("Update failed: {error}"),
-        };
-        general.push(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(color(TEXT_MUTED))
-                        .child(text!(status).with_id("update-status")),
-                )
-                .child(styled_button(
-                    "check-update-now",
-                    "Check now",
-                    Tone::Secondary,
-                    |this, _, cx| {
-                        this.check_update_now();
-                        cx.notify();
-                    },
-                    cx,
-                ))
-                .into_any_element(),
-        );
     }
+    let version = format!("Nuschl {}", nuschl_version::version());
+    let status = match &this.update {
+        UpdateState::Idle => version.clone(),
+        UpdateState::Checking => "Checking…".into(),
+        UpdateState::UpToDate => format!("{version} is up to date."),
+        UpdateState::Available(update) => format!("Nuschl {} is available.", update.version),
+        UpdateState::Installing { .. } => "Installing the update…".into(),
+        UpdateState::Installed => "Update installed; restart to use it.".into(),
+        UpdateState::Failed(error) => format!("Update failed: {error}"),
+    };
+    let mut row = div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(color(TEXT_MUTED))
+                .child(text!(status).with_id("update-status")),
+        )
+        .child(styled_button(
+            "copy-version",
+            "Copy version",
+            Tone::Secondary,
+            move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(version.clone())),
+            cx,
+        ));
+    if updates {
+        row = row.child(styled_button(
+            "check-update-now",
+            "Check now",
+            Tone::Secondary,
+            |this, _, cx| {
+                this.check_update_now();
+                cx.notify();
+            },
+            cx,
+        ));
+    }
+    general.push(row.into_any_element());
     let force_tcp = settings.force_tcp;
     let reconnect = settings.auto_reconnect;
     let network = vec![

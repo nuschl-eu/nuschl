@@ -25,6 +25,7 @@ nuschl-legacy-html.workspace = true
 nuschl-identity.workspace = true
 nuschl-kt.workspace = true
 nuschl-e2ee.workspace = true
+nuschl-version.workspace = true
 async-trait = "0.1.92"
 argon2 = { version = "0.5.3", default-features = false, features = [
   "alloc",

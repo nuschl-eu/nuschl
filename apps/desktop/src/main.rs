@@ -62,7 +62,7 @@ use gpui_kit::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
 use nuschl_session::config::Profile;
 
 #[derive(Parser)]
-#[command(version, about = "Nuschl GPUI desktop foundation")]
+#[command(version = nuschl_version::version(), about = "Nuschl GPUI desktop foundation")]
 struct Arguments {
     #[arg(long, global = true)]
     profile_dir: Option<PathBuf>,

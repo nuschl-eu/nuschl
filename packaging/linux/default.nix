@@ -39,6 +39,8 @@ let
     mkdir -p "$out/usr/bin"
     ln -s ../lib/nuschl/nuschl "$out/usr/bin/nuschl"
     cp -R --no-preserve=mode ${desktopFiles}/share "$out/usr/"
+    # The commit the programs show with their version, if recorded.
+    [ ! -e ${binaries}/share/nuschl ] || cp -R --no-preserve=mode ${binaries}/share/nuschl "$out/usr/share/"
     cp -R --no-preserve=mode ${nativeNotices}/share/licenses "$out/usr/share/"
     install -Dm644 ${projectRoot + "/LICENSE"} "$out/usr/share/licenses/nuschl/EUPL-1.2"
     install -Dm644 ${
