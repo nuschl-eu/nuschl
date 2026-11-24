@@ -473,6 +473,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "nuschl-video-encode" = rec {
+      packageId = "nuschl-video-encode";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nuschl-video-encode";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "nuschl-video-worker" = rec {
       packageId = "nuschl-video-worker";
       build = internal.buildRustCrateWithFeatures {
@@ -26783,6 +26793,26 @@ rec {
           "signer" = [ "ed25519" "mldsa44" "dep:getrandom" "ml-dsa/rand_core" ];
         };
         resolvedDefaultFeatures = [ "default" "ed25519" "mldsa44" "runtime-fixture" "signer" ];
+      };
+      "nuschl-video-encode" = rec {
+        crateName = "nuschl-video-encode";
+        version = "0.3.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../../crates/video-encode; };
+        libName = "nuschl_video_encode";
+        devDependencies = [
+          {
+            name = "nuschl-stream-quality";
+            packageId = "nuschl-stream-quality";
+          }
+          {
+            name = "rav1d";
+            packageId = "rav1d";
+            usesDefaultFeatures = false;
+            features = [ "bitdepth_8" ];
+          }
+        ];
+
       };
       "nuschl-video-worker" = rec {
         crateName = "nuschl-video-worker";
