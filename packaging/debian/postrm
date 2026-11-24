@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: EUPL-1.2
+# On purge dpkg deletes the sandbox launcher's AppArmor profile; this unloads it.
+set -e
+if [ "$1" = purge ] && [ -e /sys/kernel/security/apparmor/.remove ]; then
+  printf nuschl-bwrap 2>/dev/null >/sys/kernel/security/apparmor/.remove || true
+fi

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: EUPL-1.2
+# Nuschl's sandbox launcher /usr/lib/nuschl/bwrap, the bubblewrap it runs and
+# the workers bubblewrap starts may create user namespaces, which Ubuntu 23.10
+# and later restrict. The profile leaves them otherwise unconfined.
+abi <abi/4.0>,
+
+profile nuschl-bwrap /usr/lib/nuschl/bwrap flags=(unconfined) {
+  userns,
+}

@@ -863,7 +863,7 @@
         packages.${distroOutput "server-static"} = serverStatic;
         packages.${if linuxDistro ? aur then distroOutput "aur" else null} = linuxDistro.aur;
         packages.${distroOutput "apt-repository"} = linuxDistro.aptRepository.command;
-        # The clean-system package tests, including the Ubuntu AppArmor test.
+        # The clean-system package tests.
         legacyPackages.${distroOutput "distroTests"} = linuxDistro.tests;
         packages.default-crane = cranePackage;
         packages.emojiAssets = emojiAssets;

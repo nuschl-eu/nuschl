@@ -12,11 +12,13 @@ use tokio::process::Command;
 
 use crate::{Error, Role};
 
+/// The program `name` next to the running executable, else on the `PATH`.
+/// The Debian package's `bwrap` there runs bubblewrap under its AppArmor profile.
 fn helper(name: &'static str) -> Result<std::path::PathBuf, Error> {
-    std::env::var_os("PATH")
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    crate::sibling(name)
         .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .map(|directory| directory.join(name))
+        .chain(std::env::split_paths(&path).map(|directory| directory.join(name)))
         .find(|path| path.is_file())
         .ok_or(Error::MissingSandboxHelper(name))
 }

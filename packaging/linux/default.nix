@@ -27,11 +27,15 @@ let
     "nuschl-update-verify-ed25519"
     "nuschl-update-verify-mldsa44"
   ];
-  # Helper discovery looks next to the executable.
+  # Helper discovery looks next to the executable. The sandbox runs
+  # bubblewrap through the launcher bwrap there, which the AppArmor profile
+  # nuschl-bwrap lets create user namespaces.
   stage = pkgs.runCommand "nuschl-stage-${version}" { } ''
     for program in ${pkgs.lib.escapeShellArgs programs}; do
       install -Dm755 ${binaries}/lib/nuschl/$program "$out/usr/lib/nuschl/$program"
     done
+    install -Dm755 ${./bwrap} "$out/usr/lib/nuschl/bwrap"
+    install -Dm644 ${./apparmor.d/nuschl-bwrap} "$out/etc/apparmor.d/nuschl-bwrap"
     mkdir -p "$out/usr/bin"
     ln -s ../lib/nuschl/nuschl "$out/usr/bin/nuschl"
     cp -R --no-preserve=mode ${desktopFiles}/share "$out/usr/"

@@ -5,21 +5,25 @@
 # removes it.
 #   install-test.sh apt REPOSITORY SUITE VERSION NEXT-VERSION
 #   install-test.sh pacman PACKAGE
-#   install-test.sh apt-install REPOSITORY SUITE   (installs only)
-#   install-test.sh sandbox                        (checks the sandbox only)
 set -eux
 manager=$1
 shift
 id tester 2>/dev/null || useradd --create-home tester
 
 # The content worker renders a message through the sandbox, as an
-# unprivileged user and with the test VM's Nix store hidden. Without bwrap
+# unprivileged user and with the test VM's Nix store hidden. Without prlimit
 # on the PATH the sandbox fails closed.
 hidden='mkdir -p /nix && mount -t tmpfs none /nix && exec runuser -u tester --'
+profile=/etc/apparmor.d/nuschl-bwrap
 
 sandbox() {
   unshare --mount sh -c "$hidden nuschl render 'sandboxed **content**'" | grep -F content
   if unshare --mount sh -c "$hidden env PATH=/nonexistent /usr/bin/nuschl render text"; then exit 1; fi
+}
+
+# Whether AppArmor restricts unprivileged user namespaces, as Ubuntu does.
+restricted() {
+  test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = 1
 }
 
 worker_starts() {
@@ -57,6 +61,12 @@ apt)
   sources "$repository" "$suite"
   apt-get install --yes "nuschl=$version"
   check "${version%-*}"
+  if restricted; then
+    # Without the package's AppArmor profile the sandbox fails closed; the
+    # upgrade loads the profile again.
+    apparmor_parser --remove "$profile"
+    if unshare --mount sh -c "$hidden nuschl render text"; then exit 1; fi
+  fi
   apt-get install --yes nuschl
   test "$(dpkg-query --show --showformat '${Version}' nuschl)" = "$next"
   check "${next%-*}"
@@ -65,6 +75,8 @@ apt)
   test -z "$(runuser -u tester -- xdg-mime query default x-scheme-handler/mumble)"
   apt-get purge --yes nuschl
   if dpkg-query --show nuschl; then exit 1; fi
+  test ! -e "$profile"
+  if restricted && grep '^nuschl-bwrap ' /sys/kernel/security/apparmor/profiles; then exit 1; fi
   ;;
 pacman)
   package=$1
@@ -73,13 +85,6 @@ pacman)
   pacman --remove --noconfirm nuschl-bin
   test ! -e /usr/lib/nuschl
   test -z "$(runuser -u tester -- xdg-mime query default x-scheme-handler/mumble)"
-  ;;
-apt-install)
-  sources "$1" "$2"
-  apt-get install --yes nuschl
-  ;;
-sandbox)
-  sandbox
   ;;
 esac
 echo "install test passed"

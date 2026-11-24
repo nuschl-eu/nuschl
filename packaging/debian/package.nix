@@ -1,5 +1,6 @@
-# The .deb: the stage plus a control file. It has no maintainer scripts; the
-# dpkg triggers of desktop-file-utils and hicolor-icon-theme refresh the caches.
+# The .deb: the stage plus a control file. Its maintainer scripts load the
+# AppArmor profile and unload it on purge; the dpkg triggers of
+# desktop-file-utils and hicolor-icon-theme refresh the caches.
 # The portable build checks each program's libraries, interpreter and glibc
 # symbols; libc6 comes from the newest glibc symbol.
 {
@@ -20,8 +21,11 @@ pkgs.runCommand "nuschl_${version}_amd64.deb"
   ''
     cp -R ${stage} root
     chmod -R u+w root
-    glibc=$(readelf -VW root/usr/lib/nuschl/* | grep -o 'GLIBC_2\.[0-9.]*' | sort -uV | tail -n 1)
+    glibc=$(readelf -VW root/usr/lib/nuschl/nuschl* | grep -o 'GLIBC_2\.[0-9.]*' | sort -uV | tail -n 1)
     mkdir root/DEBIAN
+    install -m755 ${./postinst} root/DEBIAN/postinst
+    install -m755 ${./postrm} root/DEBIAN/postrm
+    echo /etc/apparmor.d/nuschl-bwrap > root/DEBIAN/conffiles
     cat > root/DEBIAN/control <<EOF
     Package: nuschl
     Version: ${version}
