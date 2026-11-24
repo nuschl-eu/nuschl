@@ -684,6 +684,173 @@ mod tests {
         assert!(!backlog.dropped(0));
     }
 
+    /// A queue sampled at `at`, as str0m reports it between polls.
+    struct Sample {
+        at: Instant,
+        oldest: Option<Instant>,
+        bytes: usize,
+    }
+
+    impl StreamTxQueueInfo for Sample {
+        fn created_at(&self) -> Instant {
+            self.at
+        }
+
+        fn byte_size(&self) -> usize {
+            self.bytes
+        }
+
+        fn packet_count(&self) -> usize {
+            usize::from(self.bytes > 0)
+        }
+
+        fn first_unsent(&self) -> Option<Instant> {
+            self.oldest
+        }
+    }
+
+    /// Random layered streams through a queue that drains at the receiver's
+    /// rate, sampled every few milliseconds, with late packets: a temporal
+    /// unit with a packet out goes out whole, key pictures go out, a packet of
+    /// a delta unit waits at most twice the bound beyond the key picture and
+    /// two units, and a link of 2.5 times the source's rate leaves nothing out.
+    #[test]
+    fn the_queue_holds_its_bounds_over_random_streams() {
+        let start = Instant::now();
+        let mut skipped = 0;
+        for seed in 1..=200u64 {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut below = |n: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % n
+            };
+            let rate = [500_000, 2_000_000, 8_000_000, 20_000_000][below(4) as usize];
+            let bound = [QUEUE_BOUND, LOW_LATENCY_BOUND][below(2) as usize];
+            let source = rate * (1 + below(12)) / 5;
+            let fps = [15, 30, 60][below(3) as usize];
+            let delta = source / 8 / fps;
+            let time = |bytes: u64| Duration::from_nanos(bytes * 8_000_000_000 / rate);
+            let limit = bound * 2 + time(12 * delta) + time(3 * delta) * 2;
+            let mut layers = Layers::default();
+            let mut backlog = Backlog::default();
+            // When each queued packet came and when it leaves.
+            let mut queue: VecDeque<(Instant, Instant, usize)> = VecDeque::new();
+            let mut sample = Sample {
+                at: start,
+                oldest: None,
+                bytes: 0,
+            };
+            let mut held = None;
+            let mut number = 0u16;
+            let mut left = VecDeque::new();
+            let mut keyed = 0;
+            for unit in 0..10 * fps {
+                // Key pictures at least 2 s apart, as the SFU asks for them.
+                let key = unit == 0 || unit >= keyed + 2 * fps && below(50) == 0;
+                if key {
+                    keyed = unit;
+                }
+                let bytes = if key { 8 } else { 1 } * delta * (50 + below(100)) / 100;
+                let timestamp = unit * 90_000 / fps;
+                // The unit's packets: one or two frames, then maybe a late one
+                // of the unit before.
+                let mut packets = Vec::new();
+                let frames = 1 + below(2);
+                for index in 0..frames {
+                    number = number.wrapping_add(1);
+                    let size = (bytes / frames).max(1);
+                    let count = size.div_ceil(1200);
+                    for packet in 0..count {
+                        let [high, low] = number.to_be_bytes();
+                        let flags = u8::from(packet == 0) << 7 | u8::from(packet + 1 == count) << 6;
+                        let first = key && index == 0;
+                        let mut descriptor = vec![flags | u8::from(!first), high, low];
+                        if unit == 0 && packet == 0 {
+                            descriptor.extend([0x80, 0x00, 0x3a, 0x40, 0x00]);
+                        }
+                        let marker = index + 1 == frames && packet + 1 == count;
+                        let payload = (size / count) as usize;
+                        packets.push((descriptor, timestamp, payload, marker, key));
+                    }
+                }
+                if let Some(late) = held.take() {
+                    packets.insert(1, late);
+                }
+                if unit > 0 && below(10) == 0 {
+                    held = packets.pop();
+                }
+                let at = start + Duration::from_nanos(unit * 1_000_000_000 / fps);
+                for (index, (descriptor, timestamp, payload, marker, key)) in
+                    packets.into_iter().enumerate()
+                {
+                    let now = at + Duration::from_micros(50 * index as u64);
+                    while queue.front().is_some_and(|&(_, leaves, _)| leaves <= now) {
+                        queue.pop_front();
+                    }
+                    if now >= sample.at + Duration::from_millis(1 + below(5)) {
+                        sample = Sample {
+                            at: now,
+                            oldest: queue.front().map(|&(came, ..)| came),
+                            bytes: queue.iter().map(|&(.., bytes)| bytes).sum(),
+                        };
+                    }
+                    let frame = layers
+                        .packet(&descriptor, payload, timestamp, now - start)
+                        .expect("valid descriptor");
+                    // As the selector: the rest of a frame left out stays out.
+                    if left.contains(&frame.number) {
+                        continue;
+                    }
+                    let discardable = !key && timestamp / (90_000 / fps) % 2 == 1;
+                    let out = backlog.out(timestamp);
+                    let admitted = backlog.layered(
+                        &frame,
+                        timestamp,
+                        discardable,
+                        Some(&sample),
+                        rate,
+                        bound,
+                        now,
+                    );
+                    if frame.start && frame.references().next().is_none() {
+                        assert_eq!(admitted, Layered::Send, "seed {seed}: a key picture");
+                    }
+                    let left_out = match admitted {
+                        Layered::Send => !out && backlog.capped(Some(&sample), payload),
+                        Layered::Skip => true,
+                    };
+                    assert!(
+                        !(out && left_out),
+                        "seed {seed}: a unit with a packet out loses one"
+                    );
+                    if left_out {
+                        assert!(
+                            5 * source > 2 * rate,
+                            "seed {seed}: left out on a wide link"
+                        );
+                        dd::push(&mut left, frame.number);
+                        skipped += 1;
+                        continue;
+                    }
+                    backlog.enqueued(payload, payload as u64, marker, timestamp);
+                    let free = queue.back().map_or(now, |&(_, leaves, _)| leaves.max(now));
+                    let leaves = free + time(payload as u64);
+                    queue.push_back((now, leaves, payload));
+                    if !key {
+                        let waited = leaves - now;
+                        assert!(
+                            waited <= limit,
+                            "seed {seed}: waited {waited:?} of {limit:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(skipped > 0);
+    }
+
     /// A key picture and a delta frame referencing the frame before it.
     fn key_and_delta() -> (Frame, Frame) {
         let mut layers = Layers::default();
