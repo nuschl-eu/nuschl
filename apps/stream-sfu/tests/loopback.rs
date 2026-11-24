@@ -484,7 +484,7 @@ async fn next(from_sfu: &mut mpsc::UnboundedReceiver<Value>) -> Value {
 /// Joins with the admit proof, the host proof and the room's keys as asked,
 /// decoding AV1 and VP9; returns the peer and the SFU's first answer.
 async fn join(url: &str, admit: &[u8; 32], host: bool, create: bool) -> (Peer, Value) {
-    join_decoding(url, admit, host, create, &["av1", "vp9"], false).await
+    join_decoding(url, admit, host, create, &["av1", "vp9"], &[]).await
 }
 
 async fn join_decoding(
@@ -493,7 +493,7 @@ async fn join_decoding(
     host: bool,
     create: bool,
     codecs: &[&str],
-    video_limits: bool,
+    capabilities: &[&str],
 ) -> (Peer, Value) {
     let (to_sfu, mut from_sfu) = connect(url).await;
     let hello = next(&mut from_sfu).await;
@@ -506,9 +506,9 @@ async fn join_decoding(
         "proof": prove(admit, b"nuschl/stream/v2 sfu admit", &nonce),
         "codecs": codecs,
     });
-    if video_limits {
-        assert_eq!(hello["video_limits"], true);
-        message["video_limits"] = true.into();
+    for &capability in capabilities {
+        assert_eq!(hello[capability], true);
+        message[capability] = true.into();
     }
     if host {
         message["host_proof"] = prove(&HOST, b"nuschl/stream/v2 sfu host", &nonce).into();
@@ -867,7 +867,8 @@ async fn video_limit_is_source_scoped_and_can_clear_on_a_quiet_source() {
     let sfu = start("");
     let url = &sfu.url;
     let (mut host, _) = join(url, &ADMIT, true, true).await;
-    let (mut receiver, _) = join_decoding(url, &ADMIT, false, false, &["av1"], true).await;
+    let (mut receiver, _) =
+        join_decoding(url, &ADMIT, false, false, &["av1"], &["video_limits"]).await;
     let (mut legacy, _) = join(url, &ADMIT, false, false).await;
     host.start_publishing(Codec::Av1);
     host.expect("quality").await;
@@ -996,12 +997,12 @@ async fn forwards_media_and_key_messages_unchanged() {
 
     // A peer without AV1 switches the call to VP9 and back when it leaves; a
     // peer without VP9 cannot join then.
-    let (vp9, welcome) = join_decoding(url, &ADMIT, false, false, &["vp9"], false).await;
+    let (vp9, welcome) = join_decoding(url, &ADMIT, false, false, &["vp9"], &[]).await;
     assert_eq!(welcome["codec"], "vp9");
     assert_eq!(bob.expect("codec").await["codec"], "vp9");
-    let (_, refused) = join_decoding(url, &ADMIT, false, false, &["av1"], false).await;
+    let (_, refused) = join_decoding(url, &ADMIT, false, false, &["av1"], &[]).await;
     assert_eq!(refused, json!({"type": "error", "reason": "codec"}));
-    let (_, refused) = join_decoding(url, &ADMIT, false, false, &[], false).await;
+    let (_, refused) = join_decoding(url, &ADMIT, false, false, &[], &[]).await;
     assert_eq!(refused["reason"], "join");
     let vp9_id = vp9.id;
     drop(vp9);
@@ -1782,4 +1783,129 @@ async fn one_endless_temporal_unit_stays_within_its_bound() {
         "b: {before:?} before, {last:?} in the last 5 s"
     );
     assert!(last.0 <= 24, "a's endless unit is shed: {counts:?}");
+}
+
+/// A browser-like encoder: a frame every 33 ms when the SFU's latest
+/// `max_bitrate` has paid for it, with up to 200 ms of credit; it drops the
+/// frame otherwise, as browsers do under a low target.
+#[derive(Default)]
+struct Encoder {
+    /// Each `max_bitrate` received.
+    limits: Vec<u64>,
+    credit: f64,
+    paid: Option<Instant>,
+}
+
+impl Encoder {
+    fn step(&mut self, host: &mut Peer, packets: usize) {
+        for message in host.messages.extract_if(.., |m| m["type"] == "quality") {
+            self.limits
+                .push(message["max_bitrate"].as_u64().expect("bitrate"));
+        }
+        let connected = host
+            .publish
+            .as_ref()
+            .is_some_and(|p| p.0.rtc.is_connected());
+        let due = host
+            .last_frame
+            .is_none_or(|at| at.elapsed() >= Duration::from_millis(33));
+        if !connected || !due {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = self
+            .paid
+            .replace(now)
+            .map_or(0.0, |at| (now - at).as_secs_f64());
+        let bytes_per_second = self.limits.last().copied().unwrap_or(0) as f64 / 8.0;
+        self.credit = (self.credit + bytes_per_second * elapsed).min(bytes_per_second * 0.2);
+        // send_frame's packets carry about 620 bytes of payload each.
+        let bytes = packets as f64 * 620.0;
+        if self.credit >= bytes {
+            self.credit -= bytes;
+            host.frame_packets = packets;
+            host.send_frame();
+        } else {
+            host.last_frame = Some(now);
+        }
+    }
+}
+
+/// A static screen sends little, so the viewer's estimate starts low and its
+/// traffic stays application-limited. The screen's encoder limit still reaches
+/// its tier's ceiling and the viewer gets its frame rate within seconds, and
+/// both hold when the content gets busy. A second publisher's camera reaches the
+/// viewer at its lowest tier alongside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quiet_screen_reaches_its_tier_on_a_fast_link() {
+    let sfu = start("receiver_bitrate = 6000000");
+    let url = sfu.url.as_str();
+    let (mut host, _) = join_decoding(url, &ADMIT, true, true, &["vp9"], &["screen_rate"]).await;
+    let (mut camera, _) = join(url, &ADMIT, false, false).await;
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
+    host.publish_source(Codec::Vp9, true);
+    camera.start_publishing(Codec::Vp9);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while viewer.tracks.len() < 2 {
+        assert!(Instant::now() < deadline, "both sources offered");
+        for peer in [&mut host, &mut camera, &mut viewer] {
+            peer.step();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    viewer.send(source_request(host.id, Kind::Screen, 1));
+    viewer.send(source_request(camera.id, Kind::Camera, 0));
+    let ceiling = Kind::Screen.ladder()[1].ceiling;
+    let mut encoder = Encoder::default();
+    // Frames of one packet while static (150 kbit/s), sixteen when busy (2.4 Mbit/s).
+    let mut run = async |packets: usize, seconds: u64| {
+        let end = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < end {
+            for peer in [&mut host, &mut camera, &mut viewer] {
+                peer.step();
+            }
+            if let Some(leg) = &mut viewer.subscribe {
+                leg.link.get_or_insert_with(|| {
+                    Link::new(
+                        8_000_000,
+                        Duration::from_millis(20),
+                        Duration::from_millis(500),
+                    )
+                });
+            }
+            camera.send_frame();
+            encoder.step(&mut host, packets);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let limits = encoder.limits.len();
+        let frames = viewer
+            .received
+            .get(&host.id)
+            .map_or(0, |p| p.iter().filter(|p| p.marker).count());
+        (limits, frames)
+    };
+    run(1, 4).await;
+    let (_, before) = run(1, 0).await;
+    let (reached, quiet) = run(1, 2).await;
+    let (_, busy) = run(16, 5).await;
+    drop(run);
+    let limits = &encoder.limits;
+    let quiet_fps = (quiet - before) as f64 / 2.0;
+    let busy_fps = (busy - quiet) as f64 / 5.0;
+    assert!(
+        limits[..reached]
+            .last()
+            .is_some_and(|&limit| limit >= ceiling * 9 / 10),
+        "the encoder limit stays below the tier's {ceiling}: {limits:?}"
+    );
+    assert!(
+        limits
+            .last()
+            .is_some_and(|&limit| limit >= ceiling * 9 / 10),
+        "the busy screen lost its limit: {limits:?}"
+    );
+    assert!(
+        quiet_fps >= 24.0 && busy_fps >= 24.0,
+        "{quiet_fps} fps quiet, {busy_fps} fps busy, limits {limits:?}"
+    );
 }
