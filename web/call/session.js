@@ -295,7 +295,7 @@ export class Call extends EventTarget {
 
   /** A send transceiver for `track`, encrypted in the stream worker. */
   sender(kind, track, mode) {
-    track.contentHint = HINTS[this.modes[kind].prefer][0];
+    if (kind !== "audio") track.contentHint = HINTS[this.modes[kind].prefer][0];
     mode = this.codec === "av1" ? mode : undefined;
     const add = (encoding) => this.publisher.addTransceiver(track, {
       direction: "sendonly", ...(encoding ? { sendEncodings: [{ scalabilityMode: encoding }] } : {}),

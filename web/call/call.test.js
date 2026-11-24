@@ -332,6 +332,10 @@ test("a source's mode sets its sender's hints and reaches the SFU", async () => 
   const camera = { getSettings: () => ({}) };
   call.sender("camera", camera);
   assert.equal(camera.contentHint, "motion");
+  // Tab audio keeps its own hint.
+  const audio = {};
+  call.sender("audio", audio);
+  assert.equal(audio.contentHint, undefined);
   delete globalThis.RTCRtpScriptTransform;
 });
 
