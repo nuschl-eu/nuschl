@@ -2307,14 +2307,17 @@ mod model {
         }
     }
 
-    /// A frame the source made.
+    /// A frame the source made: its id in the run, and its frame number.
     #[derive(Clone, Debug)]
     struct Made {
+        id: u64,
         number: u16,
         spatial: u8,
         temporal: u8,
         key: bool,
+        /// The frames it references, by number and by id.
         references: Vec<u16>,
+        refs: Vec<u64>,
         chains: Vec<u8>,
         packets: usize,
         timestamp: u64,
@@ -2331,11 +2334,15 @@ mod model {
     #[derive(Clone)]
     struct Packet {
         descriptor: Vec<u8>,
-        frame: u16,
+        id: u64,
         index: usize,
         timestamp: u64,
         /// The publisher's marker: the unit's last packet.
         marker: bool,
+        /// When the source sent it, and whether it repeats a packet: a repair
+        /// comes within the publisher's two seconds of history.
+        sent: Duration,
+        repair: bool,
     }
 
     /// The source: its structure, its active layers and its timing.
@@ -2352,11 +2359,12 @@ mod model {
         since_key: u64,
         units: u64,
         /// Per spatial layer, the latest frame of each temporal layer since the
-        /// key picture.
-        latest: Vec<Vec<Option<u16>>>,
+        /// key picture, by number and id.
+        latest: Vec<Vec<Option<(u16, u64)>>>,
         /// Per chain, its latest frame.
         chains: Vec<Option<u16>>,
-        frames: HashMap<u16, Made>,
+        frames: HashMap<u64, Made>,
+        made: u64,
     }
 
     impl Source {
@@ -2383,16 +2391,18 @@ mod model {
             for spatial in 0..self.active.0 {
                 let number = self.number;
                 self.number = self.number.wrapping_add(1);
-                let references: Vec<u16> = if key {
+                let id = self.made;
+                self.made += 1;
+                let references: Vec<(u16, u64)> = if key {
                     frames
                         .last()
-                        .map(|f: &Made| vec![f.number])
+                        .map(|f: &Made| vec![(f.number, f.id)])
                         .unwrap_or_default()
                 } else {
                     // The latest frame of a lower temporal layer, T0 for T0.
                     let latest = &self.latest[usize::from(spatial)];
                     let below = latest[..usize::from(temporal.max(1))].iter().flatten();
-                    let reference = below.min_by_key(|&&n| number.wrapping_sub(n));
+                    let reference = below.min_by_key(|&&(n, _)| number.wrapping_sub(n));
                     reference.into_iter().copied().collect()
                 };
                 // A key picture's base starts every chain.
@@ -2412,13 +2422,15 @@ mod model {
                         *last = Some(number);
                     }
                 }
-                self.latest[usize::from(spatial)][usize::from(temporal)] = Some(number);
+                self.latest[usize::from(spatial)][usize::from(temporal)] = Some((number, id));
                 frames.push(Made {
+                    id,
                     number,
                     spatial,
                     temporal,
                     key,
-                    references,
+                    references: references.iter().map(|r| r.0).collect(),
+                    refs: references.iter().map(|r| r.1).collect(),
                     chains,
                     packets: 1,
                     timestamp: self.timestamp,
@@ -2506,15 +2518,13 @@ mod model {
         fell: Option<(Duration, Option<u32>)>,
         /// The packets it got, per frame, and the units it lost frames of at
         /// the SFU.
-        got: HashMap<u16, HashSet<usize>>,
+        got: HashMap<u64, HashSet<usize>>,
         lost: HashSet<u64>,
-        /// The units it got a late frame of, with the publisher's marker alone.
-        late: HashSet<u64>,
         /// The latest unit the queue shed.
         shed: Option<u64>,
         generation: Option<u32>,
-        /// The marked packets it got, per unit.
-        marked: BTreeMap<u64, HashSet<(u16, usize)>>,
+        /// The marked packets it got, per unit, by frame id.
+        marked: BTreeMap<u64, HashSet<(u64, usize)>>,
     }
 
     /// What the SFU knows of the source: the layer sizes and active layers of
@@ -2587,6 +2597,18 @@ mod model {
             let old = viewer
                 .layer
                 .and_then(|old| choices.iter().position(|c| c.layer == old));
+            // When the old layer leaves the choices, the new one is at most the
+            // highest choice at or below it in both layers.
+            if had
+                && old.is_none()
+                && let Some(previous) = viewer.layer
+            {
+                let below = |c: &Choice| {
+                    c.layer.spatial <= previous.spatial && c.layer.temporal <= previous.temporal
+                };
+                let seat = choices.iter().rposition(below).unwrap_or(0);
+                assert!(point <= seat, "{previous:?} left the choices for {layer:?}");
+            }
             if had
                 && let Some(old) = old
                 && viewer.layer != Some(layer)
@@ -2630,6 +2652,10 @@ mod model {
     fn run(seed: u64) -> [usize; 4] {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let camera = seed.is_multiple_of(2);
+        // The source either jumps back in time now and then, as a new stream
+        // on the same source, or reopens its encoder, which numbers frames
+        // anew while its RTP timestamps run on.
+        let reopens = seed % 4 < 2;
         let svcs: &[Svc] = if camera {
             &[
                 Svc {
@@ -2674,6 +2700,7 @@ mod model {
             units: 0,
             latest: Vec::new(),
             chains: vec![None; usize::from(svc.spatial)],
+            made: 0,
             frames: HashMap::new(),
         };
         let mut layers = Layers::default();
@@ -2705,7 +2732,7 @@ mod model {
                 source.fps = rng.pick(rates);
                 steady_since = None;
             }
-            if rng.chance(1) {
+            if !reopens && rng.chance(1) {
                 // A new stream on the source: back in time.
                 source.timestamp -= 10 * CLOCK;
                 steady_since = None;
@@ -2719,6 +2746,11 @@ mod model {
             if key {
                 last_key = Some(wall);
                 seen.stats[3] += 1;
+                if reopens && rng.chance(5) {
+                    // A reopened encoder numbers its frames anew; its RTP
+                    // timestamps run on.
+                    source.number = source.number.wrapping_sub(1 + rng.below(200) as u16);
+                }
                 if rng.chance(10) {
                     // A new structure, or other active layers.
                     let svc = rng.pick(svcs);
@@ -2779,10 +2811,12 @@ mod model {
                     let first_mask = if packet == 0 && frame.key { mask } else { None };
                     let packet = Packet {
                         descriptor: source.descriptor(&frame, packet, first_mask),
-                        frame: frame.number,
+                        id: frame.id,
                         index: packet,
                         timestamp: frame.timestamp,
                         marker,
+                        sent: wall,
+                        repair: false,
                     };
                     let at = delivered + pending.len();
                     let at = if rng.chance(2) {
@@ -2791,11 +2825,15 @@ mod model {
                         at
                     };
                     if rng.chance(1) {
-                        pending.push((at + 3 + rng.below(20) as usize, packet.clone()));
+                        let repair = Packet {
+                            repair: true,
+                            ..packet.clone()
+                        };
+                        pending.push((at + 3 + rng.below(20) as usize, repair));
                     }
                     pending.push((at, packet));
                 }
-                source.frames.insert(frame.number, frame);
+                source.frames.insert(frame.id, frame);
             }
             if rng.chance(3) && pending.len() >= 2 {
                 let n = pending.len();
@@ -2803,14 +2841,21 @@ mod model {
                 pending[n - 2].0 = b;
                 pending[n - 1].0 = a;
             }
+            // Packets come in their order, reordered by up to 300 ms; repairs
+            // come within two seconds.
             pending.sort_by_key(|(at, _)| *at);
-            let ready = pending
-                .iter()
-                .take_while(|(at, _)| *at <= delivered + 8)
-                .count();
-            let ready: Vec<(usize, Packet)> = pending.drain(..ready).collect();
+            let due = |(at, packet): &(usize, Packet)| {
+                *at <= delivered + 8
+                    || !packet.repair
+                        && now.saturating_sub(packet.sent) > Duration::from_millis(300)
+            };
+            let (ready, wait): (Vec<_>, Vec<_>) = pending.drain(..).partition(due);
+            pending = wait;
             for (_, packet) in ready {
                 delivered += 1;
+                if packet.repair && now.saturating_sub(packet.sent) > Duration::from_secs(2) {
+                    continue;
+                }
                 deliver(
                     &mut layers,
                     &mut viewers,
@@ -2829,6 +2874,9 @@ mod model {
         }
         let now = wall;
         for (_, packet) in std::mem::take(&mut pending) {
+            if packet.repair && now.saturating_sub(packet.sent) > Duration::from_secs(2) {
+                continue;
+            }
             deliver(
                 &mut layers,
                 &mut viewers,
@@ -2851,7 +2899,7 @@ mod model {
     #[derive(Default)]
     struct Seen {
         stats: [usize; 4],
-        unreadable: HashSet<u16>,
+        unreadable: HashSet<u64>,
         known: Known,
     }
 
@@ -2864,11 +2912,11 @@ mod model {
         rng: &mut Rng,
         seen: &mut Seen,
     ) {
-        let made = &source.frames[&packet.frame];
+        let made = &source.frames[&packet.id];
         // A packet the SFU cannot read, from before or after the structure
         // it has, reaches no viewer.
         let Some(frame) = layers.packet(&packet.descriptor, 1000, packet.timestamp, now) else {
-            seen.unreadable.insert(packet.frame);
+            seen.unreadable.insert(packet.id);
             return;
         };
         if frame.start && made.key {
@@ -2918,9 +2966,6 @@ mod model {
                 continue;
             }
             seen.stats[0] += 1;
-            if owed {
-                viewer.late.insert(made.unit);
-            }
             let current = viewer.selector.current();
             if !rest {
                 let unit = viewer.selector.unit(&frame, packet.timestamp);
@@ -2976,12 +3021,12 @@ mod model {
             }
             viewer
                 .got
-                .entry(packet.frame)
+                .entry(packet.id)
                 .or_default()
                 .insert(packet.index);
             if marker {
                 let marks = viewer.marked.entry(made.unit).or_default();
-                marks.insert((packet.frame, packet.index));
+                marks.insert((packet.id, packet.index));
             }
         }
     }
@@ -2989,23 +3034,20 @@ mod model {
     /// Every whole frame a viewer got is decodable from whole frames it got,
     /// and a unit whose frames all reached the viewer whole has one marker, on
     /// its last packet.
-    fn check(viewer: &Viewer, source: &Source, unreadable: &HashSet<u16>) {
-        let whole = |number: &u16| {
-            let made = &source.frames[number];
-            viewer
-                .got
-                .get(number)
-                .is_some_and(|p| p.len() == made.packets)
+    fn check(viewer: &Viewer, source: &Source, unreadable: &HashSet<u64>) {
+        let whole = |id: &u64| {
+            let made = &source.frames[id];
+            viewer.got.get(id).is_some_and(|p| p.len() == made.packets)
         };
-        let mut units: BTreeMap<u64, Vec<u16>> = BTreeMap::new();
-        for number in viewer.got.keys() {
-            let made = &source.frames[number];
-            units.entry(made.unit).or_default().push(*number);
-            if whole(number) {
-                for reference in made.references.iter().filter(|r| !unreadable.contains(r)) {
+        let mut units: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for id in viewer.got.keys() {
+            let made = &source.frames[id];
+            units.entry(made.unit).or_default().push(*id);
+            if whole(id) {
+                for reference in made.refs.iter().filter(|r| !unreadable.contains(r)) {
                     assert!(
                         whole(reference),
-                        "frame {number} lacks {reference}: {:?} refs {:?}; got {:?} lost {}",
+                        "frame {id} lacks {reference}: {:?} refs {:?}; got {:?} lost {}",
                         made,
                         source.frames.get(reference),
                         viewer.got.get(reference),
@@ -3017,7 +3059,7 @@ mod model {
         // A unit with a packet the SFU found unreadable may lack its marker.
         let unreadable: HashSet<u64> = unreadable.iter().map(|f| source.frames[f].unit).collect();
         for (unit, frames) in units {
-            let lost = viewer.lost.contains(&unit) || viewer.late.contains(&unit);
+            let lost = viewer.lost.contains(&unit);
             if frames.iter().all(whole) && !lost && !unreadable.contains(&unit) {
                 let top = frames
                     .iter()
