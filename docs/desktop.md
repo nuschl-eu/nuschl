@@ -108,7 +108,9 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
   peer to peer, with a magic-wormhole code in the message that stock Mumble users
   can use with any wormhole client, and shows offers as file cards. An offer
   that cannot start, such as one whose magic-wormhole server is unreachable,
-  ends with a note in the composer.
+  ends with a note in the composer. **Stop offering** ends an offer and any
+  download from it still running; the conversation is told, and the offer
+  stays ended.
 - Attached images go at the message's quality, chosen beside them:
   - **Low** and **High** re-encode the image upright, without the original's
     metadata (GPS coordinates, capture time, device model) or file name: Low
