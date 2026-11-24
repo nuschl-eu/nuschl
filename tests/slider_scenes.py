@@ -478,7 +478,13 @@ class Scenes:
                 time.sleep(0.1)
             eventually(lambda: abs(saved(settings_path, "appearance", "zoom") - zoom / 100) < 0.001,
                        "zoom shortcut did not update the actual setting")
-            self.wait_for("push button", "Settings", "no Settings button").press()
+            button = eventually(lambda: self.find("push button", "Settings") or self.find("push button", "Channels"),
+                                "no Settings or Channels button")
+            if button.name == "Channels":
+                # A window too narrow for the sidebar shows it in the Channels sheet.
+                button.press()
+                button = self.wait_for("push button", "Settings", "no Settings button in the Channels sheet")
+            button.press()
             dialog = self.wait_for("dialog", "Settings", "Settings did not open")
             slider = self.wait_for("slider", "Voice activity sensitivity", "no sensitivity slider")
             slider.call("Component", "GrabFocus")
