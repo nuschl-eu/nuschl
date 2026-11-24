@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Step-down and step-up timing (§5.3). A [`Stepper`] moves along a list of
-//! points, lowest first, grouped by resolution and ordered by frame rate within a
-//! resolution: an encoder's tiers ([`Encoder`]) or a receiver's decode targets
-//! ([`crate::dd::Layers::choices`]). It steps down at once within a resolution
-//! and changes resolution at most once per 10 s; it steps up after the budget has
-//! covered 1.3 times the next point's floor for 10 s (frame rate) or 30 s
-//! (resolution).
+//! points, lowest first, grouped by what they keep and ordered by what gives way
+//! within a group: an encoder's tiers ([`Encoder`]) or a receiver's decode
+//! targets ([`crate::dd::Layers::choices`]), grouped by resolution, or by frame
+//! rate for a Smooth source. It steps down at once within a group and changes
+//! group at most once per 10 s; it steps up after the budget has covered 1.3
+//! times the next point's floor for 10 s (within a group) or 30 s (to another
+//! group).
 
 use crate::{Kind, Tier};
 use std::time::Duration;
 
-const FRAME_RATE_UP: Duration = Duration::from_secs(10);
-const RESOLUTION_UP: Duration = Duration::from_secs(30);
-const RESOLUTION_INTERVAL: Duration = Duration::from_secs(10);
+const WITHIN_GROUP_UP: Duration = Duration::from_secs(10);
+const GROUP_UP: Duration = Duration::from_secs(30);
+const GROUP_INTERVAL: Duration = Duration::from_secs(10);
 /// A receiver lowers its decode capacity after this long below 90 % of its
 /// target frame rate.
 const DECODE_SLOW: Duration = Duration::from_secs(3);
@@ -42,7 +43,7 @@ pub fn ceiling(floors: &[u64], current: usize, available: u64) -> usize {
 pub struct Stepper {
     current: usize,
     up_since: Option<Duration>,
-    resolution_changed: Option<Duration>,
+    group_changed: Option<Duration>,
 }
 
 impl Stepper {
@@ -50,7 +51,7 @@ impl Stepper {
         Self {
             current,
             up_since: None,
-            resolution_changed: None,
+            group_changed: None,
         }
     }
 
@@ -58,25 +59,32 @@ impl Stepper {
         self.current
     }
 
+    /// Moves to `point` of new points without a step: the hold toward a
+    /// higher point starts over.
+    pub fn seat(&mut self, point: usize) {
+        self.current = point;
+        self.up_since = None;
+    }
+
     /// Moves toward `ceiling`, the highest point the budget allows now (for
-    /// example from [`ceiling`] or [`crate::budget::allocate`]). `resolutions[i]`
-    /// is point i's resolution; returns the point to use.
-    pub fn update(&mut self, resolutions: &[u32], ceiling: usize, now: Duration) -> usize {
-        let Some(top) = resolutions.len().checked_sub(1) else {
+    /// example from [`ceiling`] or [`crate::budget::allocate`]). `groups[i]` is
+    /// point i's group, its resolution or frame rate; returns the point to use.
+    pub fn update(&mut self, groups: &[u32], ceiling: usize, now: Duration) -> usize {
+        let Some(top) = groups.len().checked_sub(1) else {
             return 0;
         };
         let ceiling = ceiling.min(top);
         self.current = self.current.min(top);
-        let resolution = resolutions[self.current];
+        let group = groups[self.current];
         let next = if ceiling < self.current {
             self.up_since = None;
-            let lowest = resolutions
+            let lowest = groups
                 .iter()
-                .position(|&r| r == resolution)
+                .position(|&g| g == group)
                 .unwrap_or(self.current);
             let may_change = self
-                .resolution_changed
-                .is_none_or(|at| now.saturating_sub(at) >= RESOLUTION_INTERVAL);
+                .group_changed
+                .is_none_or(|at| now.saturating_sub(at) >= GROUP_INTERVAL);
             if ceiling >= lowest || may_change {
                 ceiling
             } else {
@@ -84,10 +92,10 @@ impl Stepper {
             }
         } else if ceiling > self.current {
             let next = self.current + 1;
-            let hold = if resolutions[next] == resolution {
-                FRAME_RATE_UP
+            let hold = if groups[next] == group {
+                WITHIN_GROUP_UP
             } else {
-                RESOLUTION_UP
+                GROUP_UP
             };
             let since = *self.up_since.get_or_insert(now);
             if now.saturating_sub(since) < hold {
@@ -99,8 +107,8 @@ impl Stepper {
             self.up_since = None;
             return self.current;
         };
-        if resolutions[next] != resolution {
-            self.resolution_changed = Some(now);
+        if groups[next] != group {
+            self.group_changed = Some(now);
         }
         self.current = next;
         next
@@ -229,11 +237,23 @@ mod tests {
         assert_eq!(stepper.update(&RESOLUTIONS, 3, secs(2)), 0);
         let mut stepper = Stepper::new(3);
         assert_eq!(stepper.update(&RESOLUTIONS, 3, secs(0)), 3);
-        stepper.resolution_changed = Some(secs(100));
+        stepper.group_changed = Some(secs(100));
         assert_eq!(stepper.update(&RESOLUTIONS, 0, secs(105)), 2);
         assert_eq!(stepper.update(&RESOLUTIONS, 0, secs(109)), 2);
         // One resolution change may cross several points.
         assert_eq!(stepper.update(&RESOLUTIONS, 0, secs(110)), 0);
+    }
+
+    #[test]
+    fn a_smooth_source_drops_resolution_at_once_and_frame_rate_once_per_10_s() {
+        // Smooth decode targets (spatial, temporal): (0, 0), (0, 1), (0, 2),
+        // (1, 2), (2, 2), grouped by frame rate.
+        let frame_rates = [0, 1, 2, 2, 2];
+        let mut stepper = Stepper::new(4);
+        assert_eq!(stepper.update(&frame_rates, 2, secs(0)), 2);
+        assert_eq!(stepper.update(&frame_rates, 1, secs(1)), 1);
+        assert_eq!(stepper.update(&frame_rates, 0, secs(2)), 1);
+        assert_eq!(stepper.update(&frame_rates, 0, secs(11)), 0);
     }
 
     #[test]

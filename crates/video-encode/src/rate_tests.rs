@@ -312,3 +312,23 @@ fn a_stateful_backend_codes_each_input_once_and_follows_a_drop_with_a_keyframe()
     }
     assert!(dropped > 0);
 }
+
+#[test]
+fn a_reopened_encoder_continues_the_frame_numbers() {
+    let mut run = Run::new(camera(1_000_000, Layering::L1T3));
+    run.seconds(1, moving);
+    let sent = run.encoder.sent();
+    let model = Model {
+        pixels: 1280.0 * 720.0,
+        seed: 7,
+        calls: 0,
+    };
+    let config = camera(1_000_000, Layering::L1T3);
+    let encoder = Encoder::new(model, config).expect("one tile");
+    let mut encoder = encoder.continuing(sent);
+    let now = Duration::from_secs(1);
+    let encoded = encoder.encode(&moving(1.0), now).unwrap().expect("a frame");
+    assert!(encoded.keyframe);
+    let number = u16::from_be_bytes([encoded.descriptor[1], encoded.descriptor[2]]);
+    assert_eq!(u64::from(number), sent);
+}

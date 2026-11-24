@@ -5,7 +5,7 @@
 // connection, encrypted in the stream worker and encoded in the call codec.
 import { DirectPaths, ENCODINGS } from "./direct.js";
 import { MAX_PEERS, join, parse, publishTier } from "./signal.js";
-import { preferences, scalabilityMode, sendCodecs } from "./support.js";
+import { HINTS, preferences, scalabilityMode, sendCodecs, setLatency } from "./support.js";
 
 /** A publisher whose keys have not arrived is asked again after this. */
 const RESUBSCRIBE_MS = 5000;
@@ -24,6 +24,8 @@ export class Call extends EventTarget {
   keys = new Map();
   /** This page's camera, screen and optional tab audio. */
   sources = new Map();
+  /** The user's Sharp/Smooth and Low latency choice per video source. */
+  modes = { camera: { prefer: "smooth", low_latency: false }, screen: { prefer: "sharp", low_latency: false } };
   self = null;
   role = null;
   codec = null;
@@ -160,6 +162,14 @@ export class Call extends EventTarget {
         }
         return;
       }
+      case "mode": {
+        const track = this.tracks.get(message.mid);
+        if (track?.peer !== message.peer || track.kind !== "video") return;
+        track.mode = message.mode;
+        setLatency(track.receiver, track.mode);
+        setLatency(this.direct.track(track).receiver, track.mode);
+        return;
+      }
       case "error":
         return this.end(message.reason);
       default:
@@ -285,6 +295,7 @@ export class Call extends EventTarget {
 
   /** A send transceiver for `track`, encrypted in the stream worker. */
   sender(kind, track, mode) {
+    if (kind !== "audio") track.contentHint = HINTS[this.modes[kind].prefer][0];
     mode = this.codec === "av1" ? mode : undefined;
     const add = (encoding) => this.publisher.addTransceiver(track, {
       direction: "sendonly", ...(encoding ? { sendEncodings: [{ scalabilityMode: encoding }] } : {}),
@@ -322,6 +333,25 @@ export class Call extends EventTarget {
     return this.applyCap(kind, source);
   }
 
+  /** Sets `kind`'s Sharp/Smooth and Low latency choice, also for its live source. */
+  async setMode(kind, mode) {
+    this.modes[kind] = mode;
+    const source = this.sources.get(kind);
+    if (!source) return;
+    source.track.contentHint = HINTS[mode.prefer][0];
+    this.sendModes();
+    await this.applyCap(kind, source);
+  }
+
+  /** Tells the SFU the mode of each video source on the publish connection. */
+  sendModes() {
+    const modes = {};
+    for (const [kind, { transceiver }] of this.sources) {
+      if (kind !== "audio" && transceiver.mid) modes[transceiver.mid] = this.modes[kind];
+    }
+    this.send({ type: "modes", modes });
+  }
+
   applyCap(kind, source) {
     if (kind === "audio") return;
     source.applying = Promise.resolve(source.applying).then(async () => {
@@ -337,7 +367,10 @@ export class Call extends EventTarget {
       if (!encoding) return;
       const settings = source.track.getSettings();
       const scale = Math.max(1, Math.min(settings.width ?? 0, settings.height ?? 0) / height);
-      if (encoding.scaleResolutionDownBy === scale && encoding.maxFramerate === fps && encoding.maxBitrate === bitrate) return;
+      const degradation = HINTS[this.modes[kind].prefer][1];
+      if (encoding.scaleResolutionDownBy === scale && encoding.maxFramerate === fps && encoding.maxBitrate === bitrate &&
+        parameters.degradationPreference === degradation) return;
+      parameters.degradationPreference = degradation;
       encoding.scaleResolutionDownBy = scale;
       encoding.maxFramerate = fps;
       encoding.maxBitrate = bitrate;
@@ -403,6 +436,7 @@ export class Call extends EventTarget {
       await this.publisher.setLocalDescription();
       const screen = this.sources.get("screen")?.transceiver.mid;
       this.send({ type: "offer", sdp: this.publisher.localDescription.sdp, screens: screen ? [screen] : [] });
+      this.sendModes();
     } catch (error) {
       this.offering = false;
       throw error;

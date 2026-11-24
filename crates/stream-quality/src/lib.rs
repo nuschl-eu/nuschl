@@ -73,7 +73,7 @@ pub const SCREEN: [Tier; 4] = [
 pub enum Quality {
     /// The tile's size.
     Auto,
-    /// A tier index into the ladder.
+    /// The tile's size up to this tier index into the ladder.
     Tier(u8),
 }
 
@@ -115,11 +115,15 @@ impl Kind {
             .unwrap_or(0)
     }
 
-    /// The tier a viewer asks for: Auto asks for the tile's size.
+    /// The tier a viewer asks for: the tile's size, up to a chosen tier. Before
+    /// the tile has a size (0), a chosen tier asks for itself.
     pub fn request(self, quality: Quality, tile_height: u32) -> usize {
+        let fit = (tile_height > 0).then(|| self.fit(tile_height));
         match quality {
             Quality::Auto => self.fit(tile_height),
-            Quality::Tier(tier) => usize::from(tier).min(self.top()),
+            Quality::Tier(tier) => usize::from(tier)
+                .min(self.top())
+                .min(fit.unwrap_or(usize::MAX)),
         }
     }
 }
@@ -265,6 +269,11 @@ mod tests {
         assert_eq!(Kind::Camera.request(Quality::Auto, 4000), 3);
         assert_eq!(Kind::Screen.request(Quality::Tier(9), 0), 3);
         assert_eq!(Kind::Screen.request(Quality::Tier(1), 2000), 1);
+        assert_eq!(
+            Kind::Screen.request(Quality::Tier(2), 700),
+            0,
+            "a tier limits the tile"
+        );
         assert_eq!(Kind::Screen.tier_of(768), 0);
         assert_eq!(Kind::Screen.tier_of(1440), 2);
         assert_eq!(Kind::Camera.tier_of(90), 0);

@@ -93,7 +93,7 @@ mod tests {
             for (number, (temporal, bytes)) in (0u16..).zip(stream(layering, 24)) {
                 assert_eq!(bytes.len() > 3, number == 0, "{layering:?}");
                 let frame = layers
-                    .packet(&bytes, 1000, Duration::ZERO)
+                    .packet(&bytes, 1000, u64::from(number) * 3000, Duration::ZERO)
                     .expect("valid descriptor");
                 assert!(frame.start && frame.end);
                 assert_eq!(frame.number, number);
@@ -129,7 +129,10 @@ mod tests {
                 number,
                 plan.key.then_some((640, 360)),
             );
-            let frame = layers.packet(&bytes, 100, Duration::ZERO).expect("valid");
+            let timestamp = u64::from(number) * 3000;
+            let frame = layers
+                .packet(&bytes, 100, timestamp, Duration::ZERO)
+                .expect("valid");
             let expected = (!plan.key)
                 .then(|| pattern.slots[usize::from(plan.reference)])
                 .flatten()

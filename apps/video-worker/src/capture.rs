@@ -308,8 +308,10 @@ fn encode_pictures(
         #[cfg(feature = "aom")]
         let encoded = {
             let size = (settings.width, settings.height);
+            // A reopened encoder numbers its frames on.
             if current.as_ref().is_none_or(|(opened, _)| *opened != size) {
-                current = Some((size, aom::open(source, settings)?));
+                let sent = current.take().map_or(0, |(_, encoder)| encoder.sent());
+                current = Some((size, aom::open(source, settings)?.continuing(sent)));
             }
             let Some((_, encoder)) = &mut current else {
                 continue;

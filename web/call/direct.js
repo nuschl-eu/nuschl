@@ -3,7 +3,7 @@
 // through the stream worker's authenticated pair, and the SFU stays available
 // for fallback. A direct leg negotiates with detached senders.
 import { MAX_VIDEO_BITRATE, TIERS, fitTier, publishTier } from "./signal.js";
-import { sendCodecs } from "./support.js";
+import { sendCodecs, setLatency } from "./support.js";
 
 const GATHER_TIMEOUT = 3000;
 const SETUP_TIMEOUT = 15000;
@@ -95,6 +95,7 @@ function desiredRate(call, sources) {
 
 async function applyCaps({ kind, local, direct }, screenRate) {
   const caps = encodingOf(local.sender);
+  const { degradationPreference } = local.sender.getParameters();
   const parameters = direct.sender.getParameters();
   const encoding = parameters.encodings[0];
   const values = {
@@ -102,7 +103,9 @@ async function applyCaps({ kind, local, direct }, screenRate) {
     maxFramerate: caps.maxFramerate,
     scaleResolutionDownBy: caps.scaleResolutionDownBy,
   };
-  if (!Object.entries(values).some(([key, value]) => encoding[key] !== value)) return;
+  if (parameters.degradationPreference === degradationPreference &&
+    !Object.entries(values).some(([key, value]) => encoding[key] !== value)) return;
+  parameters.degradationPreference = degradationPreference;
   for (const [key, value] of Object.entries(values)) {
     if (value === undefined) delete encoding[key];
     else encoding[key] = value;
@@ -343,6 +346,7 @@ export class DirectPaths {
         receiver.transform = new RTCRtpScriptTransform(call.stream.worker, {
           side: "receive", peer, track: receiver.track.id,
         });
+        setLatency(receiver, [...call.tracks.values()].find((track) => track.peer === peer && track.source === source)?.mode);
         leg.tracks.set(source, { receiver, stream: new MediaStream([receiver.track]) });
       }
       await leg.pc.setLocalDescription();

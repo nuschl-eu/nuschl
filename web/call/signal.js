@@ -69,6 +69,10 @@ const messages = {
     limit: optional((value) => videoLimits.has(value)),
   },
   video_limit: { mid, peer: (value) => id(value) && value > 0, limit: (value) => videoLimits.has(value) },
+  mode: {
+    mid, peer: id,
+    mode: object({ prefer: oneOf("sharp", "smooth"), low_latency: optional((value) => typeof value === "boolean") }),
+  },
   error: { reason: text(64) },
 };
 
