@@ -285,6 +285,10 @@ pub struct Layers {
     window: Option<Duration>,
     /// Whether a full window has measured the rates.
     measured: bool,
+    /// When the latest packet arrived, and whether the current window holds
+    /// a pause of over a second.
+    last: Option<Duration>,
+    paused: bool,
     bytes: [u64; 32],
     rates: [u64; 32],
     /// The RTP timestamps of the latest temporal units, oldest first.
@@ -308,10 +312,14 @@ impl Layers {
         now: Duration,
     ) -> Option<Frame> {
         let frame = self.parse(descriptor)?;
+        self.paused |= self
+            .last
+            .is_some_and(|last| now.saturating_sub(last) > WINDOW);
+        self.last = Some(now);
         let elapsed = now.saturating_sub(*self.window.get_or_insert(now));
         if elapsed >= WINDOW {
-            // A window over two seconds long spans a pause: the rates stay.
-            if elapsed < 2 * WINDOW {
+            // A window across a pause keeps the rates it has.
+            if !self.paused || !self.measured {
                 let millis = elapsed.as_millis() as u64;
                 for target in 0..32 {
                     self.rates[target] = self.bytes[target] * 8000 / millis;
@@ -320,6 +328,7 @@ impl Layers {
             }
             self.bytes = [0; 32];
             self.window = Some(now);
+            self.paused = false;
         }
         for target in 0..32 {
             if frame.dti(target) != Dti::NotPresent {
@@ -1375,6 +1384,36 @@ mod tests {
         // A window across a three-second pause keeps the measured rates.
         l1t3_at(&mut layers, 31, 8000);
         assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+    }
+
+    #[test]
+    fn a_window_across_a_pause_keeps_the_rates() {
+        let mut layers = Layers::default();
+        let rate = |layers: &Layers| layers.choices(Kind::Screen, 3, false, 0)[2].rate;
+        for number in 0..61u16 {
+            l1t3_at(&mut layers, number, u64::from(number) * 1000 / 30);
+        }
+        assert_eq!(rate(&layers), 240_000);
+        // A 1.5 s pause inside the next window: the rates stay.
+        for number in 61..76u16 {
+            l1t3_at(
+                &mut layers,
+                number,
+                2000 + u64::from(number - 61) * 1000 / 30,
+            );
+        }
+        l1t3_at(&mut layers, 76, 4000);
+        assert_eq!(rate(&layers), 240_000);
+        // A 0.6 s pause counts: 16 frames of 8000 bits over 1.1 s.
+        for number in 77..92u16 {
+            l1t3_at(
+                &mut layers,
+                number,
+                4000 + u64::from(number - 76) * 1000 / 30,
+            );
+        }
+        l1t3_at(&mut layers, 92, 5100);
+        assert_eq!(rate(&layers), 16 * 8000 * 1000 / 1100);
     }
 
     #[test]

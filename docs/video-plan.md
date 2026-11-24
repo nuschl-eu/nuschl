@@ -326,8 +326,9 @@ Measurements, per source:
   source's frame rate: WebRTC's scalability modes double the frame rate with
   each temporal layer.
 - The bitrate of each target is its bytes over one-second windows from the
-  source's first frame. A window across a pause of over a second keeps the
-  previous rates. A new set of targets starts the windows over.
+  source's first frame. A window with a pause of over a second between two
+  packets keeps the previous rates, and gives a source without rates its
+  first ones. A new set of targets starts the windows over.
 
 Choices, per viewer: a target is eligible when its spatial layer's height
 belongs to the viewer's tier or a lower one and its frame rate is at most 1.25
