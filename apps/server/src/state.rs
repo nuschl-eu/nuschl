@@ -1032,28 +1032,27 @@ impl State {
 
     /// Remember a registered user's channel (Murmur's `setLastChannel`).
     pub fn remember_channel(&mut self, session: u32) {
-        // Temporary admission must not become the persisted reconnect target.
-        if self.knocks.grants.contains_key(&session) {
-            return;
-        }
-        let Some(user) = self.users.get(&session) else {
+        let Some((id, channel)) = self.remembered(session) else {
             return;
         };
-        let (Some(id), channel) = (user.user_id, user.channel) else {
-            return;
-        };
-        if self
-            .channels
-            .get(channel)
-            .is_some_and(|channel| channel.temporary)
-        {
-            return;
-        }
         if let Some(registered) = self.registry.users.get_mut(&id) {
             registered.last_channel = Some(channel);
             registered.last_active = Some(now_unix());
         }
         self.persist_registration(id);
+    }
+
+    /// The registration and channel a registered user's presence is recorded
+    /// with: none in a temporary channel, and none with a temporary admission,
+    /// which must not become the persisted reconnect target.
+    pub(crate) fn remembered(&self, session: u32) -> Option<(u32, u32)> {
+        let user = self.users.get(&session)?;
+        let temporary = self
+            .channels
+            .get(user.channel)
+            .is_some_and(|channel| channel.temporary);
+        (!temporary && !self.knocks.grants.contains_key(&session))
+            .then_some((user.user_id?, user.channel))
     }
 
     pub fn log_name(&self, session: u32) -> String {

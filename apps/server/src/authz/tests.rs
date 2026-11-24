@@ -3092,6 +3092,30 @@ fn a_stock_message_to_a_hidden_session_archives_nothing() {
     );
 }
 
+/// When a registered user was last seen moves on disconnect only where its
+/// channel would be recorded: a temporary channel leaves it as it was.
+#[test]
+fn leaving_from_a_temporary_channel_keeps_when_last_seen() {
+    let mut f = Fixture::new(Config::default());
+    let [_, _, _, member, registered, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(TEMP),
+            ..Default::default()
+        },
+    );
+    assert_eq!(f.state.users[&member].channel, TEMP);
+    for id in [MEMBER, REGISTERED] {
+        f.state.registry.users.get_mut(&id).unwrap().last_active = Some(0);
+    }
+    f.state.disconnect(member, true);
+    f.state.disconnect(registered, true);
+    assert_eq!(f.state.registry.users[&MEMBER].last_active, Some(0));
+    assert_ne!(f.state.registry.users[&REGISTERED].last_active, Some(0));
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is

@@ -661,7 +661,8 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   descriptions, comments, statistics, kicks, channel edits, links, ACLs,
   knocks and share links; no `PermissionDenied` names them, the registration
   list leaves out a last channel the reader does not see and when that user
-  was last seen. A hidden channel's
+  was last seen; a disconnect from a temporary channel or with a temporary
+  admission leaves that time as it was, as their moves there do. A hidden channel's
   name stays taken among its siblings, as on Murmur, so someone allowed to
   create channels there can find that a sibling of that name exists. Voice (speech
   into linked channels, whispers and shouts), stock text, typing indicators

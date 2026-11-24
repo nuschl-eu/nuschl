@@ -992,6 +992,8 @@ impl State {
     /// Drop a user's session: everyone else learns it left (`announce`, unless
     /// they were already told), and the connection flushes and closes.
     pub fn disconnect(&mut self, session: u32, announce: bool) {
+        // When it was last seen is recorded only where its channel would be.
+        let remembered = self.remembered(session).is_some();
         self.knock_left(session, None);
         let Some(user) = self.users.remove(&session) else {
             return;
@@ -1042,7 +1044,8 @@ impl State {
         {
             self.conversations.markers.remove(&account);
         }
-        if let Some(id) = user.user_id
+        if remembered
+            && let Some(id) = user.user_id
             && let Some(registered) = self.registry.users.get_mut(&id)
         {
             registered.last_active = Some(now_unix());
