@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 
 #[derive(Parser)]
 #[command(
-    version,
+    version = nuschl_version::version(),
     about = "Mumble client: newline-delimited JSON commands on stdin and events on stdout"
 )]
 struct Arguments {

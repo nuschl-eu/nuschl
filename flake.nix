@@ -150,6 +150,27 @@
         # are pinned together in nix/emoji.nix.
         emojiAssets = import ./nix/emoji.nix { inherit pkgs; };
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+        # The commit the shipped packages record for their programs' version
+        # (crates/version): `7884c04`, or `7884c04-dirty` for a dirty tree.
+        commit = self.shortRev or self.dirtyShortRev or null;
+        # A copy of a package with that commit in `directory`/commit. Only these
+        # copies change with each commit; checks and VM tests use the packages
+        # without the file.
+        withCommit =
+          directory: drv:
+          if commit == null then
+            drv
+          else
+            pkgs.runCommand drv.name { meta = drv.meta or { }; } ''
+              cp -R ${drv} $out
+              chmod -R u+w $out
+              # Wrappers name the package they are in.
+              for file in $(grep -rlIF ${drv} $out || true); do
+                substituteInPlace "$file" --replace-fail ${drv} $out
+              done
+              mkdir -p "$out/${directory}"
+              echo ${commit} > "$out/${directory}/commit"
+            '';
         common = {
           pname = "nuschl";
           inherit version;
@@ -243,14 +264,19 @@
         # Omit unsupported artifact names without evaluating a Linux builder
         # (or forcing pkgs for platforms that nixpkgs no longer supports).
         distroOutput = name: if system == "x86_64-linux" then name else null;
-        linuxDistro = import ./packaging/linux/default.nix {
-          inherit pkgs;
-          binaries = linuxPortable;
-          projectRoot = ./.;
-          nativeNotices = releaseNotices.portable.bundle;
-          desktopFiles = (import ./nix/desktop-files.nix { inherit pkgs; }).linux;
-          appstreamXML = ./packaging/flatpak/org.nuschl.Nuschl.metainfo.xml;
-        };
+        # Debian and Arch packages: the shipped ones from linux-portable with
+        # its commit file, the checks' ones from linux-portable without it.
+        linuxDistroWith =
+          binaries:
+          import ./packaging/linux/default.nix {
+            inherit pkgs binaries;
+            projectRoot = ./.;
+            nativeNotices = releaseNotices.portable.bundle;
+            desktopFiles = (import ./nix/desktop-files.nix { inherit pkgs; }).linux;
+            appstreamXML = ./packaging/flatpak/org.nuschl.Nuschl.metainfo.xml;
+          };
+        linuxDistro = linuxDistroWith (withCommit "share/nuschl" linuxPortable);
+        distroChecks = linuxDistroWith linuxPortable;
         installNotices = bundle: ''
           mkdir -p "$out/share/licenses/nuschl"
           cp -R ${bundle}/share/licenses/nuschl/. "$out/share/licenses/nuschl/"
@@ -546,6 +572,7 @@
               chmod -R u+w "$out/bin"
               ${packageLayout}
             '';
+        shipped = withCommit "share/nuschl" package;
         # Cross builds from Linux. A separate toolchain keeps native checks cached.
         crossToolchain =
           p:
@@ -718,6 +745,7 @@
               </dict>
               </plist>
               PLIST
+              ${lib.optionalString (commit != null) ''echo ${commit} > "$app/Contents/Resources/commit"''}
               install -Dm644 ${./LICENSE} "$app/Contents/Resources/EUPL-1.2"
               install -Dm644 ${
                 (import ./nix/desktop-files.nix { inherit pkgs; }).macIcon
@@ -861,19 +889,19 @@
         '';
       in
       {
-        packages.default = package;
+        packages.default = shipped;
         packages.${distroOutput "linux-native-stage"} = linuxDistro.stage;
         packages.${distroOutput "deb"} = linuxDistro.deb;
-        packages.${distroOutput "linux-portable"} = linuxPortable;
-        packages.${distroOutput "server-static"} = serverStatic;
+        packages.${distroOutput "linux-portable"} = withCommit "share/nuschl" linuxPortable;
+        packages.${distroOutput "server-static"} = withCommit "share/nuschl" serverStatic;
         packages.${if linuxDistro ? aur then distroOutput "aur" else null} = linuxDistro.aur;
         packages.${distroOutput "apt-repository"} = linuxDistro.aptRepository.command;
         # The clean-system package tests.
-        legacyPackages.${distroOutput "distroTests"} = linuxDistro.tests;
+        legacyPackages.${distroOutput "distroTests"} = distroChecks.tests;
         packages.default-crane = cranePackage;
         packages.emojiAssets = emojiAssets;
-        packages.server = serverPackage;
-        packages.witness = witnessPackage;
+        packages.server = withCommit "share/nuschl" serverPackage;
+        packages.witness = withCommit "share/nuschl" witnessPackage;
         packages.update-signer = updateSigner;
         packages.update-verifier-ed25519 = updateEdVerifier;
         packages.update-verifier-mldsa44 = updateMlVerifier;
@@ -882,13 +910,14 @@
           drv = updateSigner;
           exePath = "/bin/nuschl-update-sign";
         };
-        packages.musicbot = musicbotPackage;
+        packages.musicbot = withCommit "share/nuschl" musicbotPackage;
         packages.musicbot-web = musicbotWeb;
         packages.release-notices-musicbot = musicbotNotices.bundle;
-        packages.windows = windowsPackage;
+        # The zip and the installer hold bin/ and the licences.
+        packages.windows = withCommit "bin/share/nuschl" windowsPackage;
         packages.windows-installer = import ./packaging/windows/package.nix {
           inherit pkgs version;
-          windows = windowsPackage;
+          windows = self.packages.${system}.windows;
         };
         packages.windows-update-ed25519 = windowsVerifiers.ed25519;
         packages.windows-update-mldsa44 = windowsVerifiers.mldsa44;
@@ -902,8 +931,12 @@
         packages.rtc-probe = rtcPackage;
         packages.${if pkgs.stdenv.hostPlatform.isLinux then "video-probe" else null} = videoProbe;
         # The web client's tunnel relay and its probe (docs/web.md), from cached crates.
-        packages.web-relay = crates.project.workspaceMembers."nuschl-web-relay".build;
-        packages.stream-sfu = crates.project.workspaceMembers."nuschl-stream-sfu".build;
+        packages.web-relay =
+          withCommit "share/nuschl"
+            crates.project.workspaceMembers."nuschl-web-relay".build;
+        packages.stream-sfu =
+          withCommit "share/nuschl"
+            crates.project.workspaceMembers."nuschl-stream-sfu".build;
         packages.web-client = webClient.app;
         packages.web-wasm = webClient.wasm;
         packages.web-audio-wasm = webClient.audioWasm;
@@ -952,7 +985,7 @@
           };
         apps.default =
           (flake-utils.lib.mkApp {
-            drv = package;
+            drv = shipped;
             exePath = "/bin/nuschl";
           })
           // {
@@ -961,18 +994,27 @@
         # `nix run .#tui -- mumble://name@host`: the terminal client.
         apps.tui =
           (flake-utils.lib.mkApp {
-            drv = package;
+            drv = shipped;
             exePath = "/bin/nuschl-tui";
           })
           // {
             meta.description = "Nuschl in a terminal";
           };
         checks = {
-          ${distroOutput "distro-debian"} = linuxDistro.tests.debian;
-          ${distroOutput "distro-ubuntu"} = linuxDistro.tests.ubuntu;
-          ${distroOutput "distro-arch"} = linuxDistro.tests.arch;
-          ${distroOutput "distro-aur"} = linuxDistro.aurTest;
+          ${distroOutput "distro-debian"} = distroChecks.tests.debian;
+          ${distroOutput "distro-ubuntu"} = distroChecks.tests.ubuntu;
+          ${distroOutput "distro-arch"} = distroChecks.tests.arch;
+          ${distroOutput "distro-aur"} = distroChecks.aurTest;
           build = package;
+          # The shipped package shows its commit, from bin/ and libexec/nuschl/.
+          package-commit = pkgs.runCommand "nuschl-package-commit" { } ''
+            for program in nuschl nuschld; do
+              test "$(${shipped}/bin/$program --version)" = "$program ${version} (${
+                if commit == null then "dev" else commit
+              })"
+            done
+            touch $out
+          '';
           server-build = serverPackage;
           rtc-build = rtcPackage;
           clippy = craneLib.cargoClippy (
@@ -1110,6 +1152,7 @@
               inherit pkgs home-manager;
               module = self.homeModules.default;
               nuschl = package;
+              inherit shipped;
             };
           in
           {
@@ -1155,6 +1198,7 @@
               relay = crates.project.workspaceMembers."nuschl-web-relay".build;
               module = self.nixosModules.web;
               streamModule = self.nixosModules.stream;
+              sfuPackage = crates.project.workspaceMembers."nuschl-stream-sfu".build;
             };
             # The screen-share TURN relay and stream host under their modules,
             # with a fake SFU peer (`nix build .#checks.x86_64-linux.vm-turn-stream`).
@@ -1162,6 +1206,7 @@
               inherit pkgs;
               turnModule = self.nixosModules.turn;
               streamModule = self.nixosModules.stream;
+              sfuPackage = crates.project.workspaceMembers."nuschl-stream-sfu".build;
             };
             # The call page in headless Chromium and Firefox, subscribing through the
             # SFU and TURN to synthetic publishers (`nix build .#checks.x86_64-linux.vm-call-page`).
@@ -1170,6 +1215,7 @@
               turnModule = self.nixosModules.turn;
               streamModule = self.nixosModules.stream;
               callSite = self.packages.${system}.call-site;
+              sfuPackage = crates.project.workspaceMembers."nuschl-stream-sfu".build;
               nativeCallTest = crates.sessionTest;
               nativeCallWorkers = [
                 crates.project.workspaceMembers.nuschl-crypto-worker.build

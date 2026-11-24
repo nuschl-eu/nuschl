@@ -14,6 +14,7 @@ nuschl-ipc.workspace = true
 nuschl-legacy-html.workspace = true
 nuschl-session.workspace = true
 nuschl-protocol.workspace = true
+nuschl-version.workspace = true
 axum = { version = "0.8.9", default-features = false, features = [
   "http1",
   "json",

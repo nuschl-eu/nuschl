@@ -27,6 +27,7 @@ nuschl-sandbox.workspace = true
 nuschl-session.workspace = true
 nuschl-stream = { path = "../../crates/stream", version = "0.3.0" }
 nuschl-update.workspace = true
+nuschl-version.workspace = true
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = [
   "rt",

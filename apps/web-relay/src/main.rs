@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// The web client's tunnel relay (docs/web.md).
 #[derive(Parser)]
-#[command(version)]
+#[command(version = nuschl_version::version())]
 struct Arguments {
     /// Settings (nuschl-web-relay.toml); defaults without one.
     #[arg(long)]

@@ -33,6 +33,7 @@ nuschl-link-preview = { path = "crates/link-preview", version = "0.3.0" }
 nuschl-identity = { path = "crates/identity", version = "0.3.0" }
 nuschl-kt = { path = "crates/kt", version = "0.3.0" }
 nuschl-e2ee = { path = "crates/e2ee", version = "0.3.0" }
+nuschl-version = { path = "crates/version", version = "0.3.0" }
 
 nuschl-session = { path = "crates/session", version = "0.3.0" }
 nuschl-video-encode = { path = "crates/video-encode", version = "0.3.0" }

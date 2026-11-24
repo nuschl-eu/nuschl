@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(version, about = "The project auditor for Nuschl's key transparency")]
+#[command(version = nuschl_version::version(), about = "The project auditor for Nuschl's key transparency")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

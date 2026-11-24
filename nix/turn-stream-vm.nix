@@ -10,6 +10,7 @@
   pkgs,
   turnModule,
   streamModule,
+  sfuPackage,
 }:
 let
   site = pkgs.runCommand "nuschl-stream-test-site" { } ''
@@ -97,6 +98,7 @@ pkgs.testers.runNixOSTest {
           inherit site;
           sfu = {
             enable = true;
+            package = sfuPackage;
             port = 40010;
             addresses = [
               nodes.sfu.networking.primaryIPAddress

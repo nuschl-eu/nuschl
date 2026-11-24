@@ -27,7 +27,7 @@ use subsonic::Library;
 use tokens::Tokens;
 
 #[derive(Parser)]
-#[command(version, about = "Mumble music bot for Subsonic servers")]
+#[command(version = nuschl_version::version(), about = "Mumble music bot for Subsonic servers")]
 struct Arguments {
     /// TOML configuration (see nuschl-musicbot.example.toml).
     #[arg(long)]

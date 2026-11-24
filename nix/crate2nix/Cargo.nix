@@ -483,6 +483,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "nuschl-version" = rec {
+      packageId = "nuschl-version";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "nuschl-version";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "nuschl-video-encode" = rec {
       packageId = "nuschl-video-encode";
       build = internal.buildRustCrateWithFeatures {
@@ -24621,6 +24631,10 @@ rec {
             packageId = "nuschl-update";
           }
           {
+            name = "nuschl-version";
+            packageId = "nuschl-version";
+          }
+          {
             name = "serde_json";
             packageId = "serde_json";
           }
@@ -24831,6 +24845,10 @@ rec {
           {
             name = "nuschl-session";
             packageId = "nuschl-session";
+          }
+          {
+            name = "nuschl-version";
+            packageId = "nuschl-version";
           }
           {
             name = "serde";
@@ -25971,6 +25989,10 @@ rec {
             packageId = "nuschl-session";
           }
           {
+            name = "nuschl-version";
+            packageId = "nuschl-version";
+          }
+          {
             name = "serde";
             packageId = "serde";
             features = [ "derive" ];
@@ -26720,6 +26742,10 @@ rec {
             packageId = "nuschl-stream-quality";
           }
           {
+            name = "nuschl-version";
+            packageId = "nuschl-version";
+          }
+          {
             name = "serde";
             packageId = "serde";
             features = [ "derive" ];
@@ -26944,6 +26970,10 @@ rec {
             packageId = "nuschl-session";
           }
           {
+            name = "nuschl-version";
+            packageId = "nuschl-version";
+          }
+          {
             name = "ratatui";
             packageId = "ratatui";
             usesDefaultFeatures = false;
@@ -27156,6 +27186,20 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "ed25519" "mldsa44" "runtime-fixture" "signer" ];
       };
+      "nuschl-version" = rec {
+        crateName = "nuschl-version";
+        version = "0.3.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ../../crates/version; };
+        libName = "nuschl_version";
+        devDependencies = [
+          {
+            name = "tempfile";
+            packageId = "tempfile";
+          }
+        ];
+
+      };
       "nuschl-video-encode" = rec {
         crateName = "nuschl-video-encode";
         version = "0.3.0";
@@ -27365,6 +27409,10 @@ rec {
             packageId = "nuschl-protocol";
           }
           {
+            name = "nuschl-version";
+            packageId = "nuschl-version";
+          }
+          {
             name = "prost";
             packageId = "prost";
           }
@@ -27475,6 +27523,10 @@ rec {
           {
             name = "nuschl-protocol";
             packageId = "nuschl-protocol";
+          }
+          {
+            name = "nuschl-version";
+            packageId = "nuschl-version";
           }
           {
             name = "rustls";
@@ -27597,6 +27649,10 @@ rec {
           {
             name = "nuschl-protocol";
             packageId = "nuschl-protocol";
+          }
+          {
+            name = "nuschl-version";
+            packageId = "nuschl-version";
           }
           {
             name = "prost";

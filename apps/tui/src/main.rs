@@ -23,7 +23,7 @@ use nuschl_session::config::Profile;
 use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 
 #[derive(Parser)]
-#[command(version, about = "Nuschl in a terminal")]
+#[command(version = nuschl_version::version(), about = "Nuschl in a terminal")]
 struct Arguments {
     /// A separate profile (settings, servers, history, identity) in this folder.
     #[arg(long)]

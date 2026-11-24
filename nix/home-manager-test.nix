@@ -6,7 +6,10 @@
   pkgs,
   home-manager,
   module,
+  # The package without its commit file, as in every check, and the shipped
+  # one with it (flake.nix, withCommit).
   nuschl,
+  shipped,
 }:
 let
   inherit (pkgs) lib;
@@ -22,7 +25,10 @@ let
             homeDirectory = "/home/alice";
             stateVersion = "26.05";
           };
-          programs.nuschl.enable = true;
+          programs.nuschl = {
+            enable = true;
+            package = nuschl;
+          };
         }
         extra
       ];
@@ -179,7 +185,7 @@ in
 assert lib.assertMsg legacy.config.programs.nuschl.settings.force_tcp
   "legacy programs.nuschel alias lost settings";
 assert lib.assertMsg (
-  full.config.programs.nuschl.package.outPath == nuschl.outPath
+  plain.options.programs.nuschl.package.default.outPath == shipped.outPath
 ) "programs.nuschl.package does not default to this flake's package";
 assert lib.assertMsg (accepted == [ ]) "invalid bookmarks were accepted: ${toString accepted}";
 assert lib.assertMsg (lib.length settingFields > 15) "could not read ClientSettings' fields";
@@ -317,6 +323,7 @@ assert lib.assertMsg (accepts {
           home.stateVersion = "26.05";
           programs.nuschl = {
             enable = true;
+            package = nuschl;
             autostart = true;
             # The user's own choice, under a managed one.
             initialSettings.enter_sends = true;
@@ -368,7 +375,7 @@ assert lib.assertMsg (accepts {
       machine.wait_for_unit("murmur.service")
 
       with subtest("the package is on the user's PATH with its desktop entry and icons"):
-          machine.succeed("su - alice -c 'nuschl --version' | grep -Fx 'nuschl ${(builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version}'")
+          machine.succeed("su - alice -c 'nuschl --version' | grep -Fx 'nuschl ${(builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version} (dev)'")
           machine.succeed("test \"$(su - alice -c 'readlink -f \"$(command -v nuschl)\"')\" = ${nuschl}/bin/nuschl")
           machine.succeed("test -e /etc/profiles/per-user/alice/share/applications/org.nuschl.Nuschl.desktop")
           machine.succeed("test -e /etc/profiles/per-user/alice/share/icons/hicolor/scalable/apps/org.nuschl.Nuschl.svg")

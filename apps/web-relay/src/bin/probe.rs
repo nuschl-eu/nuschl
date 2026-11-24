@@ -5,7 +5,7 @@ use clap::Parser;
 use nuschl_web_relay::probe::{self, Probe};
 
 #[derive(Parser)]
-#[command(version)]
+#[command(version = nuschl_version::version())]
 struct Arguments {
     /// The relay's WebSocket URL, e.g. ws://127.0.0.1:8090/relay.
     #[arg(long)]

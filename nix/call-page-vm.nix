@@ -12,6 +12,7 @@
   callSite,
   nativeCallTest,
   nativeCallWorkers,
+  sfuPackage,
 }:
 let
   restSecret = "call-test-rest-secret";
@@ -88,6 +89,7 @@ pkgs.testers.runNixOSTest {
           inherit site;
           sfu = {
             enable = true;
+            package = sfuPackage;
             port = mediaPort;
             addresses = [ nodes.sfu.networking.primaryIPAddress ];
             openFirewall = true;

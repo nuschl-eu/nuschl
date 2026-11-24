@@ -26,6 +26,7 @@ workspace = true
 [dependencies]
 hex = "0.4.3"
 nuschl-protocol.workspace = true
+nuschl-version.workspace = true
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

@@ -176,6 +176,16 @@ command offline on crane's vendored crates and fails with a diff when its output
 differs from `nix/crate2nix`. Clippy, tests and the Windows/macOS cross builds use
 crane (`.#default-crane` builds the package the same way).
 
+The programs show their version with a commit: `nuschl --version` prints
+`nuschl 0.3.0 (7884c04)`, Settings shows it under General, and `nuschld` logs it at
+startup (`crates/version`). They read it from `share/nuschl/commit` in their
+installation. The flake's shipped packages (`default`, `server`, `linux-portable`,
+`deb`, `windows`, `macos-app` and the others) are copies with that file, holding
+`self.shortRev`, or `self.dirtyShortRev` for a dirty tree. No compiled derivation
+depends on the commit, and checks and VM tests use the packages without the file and
+show `dev`. Cargo builds in a git checkout compile in its commit, with `-dirty` for
+uncommitted changes to tracked files; the installation's file takes precedence.
+
 Windows and macOS packages are cross-built from Linux: `.#windows`, `.#macos-app`,
 `.#macos-universal` and `.#macos-aarch64` ([install.md](install.md#how-releases-are-made)).
 

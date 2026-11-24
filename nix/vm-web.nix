@@ -11,6 +11,7 @@
   relay,
   module,
   streamModule,
+  sfuPackage,
 }:
 let
   mediaPort = 40010;
@@ -67,6 +68,7 @@ pkgs.testers.runNixOSTest {
           enableACME = false;
           sfu = {
             enable = true;
+            package = sfuPackage;
             port = mediaPort;
             addresses = [ nodes.web.networking.primaryIPAddress ];
             openFirewall = true;
