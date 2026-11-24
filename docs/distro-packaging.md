@@ -33,7 +33,8 @@ In the stage it is a launcher script that runs `/usr/bin/bwrap`, and the
 AppArmor profile `/etc/apparmor.d/nuschl-bwrap` attaches to it: Ubuntu 23.10 and
 later give user namespaces of programs without a profile no capabilities. The
 profile allows user namespaces and leaves everything else unconfined
-(`flags=(unconfined)`); bubblewrap and the workers inherit it. It needs
+(`flags=(unconfined)`); bubblewrap and the workers inherit it, and bubblewrap's
+`--disable-userns` leaves the workers no user namespace to create. It needs
 AppArmor 4.0 (Debian 13, Ubuntu 24.04). The `.deb` marks it as a conffile, its
 postinst loads it where `aa-enabled` reports AppArmor active, and its postrm
 unloads it on purge.
@@ -73,8 +74,8 @@ needs another library, a newer glibc symbol, another interpreter, or names a Nix
 store path.
 
 Host requirements beyond glibc 2.17: PipeWire 0.3.53 for the media worker, whose
-CPAL backend calls `pw_stream_get_time_n`, and a bubblewrap with `--clearenv` for
-every worker. Debian 11's own bubblewrap 0.4.1 and PipeWire 0.3.19 fail these
+CPAL backend calls `pw_stream_get_time_n`, and a bubblewrap with `--clearenv` and
+`--disable-userns` (0.8.0) for every worker. Debian 11's own bubblewrap 0.4.1 and PipeWire 0.3.19 fail these
 checks and the workers fail closed; with bubblewrap 0.8.0 and PipeWire 0.3.65 from
 `bullseye-backports` they start. Workers run as `/worker` in their sandbox and find
 the interpreter and host libraries in its read-only `/usr/lib`, `/lib` and `/lib64`.
@@ -103,7 +104,8 @@ installs the package, runs `nuschl --version` and starts the RTC and video
 workers with the Nix store hidden, checks `xdg-mime query default` for both URL
 schemes, and renders a message with
 `nuschl render` as an unprivileged user, which runs the content worker in its
-sandbox; the same command fails without `prlimit` on the `PATH`. Debian and
+sandbox; the same command fails without `prlimit` on the `PATH`. In the content
+worker's sandbox, `unshare --user` fails. Debian and
 Ubuntu install from the signed test repository with apt, upgrade to the next
 revision, remove and purge. Arch installs `nuschl-bin` with `pacman -U` and
 removes it.

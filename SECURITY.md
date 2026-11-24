@@ -72,7 +72,9 @@ closed when a sandbox helper or platform policy is unavailable.
 
 On Linux (`crates/sandbox/src/linux.rs`) every worker runs under prlimit and
 bubblewrap with all namespaces unshared, read-only system libraries, private
-`/proc`, `/dev` and `/tmp`, an empty environment, and dies with its parent. Roles
+`/proc`, `/dev` and `/tmp`, an empty environment, and dies with its parent.
+bubblewrap's `--disable-userns` (0.8.0 and later) leaves the worker no user
+namespace to create, and bubblewrap fails when one could still be created. Roles
 add only:
 
 | Role | Grants | Limits |
@@ -95,8 +97,9 @@ The sandbox runs `prlimit` and `bwrap` from the executable's directory when they
 are there, else from the `PATH`. The Debian and Arch packages install
 `/usr/lib/nuschl/bwrap`, which runs `/usr/bin/bwrap`, and the AppArmor profile
 `nuschl-bwrap` for that path. Where AppArmor restricts unprivileged user
-namespaces (Ubuntu 23.10 and later), the profile lets the launcher, bubblewrap
-and the workers create them, as on systems without the restriction.
+namespaces (Ubuntu 23.10 and later), the profile lets the launcher and
+bubblewrap create them. The workers run under the same profile and cannot
+create any.
 
 Rules for every platform:
 
