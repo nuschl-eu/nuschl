@@ -657,7 +657,7 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   a client did not know brings that parent first. A change sends a client at
   most the channel tree it sees, as at login. A request that names a channel
   or someone the client does not see gets the answer for one that does not
-  exist: moves, listeners, text, whisper targets, permission queries,
+  exist: moves, listeners and their volumes, text, whisper targets, permission queries,
   descriptions, comments, statistics, kicks, channel edits, links, ACLs,
   knocks and share links; no `PermissionDenied` names them, the registration
   list leaves out a last channel the reader does not see. A hidden channel's

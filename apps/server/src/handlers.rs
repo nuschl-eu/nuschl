@@ -691,7 +691,7 @@ impl State {
         message.listening_volume_adjustment.retain(|adjustment| {
             adjustment
                 .listening_channel
-                .is_some_and(|channel| self.channels.get(channel).is_some())
+                .is_some_and(|channel| self.sees_channel(source, channel))
                 && adjustment.volume_adjustment.is_some_and(f32::is_finite)
         });
         message.listening_volume_adjustment.truncate(256);

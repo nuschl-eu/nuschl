@@ -2828,6 +2828,34 @@ fn a_direct_message_to_someone_in_a_hidden_channel_is_answered_as_when_they_are_
     assert_eq!(hidden, offline);
 }
 
+/// A volume adjustment for a hidden channel comes back as one for a missing
+/// channel: left out of the echo.
+#[test]
+fn volume_adjustments_for_a_hidden_channel_are_answered_as_for_a_missing_one() {
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let registered = f.actor("registered");
+    let ask = |f: &mut Fixture, channel: u32| {
+        f.received(registered);
+        f.handle(
+            registered,
+            kind::USER_STATE,
+            &proto::UserState {
+                self_mute: Some(true),
+                listening_volume_adjustment: vec![proto::user_state::VolumeAdjustment {
+                    listening_channel: Some(channel),
+                    volume_adjustment: Some(0.5),
+                }],
+                ..Default::default()
+            },
+        );
+        f.received(registered)
+    };
+    assert!(!f.state.sees_channel(registered, SECRET));
+    assert_eq!(ask(&mut f, SECRET), ask(&mut f, 999));
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is
