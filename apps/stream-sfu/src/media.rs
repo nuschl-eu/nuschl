@@ -15,7 +15,7 @@ use crate::{
         self, ClientMessage, Decoders, MAX_SCREEN_BITRATE, Mode, PeerInfo, ServerMessage, Track,
         TurnCredentials, VideoLimit, Welcome,
     },
-    quality::{self, Layered, VideoAdmission},
+    quality,
     rooms::{self, Bucket, Join, Nonce, PeerId, Refusal, RoomId, Rooms},
     routing::Routing,
     traffic::Traffic,
@@ -1064,129 +1064,29 @@ impl Core {
             let Some(stream) = api.stream_tx_by_mid(out_mid, None) else {
                 continue;
             };
-            let view = &mut forward.view;
-            // A new target list gives the indices other layers: the lowest
-            // target until the next second's choice.
-            if let Some((generation, lowest)) = targets
-                && view
-                    .generation
-                    .replace(generation)
-                    .is_some_and(|g| g != generation)
-            {
-                view.selector.meanwhile(None);
-                view.selector.want(lowest);
-            }
-            let layered = frame.flatten();
-            // The rest of a frame that went out goes out whole, also late, and
-            // so does a late frame that frames out reference.
-            let rest = layered
-                .as_ref()
-                .is_some_and(|f| view.selector.sent(f) || view.selector.owes(f));
-            if video && view.backlog.dropped(timestamp) && !rest {
-                view.rewrite.skip(*packet.seq_no);
-                if let Some(frame) = &layered {
-                    view.selector.dropped(frame);
-                }
-                keyframe |= view.selector.needs_keyframe();
-                continue;
-            }
-            let marker = match &frame {
-                None => Some(packet.header.marker),
-                Some(None) => None,
-                Some(Some(frame)) => view
-                    .selector
-                    .forward(frame, timestamp, packet.header.marker),
-            };
-            keyframe |= view.selector.needs_keyframe();
-            let Some(marker) = marker else {
-                view.rewrite.skip(*packet.seq_no);
-                continue;
-            };
-            let full = if video {
-                let queue = stream.queue_info();
-                let bitrate = peer.estimate.min(self.config.receiver_bitrate);
-                match view.backlog.admission(timestamp, queue, can_request, now) {
-                    VideoAdmission::Regular => match &layered {
-                        None => view.backlog.full(queue, bitrate, payload, bound, now),
-                        Some(frame) => {
-                            let discardable = view.selector.discardable(frame);
-                            match view.backlog.layered(
-                                frame,
-                                timestamp,
-                                discardable,
-                                queue,
-                                bitrate,
-                                bound,
-                                now,
-                            ) {
-                                // A unit with a packet out goes out whole.
-                                Layered::Send => {
-                                    !rest
-                                        && !view.backlog.out(timestamp)
-                                        && view.backlog.capped(queue, payload)
-                                }
-                                Layered::Skip => {
-                                    view.rewrite.skip(*packet.seq_no);
-                                    view.selector.dropped(frame);
-                                    keyframe |= view.selector.needs_keyframe();
-                                    continue;
-                                }
-                            }
-                        }
-                    },
-                    VideoAdmission::Burst(bytes) => view.backlog.burst_full(queue, bytes + cost),
-                    VideoAdmission::Pause => {
-                        view.rewrite.skip(*packet.seq_no);
-                        continue;
-                    }
-                    VideoAdmission::RequestKeyframe => {
-                        view.rewrite.skip(*packet.seq_no);
-                        keyframe = true;
-                        continue;
-                    }
-                }
-            } else {
-                false
-            };
             let room_budget = &mut self.rooms.get_mut(&room).expect("room").budget;
-            // The budgets lend a layered unit with a packet out its rest.
-            let lend = rest || layered.is_some() && view.backlog.out(timestamp);
-            let charge = |bucket: &mut Bucket| {
-                if lend {
-                    bucket.lend(cost as f64, now);
-                }
-                lend || bucket.take(cost as f64, now)
+            let arrival = quality::Arrival {
+                frame,
+                video,
+                seq: *packet.seq_no,
+                timestamp,
+                marker: packet.header.marker,
+                payload,
+                cost,
+                bound,
+                can_request,
+                targets,
             };
-            let limit = if full {
-                Some(VideoLimit::ForwardingBacklog)
-            } else if !charge(&mut peer.budget) {
-                Some(VideoLimit::SfuViewer)
-            } else if !charge(room_budget) {
-                Some(VideoLimit::SfuRoom)
-            } else {
-                None
-            };
-            if let Some(limit) = limit {
-                if video {
-                    view.rewrite.skip(*packet.seq_no);
-                    view.backlog
-                        .shed(timestamp, frame.is_none().then_some(now), limit);
-                    if let Some(frame) = &layered {
-                        view.selector.dropped(frame);
-                    }
-                }
-                keyframe |= view.selector.needs_keyframe();
-                continue;
-            }
-            let Some(seq) = view.rewrite.forward(*packet.seq_no) else {
-                if let Some(frame) = &layered {
-                    view.selector.dropped(frame);
-                }
+            let bitrate = peer.estimate.min(self.config.receiver_bitrate);
+            let budgets = [&mut peer.budget, room_budget];
+            let (out, wants) =
+                forward
+                    .view
+                    .admit(&arrival, stream.queue_info(), bitrate, budgets, now);
+            keyframe |= wants;
+            let Some((seq, marker)) = out else {
                 continue;
             };
-            if video {
-                view.backlog.enqueued(payload, cost, marker, timestamp);
-            }
             stream.write_rtp(
                 RtpWrite::new(
                     pt,

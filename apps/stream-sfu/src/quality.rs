@@ -16,10 +16,13 @@
 //! gets is the least of both; until it asks, it asks for the top tier. Once a
 //! second the publisher hears the resulting demand for each source.
 
-use crate::protocol::{Mode, Prefer, VideoLimit};
+use crate::{
+    protocol::{Mode, Prefer, VideoLimit},
+    rooms::Bucket,
+};
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
-    dd::{self, Frame, Layers, Pace, Selector},
+    dd::{self, Frame, Layers, Pace, Selector, Wanted},
     receive,
 };
 use std::{
@@ -92,6 +95,166 @@ pub struct View {
     pub reported_limit: Option<VideoLimit>,
     pub limit_throttle: Throttle,
     pub reported_mode: Option<Mode>,
+}
+
+/// One packet of a source on its way to one receiver.
+pub struct Arrival {
+    /// `None` without a descriptor, `Some(None)` for a descriptor the source's
+    /// structure cannot read yet.
+    pub frame: Option<Option<Frame>>,
+    pub video: bool,
+    pub seq: u64,
+    pub timestamp: u64,
+    /// The publisher's marker.
+    pub marker: bool,
+    pub payload: usize,
+    /// The payload with its packet overhead, for the budgets.
+    pub cost: u64,
+    pub bound: Duration,
+    /// Whether the source may be asked for a key frame now.
+    pub can_request: bool,
+    /// The source's target list and its lowest target.
+    pub targets: Option<(u32, Option<Wanted>)>,
+}
+
+impl View {
+    /// Admits `packet` past the selector, the queue (`queue` at the
+    /// receiver's `bitrate`) and the viewer's and room's `budgets`: the
+    /// sequence number and marker it goes out with, or `None`; and whether
+    /// the source is to send a key frame.
+    pub fn admit(
+        &mut self,
+        packet: &Arrival,
+        queue: Option<&dyn StreamTxQueueInfo>,
+        bitrate: u64,
+        budgets: [&mut Bucket; 2],
+        now: Instant,
+    ) -> (Option<(u64, bool)>, bool) {
+        let Arrival {
+            frame,
+            video,
+            seq,
+            timestamp,
+            payload,
+            cost,
+            bound,
+            ..
+        } = *packet;
+        // A new target list gives the indices other layers: the lowest target
+        // until the next second's choice.
+        if let Some((generation, lowest)) = packet.targets
+            && self
+                .generation
+                .replace(generation)
+                .is_some_and(|g| g != generation)
+        {
+            self.selector.meanwhile(None);
+            self.selector.want(lowest);
+        }
+        let layered = frame.flatten();
+        // The rest of a frame that went out goes out whole, also late, and so
+        // does a late frame that frames out reference.
+        let rest = layered
+            .as_ref()
+            .is_some_and(|f| self.selector.sent(f) || self.selector.owes(f));
+        let carried = layered.is_some() && self.backlog.out(timestamp);
+        // Leaves the packet out; whether the receiver now waits for a key frame.
+        let skip = |view: &mut Self, shed: Option<VideoLimit>| {
+            view.rewrite.skip(seq);
+            if let Some(limit) = shed {
+                view.backlog
+                    .shed(timestamp, frame.is_none().then_some(now), limit);
+            }
+            if let Some(frame) = &layered {
+                view.selector.dropped(frame);
+            }
+            view.selector.needs_keyframe()
+        };
+        if video && self.backlog.dropped(timestamp) && !rest {
+            return (None, skip(self, None));
+        }
+        let marker = match &frame {
+            None => Some(packet.marker),
+            Some(None) => None,
+            Some(Some(frame)) => self.selector.forward(frame, timestamp, packet.marker),
+        };
+        let keyframe = self.selector.needs_keyframe();
+        let Some(marker) = marker else {
+            self.rewrite.skip(seq);
+            return (None, keyframe);
+        };
+        let full = if video {
+            match self
+                .backlog
+                .admission(timestamp, queue, packet.can_request, now)
+            {
+                VideoAdmission::Regular => match &layered {
+                    None => self.backlog.full(queue, bitrate, payload, bound, now),
+                    Some(frame) => {
+                        let discardable = self.selector.discardable(frame);
+                        let admitted = self.backlog.layered(
+                            frame,
+                            timestamp,
+                            discardable,
+                            queue,
+                            bitrate,
+                            bound,
+                            now,
+                        );
+                        if admitted == Layered::Skip {
+                            return (None, skip(self, None) || keyframe);
+                        }
+                        !rest && !carried && self.backlog.capped(queue, payload)
+                    }
+                },
+                VideoAdmission::Burst(bytes) => self.backlog.burst_full(queue, bytes + cost),
+                VideoAdmission::Pause => {
+                    self.rewrite.skip(seq);
+                    return (None, keyframe);
+                }
+                VideoAdmission::RequestKeyframe => {
+                    self.rewrite.skip(seq);
+                    return (None, true);
+                }
+            }
+        } else {
+            false
+        };
+        // The budgets lend a unit with a packet out its rest.
+        let lend = rest || carried;
+        let charge = |bucket: &mut Bucket| {
+            if lend {
+                bucket.lend(cost as f64, now);
+            }
+            lend || bucket.take(cost as f64, now)
+        };
+        let [viewer, room] = budgets;
+        let limit = if full {
+            Some(VideoLimit::ForwardingBacklog)
+        } else if !charge(viewer) {
+            Some(VideoLimit::SfuViewer)
+        } else if !charge(room) {
+            Some(VideoLimit::SfuRoom)
+        } else {
+            None
+        };
+        if let Some(limit) = limit {
+            if video {
+                return (None, skip(self, Some(limit)) || keyframe);
+            }
+            return (None, keyframe);
+        }
+        let Some(seq) = self.rewrite.forward(seq) else {
+            if let Some(frame) = &layered {
+                self.selector.dropped(frame);
+            }
+            return (None, keyframe);
+        };
+        if video {
+            self.backlog.enqueued(payload, cost, marker, timestamp);
+        }
+        (Some((seq, marker)), keyframe)
+    }
 }
 
 /// The video admitted to one receiver's send queue and its temporary quality limit.
