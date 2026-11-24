@@ -361,6 +361,15 @@ impl State {
         self.reveal(viewer, &revealed);
         self.conceal(viewer, &concealed);
         if let Some(user) = self.users.get_mut(&viewer) {
+            // Later permission reports name no channel the client lost.
+            user.permission_sent
+                .retain(|channel, _| !concealed.contains(channel));
+            if user
+                .last_permission_check
+                .is_some_and(|channel| concealed.contains(&channel))
+            {
+                user.last_permission_check = None;
+            }
             user.hidden.extend(concealed);
         }
     }

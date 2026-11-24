@@ -2938,6 +2938,73 @@ fn listening_to_a_hidden_channel_sends_nothing_to_those_who_do_not_see_it() {
     assert_eq!(hidden, missing);
 }
 
+/// After a client lost a channel it asked permissions for, a later flush of
+/// its permission cache names a channel it sees.
+#[test]
+fn a_permission_flush_never_names_a_channel_the_client_no_longer_sees() {
+    use prost::Message as _;
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let [_, admin, _, member, _, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::PERMISSION_QUERY,
+        &proto::PermissionQuery {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    // The member loses the channel.
+    f.handle(admin, kind::ACL, &secret_acl(&[]));
+    assert!(!f.state.sees_channel(member, SECRET));
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(LOBBY),
+            ..Default::default()
+        },
+    );
+    f.received(member);
+    // A later change to the member's permissions elsewhere.
+    f.handle(
+        admin,
+        kind::ACL,
+        &proto::Acl {
+            channel_id: LOBBY,
+            inherit_acls: Some(true),
+            acls: vec![
+                proto::acl::ChanAcl {
+                    apply_here: Some(true),
+                    apply_subs: Some(true),
+                    group: Some("all".into()),
+                    grant: Some(perm::MAKE_TEMP_CHANNEL),
+                    deny: Some(0),
+                    ..Default::default()
+                },
+                proto::acl::ChanAcl {
+                    apply_here: Some(true),
+                    apply_subs: Some(true),
+                    user_id: Some(MEMBER),
+                    grant: Some(0),
+                    deny: Some(perm::SPEAK),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let named: Vec<u32> = f
+        .received(member)
+        .into_iter()
+        .filter(|(kind, _)| *kind == kind::PERMISSION_QUERY)
+        .filter_map(|(_, body)| proto::PermissionQuery::decode(body).unwrap().channel_id)
+        .collect();
+    assert!(!named.is_empty());
+    assert!(!named.contains(&SECRET), "PermissionQuery names {named:?}");
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is
