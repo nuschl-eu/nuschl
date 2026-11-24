@@ -7,7 +7,7 @@
 //! switch indication whose chain the receiver holds (§A.4.2).
 
 use crate::Kind;
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 pub const URI: &str =
     "https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension";
@@ -23,6 +23,14 @@ const HISTORY: usize = 256;
 const MAX_FDIFFS: usize = 8;
 /// The window over which [`Layers`] measures rates.
 const WINDOW: Duration = Duration::from_secs(1);
+/// The RTP clock of video, ticks per second.
+const CLOCK: u64 = 90_000;
+/// Temporal units in a frame-rate window: active when they span at most a
+/// second of media time.
+const RATE_UNITS: usize = 8;
+/// A source's frame rate until an active window measures it: the highest any
+/// tier asks for.
+const MAX_FPS: u64 = 60;
 
 /// A frame's decode target indication (table A.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,39 +262,69 @@ pub struct Choice {
     pub rate: u64,
 }
 
-/// One source's descriptor state and the measured rate and frame rate of each of
-/// its decode targets over the last second.
+/// One source's descriptor state, the measured rate of each of its decode
+/// targets over the last second, and its frame rate (docs/video-plan.md §5.3,
+/// layer selection).
 #[derive(Default)]
 pub struct Layers {
     structure: Option<Structure>,
-    window: Duration,
+    /// When the current rate window started: at the source's first frame,
+    /// then once a second.
+    window: Option<Duration>,
+    /// Whether a full window has measured the rates.
+    measured: bool,
     bytes: [u64; 32],
-    frames: [u32; 32],
     rates: [u64; 32],
-    fps: [u32; 32],
+    /// The RTP timestamps of the latest temporal units, oldest first.
+    units: VecDeque<u64>,
+    /// The median temporal-unit interval of the latest active window, in ticks.
+    interval: Option<u64>,
 }
 
 impl Layers {
     /// Reads one packet's descriptor and counts its `size` bytes toward the
-    /// decode targets the frame belongs to. `None` for a malformed descriptor or
-    /// one that needs a structure this source has not sent.
-    pub fn packet(&mut self, descriptor: &[u8], size: usize, now: Duration) -> Option<Frame> {
+    /// decode targets the frame belongs to; `timestamp` is the packet's
+    /// extended RTP timestamp. `None` for a malformed descriptor or one that
+    /// needs a structure this source has not sent.
+    pub fn packet(
+        &mut self,
+        descriptor: &[u8],
+        size: usize,
+        timestamp: u64,
+        now: Duration,
+    ) -> Option<Frame> {
         let frame = self.parse(descriptor)?;
-        let elapsed = now.saturating_sub(self.window);
+        let elapsed = now.saturating_sub(*self.window.get_or_insert(now));
         if elapsed >= WINDOW {
-            let millis = elapsed.as_millis() as u64;
-            for target in 0..32 {
-                self.rates[target] = self.bytes[target] * 8000 / millis;
-                self.fps[target] = (u64::from(self.frames[target]) * 1000 / millis) as u32;
+            // A window over two seconds long spans a pause: the rates stay.
+            if elapsed < 2 * WINDOW {
+                let millis = elapsed.as_millis() as u64;
+                for target in 0..32 {
+                    self.rates[target] = self.bytes[target] * 8000 / millis;
+                }
+                self.measured = true;
             }
             self.bytes = [0; 32];
-            self.frames = [0; 32];
-            self.window = now;
+            self.window = Some(now);
         }
         for target in 0..32 {
             if frame.dti(target) != Dti::NotPresent {
                 self.bytes[target] += size as u64;
-                self.frames[target] += u32::from(frame.start);
+            }
+        }
+        // A late packet of an earlier temporal unit leaves the frame rate.
+        if frame.start && self.units.back().is_none_or(|&last| timestamp > last) {
+            self.units.push_back(timestamp);
+            if self.units.len() > RATE_UNITS + 1 {
+                self.units.pop_front();
+            }
+            if self.units.len() > RATE_UNITS && timestamp - self.units[0] <= CLOCK {
+                let mut intervals: Vec<u64> = (1..self.units.len())
+                    .map(|i| self.units[i] - self.units[i - 1])
+                    .collect();
+                // The shorter median: a pause inside the window leaves it.
+                intervals.sort_unstable();
+                self.interval = Some(intervals[RATE_UNITS / 2 - 1]);
             }
         }
         Some(frame)
@@ -372,6 +410,18 @@ impl Layers {
         self.structure.is_some()
     }
 
+    /// Whether a full second of the source has measured its rates.
+    pub fn measured(&self) -> bool {
+        self.measured
+    }
+
+    /// Whether `layer`'s frame rate is at most a quarter above `fps`. The
+    /// source's frame rate halves with each temporal layer below the top.
+    fn within(&self, layer: Target, top: u8, fps: u64) -> bool {
+        let interval = self.interval.unwrap_or(CLOCK / MAX_FPS);
+        (4 * CLOCK) << layer.temporal <= (5 * fps * interval) << top
+    }
+
     /// The tier of `kind`'s ladder that the source's picture belongs to, when the
     /// source sends one spatial layer and its size: every receiver gets that
     /// picture.
@@ -387,12 +437,14 @@ impl Layers {
     /// fits when its spatial layer belongs to the tier or a lower one (when the
     /// publisher sent layer sizes) and its frame rate is at most a quarter above
     /// the tier's. These are the steps of [`crate::budget::Stream`] and
-    /// [`crate::adapt::Stepper`].
+    /// [`crate::adapt::Stepper`]. Until a full second measures the rates, the
+    /// lowest fitting target is the only choice.
     pub fn choices(&self, kind: Kind, tier: usize) -> Vec<Choice> {
         let Some(structure) = &self.structure else {
             return Vec::new();
         };
-        let tier_fps = u32::from(kind.ladder()[tier.min(kind.top())].fps);
+        let tier_fps = u64::from(kind.ladder()[tier.min(kind.top())].fps);
+        let top = structure.targets.iter().map(|t| t.temporal).max();
         let mut all: Vec<_> = structure
             .targets
             .iter()
@@ -411,11 +463,14 @@ impl Layers {
                 .heights
                 .get(usize::from(c.layer.spatial))
                 .is_none_or(|&h| kind.tier_of(h) <= tier)
-                && self.fps[c.target] * 4 <= tier_fps * 5
+                && self.within(c.layer, top.unwrap_or(0), tier_fps)
         };
         if all.iter().any(fits) {
             all.retain(fits);
         } else {
+            all.truncate(1);
+        }
+        if !self.measured {
             all.truncate(1);
         }
         all
@@ -583,8 +638,15 @@ mod tests {
         let mut layers = Layers::default();
         let frames = CHROME_L3T3
             .iter()
-            .map(|h| layers.packet(&hex(h), 1000, Duration::ZERO).expect("valid"))
+            .map(|h| {
+                layers
+                    .packet(&hex(h), 1000, 0, Duration::ZERO)
+                    .expect("valid")
+            })
             .collect();
+        // As after a full second at 30 frames a second.
+        layers.measured = true;
+        layers.interval = Some(3000);
         (layers, frames)
     }
 
@@ -677,14 +739,17 @@ mod tests {
     #[test]
     fn needs_a_structure_and_rejects_malformed_descriptors() {
         let mut layers = Layers::default();
-        assert_eq!(layers.packet(&hex(CHROME_L3T3[1]), 1, Duration::ZERO), None);
-        assert_eq!(layers.packet(&[0x80, 0x01], 1, Duration::ZERO), None);
+        assert_eq!(
+            layers.packet(&hex(CHROME_L3T3[1]), 1, 0, Duration::ZERO),
+            None
+        );
+        assert_eq!(layers.packet(&[0x80, 0x01], 1, 0, Duration::ZERO), None);
         let full = hex(CHROME_L3T3[0]);
-        assert_eq!(layers.packet(&full[..20], 1, Duration::ZERO), None);
+        assert_eq!(layers.packet(&full[..20], 1, 0, Duration::ZERO), None);
         assert!(layers.structure.is_none());
-        assert!(layers.packet(&full, 1, Duration::ZERO).is_some());
+        assert!(layers.packet(&full, 1, 0, Duration::ZERO).is_some());
         // A template id outside the structure.
-        assert_eq!(layers.packet(&[0xff, 0, 0], 1, Duration::ZERO), None);
+        assert_eq!(layers.packet(&[0xff, 0, 0], 1, 0, Duration::ZERO), None);
     }
 
     /// A synthetic L1T3 stream with libwebrtc's decode target indications:
@@ -728,11 +793,11 @@ mod tests {
     fn reads_dtis_in_target_order() {
         let mut layers = Layers::default();
         let frame = layers
-            .packet(&l1t3(0, 0, true), 1, Duration::ZERO)
+            .packet(&l1t3(0, 0, true), 1, 0, Duration::ZERO)
             .expect("valid");
         assert_eq!([frame.dti(0), frame.dti(1), frame.dti(2)], [Dti::Switch; 3]);
         let t1 = layers
-            .packet(&l1t3(1, 1, false), 1, Duration::ZERO)
+            .packet(&l1t3(1, 1, false), 1, 0, Duration::ZERO)
             .expect("valid");
         assert_eq!(
             [t1.dti(0), t1.dti(1), t1.dti(2)],
@@ -756,7 +821,7 @@ mod tests {
         for number in 0..40u16 {
             let id = pattern[usize::from(number) % 4];
             let frame = layers
-                .packet(&l1t3(id, number, number == 0), 1, Duration::ZERO)
+                .packet(&l1t3(id, number, number == 0), 1, 0, Duration::ZERO)
                 .expect("valid");
             let at = u64::from(number);
             // One packet per frame: each forwarded one ends its temporal unit.
@@ -777,7 +842,7 @@ mod tests {
         // Down to nothing at once.
         low.want(None);
         let frame = layers
-            .packet(&l1t3(1, 41, false), 1, Duration::ZERO)
+            .packet(&l1t3(1, 41, false), 1, 0, Duration::ZERO)
             .expect("valid");
         assert_eq!(low.forward(&frame, 41, true), None);
         assert_eq!(low.current(), None);
@@ -908,7 +973,7 @@ mod tests {
                 let number = unit * 2 + spatial as u16;
                 let descriptor = l2t2_key(template, number, template == 0);
                 let frame = layers
-                    .packet(&descriptor, 1, Duration::ZERO)
+                    .packet(&descriptor, 1, 0, Duration::ZERO)
                     .expect("valid");
                 if let Some(marker) = selector.forward(&frame, u64::from(unit), spatial == 1) {
                     forwarded.push(number);
@@ -925,7 +990,7 @@ mod tests {
     fn reads_chains_per_decode_target() {
         let mut layers = Layers::default();
         let key = layers
-            .packet(&l2t2_key(0, 0, true), 1, Duration::ZERO)
+            .packet(&l2t2_key(0, 0, true), 1, 0, Duration::ZERO)
             .expect("valid");
         assert_eq!(
             layers.structure.as_ref().expect("structure").protected_by,
@@ -936,7 +1001,7 @@ mod tests {
             [Some(0); 4]
         );
         let delta = layers
-            .packet(&l2t2_key(4, 5, false), 1, Duration::ZERO)
+            .packet(&l2t2_key(4, 5, false), 1, 0, Duration::ZERO)
             .expect("valid");
         let diffs: Vec<_> = (0..4)
             .map(|t| delta.chain_diff(t).expect("chains"))
@@ -955,7 +1020,9 @@ mod tests {
         w.put(0, 2);
         w.put(7, 8);
         w.put(9, 8);
-        let custom = layers.packet(&w.bytes(), 1, Duration::ZERO).expect("valid");
+        let custom = layers
+            .packet(&w.bytes(), 1, 0, Duration::ZERO)
+            .expect("valid");
         assert_eq!(custom.references().collect::<Vec<_>>(), [2, 65523]);
         assert_eq!(custom.chain_diff(0), Some(7));
         assert_eq!(custom.chain_diff(3), Some(9));
@@ -1037,7 +1104,7 @@ mod tests {
         run_l2t2(&mut layers, &mut selector, 0..3, &[0], |_, _| {});
         // Unit 3 is T1: its S1 frame is discardable for S1T1.
         let t1 = layers
-            .packet(&l2t2_key(5, 7, false), 1, Duration::ZERO)
+            .packet(&l2t2_key(5, 7, false), 1, 0, Duration::ZERO)
             .expect("valid");
         selector.dropped(&t1);
         assert_eq!(selector.current(), Some(3));
@@ -1045,35 +1112,120 @@ mod tests {
         let (forwarded, _) = run_l2t2(&mut layers, &mut selector, 4..5, &[0], |_, _| {});
         assert_eq!(forwarded, [9]);
         let t0 = layers
-            .packet(&l2t2_key(4, 9, false), 1, Duration::ZERO)
+            .packet(&l2t2_key(4, 9, false), 1, 0, Duration::ZERO)
             .expect("valid");
         selector.dropped(&t0);
         let (forwarded, _) = run_l2t2(&mut layers, &mut selector, 5..8, &[0, 7], |_, _| {});
         assert_eq!(forwarded, [14, 15]);
     }
 
+    /// Frame `number` of an L1T3 source (T0 T2 T1 T2), 1000 bytes, at `millis`
+    /// of media and wall time.
+    fn l1t3_at(layers: &mut Layers, number: u16, millis: u64) -> Option<Frame> {
+        let id = [0, 2, 1, 2][usize::from(number) % 4];
+        let descriptor = l1t3(id, number, number == 0);
+        layers.packet(
+            &descriptor,
+            1000,
+            millis * 90,
+            Duration::from_millis(millis),
+        )
+    }
+
+    fn targets(layers: &Layers, kind: Kind, tier: usize) -> Vec<usize> {
+        let choices = layers.choices(kind, tier);
+        choices.iter().map(|c| c.target).collect()
+    }
+
     #[test]
     fn measures_rates_and_offers_the_targets_that_fit() {
         let mut layers = Layers::default();
-        let pattern = [0, 2, 1, 2];
-        // Two seconds at 30 frames a second, 1000 bytes a frame.
-        for number in 0..60u16 {
-            let at = Duration::from_millis(u64::from(number) * 1000 / 30);
-            let id = pattern[usize::from(number) % 4];
-            layers.packet(&l1t3(id, number, number == 0), 1000, at);
+        // Two seconds at 30 frames a second.
+        for number in 0..61u16 {
+            l1t3_at(&mut layers, number, u64::from(number) * 1000 / 30);
         }
-        layers.packet(&l1t3(0, 60, false), 1000, Duration::from_secs(2));
         let choices = layers.choices(Kind::Camera, 3);
         let rates: Vec<_> = choices.iter().map(|c| c.rate).collect();
         // Frames 30 to 59 in the second window: 7, 15 and 30 of 8000 bits.
         assert_eq!(rates, [56_000, 120_000, 240_000]);
         // A 15 fps tier takes the 7.5 and 15 fps targets.
-        let low: Vec<_> = layers
-            .choices(Kind::Camera, 0)
-            .iter()
-            .map(|c| c.target)
-            .collect();
-        assert_eq!(low, [0, 1]);
+        assert_eq!(targets(&layers, Kind::Camera, 0), [0, 1]);
+    }
+
+    #[test]
+    fn a_source_offers_its_lowest_target_until_a_full_second_measures_it() {
+        // 30 frames a second from 4 s on.
+        let mut layers = Layers::default();
+        for number in 0..30 {
+            l1t3_at(&mut layers, number, 4000 + u64::from(number) * 1000 / 30);
+        }
+        assert!(!layers.measured());
+        assert_eq!(
+            targets(&layers, Kind::Screen, 3),
+            [0],
+            "within the first second"
+        );
+        l1t3_at(&mut layers, 30, 5000);
+        assert!(layers.measured());
+        // A 15 fps tier takes the quarter and the half rate.
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+        // A window across a three-second pause keeps the measured rates.
+        l1t3_at(&mut layers, 31, 8000);
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+    }
+
+    #[test]
+    fn frame_rates_come_from_rtp_timestamps() {
+        let mut layers = Layers::default();
+        // 5 frames a second: 8 units span 1.6 s, no active window. The source
+        // counts as 60 fps: a 15 fps tier takes the quarter rate alone, a
+        // 30 fps tier the half rate too.
+        for number in 0..16 {
+            l1t3_at(&mut layers, number, u64::from(number) * 200);
+        }
+        assert!(layers.measured());
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0]);
+        assert_eq!(targets(&layers, Kind::Screen, 1), [0, 1]);
+        // Eight units 33 ms apart in media time, all arriving at once: 30 fps.
+        for number in 16..25 {
+            let id = [0, 2, 1, 2][usize::from(number) % 4];
+            let media = (3200 + u64::from(number - 16) * 1000 / 30) * 90;
+            let at = Duration::from_millis(3300);
+            layers.packet(&l1t3(id, number, false), 1000, media, at);
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+        // A late packet of an earlier unit leaves the frame rate.
+        layers.packet(
+            &l1t3(2, 9, false),
+            1000,
+            1800 * 90,
+            Duration::from_millis(3300),
+        );
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+    }
+
+    #[test]
+    fn a_static_source_keeps_its_frame_rate() {
+        let mut layers = Layers::default();
+        for number in 0..61u16 {
+            l1t3_at(&mut layers, number, u64::from(number) * 1000 / 30);
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+        // Static: a frame every 600 ms for 12 s. The full rate does not
+        // become eligible for the 15 fps tier.
+        for number in 61..81u16 {
+            l1t3_at(&mut layers, number, 2000 + u64::from(number - 60) * 600);
+            assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1], "frame {number}");
+        }
+        // A source that slows down while active: 15 frames a second.
+        for number in 81..100u16 {
+            l1t3_at(
+                &mut layers,
+                number,
+                15_000 + u64::from(number - 80) * 1000 / 15,
+            );
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1, 2]);
     }
 
     #[test]
@@ -1112,11 +1264,13 @@ mod tests {
     #[test]
     fn an_active_mask_limits_the_choice() {
         let mut layers = Layers::default();
-        layers.packet(&l1t3(0, 0, true), 1, Duration::ZERO);
+        layers.packet(&l1t3(0, 0, true), 1, 0, Duration::ZERO);
         // Extended fields with only an active mask, 0b011: targets 0 and 1.
         let mut packet = l1t3(1, 1, false);
         packet.extend([0x43, 0]);
-        layers.packet(&packet, 1, Duration::ZERO).expect("valid");
+        layers.packet(&packet, 1, 0, Duration::ZERO).expect("valid");
+        layers.measured = true;
+        layers.interval = Some(3000);
         let targets: Vec<_> = layers
             .choices(Kind::Camera, 3)
             .iter()

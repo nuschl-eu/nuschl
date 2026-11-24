@@ -981,10 +981,12 @@ impl Core {
         // descriptor this source's structure cannot read yet, which a key frame
         // brings.
         let since = now.saturating_duration_since(self.origin);
+        let timestamp = packet.time.numer();
         let frame = match (&mut source.video, descriptor) {
             (Some(video), Some(descriptor)) => Some(video.layers.packet(
                 &descriptor.0,
                 packet.payload.len(),
+                timestamp,
                 since,
             )),
             _ => None,
@@ -996,7 +998,6 @@ impl Core {
             return;
         }
         let video = source.kind == MediaKind::Video;
-        let timestamp = packet.time.numer();
         let payload = packet.payload.len();
         let cost = (payload + PACKET_OVERHEAD) as u64;
         let can_request = source
@@ -1258,6 +1259,7 @@ impl Core {
                     receiver: id,
                     forward: index,
                     choices,
+                    measured: video.layers.measured(),
                     ceiling: probe,
                     limit,
                 });
@@ -1380,10 +1382,14 @@ impl Core {
                     .iter()
                     .map(|c| u32::from(c.layer.spatial))
                     .collect();
-                let point = view
-                    .stepper
-                    .get_or_insert_with(|| Stepper::new(ceiling))
-                    .update(&resolutions, ceiling, since);
+                // The stepper starts once a full second has measured the
+                // source: from its first choice that fits.
+                let point = if planned.measured {
+                    let stepper = view.stepper.get_or_insert_with(|| Stepper::new(ceiling));
+                    stepper.update(&resolutions, ceiling, since)
+                } else {
+                    ceiling
+                };
                 if limit == VideoLimit::WithinTarget && point < ceiling {
                     limit = VideoLimit::QualityRecovery;
                 }
@@ -1513,6 +1519,8 @@ struct Planned {
     forward: usize,
     /// The decode targets its tier allows, lowest first; none without a descriptor.
     choices: Vec<Choice>,
+    /// Whether a full second has measured the source's rates.
+    measured: bool,
     /// The most its tier needs, bits per second.
     ceiling: u64,
     limit: VideoLimit,

@@ -309,7 +309,7 @@ fn decodable(packets: &[Received]) -> (Vec<(u16, u8)>, Vec<u16>) {
     let mut indices = HashMap::new();
     for &packet in &sorted {
         let descriptor = packet.descriptor.as_ref().expect("a descriptor");
-        let Some(frame) = layers.packet(&descriptor.0, 0, Duration::ZERO) else {
+        let Some(frame) = layers.packet(&descriptor.0, 0, 0, Duration::ZERO) else {
             continue;
         };
         let index = *indices.entry(frame.number).or_insert_with(|| {
@@ -1021,17 +1021,19 @@ async fn forwards_media_and_key_messages_unchanged() {
 }
 
 /// One AV1 publisher with an L1T3 descriptor at 30 frames a second and two
-/// receivers. One asks for the 15 fps camera tier and gets the T0 and T1 frames;
-/// the other gets every frame. Each switches at switch points, and skipped
-/// frames leave no gaps in its sequence numbers.
+/// receivers that join once a second has measured it. One asks for the 15 fps
+/// camera tier and gets the T0 and T1 frames; the other gets every frame. Each
+/// switches at switch points, and skipped frames leave no gaps in its sequence
+/// numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_receiver_gets_the_layers_of_its_tier() {
     let sfu = start("");
     let url = sfu.url.as_str();
     let (mut host, _) = join(url, &ADMIT, true, true).await;
+    host.start_publishing(Codec::Av1);
+    publish_for(&mut host, Duration::from_millis(1500)).await;
     let (mut low, _) = join(url, &ADMIT, false, false).await;
     let (mut full, _) = join(url, &ADMIT, false, false).await;
-    host.start_publishing(Codec::Av1);
     let mut asked = false;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1073,6 +1075,44 @@ async fn each_receiver_gets_the_layers_of_its_tier() {
     assert_eq!(first_skip % 4, 0, "{got:?}");
 }
 
+/// An L1T3 screen at 30 frames a second that starts while its viewer asks for
+/// the 15 fps tier, as the native publisher's: the viewer gets the T0 frames
+/// until a full second has measured the source, then the T0 and T1 frames,
+/// and never a T2 frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_starting_screen_stays_within_its_viewers_tier() {
+    let sfu = start("");
+    let url = sfu.url.as_str();
+    let (mut host, _) = join(url, &ADMIT, true, true).await;
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
+    host.publish_source(Codec::Av1, true);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while viewer.tracks.is_empty() {
+        assert!(Instant::now() < deadline, "no track");
+        host.step();
+        viewer.step();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    viewer.send(source_request(host.id, Kind::Screen, 0));
+    let asked = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < asked {
+        host.step();
+        viewer.step();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let sending = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < sending {
+        host.step();
+        viewer.step();
+        host.send_frame();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let got = frames(&viewer, &host);
+    assert!(got.iter().all(|n| n % 2 == 0), "a T2 frame: {got:?}");
+    assert!(got.len() >= 60, "{got:?}");
+    assert!(got.iter().any(|n| n % 4 == 2), "T1 frames: {got:?}");
+}
+
 /// A receiver whose budget covers the T0 and T1 frames but not the T2 frames
 /// steps down to the 15 fps decode target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1082,8 +1122,9 @@ async fn a_receiver_budget_limits_its_layers() {
     let sfu = start("receiver_bitrate = 110000");
     let url = sfu.url.as_str();
     let (mut host, _) = join(url, &ADMIT, true, true).await;
-    let (mut receiver, _) = join(url, &ADMIT, false, false).await;
     host.start_publishing(Codec::Av1);
+    publish_for(&mut host, Duration::from_millis(1500)).await;
+    let (mut receiver, _) = join(url, &ADMIT, false, false).await;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         for peer in [&mut host, &mut receiver] {

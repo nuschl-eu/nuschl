@@ -505,7 +505,7 @@ mod tests {
                 descriptor.extend([0x80, 0x00, 0x3a, 0x40, 0x00]);
             }
             layers
-                .packet(&descriptor, 1, std::time::Duration::ZERO)
+                .packet(&descriptor, 1, 0, std::time::Duration::ZERO)
                 .expect("valid")
         };
         let key = frame(1, true);
@@ -584,11 +584,12 @@ mod tests {
             .packet(
                 &[0xc0, 0, 1, 0x80, 0x00, 0x3a, 0x40, 0x00],
                 1,
+                0,
                 Duration::ZERO,
             )
             .expect("key picture");
         let delta = layers
-            .packet(&[0xc1, 0, 2], 1, Duration::ZERO)
+            .packet(&[0xc1, 0, 2], 1, 0, Duration::ZERO)
             .expect("delta");
         (key, delta)
     }
