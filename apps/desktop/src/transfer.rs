@@ -239,8 +239,12 @@ impl Desktop {
                 servers: servers.clone(),
             };
             let worker = match started {
-                Ok(worker) if worker.commands.try_send(request).is_ok() => worker,
-                Ok(_) => continue,
+                // A worker that cannot take the request has exited: its
+                // offer ends before its first code (see `apply_transfer`).
+                Ok(worker) => {
+                    let _ = worker.commands.try_send(request);
+                    worker
+                }
                 Err(error) => {
                     server.set_notice(format!("File transfer is unavailable: {error}"));
                     continue;
@@ -479,6 +483,9 @@ impl Desktop {
             .find(|offer| offer.id == id)
         {
             let mut announce = false;
+            // An offer that fails before its first code ends, with a note:
+            // its card appears only with that code.
+            let mut failed = None;
             match update {
                 Update::Event(TransferEvent::Code { code })
                     if valid_code(&code) && !offer.ended =>
@@ -505,16 +512,27 @@ impl Desktop {
                     if let Some(peer) = peer {
                         offer.sending.remove(&peer);
                     }
+                    if offer.codes.is_empty() && !offer.ended {
+                        failed = Some(tidy(&reason));
+                    }
                     offer.problem = Some(tidy(&reason));
                 }
                 Update::Event(_) | Update::Unsaved(_) => {}
                 Update::Finished(_) => {
+                    if offer.codes.is_empty() && !offer.ended {
+                        failed = Some("The transfer worker stopped.".into());
+                    }
                     announce = !offer.ended && offer.posted;
                     offer.ended = true;
                     offer.commands = None;
                     offer.stop = None;
                     offer.sending.clear();
                 }
+            }
+            if let Some(reason) = failed {
+                let note = format!("Could not offer {}: {reason}", offer.offer.name);
+                self.attach_note = Some(((offer.server.clone(), offer.channel), note));
+                self.stop_offer(id, cx);
             }
             if announce {
                 self.announce(id, cx);

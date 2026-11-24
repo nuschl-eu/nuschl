@@ -106,7 +106,9 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
   re-encoded in the worker to fit the server's limit and sent the way stock Mumble
   sends it. Other files go through the paperclip or a drop: Nuschl offers them
   peer to peer, with a magic-wormhole code in the message that stock Mumble users
-  can use with any wormhole client, and shows offers as file cards.
+  can use with any wormhole client, and shows offers as file cards. An offer
+  that cannot start, such as one whose magic-wormhole server is unreachable,
+  ends with a note in the composer.
 - Attached images go at the message's quality, chosen beside them:
   - **Low** and **High** re-encode the image upright, without the original's
     metadata (GPS coordinates, capture time, device model) or file name: Low

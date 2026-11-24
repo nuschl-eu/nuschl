@@ -8,6 +8,7 @@ transfers stay on the relay, so no public rendezvous, relay or STUN server is us
 """
 import argparse
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -30,11 +31,16 @@ def frame(payload):
     return struct.pack(">I", len(body)) + body
 
 
+def listening(port):
+    with socket.socket() as probe:
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
 class Wormhole:
     """A private magic-wormhole mailbox server and transit relay on 127.0.0.1."""
 
     def __init__(self, python, root):
-        self.python = python
+        self.python, self.root = python, root
         self.bin = Path(python).parent
         self.mailbox_port, self.relay_port = free_port(), free_port()
         self.servers = {"rendezvous": f"ws://127.0.0.1:{self.mailbox_port}/v1",
@@ -48,11 +54,21 @@ class Wormhole:
                              cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT),
         ]
 
-        def listening(port):
-            with socket.socket() as probe:
-                return probe.connect_ex(("127.0.0.1", port)) == 0
         eventually(lambda: listening(self.mailbox_port) and listening(self.relay_port),
                    "wormhole servers did not start")
+
+    @contextlib.contextmanager
+    def mailbox_down(self):
+        """The mailbox server stopped, and started again afterwards."""
+        mailbox = self.daemons[0]
+        mailbox.terminate()
+        mailbox.wait()
+        try:
+            yield
+        finally:
+            self.daemons[0] = subprocess.Popen(mailbox.args, cwd=self.root, stdout=subprocess.DEVNULL,
+                                               stderr=subprocess.STDOUT)
+            eventually(lambda: listening(self.mailbox_port), "the mailbox server did not start again")
 
     def environment(self):
         """Nuschl's override: these servers, relay only."""

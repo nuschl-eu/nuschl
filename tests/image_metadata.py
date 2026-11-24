@@ -27,7 +27,10 @@ Settings' image quality is Low. Checks that:
 - an image whose file reads empty after Send brings its message back to
   the composer with a note, its text and its choice; sent again, it goes;
 - at High, a noisy picture far over the server's limit reaches the peer
-  within it.
+  within it;
+- an offer that cannot reach the magic-wormhole server ends with a note;
+  the same file offered again once the server is back, and stopped, stays
+  stopped.
 
 python3 tests/image_metadata.py target/debug --murmur <mumble-server>
     --at-spi <at-spi2-core> --wormhole-python <python with magic-wormhole servers>
@@ -261,6 +264,28 @@ def main():
                            check=True, timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return target.read_bytes()
 
+        def card(name, status):
+            """The newest card of an offer of `name` whose status line has `status`."""
+            def cards():
+                return [node for node, role, label, _ in items(nuschl) if role == "panel" and status in label
+                        and label.split(" ", 1)[-1].startswith(f"{name}, ")]
+            return eventually(lambda: (cards() or [None])[-1], f"no card of {name}: {status}", timeout=30)
+
+        def stopped(name, status="Waiting for someone to download"):
+            """Stop offering `name` from its card: the conversation is told, and
+            15 s later the end is still its last message and its card ended."""
+            def button():
+                return next((node for node, role, label, _ in items(card(name, status), subtree=True)
+                             if role == "push button" and label == "Stop offering"), None)
+            eventually(button, f"no Stop offering for {name}").press()
+            peer.wait(lambda e: e["kind"] == "text" and name in e.get("body", "")
+                      and "no longer available" in e["body"], timeout=30)
+            time.sleep(15)
+            later = [e["body"] for e in peer.events if e["kind"] == "text" and name in e.get("body", "")]
+            assert "no longer available" in later[-1], later[-3:]
+            ended = card(name, "No longer available")
+            assert not any(label == "Stop offering" for _, _, label, _ in items(ended, subtree=True))
+
         photo = root / "IMG_20261103_143012.png"
         with photo.open("wb") as file:
             file.write(b"\x89PNG\r\n\x1a\n")
@@ -454,6 +479,27 @@ def main():
         assert len(body) <= LIMIT, len(body)
         print(f"High: a {noisy.stat().st_size}-byte picture arrived as a {len(body)}-byte image "
               f"within the {LIMIT}-byte limit.", flush=True)
+
+        # The magic-wormhole server is down when a file is first offered: the
+        # offer ends with a note. Offered again once the server is back, and
+        # stopped, it stays stopped, and so does the first offer.
+        notes = root / "notes.txt"
+        notes.write_text("notes\n")
+        with wormhole.mailbox_down():
+            attach(notes)
+            find(lambda _, role, name, __: role == "list item" and name.startswith(f"File {notes.name}"),
+                 "the file is not in the tray")
+            send()
+            note = find(lambda _, __, name, ___: name.startswith(f"Could not offer {notes.name}: "),
+                        "the offer that failed left no note")[2]
+        attach(notes)
+        find(lambda _, role, name, __: role == "list item" and name.startswith(f"File {notes.name}"),
+             "the file is not in the tray")
+        send()
+        download(notes.name)
+        stopped(notes.name)
+        print(f"An offer without a magic-wormhole server ended with a note ({note!r}); offered again "
+              "and stopped, it stayed stopped.", flush=True)
     finally:
         if peer:
             peer.close()
