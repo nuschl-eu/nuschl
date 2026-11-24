@@ -120,7 +120,8 @@ deny = [
   ], reason = "AVIF encoding stays behind ravif, and native video encoding runs inside the isolated video worker" },
   { name = "rav1d", wrappers = [
     "nuschl-video-worker",
-  ], reason = "The confined video worker decodes untrusted AV1" },
+    "nuschl-video-encode",
+  ], reason = "The confined video worker decodes untrusted AV1; the encoder core's tests decode its own synthetic streams" },
   { name = "opus-rs", wrappers = [
     "nuschl-media-worker",
     "nuschl-audio-wasm",
@@ -206,7 +207,9 @@ deny = [
     "nuschl-video-worker",
     "nuschl-rtc-worker",
   ], reason = "Win32 AppContainer launch runs only as the workers' own launch stage" },
-  { name = "nuschl-capture-macos", wrappers = ["nuschl-video-worker"], reason = "Apple camera and screen bindings run only in the video capture worker" },
+  { name = "nuschl-capture-macos", wrappers = [
+    "nuschl-video-worker",
+  ], reason = "Apple camera and screen bindings run only in the video capture worker" },
   { name = "nuschl-stream", wrappers = [
     "nuschl",
     "nuschl-crypto-worker",
@@ -254,7 +257,11 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Cargo.lock pins the owner's media transport and codec patches and the rav1d Rust decoder API.
-allow-git = ["https://github.com/ambiso/opus-rs", "https://github.com/ambiso/str0m", "https://github.com/memorysafety/rav1d"]
+allow-git = [
+  "https://github.com/ambiso/opus-rs",
+  "https://github.com/ambiso/str0m",
+  "https://github.com/memorysafety/rav1d",
+]
 
 [[bans.features]]
 name = "rav1d"

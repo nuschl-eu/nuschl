@@ -8007,6 +8007,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuschl-video-encode"
+version = "0.3.0"
+dependencies = [
+ "nuschl-stream-quality",
+ "rav1d",
+]
+
+[[package]]
 name = "nuschl-video-worker"
 version = "0.3.0"
 dependencies = [
