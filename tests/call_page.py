@@ -67,6 +67,13 @@ LINK = fragment(S, P)
 CREATOR = f"{LINK}&p={b64(P)}"
 
 
+# The page's peer connections, for the receivers' statistics.
+RECORD_PEERS = """
+window.peers = [];
+window.RTCPeerConnection = class extends RTCPeerConnection {
+  constructor(...args) { super(...args); window.peers.push(this); }
+};
+"""
 # The page user's capture calls, with whether each asked for audio and the surface
 # it preselected, and their tracks. In the screen picker the user picks a monitor.
 RECORD_CAPTURE = """
@@ -257,6 +264,21 @@ def direct_video(publisher, viewer, peer):
 RECORDED_TONE = """
 const [selector, done] = arguments;
 const stream = document.querySelector(selector).srcObject;
+const [track] = stream.getAudioTracks();
+// The receiver's jitter buffer over the recording, where the page lists its connections.
+const receiver = async () => {
+  for (const pc of window.peers ?? []) {
+    const stats = await pc.getStats(track).catch(() => new Map());
+    for (const s of stats.values()) {
+      if (s.type === 'inbound-rtp') return {packets: s.packetsReceived, lost: s.packetsLost, samples: s.totalSamplesReceived,
+        concealed: s.concealedSamples, silent: s.silentConcealedSamples, events: s.concealmentEvents,
+        inserted: s.insertedSamplesForDeceleration, removed: s.removedSamplesForAcceleration,
+        delay: s.jitterBufferDelay, emitted: s.jitterBufferEmittedCount, target: s.jitterBufferTargetDelay};
+    }
+  }
+  return null;
+};
+const before = receiver();
 const recorder = new MediaRecorder(stream);
 const chunks = [];
 const stop = () => { if (recorder.state === 'recording') recorder.stop(); };
@@ -290,7 +312,9 @@ recorder.onstop = async () => {
       }
       if (sample < -0.1) positive = false;
     }
-    done({hertz: crossings * decoded.sampleRate / middle.length, rms: Math.sqrt(power / middle.length)});
+    const [start, end] = await Promise.all([before, receiver()]);
+    const receiving = start && end && Object.fromEntries(Object.keys(end).map((key) => [key, end[key] - start[key]]));
+    done({hertz: crossings * decoded.sampleRate / middle.length, rms: Math.sqrt(power / middle.length), receiving});
   } catch (error) {
     done({error: String(error), bytes: recording.size, type: recording.type, chunks: chunks.length});
   }
@@ -402,7 +426,7 @@ def native_video(viewer):
 drivers = []
 try:
     # Every browser starts first, before the media load: a busy host slows startup most.
-    user = chromium(script=RECORD_CAPTURE, devices=True)
+    user = chromium(script=RECORD_PEERS + RECORD_CAPTURE, devices=True)
     vp9 = chromium(script=WITHOUT_AV1)
     plain = chromium(script="delete window.RTCRtpScriptTransform")
     drivers += [user, vp9, plain]

@@ -749,6 +749,13 @@ async fn shared_audio(late: bool) {
     let packet = |n: u64| [nuschl_core::audio::SILENT_OPUS.as_slice(), &n.to_be_bytes()].concat();
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let mut sent = 0_u64;
+    // The screen shows a picture beside the audio, as a shared screen does,
+    // with a large key frame every second.
+    let picture = direct::picture();
+    let mut large = picture.clone();
+    large.resize(100_000, 0);
+    let mut video = tokio::time::interval(Duration::from_millis(33));
+    let (mut screen, mut frames) = (false, 0_u64);
     if late {
         // The publisher sends for a second before anyone else is in the room.
         timeout(HANDSHAKE, async {
@@ -758,8 +765,13 @@ async fn shared_audio(late: bool) {
                         sent += 1;
                         let _ = alice.send_source_frame(Purpose::SystemAudio, sent * 960, false, packet(sent));
                     }
+                    _ = video.tick(), if screen => {
+                        frames += 1;
+                        let frame = if frames % 30 == 0 { &large } else { &picture };
+                        alice.send_source_frame(Purpose::ScreenVideo, frames * 2970, true, frame.clone()).unwrap();
+                    }
                     event = alice.next() => {
-                        event.expect("publisher remains live").expect("RTC publisher");
+                        screen |= matches!(event.expect("publisher remains live").expect("RTC publisher"), MediaEvent::SourceReady { purpose: Purpose::ScreenVideo });
                     }
                 }
             }
@@ -767,6 +779,10 @@ async fn shared_audio(late: bool) {
         .await
         .unwrap();
     }
+    // Each datagram of the publish leg takes 3 ms from here on, as on a busy
+    // host: a large key frame or the bandwidth probe a new viewer starts must
+    // leave audio its turns.
+    alice.slow_publish(Duration::from_millis(3)).await;
     let bob = match early {
         Some(bob) => bob,
         None => join().await,
@@ -785,7 +801,7 @@ async fn shared_audio(late: bool) {
     // quantum delivers them.
     let mut burst = tokio::time::interval(Duration::from_millis(40));
     timeout(HANDSHAKE, async {
-        while received.len() < 30 {
+        while received.len() < 100 {
             tokio::select! {
                 _ = burst.tick() => {
                     for _ in 0..2 {
@@ -793,16 +809,21 @@ async fn shared_audio(late: bool) {
                         alice.send_source_frame(Purpose::SystemAudio, sent * 960, false, packet(sent)).unwrap();
                     }
                 }
+                _ = video.tick(), if screen => {
+                    frames += 1;
+                    let frame = if frames % 30 == 0 { &large } else { &picture };
+                    alice.send_source_frame(Purpose::ScreenVideo, frames * 2970, true, frame.clone()).unwrap();
+                }
                 event = alice.next() => {
-                    event.expect("publisher remains live").expect("RTC publisher");
+                    screen |= matches!(event.expect("publisher remains live").expect("RTC publisher"), MediaEvent::SourceReady { purpose: Purpose::ScreenVideo });
                 }
                 event = bob.next() => match event.expect("viewer remains live").expect("RTC viewer") {
                     MediaEvent::SourceAvailable { publisher: from, purpose: Purpose::SystemAudio } => {
                         assert_eq!(from, publisher);
                         available = true;
                     }
-                    MediaEvent::Frame { publisher: from, purpose, timestamp, key_frame, data, .. } => {
-                        assert_eq!((from, purpose, key_frame), (publisher, Purpose::SystemAudio, false));
+                    MediaEvent::Frame { publisher: from, purpose: Purpose::SystemAudio, timestamp, key_frame, data, .. } => {
+                        assert_eq!((from, key_frame), (publisher, false));
                         let number = u64::from_be_bytes(data[3..].try_into().unwrap());
                         assert_eq!(data, packet(number));
                         assert!(received.last().is_none_or(|&(previous, _)| previous < number));

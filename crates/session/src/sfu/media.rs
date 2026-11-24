@@ -34,6 +34,9 @@ use direct::{Candidates, Direct, Role, Signal};
 pub use rtc::Purpose;
 
 const UDP_BURST: usize = 64;
+/// A drain hands the media task back after this long, so audio and video
+/// writes keep their turns while a bandwidth probe or a large frame leaves.
+const DRAIN_SLICE: Duration = Duration::from_millis(5);
 const MAX_PENDING_FRAME_AGE: Duration = Duration::from_millis(150);
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
 // A subscription accepts 48 SDP sections, including its control channel and first source.
@@ -189,6 +192,8 @@ enum Input {
     LoseDirect,
     #[cfg(test)]
     ThrottleDirect(u64),
+    #[cfg(test)]
+    SlowPublish(Duration),
 }
 
 struct Audio {
@@ -417,6 +422,12 @@ impl Media {
     #[cfg(test)]
     pub(super) async fn lose_direct(&self) {
         assert!(self.input.send(Input::LoseDirect).await.is_ok());
+    }
+
+    /// Every datagram the publish leg sends then takes `delay`, as on a busy host.
+    #[cfg(test)]
+    pub(super) async fn slow_publish(&self, delay: Duration) {
+        assert!(self.input.send(Input::SlowPublish(delay)).await.is_ok());
     }
 
     #[cfg(test)]
@@ -652,6 +663,8 @@ struct Leg {
     audio: HashSet<u64>,
     #[cfg(test)]
     throttle: Option<Shaper>,
+    #[cfg(test)]
+    slow: Option<Duration>,
 }
 
 /// A bottleneck for a leg's outgoing datagrams: a queue drained at a byte
@@ -770,6 +783,8 @@ impl Leg {
             audio: HashSet::new(),
             #[cfg(test)]
             throttle: None,
+            #[cfg(test)]
+            slow: None,
         })
     }
 
@@ -1242,6 +1257,12 @@ async fn run(
                 Some(Input::ThrottleDirect(rate)) => {
                     for attempt in direct.iter_mut().flat_map(|direct| &mut direct.legs) {
                         attempt.transport.throttle = Some(Shaper::new(rate));
+                    }
+                }
+                #[cfg(test)]
+                Some(Input::SlowPublish(delay)) => {
+                    if let Some(leg) = &mut publish {
+                        leg.slow = Some(delay);
                     }
                 }
                 #[cfg(test)]
@@ -1740,7 +1761,11 @@ async fn drain(
     while let Some((data, destination)) = leg.throttle.as_mut().and_then(Shaper::due) {
         leg.network.send(&data, destination).await?;
     }
+    let started = Instant::now();
     for _ in 0..UDP_BURST {
+        if started.elapsed() >= DRAIN_SLICE {
+            break;
+        }
         let packet = worker
             .exchange(Command::Poll { leg: leg.id }, Vec::new())
             .await?;
@@ -1762,6 +1787,10 @@ async fn drain(
                 if let Some(shaper) = &mut leg.throttle {
                     shaper.push(packet.data, destination);
                     continue;
+                }
+                #[cfg(test)]
+                if let Some(delay) = leg.slow {
+                    sleep(delay).await;
                 }
                 leg.network.send(&packet.data, destination).await?;
             }
