@@ -188,9 +188,14 @@ holds the keys using libcrux's portable wasm32 build (SECURITY.md).
 
 Owner target: up to 4K60 for screens where devices and the network sustain it;
 each receiver gets min(request, decode capacity, network capacity, policy).
-Camera quality and screen quality are user-selectable (Owner): Auto, then the
-§5.1 tier ladder. A publisher picks a source's top tier, a viewer the tier it
-requests, both within that minimum.
+Each source has two settings, chosen by its sender (Owner, #534): Sharp or
+Smooth, and Low latency. Sharp keeps the resolution and lowers the frame rate
+when bandwidth or CPU is short; Smooth keeps the frame rate and lowers the
+resolution. Screens start Sharp, cameras Smooth. Low latency bounds each
+viewer's queue at the SFU to 50 ms, and receivers render its frames at once
+(`jitterBufferTarget` 0 in browsers). Resolution and frame rate follow the
+bandwidth and the source; a publisher may limit a source to a §5.1 tier under
+Advanced, and a viewer's Auto fits the tile within an optional tier limit.
 Quality and path changes leave keys and relay-only untouched.
 
 ### 5.1 Tiers
@@ -236,12 +241,14 @@ and pacing use measured payload rates.
 - Encoder caps: screen key frames ≤1 MiB from 1440p up, ≤512 KiB below; camera
   key frames ≤256 KiB; deltas ≤ half the key-frame cap. An oversized frame is
   dropped and a key frame requested.
-- SFU queues hold about 300 ms at the leg's estimate, clamped to 32 KiB–2 MiB;
-  RTX caches about 1 s. A layered source's queue measures how long a frame
-  starting now waits, less the time the last key picture takes: past 300 ms it
-  lowers the receiver's target and leaves out whole frames the target can do
-  without, past 600 ms every frame but a key picture until the next switch
-  point. A key picture's temporal unit goes out whole up to 8 MiB.
+- SFU queues hold about 300 ms at the leg's estimate, 50 ms for a Low latency
+  source, clamped to 32 KiB–2 MiB; RTX caches about 1 s. A layered source's
+  queue measures how long a frame starting now waits, less the time the last
+  key picture takes: past the bound it lowers the receiver's target and leaves
+  out whole frames the target can do without, past twice the bound every frame
+  but a key picture until the next switch point. A temporal unit with a frame
+  out keeps its later frames. A key picture's temporal unit goes out whole up
+  to 8 MiB.
 - Key-frame requests: one per receiver and source per 2 s, coalesced per
   source; native senders repair loss with intra refresh. For a layered source
   the SFU asks only when a receiver lacks a chain of the decode target it
@@ -266,14 +273,19 @@ and pacing use measured payload rates.
 - Receivers send a fixed-size `QualityRequest` per source, at most once a
   second; "Auto" asks for the tile's size. They report decode capacity under the
   channel key and step down after 3 s below 90 % of the target frame rate.
-- The SFU picks layers per receiver from the DD, so a slow receiver lowers only
-  its own quality; it tells each publisher the largest demand per source.
+- The SFU picks layers per receiver from the DD (below), so a slow receiver
+  lowers only its own quality; it tells each publisher the largest demand per
+  source. A demand below the tier receivers want keeps that tier's height for a
+  Sharp source and its frame rate for a Smooth one. Browser senders set the
+  track's `contentHint` (`detail` or `motion`) and the sender's
+  `degradationPreference` (`maintain-resolution` or `maintain-framerate`).
 - Congestion control is GCC/TWCC on every leg. A publisher's target is
   min(upload estimate × 0.85, largest demand), split across its sources with
   the screen first.
-- Step-down order: bitrate, then frame rate, then resolution (at most once per
-  10 s). Step-up needs 1.3× the next tier's floor for 10 s (frame rate) or 30 s
-  (resolution).
+- Step-down order: bitrate, then what the mode gives up, then what it keeps (at
+  most once per 10 s): frame rate before resolution for Sharp, resolution before
+  frame rate for Smooth. Step-up needs 1.3× the next point's floor for 10 s
+  (what the mode gives up) or 30 s (what it keeps).
 
 Screen publishers use the selected tier for dimensions and cadence. With the
 screen-rate capability, the SFU supplies a separate encoder ceiling. The
@@ -287,6 +299,76 @@ whichever is lower. The SFU probes within configured limits while
 actual payload varies with screen motion. The traffic pacing tier also caps
 screen bitrate whenever pacing is active. Direct screen publishers use their
 direct congestion controller for bitrate.
+
+#### Layer selection
+
+The SFU chooses a decode target for each viewer of each layered source
+(`crates/stream-quality/src/dd.rs`, `apps/stream-sfu/src/media.rs`).
+
+Inputs. Per source, from the Dependency Descriptor: the decode targets with
+their spatial and temporal layers, the layer sizes, the active targets, and
+each frame's decode target indications, references and chains; and the RTP
+timestamps of its temporal units. Per viewer: the tier it asks for and decodes,
+lowered by the traffic policy (each tier caps the height and the frame rate),
+its bandwidth estimate and the SFU's budgets, the source's mode, and the queue
+bound (300 ms, 50 ms for Low latency).
+
+Measurements, per source:
+
+- The frame rate is the median temporal-unit interval of the latest active
+  window: 9 consecutive temporal units within one second of media time, so a
+  short pause inside a window leaves the median. A slower window, from a
+  static or slow source, keeps the measurement. Until
+  the first active window the source counts as 60 fps, the highest rate any
+  tier asks for. A target whose highest temporal layer is t of T has
+  2^(t−T) of the source's frame rate: WebRTC's scalability modes double the
+  frame rate with each temporal layer.
+- The bitrate of each target is its bytes over one-second windows from the
+  source's first frame. A window across a pause of over a second keeps the
+  previous rates.
+
+Choices, per viewer: a target is eligible when its spatial layer's height
+belongs to the viewer's tier or a lower one and its frame rate is at most 1.25
+times the tier's. The lowest active target is always eligible, and until the
+first bitrate window ends it is the only one. A Sharp source's eligible
+targets go by spatial, then temporal layer; a Smooth source's go along its
+lowest spatial layer by temporal layer, then along its top temporal layer by
+spatial layer. Each step of a late queue removes the top choice, down to the
+lowest choice of the top group: the top spatial layer for Sharp, the top
+temporal layer for Smooth.
+
+State, per viewer and source, updated once a second:
+
+- The budgets allocate each viewer the highest choice whose rate fits
+  (1.3 times the rate above the current choice).
+- A stepper starts at that choice once the source's bitrates are measured and
+  moves toward the allocation: down at once within a group (spatial layer for
+  Sharp, temporal for Smooth) and to another group at most once per 10 s; up
+  after the allocation has allowed the next choice for 10 s within a group or
+  30 s to another group. Its choice is the wanted target.
+- The selector forwards the current target's frames. It switches to the
+  wanted target at the first frame that starts a temporal unit, is a switch
+  point for the wanted target and whose chain the viewer holds; when the viewer
+  lacks that chain, the SFU asks the publisher for a key frame, at most once
+  per 2 s. A frame the current target needs and the viewer misses leaves it
+  without a target until the next such switch point.
+- The queue leaves out a frame the target can do without once the queue's
+  delay passes the bound, every frame but a key picture past twice the bound,
+  and keeps a temporal unit with a frame out whole. Each overloaded second
+  adds a step; steps recover one per 10 s.
+
+Invariants:
+
+- The wanted target is eligible: it never exceeds the viewer's tier in height
+  or frame rate.
+- Every forwarded frame belongs to the current target, and the current target
+  changes only at a switch point whose chain the viewer holds.
+- No target above the lowest comes from an incomplete bitrate window, and no
+  frame rate from a window that is not active.
+- A static or slow source keeps its measured frame rate, so it makes no target
+  eligible that was not eligible while it was active.
+- Moves follow the stepper's holds, and each forwarded temporal unit ends with
+  one marker.
 
 ### 5.4 Direct or relayed
 
@@ -528,7 +610,8 @@ Murmur 1.4 and 1.5 with a stock Mumble client, and relay-only by packet capture.
 - On Nuschl servers, later: the voice channel's WebRTC session is the call,
   and Start camera and Share screen add tracks to it, with per-participant
   admission, limits and removal (§3).
-- Camera quality and screen quality are user-selectable (§5).
+- Each source is Sharp or Smooth and may be Low latency; resolution and frame
+  rate limits sit under Advanced (§5).
 - Call model: one call per channel or direct conversation with camera and
   screen as sources (§2).
 - Call keys: per-publisher sender keys over the K1 exchange (§4); a call-wide
