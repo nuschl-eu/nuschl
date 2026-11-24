@@ -1615,9 +1615,6 @@ async fn a_murmur_database_imports_with_its_passwords_and_acls() {
     login("alice", "hunter2", leak(identity())).await.unwrap();
 }
 
-/// Murmur keeps registered users' listeners (`channel_listeners`): they come
-/// back on reconnect and after a restart, with their volume; removing one
-/// forgets it; an unregistered user's listeners end with the connection.
 /// Mumble's permission bits a Private channel denies everyone else (#341).
 const PRIVATE_ACCESS: u32 = 0x2 | 0x4 | 0x800 | 0x8 | 0x100 | 0x200;
 
@@ -1895,6 +1892,9 @@ async fn private_channels_and_the_people_in_them_reach_only_those_who_may_enter(
     fixture.running.shutdown().await;
 }
 
+/// Murmur keeps registered users' listeners (`channel_listeners`): they come
+/// back on reconnect and after a restart, with their volume; removing one
+/// forgets it; an unregistered user's listeners end with the connection.
 #[tokio::test]
 async fn registered_users_keep_their_listeners() {
     let fixture = Fixture::start("").await;

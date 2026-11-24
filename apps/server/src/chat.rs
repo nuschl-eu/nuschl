@@ -1171,6 +1171,7 @@ impl State {
             retention_days,
             live_only,
             own_retention: self.own_retention(&channel.conversation_id).is_some(),
+            rules: Vec::new(),
         }
     }
 

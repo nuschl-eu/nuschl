@@ -134,7 +134,7 @@ impl State {
             }
             kind::CHANNEL_STATE => {
                 if let Some(message) = decode(&frame.payload) {
-                    self.channel_state_message(session, message);
+                    self.channel_state_message(session, message, &frame.payload);
                 }
             }
             kind::USER_REMOVE => {
@@ -1841,7 +1841,12 @@ impl State {
         }
     }
 
-    fn channel_state_message(&mut self, source: u32, mut message: proto::ChannelState) {
+    fn channel_state_message(
+        &mut self,
+        source: u32,
+        mut message: proto::ChannelState,
+        body: &[u8],
+    ) {
         let existing = message.channel_id;
         if let Some(id) = existing {
             if !self.sees_channel(source, id) {
@@ -1900,16 +1905,50 @@ impl State {
             return;
         }
         match existing {
-            None => self.create_channel(source, message, &source_version),
+            None => {
+                if let Some(rules) = self.create_rules(source, body) {
+                    self.create_channel(source, message, &source_version, rules);
+                }
+            }
             Some(id) => self.update_channel(source, id, message),
         }
     }
 
+    /// The rules a create carries from a client with `hidden-channels/1`
+    /// (none from others); `None` refuses the create, when they are malformed
+    /// or past the editor's limits.
+    fn create_rules(&self, source: u32, body: &[u8]) -> Option<Vec<AclEntry>> {
+        use nuschl_protocol::nuschl::{capability, create_rules};
+        if !self
+            .users
+            .get(&source)
+            .and_then(|user| user.extension.as_ref())
+            .is_some_and(|extension| extension.has(capability::HIDDEN_CHANNELS))
+        {
+            return Some(Vec::new());
+        }
+        let entries: Vec<proto::acl::ChanAcl> = create_rules(body)?
+            .into_iter()
+            .map(|rule| proto::acl::ChanAcl {
+                apply_here: Some(rule.apply_here),
+                apply_subs: Some(rule.apply_subs),
+                inherited: None,
+                user_id: rule.user_id,
+                group: Some(rule.group),
+                grant: Some(rule.grant),
+                deny: Some(rule.deny),
+            })
+            .collect();
+        self.acl_entries(&entries)
+    }
+
+    /// A channel made with `rules`, applied before any client hears of it.
     fn create_channel(
         &mut self,
         source: u32,
         message: proto::ChannelState,
         version: &crate::state::ClientInfo,
+        rules: Vec<AclEntry>,
     ) {
         let (Some(parent), Some(name)) = (message.parent, message.name.clone()) else {
             return;
@@ -1973,6 +2012,7 @@ impl State {
             admins.add.insert(user_id);
             channel.node.groups.insert("admin".into(), admins);
         }
+        channel.node.acls = rules;
         self.conversations.add_channel(channel.conversation_id, id);
         self.channels.0.insert(id, channel);
         if let Some(parent) = self.channels.get_mut(parent) {
@@ -2247,23 +2287,52 @@ impl State {
         }
     }
 
-    fn set_acl(&mut self, source: u32, id: u32, message: proto::Acl) {
-        if message.acls.len() > MAX_ACL_ENTRIES
-            || message.groups.len() > MAX_GROUPS
-            || message.groups.iter().any(|group| {
-                group.name.len() > MAX_NAME_BYTES
-                    || group.add.len() + group.remove.len() > MAX_GROUP_MEMBERS
-            })
-            || message.acls.iter().any(|entry| {
+    /// Rules a client sent, as stored: those naming unknown accounts are left
+    /// out, permissions stay within Mumble's; `None` past the editor's limits.
+    fn acl_entries(&self, entries: &[proto::acl::ChanAcl]) -> Option<Vec<AclEntry>> {
+        if entries.len() > MAX_ACL_ENTRIES
+            || entries.iter().any(|entry| {
                 entry
                     .group
                     .as_ref()
                     .is_some_and(|group| group.len() > MAX_NAME_BYTES)
             })
         {
+            return None;
+        }
+        let valid = |user_id: &u32| self.registry.users.contains_key(user_id);
+        Some(
+            entries
+                .iter()
+                .filter(|entry| entry.user_id.is_none_or(|user_id| valid(&user_id)))
+                .map(|entry| AclEntry {
+                    apply_here: entry.apply_here(),
+                    apply_subs: entry.apply_subs(),
+                    user_id: entry.user_id,
+                    group: if entry.user_id.is_some() {
+                        String::new()
+                    } else {
+                        entry.group.clone().unwrap_or_default()
+                    },
+                    grant: entry.grant() & perm::ALL,
+                    deny: entry.deny() & perm::ALL,
+                })
+                .collect(),
+        )
+    }
+
+    fn set_acl(&mut self, source: u32, id: u32, message: proto::Acl) {
+        let acls = self.acl_entries(&message.acls);
+        let Some(acls) = acls.filter(|_| {
+            message.groups.len() <= MAX_GROUPS
+                && !message.groups.iter().any(|group| {
+                    group.name.len() > MAX_NAME_BYTES
+                        || group.add.len() + group.remove.len() > MAX_GROUP_MEMBERS
+                })
+        }) else {
             tracing::info!(actor = %self.log_name(source), channel = id, "refused an oversized ACL");
             return;
-        }
+        };
         let valid = |user_id: &u32| self.registry.users.contains_key(user_id);
         let groups: BTreeMap<String, Group> = message
             .groups
@@ -2278,23 +2347,6 @@ impl State {
                         remove: group.remove.iter().copied().filter(valid).collect(),
                     },
                 )
-            })
-            .collect();
-        let acls: Vec<AclEntry> = message
-            .acls
-            .iter()
-            .filter(|entry| entry.user_id.is_none_or(|user_id| valid(&user_id)))
-            .map(|entry| AclEntry {
-                apply_here: entry.apply_here(),
-                apply_subs: entry.apply_subs(),
-                user_id: entry.user_id,
-                group: if entry.user_id.is_some() {
-                    String::new()
-                } else {
-                    entry.group.clone().unwrap_or_default()
-                },
-                grant: entry.grant() & perm::ALL,
-                deny: entry.deny() & perm::ALL,
             })
             .collect();
         let Some(channel) = self.channels.get_mut(id) else {

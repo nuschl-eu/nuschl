@@ -90,6 +90,21 @@ message ChannelInfo {
   bool live_only = 4;
   // The channel sets its own retention (otherwise it follows the server's).
   bool own_retention = 5;
+  // From a client with `hidden-channels/1`, on a create: the new channel's own
+  // rules, which the server applies before any client hears of the channel.
+  // Servers never send them.
+  repeated Rule rules = 6;
+}
+
+// One of a channel's rules (Mumble's `ACL.ChanACL`): for a registered user or
+// a group, here and in subchannels, the permissions it allows and denies.
+message Rule {
+  bool apply_here = 1;
+  bool apply_subs = 2;
+  optional uint32 user_id = 3;
+  string group = 4;
+  uint32 grant = 5;
+  uint32 deny = 6;
 }
 
 // A channel's retention in `ChannelSettings`.

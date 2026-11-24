@@ -445,7 +445,10 @@ the wire definition):
   `DirectOpened`, `ListDirect`, `DirectList`, `ChannelSettings`, `Done`. Field 7200 of
   `ChannelState` carries a channel's conversation id, visibility and retention
   (`retention_days`, 0 for forever; `live_only`; `own_retention`), to Nuschl
-  connections only. `ChannelSettings` changes only what it carries: an optional
+  connections only; with `hidden-channels/1`, a client's create carries the new
+  channel's own rules there (`rules`, Mumble's `ChanACL` fields), which the server
+  applies before any client hears of the channel, and refuses the create when they
+  are malformed or past the ACL editor's limits. `ChannelSettings` changes only what it carries: an optional
   visibility and an optional `Retention` (server default, forever, 1–36,500 days or
   live-only), with `confirm_expiry` for a shortening.
 - **Minimum versions**: `Hello.client_version` (field 5, at most 64 bytes, only

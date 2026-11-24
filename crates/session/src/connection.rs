@@ -350,6 +350,10 @@ pub enum Command {
         parent: u32,
         name: String,
         temporary: bool,
+        /// The new channel's own rules, sent with the create to a server that
+        /// negotiated `hidden-channels/1`, which applies them before anyone
+        /// hears of the channel; left out elsewhere.
+        rules: Vec<AclEntry>,
     },
     EditChannel {
         channel: u32,
@@ -2994,17 +2998,44 @@ impl State {
                 parent,
                 name,
                 temporary,
+                rules,
             } => {
                 if self.channels.contains_key(&parent) && valid_name(&name) {
-                    self.queue(
-                        kind::CHANNEL_STATE,
-                        &proto::ChannelState {
-                            parent: Some(parent),
-                            name: Some(name),
-                            temporary: Some(temporary),
-                            ..Default::default()
-                        },
-                    );
+                    let state = proto::ChannelState {
+                        parent: Some(parent),
+                        name: Some(name),
+                        temporary: Some(temporary),
+                        ..Default::default()
+                    };
+                    let hides = self.extension.as_ref().is_some_and(|capabilities| {
+                        capabilities
+                            .iter()
+                            .any(|c| c == nuschl::capability::HIDDEN_CHANNELS)
+                    });
+                    let mut payload = state.encode_to_vec();
+                    if hides && !rules.is_empty() {
+                        let rules = rules
+                            .into_iter()
+                            .map(|rule| nuschl::v1::Rule {
+                                apply_here: rule.apply_here,
+                                apply_subs: rule.apply_subs,
+                                user_id: rule.user_id,
+                                group: rule.group.unwrap_or_default(),
+                                grant: rule.grant,
+                                deny: rule.deny,
+                            })
+                            .collect();
+                        nuschl::v1::ChannelStateExtension {
+                            nuschl: Some(nuschl::v1::ChannelInfo {
+                                rules,
+                                ..Default::default()
+                            }),
+                        }
+                        .encode(&mut payload)
+                        .ok();
+                    }
+                    self.outbox.charge(Instant::now());
+                    self.outbound.push((kind::CHANNEL_STATE, payload));
                 }
             }
             Command::EditChannel { channel, edit } => {

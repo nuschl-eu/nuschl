@@ -1895,8 +1895,8 @@ impl Fixture {
     /// A Private channel below the root, as the channel type stores it
     /// (`@all` denied and `@admin` allowed Traverse, Enter, Listen, Speak,
     /// Whisper, Text message, here and in subchannels), with the member's row
-    /// and Write for the owner, and a subchannel; created at once, as a
-    /// client would see a channel created with its rules.
+    /// and Write for the owner, and a subchannel; each comes with its rules,
+    /// as a create that carries a type's rules (`hidden-channels/1`) makes it.
     fn add_secret(&mut self) {
         let access = perm::TRAVERSE
             | perm::ENTER
@@ -2237,6 +2237,96 @@ fn group_membership_shows_and_hides_a_private_channel_with_its_people() {
     let heard = Heard::of(&f.received(registered));
     assert_eq!(heard.removed_users, [member]);
     assert_eq!(heard.removed_channels, [INNER, SECRET]);
+}
+
+/// The private ACL [`Fixture::add_secret`] stores, with `members` allowed by
+/// name.
+fn secret_acl(members: &[u32]) -> proto::Acl {
+    let access = perm::TRAVERSE
+        | perm::ENTER
+        | perm::LISTEN
+        | perm::SPEAK
+        | perm::WHISPER
+        | perm::TEXT_MESSAGE;
+    let rule = |group: Option<&str>, user_id: Option<u32>, grant, deny| proto::acl::ChanAcl {
+        apply_here: Some(true),
+        apply_subs: Some(true),
+        group: group.map(str::to_owned),
+        user_id,
+        grant: Some(grant),
+        deny: Some(deny),
+        ..Default::default()
+    };
+    let mut acls = vec![
+        rule(Some("all"), None, 0, access),
+        rule(Some("admin"), None, access, 0),
+    ];
+    acls.extend(members.iter().map(|id| rule(None, Some(*id), access, 0)));
+    proto::Acl {
+        channel_id: SECRET,
+        inherit_acls: Some(true),
+        acls,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_channel_created_with_private_rules_is_never_shown_to_others() {
+    use prost::Message as _;
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    let [_, admin, _, member, _, _, anonymous] = f.actors;
+    for session in f.actors {
+        f.received(session);
+    }
+    let create = |f: &mut Fixture, name: &str, rules: Vec<v1::Rule>| {
+        let mut body = proto::ChannelState {
+            parent: Some(0),
+            name: Some(name.into()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        v1::ChannelStateExtension {
+            nuschl: Some(v1::ChannelInfo {
+                rules,
+                ..Default::default()
+            }),
+        }
+        .encode(&mut body)
+        .unwrap();
+        f.state.handle(
+            admin,
+            ControlFrame {
+                kind: kind::CHANNEL_STATE,
+                payload: Bytes::from(body),
+            },
+            &mut Datagrams::default(),
+        );
+        f.state
+            .channels
+            .0
+            .values()
+            .find(|channel| channel.name == name)
+            .map(|channel| channel.id)
+    };
+    let rules: Vec<v1::Rule> = secret_acl(&[MEMBER])
+        .acls
+        .into_iter()
+        .map(|acl| v1::Rule {
+            apply_here: acl.apply_here(),
+            apply_subs: acl.apply_subs(),
+            user_id: acl.user_id,
+            group: acl.group.clone().unwrap_or_default(),
+            grant: acl.grant(),
+            deny: acl.deny(),
+        })
+        .collect();
+    let layoffs = create(&mut f, "Layoffs", rules.clone()).unwrap();
+    assert!(!f.state.sees_channel(anonymous, layoffs));
+    assert_eq!(Heard::of(&f.received(anonymous)), Heard::default());
+    assert_eq!(Heard::of(&f.received(member)).channels, [layoffs]);
+    // Rules past the editor's limits make no channel.
+    assert_eq!(create(&mut f, "Many", vec![rules[0].clone(); 513]), None);
 }
 
 #[test]

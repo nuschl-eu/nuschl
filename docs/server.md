@@ -649,7 +649,11 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   A user who moves gets the channels of its new place before anyone hears of
   the move, and is seen arriving (its whole `UserState`, as on login) or
   leaving (`UserRemove`) by those who see only one of the two channels. A
-  new channel reaches only those who see it; a channel moving under a parent
+  new channel reaches only those who see it, under the rules its create
+  carries from a client with `hidden-channels/1` (`ChannelInfo.rules`,
+  applied before anyone hears of the channel; a create with malformed or too
+  many rules is refused); a stock client's create and its ACL arrive one
+  after the other, and the channel shows in between. A channel moving under a parent
   a client did not know brings that parent first. A change sends a client at
   most the channel tree it sees, as at login. A request that names a channel
   or someone the client does not see gets the answer for one that does not

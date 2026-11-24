@@ -61,9 +61,12 @@ message in the receiver's channel for private messages too, so Members only and
 Private also stop everyone else's private messages to people inside. Rules the
 table cannot show leave the type unset.
 
-**Create sub-channel…** offers the same types. Once the server shows the new
-channel on the same connection, its permissions open, take the type and save.
-The type applies only when the channel's rules name this account or certificate
+**Create sub-channel…** offers the same types. On a server that negotiated
+`hidden-channels/1` the type's rules go with the create, and nuschld applies them
+before any client hears of the channel, so nobody the type leaves out sees it even
+for a moment; the channel's permissions then open with nothing to save. Elsewhere,
+once the server shows the new channel on the same connection, its permissions
+open, take the type and save. The type applies only when the channel's rules name this account or certificate
 as its creator: its own `admin` group, or Murmur's Write rule for a creator
 without Write. A refusal, a reconnect or 15 seconds without the channel drop the
 request. Murmur and nuschld refuse a name a sibling already has.

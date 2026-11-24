@@ -1120,6 +1120,53 @@ impl Fixture {
     }
 }
 
+/// A channel created as Private through the session, as the desktop creates
+/// one on a server with `hidden-channels/1`, never reaches anyone else.
+#[tokio::test]
+async fn a_channel_created_private_through_the_session_reaches_nobody_else() {
+    let fixture = Fixture::start("").await;
+    fixture.edit_channel(0, |root| {
+        root.node
+            .acls
+            .push(entry("all", None, perm::MAKE_CHANNEL, 0))
+    });
+    let mut guest = nuschl(&fixture, "Guest", 1).await;
+    let mut creator = nuschl(&fixture, "Creator", 0).await;
+    creator
+        .command(Command::CreateChannel {
+            parent: 0,
+            name: "Plans".into(),
+            temporary: false,
+            rules: nuschl_core::admin::new_channel_rules(nuschl_core::access::Kind::Private, "")
+                .unwrap(),
+        })
+        .await;
+    let plans = creator
+        .wait(|event| match event {
+            SessionEvent::Channel(channel) if channel.name == "Plans" => Some(channel.id),
+            _ => None,
+        })
+        .await;
+    assert!(
+        !guest
+            .arrives(Duration::from_millis(500), |event| {
+                matches!(event, SessionEvent::Channel(channel) if channel.id == plans)
+            })
+            .await
+    );
+    let state = fixture.running.server.lock();
+    assert!(
+        state
+            .channels
+            .get(plans)
+            .unwrap()
+            .node
+            .acls
+            .iter()
+            .any(|acl| { acl.group == "all" && acl.deny & perm::TRAVERSE != 0 })
+    );
+}
+
 fn entry(group: &str, user: Option<u32>, grant: u32, deny: u32) -> nuschld::acl::AclEntry {
     nuschld::acl::AclEntry {
         apply_here: true,
@@ -2147,6 +2194,7 @@ async fn temporary_history_goes_with_its_channel_and_deleted_channels_are_archiv
             parent: 0,
             name: "Temp".into(),
             temporary: true,
+            rules: Vec::new(),
         })
         .await;
     let (channel, conversation) = alice

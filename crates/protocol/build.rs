@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".nuschl.v1.Message",
             ".nuschl.v1.ShareLinkCreate",
             ".nuschl.v1.ShareLink",
+            ".nuschl.v1.Rule",
         ])
         .compile_protos(
             &[
