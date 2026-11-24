@@ -8870,7 +8870,7 @@ dependencies = [
 [[package]]
 name = "opus-rs"
 version = "0.1.42"
-source = "git+https://github.com/ambiso/opus-rs#6e2284cedd4df9a5c958cc4f2975619eee5dec33"
+source = "git+https://github.com/ambiso/opus-rs#8708b2b6a4aaececa079cb5134b2dedc7a964be4"
 dependencies = [
  "fearless_simd 1.2.0",
 ]
