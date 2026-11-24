@@ -55,10 +55,17 @@
       <footer>
         <div id="controls">
           <button type="button" id="camera" aria-pressed="false" disabled>Start camera</button>
-          <select id="camera-quality" aria-label="Camera quality"></select>
+          <select id="camera-prefer" aria-label="Camera mode"></select>
+          <label><input type="checkbox" id="camera-latency"> Low latency</label>
           <button type="button" id="screen" aria-pressed="false" disabled>Share screen</button>
-          <select id="screen-quality" aria-label="Screen quality"></select>
+          <select id="screen-prefer" aria-label="Screen mode"></select>
+          <label><input type="checkbox" id="screen-latency"> Low latency</label>
           <label hidden><input type="checkbox" id="screen-audio"> Share browser tab audio</label>
+          <details id="advanced">
+            <summary>Advanced</summary>
+            <label>Camera limit <select id="camera-quality"></select></label>
+            <label>Screen limit <select id="screen-quality"></select></label>
+          </details>
           <span id="notice" role="status" hidden></span>
         </div>
       </footer>

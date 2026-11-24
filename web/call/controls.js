@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 // Start camera and Share screen (docs/video-plan.md §7): the camera opens only on the
 // user's own Start camera, every share asks the browser's picker again, and this
-// page never opens the microphone.
+// page never opens the microphone. Each source has Sharp or Smooth and Low latency;
+// its resolution and frame rate limit sit under Advanced.
 
 import { TIERS } from "./signal.js";
 
@@ -74,7 +75,20 @@ export class Controls {
     for (const kind of ["camera", "screen"]) {
       const button = $(kind);
       const quality = $(`${kind}-quality`);
+      const prefer = $(`${kind}-prefer`);
+      const latency = $(`${kind}-latency`);
       qualityOptions(quality, kind);
+      prefer.replaceChildren(...[["sharp", "Sharp"], ["smooth", "Smooth"]].map(([value, label]) => {
+        const entry = document.createElement("option");
+        entry.value = value;
+        entry.textContent = label;
+        return entry;
+      }));
+      prefer.value = call.modes[kind].prefer;
+      latency.checked = call.modes[kind].low_latency;
+      const mode = () => call.setMode(kind, { prefer: prefer.value, low_latency: latency.checked }).catch(() => {});
+      prefer.addEventListener("change", mode);
+      latency.addEventListener("change", mode);
       quality.addEventListener("change", () => call.setPublishTier(kind, quality.value));
       button.addEventListener("click", () => this.toggle(kind));
       this.sources[kind] = { button, quality };
