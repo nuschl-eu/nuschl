@@ -63,8 +63,8 @@ try {
   assert.deepEqual(await guest.evaluate(() => videoCaptureCalls), []);
 
   await hostPage.getByText("Advanced", { exact: true }).click();
-  await hostPage.getByLabel("Camera limit", { exact: true }).selectOption("0");
-  await hostPage.getByLabel("Screen limit", { exact: true }).selectOption("0");
+  await hostPage.getByLabel("Camera limit").selectOption("0");
+  await hostPage.getByLabel("Screen limit").selectOption("0");
   await hostPage.getByRole("button", { name: "Start camera", exact: true }).click();
   await hostPage.getByRole("button", { name: "Share screen", exact: true }).click();
   await guest.waitForFunction(() => {
