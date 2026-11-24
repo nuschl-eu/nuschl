@@ -16,11 +16,10 @@
 //! gets is the least of both; until it asks, it asks for the top tier. Once a
 //! second the publisher hears the resulting demand for each source.
 
-use crate::protocol::VideoLimit;
+use crate::protocol::{Mode, Prefer, VideoLimit};
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
-    adapt::Stepper,
-    dd::{Frame, Layers, Selector},
+    dd::{self, Frame, Layers, Pace, Selector},
     receive,
 };
 use std::{
@@ -29,32 +28,50 @@ use std::{
 };
 use str0m::rtp::{Extension, ExtensionSerializer, ExtensionValues, StreamTxQueueInfo};
 
-const QUEUE_AGE: Duration = Duration::from_millis(300);
 const MIN_QUEUE_BYTES: u64 = 32 * 1024;
 const MAX_QUEUE_BYTES: u64 = 2 * 1024 * 1024;
-/// How long a layered frame may wait in a receiver's queue before the queue
-/// leaves frames out.
+/// How long a frame may wait in a receiver's queue before the queue leaves
+/// frames out.
 pub const QUEUE_BOUND: Duration = Duration::from_millis(300);
+/// [`QUEUE_BOUND`] for a Low latency source.
+pub const LOW_LATENCY_BOUND: Duration = Duration::from_millis(50);
 /// The largest frame a publisher sends, an 8 MiB screen frame: a key picture's
 /// temporal unit, and a recovery picture, up to this size goes out whole.
 pub const MAX_KEY_BYTES: u64 = 8 * 1024 * 1024;
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
-/// A video source: its kind and the demand last sent to its publisher.
+/// A video source: its kind, its sender's mode and the demand last sent to its
+/// publisher.
 pub struct Video {
     pub kind: Kind,
-    pub demand: Option<(usize, u64, Option<VideoLimit>)>,
+    pub mode: Mode,
+    /// The tier, height, frame rate, bitrate and limit last asked of it.
+    pub demand: Option<(usize, u16, u8, u64, Option<VideoLimit>)>,
     pub throttle: Throttle,
     pub layers: Layers,
 }
 
 impl Video {
-    pub fn new(kind: Kind) -> Self {
+    pub fn new(kind: Kind, mode: Mode) -> Self {
         Self {
             kind,
+            mode,
             demand: None,
             throttle: Throttle::default(),
             layers: Layers::default(),
+        }
+    }
+
+    pub fn smooth(&self) -> bool {
+        self.mode.prefer == Prefer::Smooth
+    }
+
+    /// How long its frames may wait in a receiver's queue.
+    pub fn bound(&self) -> Duration {
+        if self.mode.low_latency {
+            LOW_LATENCY_BOUND
+        } else {
+            QUEUE_BOUND
         }
     }
 }
@@ -67,11 +84,14 @@ pub struct View {
     pub throttle: Throttle,
     pub selector: Selector,
     /// Paces moves toward the receiver's share of the budgets.
-    pub stepper: Option<Stepper>,
+    pub pace: Option<Pace>,
+    /// The source's target list its selector's targets belong to.
+    pub generation: Option<u32>,
     pub rewrite: Rewrite,
     pub backlog: Backlog,
     pub reported_limit: Option<VideoLimit>,
     pub limit_throttle: Throttle,
+    pub reported_mode: Option<Mode>,
 }
 
 /// The video admitted to one receiver's send queue and its temporary quality limit.
@@ -80,9 +100,12 @@ pub struct Backlog {
     dropped_through: Option<u64>,
     /// The layered frame left out whole.
     skipping: Option<u16>,
-    /// The bytes of the last key picture's temporal unit, and whether more of
-    /// it is to come: the queue's bound grows by the time they take.
-    key: (u64, bool),
+    /// The timestamps of the latest temporal units with a packet out.
+    units: VecDeque<u64>,
+    /// The bytes of the last key picture's temporal unit, and its timestamp
+    /// while more of it is to come: the queue's bound grows by the time they
+    /// take.
+    key: (u64, Option<u64>),
     sampled_at: Option<Instant>,
     unsampled_bytes: usize,
     overloaded: Option<VideoLimit>,
@@ -120,8 +143,11 @@ pub enum Layered {
 }
 
 impl Backlog {
+    /// Whether the packet at `timestamp` belongs to what the queue shed: the
+    /// unit at `dropped_through` and the second before it.
     pub fn dropped(&self, timestamp: u64) -> bool {
-        self.dropped_through.is_some_and(|last| timestamp <= last)
+        self.dropped_through
+            .is_some_and(|last| timestamp <= last && last - timestamp <= 90_000)
     }
 
     pub fn shed(&mut self, timestamp: u64, pause: Option<Instant>, limit: VideoLimit) {
@@ -152,24 +178,28 @@ impl Backlog {
     }
 
     /// Whether `payload` more bytes take the queue of a source without a
-    /// descriptor past about 300 ms, beyond the last recovery picture.
+    /// descriptor past about `bound`, beyond the last recovery picture.
     pub fn full(
         &mut self,
         queue: Option<&dyn StreamTxQueueInfo>,
         bitrate: u64,
         payload: usize,
+        bound: Duration,
         now: Instant,
     ) -> bool {
-        let limit = (bitrate / 8 * 3 / 10).clamp(MIN_QUEUE_BYTES, MAX_QUEUE_BYTES);
+        let bytes = u128::from(bitrate) * bound.as_millis() / 8000;
+        let limit = u64::try_from(bytes)
+            .unwrap_or(u64::MAX)
+            .clamp(MIN_QUEUE_BYTES, MAX_QUEUE_BYTES);
         let age = queue
             .and_then(StreamTxQueueInfo::first_unsent)
             .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
         let queued = self.queued_bytes(queue) as u64;
-        if queued <= limit && age < QUEUE_AGE && !self.key.1 {
+        if queued <= limit && age < bound && self.key.1.is_none() {
             self.key.0 = 0;
         }
         let picture = Duration::from_secs_f64(self.key.0 as f64 * 8.0 / bitrate.max(1) as f64);
-        queued + payload as u64 > limit + self.key.0 || age >= QUEUE_AGE + picture
+        queued + payload as u64 > limit + self.key.0 || age >= bound + picture
     }
 
     /// Admits a packet of the layered `frame` by how long a frame starting now
@@ -177,10 +207,13 @@ impl Backlog {
     /// takes. Past `bound` the receiver's target drops a step, and a frame its
     /// target can do without (`discardable`) is left out whole; past twice
     /// `bound` every frame but a key picture is, and the receiver waits for the
-    /// next switch point.
+    /// next switch point. A temporal unit (at `timestamp`) with a frame out
+    /// keeps its later frames: its last one carries the marker.
+    #[allow(clippy::too_many_arguments)]
     pub fn layered(
         &mut self,
         frame: &Frame,
+        timestamp: u64,
         discardable: bool,
         queue: Option<&dyn StreamTxQueueInfo>,
         bitrate: u64,
@@ -196,16 +229,18 @@ impl Backlog {
             let time =
                 |bytes: u64| Duration::from_secs_f64(bytes as f64 * 8.0 / bitrate.max(1) as f64);
             let delay = age.max(time(queued));
-            if delay <= bound && !self.key.1 {
+            // The grown bound lasts until the delay falls to half the bound:
+            // the packets behind the key picture wait for it too.
+            if delay <= bound / 2 && self.key.1.is_none() {
                 self.key.0 = 0;
             }
             let delay = delay.saturating_sub(time(self.key.0));
             let key = frame.references().next().is_none();
             if key {
-                self.key = (0, true);
+                self.key = (0, Some(timestamp));
             } else if delay > bound {
                 self.overloaded(VideoLimit::ForwardingBacklog);
-                if discardable || delay > bound * 2 {
+                if (discardable || delay > bound * 2) && !self.out(timestamp) {
                     self.skipping = Some(frame.number);
                 }
             }
@@ -224,10 +259,18 @@ impl Backlog {
         self.queued_bytes(queue).saturating_add(payload) as u64 > cap
     }
 
-    pub fn enqueued(&mut self, payload: usize, cost: u64, marker: bool) {
+    /// Whether a packet of the temporal unit at `timestamp` is out: the
+    /// unit's later packets go out too, the last one with the marker.
+    pub fn out(&self, timestamp: u64) -> bool {
+        self.units.contains(&timestamp)
+    }
+
+    /// A packet of the temporal unit at `timestamp` went out.
+    pub fn enqueued(&mut self, payload: usize, cost: u64, marker: bool, timestamp: u64) {
+        dd::push(&mut self.units, timestamp);
         self.unsampled_bytes += payload;
-        if self.key.1 {
-            self.key = (self.key.0 + payload as u64, !marker);
+        if self.key.1 == Some(timestamp) {
+            self.key = (self.key.0 + payload as u64, (!marker).then_some(timestamp));
         }
         if let Recovery::Picture { timestamp, bytes } = self.recovery {
             self.recovery = if marker {
@@ -268,7 +311,7 @@ impl Backlog {
                     timestamp,
                     bytes: 0,
                 };
-                self.key = (0, true);
+                self.key = (0, Some(timestamp));
                 VideoAdmission::Burst(0)
             }
             Recovery::Picture {
@@ -305,6 +348,11 @@ impl Backlog {
 
     pub fn tier(&self, tier: usize) -> usize {
         tier.saturating_sub(self.steps)
+    }
+
+    /// How many steps a late queue lowers the receiver's quality.
+    pub fn steps(&self) -> usize {
+        self.steps
     }
 
     pub fn limited(&self) -> bool {
@@ -475,11 +523,31 @@ mod tests {
             oldest: now,
             bytes: 74_000,
         };
-        assert!(!backlog.full(Some(&sample), 2_000_000, 1000, now));
-        backlog.enqueued(1000, 1000, false);
-        assert!(backlog.full(Some(&sample), 2_000_000, 1, now));
-        assert!(backlog.full(Some(&sample), 15_000_000, 1000, now + QUEUE_AGE));
-        assert!(!backlog.full(None, 2_000_000, 1000, now));
+        assert!(!backlog.full(Some(&sample), 2_000_000, 1000, QUEUE_BOUND, now));
+        backlog.enqueued(1000, 1000, false, 0);
+        assert!(backlog.full(Some(&sample), 2_000_000, 1, QUEUE_BOUND, now));
+        let late = now + QUEUE_BOUND;
+        assert!(backlog.full(Some(&sample), 15_000_000, 1000, QUEUE_BOUND, late));
+        assert!(!backlog.full(None, 2_000_000, 1000, QUEUE_BOUND, now));
+        // A Low latency source's queue holds 50 ms, and at least 32 KiB.
+        let mut backlog = Backlog::default();
+        let small = Queue {
+            oldest: now,
+            bytes: 30_000,
+        };
+        let wide = Queue {
+            oldest: now,
+            bytes: 80_000,
+        };
+        let mut low = |queue: &Queue, bitrate, payload, ms| {
+            let at = now + Duration::from_millis(ms);
+            backlog.full(Some(queue), bitrate, payload, LOW_LATENCY_BOUND, at)
+        };
+        assert!(!low(&small, 2_000_000, 1000, 49));
+        assert!(low(&small, 2_000_000, 1000, 50));
+        assert!(low(&small, 2_000_000, 4000, 0));
+        assert!(!low(&wide, 20_000_000, 1000, 0));
+        assert!(low(&wide, 20_000_000, 50_000, 0));
     }
 
     #[test]
@@ -497,7 +565,7 @@ mod tests {
                 descriptor.extend([0x80, 0x00, 0x3a, 0x40, 0x00]);
             }
             layers
-                .packet(&descriptor, 1, std::time::Duration::ZERO)
+                .packet(&descriptor, 1, 0, std::time::Duration::ZERO)
                 .expect("valid")
         };
         let key = frame(1, true);
@@ -505,10 +573,14 @@ mod tests {
         let later = frame(2, false);
         // 2 Mbit/s: 100 kB wait 400 ms, 200 kB 800 ms.
         let queue = |bytes: usize| Queue { oldest: now, bytes };
-        let admit = |backlog: &mut Backlog, frame: &Frame, discardable, bytes| {
+        // Each frame starts a temporal unit of its own.
+        let mut unit = 0;
+        let mut admit = |backlog: &mut Backlog, frame: &Frame, discardable, bytes| {
             let queue = queue(bytes);
+            unit += 1;
             backlog.layered(
                 frame,
+                unit,
                 discardable,
                 Some(&queue),
                 2_000_000,
@@ -536,7 +608,7 @@ mod tests {
         assert_eq!(admit(&mut backlog, &key, false, 200_000), Layered::Send);
         // The key picture's 400 kB, 1.6 s, extend the bound for the frames
         // behind it: with 100 kB more they wait 400 ms past it.
-        backlog.enqueued(400_000, 400_000, true);
+        backlog.enqueued(400_000, 400_000, true, 6);
         let sample = |bytes| Queue {
             oldest: now + Duration::from_millis(1),
             bytes,
@@ -545,6 +617,7 @@ mod tests {
             let queue = sample(bytes);
             backlog.layered(
                 frame,
+                u64::from(frame.number) + 100,
                 discardable,
                 Some(&queue),
                 2_000_000,
@@ -562,6 +635,313 @@ mod tests {
         backlog.tick(now);
         assert_eq!(backlog.tier(3), 2);
         assert_eq!(backlog.limit(), Some(VideoLimit::ForwardingBacklog));
+    }
+
+    #[test]
+    fn a_key_pictures_allowance_lasts_until_the_queue_catches_up() {
+        let now = Instant::now();
+        let (key, delta) = key_and_delta();
+        let mut backlog = Backlog::default();
+        // 2 Mbit/s: 100 kB wait 400 ms. Each unit samples the queue anew.
+        let admit = |backlog: &mut Backlog, frame: &Frame, unit, bytes| {
+            let oldest = now + Duration::from_millis(unit);
+            let queue = Queue { oldest, bytes };
+            backlog.layered(frame, unit, true, Some(&queue), 2_000_000, QUEUE_BOUND, now)
+        };
+        // A 100 kB key picture at unit 1, with a late marker of unit 0 between
+        // its packets.
+        assert_eq!(admit(&mut backlog, &key, 1, 0), Layered::Send);
+        backlog.enqueued(50_000, 50_000, false, 1);
+        backlog.enqueued(1000, 1000, true, 0);
+        backlog.enqueued(50_000, 50_000, true, 1);
+        // Its 400 ms extend the bound: 600 ms behind it pass.
+        assert_eq!(admit(&mut backlog, &delta, 2, 150_000), Layered::Send);
+        // Until the delay falls to half the bound.
+        assert_eq!(admit(&mut backlog, &delta, 3, 60_000), Layered::Send);
+        assert_eq!(admit(&mut backlog, &delta, 4, 150_000), Layered::Send);
+        assert_eq!(admit(&mut backlog, &delta, 5, 30_000), Layered::Send);
+        assert_eq!(admit(&mut backlog, &delta, 6, 150_000), Layered::Skip);
+    }
+
+    #[test]
+    fn late_packets_and_a_jump_back_keep_the_units() {
+        let second = 90_000;
+        let mut backlog = Backlog::default();
+        // A packet of a unit two seconds back, then one of a new stream from
+        // time 0: each unit keeps its later packets.
+        backlog.enqueued(1000, 1000, false, 10 * second);
+        backlog.enqueued(1000, 1000, true, 8 * second);
+        backlog.enqueued(1000, 1000, false, 0);
+        for unit in [10 * second, 8 * second, 0] {
+            assert!(backlog.out(unit), "{unit}");
+        }
+        // A shed takes its unit and the second before it.
+        backlog.shed(10 * second, None, VideoLimit::ForwardingBacklog);
+        assert!(backlog.dropped(10 * second));
+        assert!(backlog.dropped(9 * second));
+        assert!(!backlog.dropped(10 * second + 1));
+        assert!(!backlog.dropped(8 * second));
+        assert!(!backlog.dropped(0));
+    }
+
+    /// A queue sampled at `at`, as str0m reports it between polls.
+    struct Sample {
+        at: Instant,
+        oldest: Option<Instant>,
+        bytes: usize,
+    }
+
+    impl StreamTxQueueInfo for Sample {
+        fn created_at(&self) -> Instant {
+            self.at
+        }
+
+        fn byte_size(&self) -> usize {
+            self.bytes
+        }
+
+        fn packet_count(&self) -> usize {
+            usize::from(self.bytes > 0)
+        }
+
+        fn first_unsent(&self) -> Option<Instant> {
+            self.oldest
+        }
+    }
+
+    /// Random layered streams through a queue that drains at the receiver's
+    /// rate, sampled every few milliseconds, with late packets: a temporal
+    /// unit with a packet out goes out whole, key pictures go out, a packet of
+    /// a delta unit waits at most twice the bound beyond the key picture and
+    /// two units, and a link of 2.5 times the source's rate leaves nothing out.
+    #[test]
+    fn the_queue_holds_its_bounds_over_random_streams() {
+        let start = Instant::now();
+        let mut skipped = 0;
+        for seed in 1..=200u64 {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut below = |n: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % n
+            };
+            let rate = [500_000, 2_000_000, 8_000_000, 20_000_000][below(4) as usize];
+            let bound = [QUEUE_BOUND, LOW_LATENCY_BOUND][below(2) as usize];
+            let source = rate * (1 + below(12)) / 5;
+            let fps = [15, 30, 60][below(3) as usize];
+            let delta = source / 8 / fps;
+            let time = |bytes: u64| Duration::from_nanos(bytes * 8_000_000_000 / rate);
+            let limit = bound * 2 + time(12 * delta) + time(3 * delta) * 2;
+            let mut layers = Layers::default();
+            let mut backlog = Backlog::default();
+            // When each queued packet came and when it leaves.
+            let mut queue: VecDeque<(Instant, Instant, usize)> = VecDeque::new();
+            let mut sample = Sample {
+                at: start,
+                oldest: None,
+                bytes: 0,
+            };
+            let mut held = None;
+            let mut number = 0u16;
+            let mut left = VecDeque::new();
+            let mut keyed = 0;
+            for unit in 0..10 * fps {
+                // Key pictures at least 2 s apart, as the SFU asks for them.
+                let key = unit == 0 || unit >= keyed + 2 * fps && below(50) == 0;
+                if key {
+                    keyed = unit;
+                }
+                let bytes = if key { 8 } else { 1 } * delta * (50 + below(100)) / 100;
+                let timestamp = unit * 90_000 / fps;
+                // The unit's packets: one or two frames, then maybe a late one
+                // of the unit before.
+                let mut packets = Vec::new();
+                let frames = 1 + below(2);
+                for index in 0..frames {
+                    number = number.wrapping_add(1);
+                    let size = (bytes / frames).max(1);
+                    let count = size.div_ceil(1200);
+                    for packet in 0..count {
+                        let [high, low] = number.to_be_bytes();
+                        let flags = u8::from(packet == 0) << 7 | u8::from(packet + 1 == count) << 6;
+                        let first = key && index == 0;
+                        let mut descriptor = vec![flags | u8::from(!first), high, low];
+                        if unit == 0 && packet == 0 {
+                            descriptor.extend([0x80, 0x00, 0x3a, 0x40, 0x00]);
+                        }
+                        let marker = index + 1 == frames && packet + 1 == count;
+                        let payload = (size / count) as usize;
+                        packets.push((descriptor, timestamp, payload, marker, key));
+                    }
+                }
+                if let Some(late) = held.take() {
+                    packets.insert(1, late);
+                }
+                if unit > 0 && below(10) == 0 {
+                    held = packets.pop();
+                }
+                let at = start + Duration::from_nanos(unit * 1_000_000_000 / fps);
+                for (index, (descriptor, timestamp, payload, marker, key)) in
+                    packets.into_iter().enumerate()
+                {
+                    let now = at + Duration::from_micros(50 * index as u64);
+                    while queue.front().is_some_and(|&(_, leaves, _)| leaves <= now) {
+                        queue.pop_front();
+                    }
+                    if now >= sample.at + Duration::from_millis(1 + below(5)) {
+                        sample = Sample {
+                            at: now,
+                            oldest: queue.front().map(|&(came, ..)| came),
+                            bytes: queue.iter().map(|&(.., bytes)| bytes).sum(),
+                        };
+                    }
+                    let frame = layers
+                        .packet(&descriptor, payload, timestamp, now - start)
+                        .expect("valid descriptor");
+                    // As the selector: the rest of a frame left out stays out.
+                    if left.contains(&frame.number) {
+                        continue;
+                    }
+                    let discardable = !key && timestamp / (90_000 / fps) % 2 == 1;
+                    let out = backlog.out(timestamp);
+                    let admitted = backlog.layered(
+                        &frame,
+                        timestamp,
+                        discardable,
+                        Some(&sample),
+                        rate,
+                        bound,
+                        now,
+                    );
+                    if frame.start && frame.references().next().is_none() {
+                        assert_eq!(admitted, Layered::Send, "seed {seed}: a key picture");
+                    }
+                    let left_out = match admitted {
+                        Layered::Send => !out && backlog.capped(Some(&sample), payload),
+                        Layered::Skip => true,
+                    };
+                    assert!(
+                        !(out && left_out),
+                        "seed {seed}: a unit with a packet out loses one"
+                    );
+                    if left_out {
+                        assert!(
+                            5 * source > 2 * rate,
+                            "seed {seed}: left out on a wide link"
+                        );
+                        dd::push(&mut left, frame.number);
+                        skipped += 1;
+                        continue;
+                    }
+                    backlog.enqueued(payload, payload as u64, marker, timestamp);
+                    let free = queue.back().map_or(now, |&(_, leaves, _)| leaves.max(now));
+                    let leaves = free + time(payload as u64);
+                    queue.push_back((now, leaves, payload));
+                    if !key {
+                        let waited = leaves - now;
+                        assert!(
+                            waited <= limit,
+                            "seed {seed}: waited {waited:?} of {limit:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(skipped > 0);
+    }
+
+    /// A key picture and a delta frame referencing the frame before it.
+    fn key_and_delta() -> (Frame, Frame) {
+        let mut layers = Layers::default();
+        let key = layers
+            .packet(
+                &[0xc0, 0, 1, 0x80, 0x00, 0x3a, 0x40, 0x00],
+                1,
+                0,
+                Duration::ZERO,
+            )
+            .expect("key picture");
+        let delta = layers
+            .packet(&[0xc1, 0, 2], 1, 0, Duration::ZERO)
+            .expect("delta");
+        (key, delta)
+    }
+
+    #[test]
+    fn a_temporal_unit_with_a_frame_out_keeps_its_later_frames() {
+        let now = Instant::now();
+        let (key, delta) = key_and_delta();
+        let mut backlog = Backlog::default();
+        // 2 Mbit/s: 100 kB wait 400 ms.
+        let queue = Queue {
+            oldest: now,
+            bytes: 100_000,
+        };
+        let admit = |backlog: &mut Backlog, frame: &Frame, unit| {
+            let queue = Some(&queue as &dyn StreamTxQueueInfo);
+            backlog.layered(frame, unit, true, queue, 2_000_000, QUEUE_BOUND, now)
+        };
+        assert_eq!(admit(&mut backlog, &delta, 1), Layered::Skip);
+        assert_eq!(admit(&mut backlog, &key, 2), Layered::Send);
+        backlog.enqueued(1000, 1048, false, 2);
+        assert_eq!(admit(&mut backlog, &delta, 2), Layered::Send);
+        assert_eq!(admit(&mut backlog, &delta, 3), Layered::Skip);
+    }
+
+    #[test]
+    fn a_late_frame_of_an_earlier_unit_keeps_the_current_unit_whole() {
+        let now = Instant::now();
+        let mut layers = Layers::default();
+        layers
+            .packet(
+                &[0xc0, 0, 1, 0x80, 0x00, 0x3a, 0x40, 0x00],
+                1,
+                0,
+                Duration::ZERO,
+            )
+            .expect("key picture");
+        let mut delta = |number| {
+            let frame = layers.packet(&[0xc1, 0, number], 1, 0, Duration::ZERO);
+            frame.expect("delta")
+        };
+        let (lower, late, top) = (delta(10), delta(8), delta(11));
+        let mut backlog = Backlog::default();
+        // 2 Mbit/s: 100 kB wait 400 ms, between the bound and twice it.
+        let queue = Queue {
+            oldest: now,
+            bytes: 100_000,
+        };
+        let admit = |backlog: &mut Backlog, frame: &Frame, unit, discardable| {
+            let queue = Some(&queue as &dyn StreamTxQueueInfo);
+            backlog.layered(frame, unit, discardable, queue, 2_000_000, QUEUE_BOUND, now)
+        };
+        // Unit 200's lower frame goes out, then a repaired frame of unit 100.
+        assert_eq!(admit(&mut backlog, &lower, 200, false), Layered::Send);
+        backlog.enqueued(1000, 1048, false, 200);
+        assert_eq!(admit(&mut backlog, &late, 100, false), Layered::Send);
+        backlog.enqueued(1000, 1048, true, 100);
+        // Unit 200's top frame, with the marker, follows.
+        assert!(backlog.out(200));
+        assert_eq!(admit(&mut backlog, &top, 200, true), Layered::Send);
+    }
+
+    #[test]
+    fn a_low_latency_queue_leaves_out_frames_past_50_ms() {
+        let now = Instant::now();
+        let (key, delta) = key_and_delta();
+        let mut backlog = Backlog::default();
+        // 2 Mbit/s: 15 kB wait 60 ms.
+        let queue = Queue {
+            oldest: now,
+            bytes: 15_000,
+        };
+        let mut admit = |frame: &Frame, unit, bound| {
+            backlog.layered(frame, unit, true, Some(&queue), 2_000_000, bound, now)
+        };
+        assert_eq!(admit(&delta, 1, QUEUE_BOUND), Layered::Send);
+        assert_eq!(admit(&delta, 2, LOW_LATENCY_BOUND), Layered::Skip);
+        assert_eq!(admit(&key, 3, LOW_LATENCY_BOUND), Layered::Send);
     }
 
     #[test]
@@ -625,12 +1005,12 @@ mod tests {
         ));
         assert!(!backlog.burst_full(None, MAX_KEY_BYTES));
         assert!(backlog.burst_full(None, MAX_KEY_BYTES + 1));
-        backlog.enqueued(1200, 1248, false);
+        backlog.enqueued(1200, 1248, false, 15);
         assert!(matches!(
             backlog.admission(15, None, true, ready),
             VideoAdmission::Burst(1248)
         ));
-        backlog.enqueued(1000, 1048, true);
+        backlog.enqueued(1000, 1048, true, 15);
         assert!(matches!(
             backlog.admission(16, None, true, ready),
             VideoAdmission::Regular

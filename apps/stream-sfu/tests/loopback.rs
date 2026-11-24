@@ -73,7 +73,9 @@ fn prove(key: &[u8; 32], label: &[u8], nonce: &[u8]) -> String {
 struct Leg {
     rtc: Rtc,
     socket: UdpSocket,
-    events: Vec<Event>,
+    /// Each event with the time its datagram reached the socket.
+    events: Vec<(Instant, Event)>,
+    arrived: Instant,
     /// Drops every nth incoming AV1 media packet; retransmissions pass.
     loss: Option<(u64, u64)>,
     link: Option<Link>,
@@ -86,7 +88,8 @@ struct Link {
     delay: Duration,
     buffer: Duration,
     free: Instant,
-    queue: std::collections::VecDeque<(Instant, std::net::SocketAddr, Vec<u8>)>,
+    /// Each datagram with the time it leaves the link and the time it arrived.
+    queue: std::collections::VecDeque<(Instant, Instant, std::net::SocketAddr, Vec<u8>)>,
 }
 
 impl Link {
@@ -108,7 +111,7 @@ impl Link {
         // With the IPv4 and UDP headers.
         self.free = start + Duration::from_secs_f64((datagram.len() + 28) as f64 * 8.0 / self.rate);
         self.queue
-            .push_back((self.free + self.delay, source, datagram.to_vec()));
+            .push_back((self.free + self.delay, now, source, datagram.to_vec()));
     }
 }
 
@@ -128,6 +131,7 @@ impl Leg {
             rtc,
             socket,
             events: Vec::new(),
+            arrived: Instant::now(),
             loss: None,
             link: None,
         }
@@ -159,7 +163,7 @@ impl Leg {
                 Output::Transmit(t) => {
                     let _ = self.socket.send_to(&t.contents, t.destination);
                 }
-                Output::Event(event) => self.events.push(event),
+                Output::Event(event) => self.events.push((self.arrived, event)),
             }
         }
     }
@@ -176,6 +180,7 @@ impl Leg {
                 link.arrive(Instant::now(), source, &buffer[..length]);
                 continue;
             }
+            self.arrived = Instant::now();
             let input = Input::Receive(
                 Instant::now(),
                 Receive {
@@ -192,7 +197,8 @@ impl Leg {
         while let Some(link) = &mut self.link
             && link.queue.front().is_some_and(|(due, ..)| *due <= now)
         {
-            let (_, source, datagram) = link.queue.pop_front().expect("a datagram");
+            let (_, arrived, source, datagram) = link.queue.pop_front().expect("a datagram");
+            self.arrived = arrived;
             let input = Input::Receive(
                 now,
                 Receive {
@@ -214,6 +220,8 @@ impl Leg {
 
 /// A packet a subscriber received from one publisher.
 struct Received {
+    /// When it reached the subscriber's socket.
+    at: Instant,
     seq: u64,
     pt: u8,
     timestamp: u32,
@@ -265,6 +273,8 @@ struct Replay {
     timestamp: u32,
     sent_at: Option<Instant>,
     restart: Option<Instant>,
+    /// When each frame number went out.
+    sent: HashMap<u16, Instant>,
 }
 
 /// How long a replayed publisher takes to answer a key frame request, like a
@@ -281,6 +291,7 @@ impl Replay {
             timestamp: 0,
             sent_at: None,
             restart: None,
+            sent: HashMap::new(),
         }
     }
 }
@@ -309,7 +320,7 @@ fn decodable(packets: &[Received]) -> (Vec<(u16, u8)>, Vec<u16>) {
     let mut indices = HashMap::new();
     for &packet in &sorted {
         let descriptor = packet.descriptor.as_ref().expect("a descriptor");
-        let Some(frame) = layers.packet(&descriptor.0, 0, Duration::ZERO) else {
+        let Some(frame) = layers.packet(&descriptor.0, 0, 0, Duration::ZERO) else {
             continue;
         };
         let index = *indices.entry(frame.number).or_insert_with(|| {
@@ -591,7 +602,7 @@ impl Peer {
         }
         if let Some(leg) = &mut self.subscribe {
             leg.step();
-            for event in leg.events.drain(..) {
+            for (at, event) in leg.events.drain(..) {
                 if let Event::RtpPacket(packet) = event {
                     let mid = leg
                         .rtc
@@ -601,6 +612,7 @@ impl Peer {
                         .expect("a stream");
                     let from = self.tracks[&mid];
                     self.received.entry(from).or_default().push(Received {
+                        at,
                         seq: *packet.seq_no,
                         pt: *packet.header.payload_type,
                         timestamp: packet.header.timestamp,
@@ -618,7 +630,7 @@ impl Peer {
         }
         if let Some((leg, ..)) = &mut self.publish {
             leg.step();
-            for event in leg.events.drain(..) {
+            for (_, event) in leg.events.drain(..) {
                 if let Event::KeyframeRequest(_) = event {
                     self.keyframe_requests += 1;
                     if let Some(replay) = &mut self.replay {
@@ -674,6 +686,7 @@ impl Peer {
             replay.timestamp = replay.timestamp.wrapping_add(frame.timestamp);
             replay.number =
                 u16::from_be_bytes([frame.first[1], frame.first[2]]).wrapping_add(replay.offset);
+            replay.sent.insert(replay.number, now);
             let size = frame.bytes / frame.packets;
             for index in 0..frame.packets {
                 let (first, last) = (index == 0, index + 1 == frame.packets);
@@ -1021,17 +1034,19 @@ async fn forwards_media_and_key_messages_unchanged() {
 }
 
 /// One AV1 publisher with an L1T3 descriptor at 30 frames a second and two
-/// receivers. One asks for the 15 fps camera tier and gets the T0 and T1 frames;
-/// the other gets every frame. Each switches at switch points, and skipped
-/// frames leave no gaps in its sequence numbers.
+/// receivers that join once a second has measured it. One asks for the 15 fps
+/// camera tier and gets the T0 and T1 frames; the other gets every frame. Each
+/// switches at switch points, and skipped frames leave no gaps in its sequence
+/// numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_receiver_gets_the_layers_of_its_tier() {
     let sfu = start("");
     let url = sfu.url.as_str();
     let (mut host, _) = join(url, &ADMIT, true, true).await;
+    host.start_publishing(Codec::Av1);
+    publish_for(&mut host, Duration::from_millis(1500)).await;
     let (mut low, _) = join(url, &ADMIT, false, false).await;
     let (mut full, _) = join(url, &ADMIT, false, false).await;
-    host.start_publishing(Codec::Av1);
     let mut asked = false;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1073,6 +1088,44 @@ async fn each_receiver_gets_the_layers_of_its_tier() {
     assert_eq!(first_skip % 4, 0, "{got:?}");
 }
 
+/// An L1T3 screen at 30 frames a second that starts while its viewer asks for
+/// the 15 fps tier, as the native publisher's: the viewer gets the T0 frames
+/// until a full second has measured the source, then the T0 and T1 frames,
+/// and never a T2 frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_starting_screen_stays_within_its_viewers_tier() {
+    let sfu = start("");
+    let url = sfu.url.as_str();
+    let (mut host, _) = join(url, &ADMIT, true, true).await;
+    let (mut viewer, _) = join(url, &ADMIT, false, false).await;
+    host.publish_source(Codec::Av1, true);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while viewer.tracks.is_empty() {
+        assert!(Instant::now() < deadline, "no track");
+        host.step();
+        viewer.step();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    viewer.send(source_request(host.id, Kind::Screen, 0));
+    let asked = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < asked {
+        host.step();
+        viewer.step();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let sending = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < sending {
+        host.step();
+        viewer.step();
+        host.send_frame();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let got = frames(&viewer, &host);
+    assert!(got.iter().all(|n| n % 2 == 0), "a T2 frame: {got:?}");
+    assert!(got.len() >= 60, "{got:?}");
+    assert!(got.iter().any(|n| n % 4 == 2), "T1 frames: {got:?}");
+}
+
 /// A receiver whose budget covers the T0 and T1 frames but not the T2 frames
 /// steps down to the 15 fps decode target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1082,8 +1135,9 @@ async fn a_receiver_budget_limits_its_layers() {
     let sfu = start("receiver_bitrate = 110000");
     let url = sfu.url.as_str();
     let (mut host, _) = join(url, &ADMIT, true, true).await;
-    let (mut receiver, _) = join(url, &ADMIT, false, false).await;
     host.start_publishing(Codec::Av1);
+    publish_for(&mut host, Duration::from_millis(1500)).await;
+    let (mut receiver, _) = join(url, &ADMIT, false, false).await;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         for peer in [&mut host, &mut receiver] {
@@ -1136,7 +1190,11 @@ async fn an_overloaded_single_layer_publisher_receives_lower_encoder_limits() {
             let tier = usize::from(demand.tier);
             let cap = demand.kind.ladder()[tier];
             assert_eq!(message["max_height"], cap.height);
-            assert_eq!(message["max_fps"], cap.fps);
+            // A Smooth camera keeps the frame rate of the tier its viewer wants.
+            assert_eq!(
+                message["max_fps"],
+                demand.kind.ladder()[demand.kind.top()].fps
+            );
             assert_eq!(message["max_bitrate"], cap.ceiling);
             if began && tier < demand.kind.top() {
                 assert!((1..host.sent.len()).contains(&viewer.count(host.id)));
@@ -1554,4 +1612,132 @@ async fn a_throttled_viewer_gets_decodable_frames() {
     let recent = decoded.iter().filter(|f| numbers.contains(&f.0)).count();
     let spatial: Vec<u8> = decoded.iter().map(|f| f.1).collect();
     assert!(recent >= 20, "{recent} recent frames, layers {spatial:?}");
+}
+
+/// A publisher replaying Chromium's L3T3_KEY camera in `mode`, and a viewer
+/// that joins once the replay runs.
+async fn camera_call(url: &str, mode: Value) -> (Peer, Peer) {
+    let (mut host, _) = join(url, &ADMIT, true, true).await;
+    host.replay = Some(Replay::new(fixture(include_str!(
+        "fixtures/chrome-l3t3-key.txt"
+    ))));
+    host.publish_source(Codec::Av1, false);
+    let mid = host.publish.as_ref().expect("publishing").2.to_string();
+    host.send(json!({"type": "modes", "modes": {mid: mode}}));
+    replay_alone(&mut host).await;
+    let (viewer, _) = join(url, &ADMIT, false, false).await;
+    (host, viewer)
+}
+
+/// Steps `host`, replaying, and `viewer` behind a `rate` downlink with 20 ms
+/// of delay for `duration`.
+async fn throttled(host: &mut Peer, viewer: &mut Peer, rate: u64, duration: Duration) {
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        host.step();
+        viewer.step();
+        host.send_replay();
+        if let Some(leg) = &mut viewer.subscribe {
+            let link = leg.link.get_or_insert_with(|| {
+                Link::new(rate, Duration::from_millis(20), Duration::from_secs(10))
+            });
+            link.rate = rate as f64;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn number(packet: &Received) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        packet.descriptor.as_ref()?.0[1..3].try_into().ok()?,
+    ))
+}
+
+/// The frame rate and the top spatial layer of the frames a viewer decoded
+/// in the last five seconds of media.
+fn recent_rate(packets: &[Received]) -> (f64, u8) {
+    let (decoded, broken) = decodable(packets);
+    assert!(broken.is_empty(), "undecodable frames {broken:?}");
+    let timestamps: HashMap<u16, u32> = packets
+        .iter()
+        .filter_map(|p| Some((number(p)?, p.timestamp)))
+        .collect();
+    let last = decoded
+        .iter()
+        .map(|f| timestamps[&f.0])
+        .max()
+        .expect("decoded frames");
+    let recent: Vec<_> = decoded
+        .iter()
+        .filter(|f| last.wrapping_sub(timestamps[&f.0]) < 5 * 90_000)
+        .collect();
+    let units: std::collections::HashSet<u32> = recent.iter().map(|f| timestamps[&f.0]).collect();
+    let spatial = recent.iter().map(|f| f.1).max().expect("recent frames");
+    (units.len() as f64 / 5.0, spatial)
+}
+
+/// Chromium's L3T3_KEY camera to a viewer behind a 1.5 Mbit/s downlink: the
+/// top spatial layer fits at up to half the frame rate (about 1 Mbit/s), and
+/// at the full rate of about 23 frames a second (1.4 Mbit/s and packet
+/// overhead) it does not. A Sharp source keeps the top spatial layer and
+/// loses frame rate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sharp_stream_keeps_its_resolution() {
+    let sfu = start("");
+    let (mut host, mut viewer) = camera_call(&sfu.url, json!({"prefer": "sharp"})).await;
+    throttled(&mut host, &mut viewer, 1_500_000, Duration::from_secs(20)).await;
+    let (rate, spatial) = recent_rate(&viewer.received[&host.id]);
+    assert_eq!(spatial, 2, "{rate} frames a second");
+    assert!(rate <= 16.0, "{rate} frames a second");
+}
+
+/// The camera of [`a_sharp_stream_keeps_its_resolution`] as a Smooth source
+/// keeps its frame rate on a lower spatial layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_smooth_stream_keeps_its_frame_rate() {
+    let sfu = start("");
+    let (mut host, mut viewer) = camera_call(&sfu.url, json!({"prefer": "smooth"})).await;
+    throttled(&mut host, &mut viewer, 1_500_000, Duration::from_secs(20)).await;
+    let (rate, spatial) = recent_rate(&viewer.received[&host.id]);
+    assert!(spatial < 2, "spatial layer {spatial}");
+    assert!(rate >= 18.0, "{rate} frames a second");
+}
+
+/// A Low latency camera's viewer whose downlink falls from 3 to 0.7 Mbit/s
+/// while a key picture arrives. Once its layer has followed, two seconds
+/// later, its frames leave the SFU within the 50 ms budget, and the frames it
+/// needs within a few times that; the 300 ms queue of other sources holds them
+/// for hundreds of milliseconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_low_latency_stream_stays_within_its_budget() {
+    let sfu = start("");
+    let mode = json!({"prefer": "smooth", "low_latency": true});
+    let (mut host, mut viewer) = camera_call(&sfu.url, mode).await;
+    throttled(&mut host, &mut viewer, 3_000_000, Duration::from_secs(5)).await;
+    let drop = Instant::now();
+    host.replay.as_mut().expect("replay").restart = Some(drop);
+    throttled(&mut host, &mut viewer, 700_000, Duration::from_secs(7)).await;
+    // Each frame's wait at the SFU: until its first packet reaches the
+    // viewer's socket, in front of the downlink.
+    let sent = &host.replay.as_ref().expect("replay").sent;
+    let mut first: HashMap<u16, Instant> = HashMap::new();
+    for packet in &viewer.received[&host.id] {
+        if let Some(number) = number(packet) {
+            let at = first.entry(number).or_insert(packet.at);
+            *at = (*at).min(packet.at);
+        }
+    }
+    let settled = drop + Duration::from_secs(2);
+    let mut waits: Vec<Duration> = first
+        .iter()
+        .filter(|(number, _)| sent.get(number).is_some_and(|at| *at >= settled))
+        .map(|(number, at)| at.saturating_duration_since(sent[number]))
+        .collect();
+    waits.sort();
+    assert!(waits.len() >= 50, "{} frames", waits.len());
+    let p95 = waits[waits.len() * 95 / 100];
+    let max = waits[waits.len() - 1];
+    assert!(p95 <= Duration::from_millis(50), "95th percentile {p95:?}");
+    assert!(max <= Duration::from_millis(200), "longest {max:?}");
+    recent_rate(&viewer.received[&host.id]);
 }

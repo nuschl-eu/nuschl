@@ -116,6 +116,12 @@ impl Bucket {
         self.tokens -= amount;
         true
     }
+
+    /// Takes `amount` on credit: later takes wait until it is paid back.
+    pub fn lend(&mut self, amount: f64, now: Instant) {
+        self.take(0.0, now);
+        self.tokens -= amount;
+    }
 }
 
 /// A media budget in bytes for `bits_per_second`, with a burst of one second,

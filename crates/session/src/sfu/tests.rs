@@ -651,8 +651,8 @@ async fn native_video_for_policy(relay_only: bool) {
             .expect("the native viewer's quality reaches the publisher");
         }
 
-        // An explicit selection can request 1440p from a much shorter tile.
-        bob.set_quality(publisher, Purpose::ScreenVideo, Quality::Tier(2), 180)
+        // A chosen tier limits a taller tile to 1440p.
+        bob.set_quality(publisher, Purpose::ScreenVideo, Quality::Tier(2), 4000)
             .unwrap();
         encoder_limits(&mut alice, 2).await;
 

@@ -336,10 +336,11 @@ export class View {
     const sent = this.sentTiers.get(original) ?? { at: -Infinity };
     this.sentTiers.set(original, sent);
     let size = 0, timer;
+    // Auto fits the tile; a chosen tier limits it.
     const chosen = () => {
-      if (select.value === "") return size > 0 ? fitTier(kind, size) : undefined;
-      const tier = Number(select.value);
-      return TIERS[kind][tier] ? tier : undefined;
+      const limit = select.value !== "" && TIERS[kind][Number(select.value)] ? Number(select.value) : undefined;
+      if (size === 0) return limit;
+      return Math.min(fitTier(kind, size), limit ?? Infinity);
     };
     const send = () => {
       clearTimeout(timer);
@@ -364,7 +365,7 @@ export class View {
     this.observer.observe(video, { box: "device-pixel-content-box" });
     send();
     return {
-      control: element(this.document, "label", { class: "viewer-quality" }, "Receive quality", select),
+      control: element(this.document, "label", { class: "viewer-quality" }, "Receive limit", select),
       requested: () => TIERS[kind][chosen()],
     };
   }
