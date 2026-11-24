@@ -67,6 +67,18 @@ struct Outgoing {
     direct: bool,
 }
 
+impl Outgoing {
+    /// Whether `offer`, a message in this offer's conversation, is one this
+    /// offer posted: one of its codes, or its end.
+    fn owns(&self, offer: &Offer) -> bool {
+        self.offer.same_file(offer)
+            && match &offer.code {
+                Some(code) => self.codes.contains(code),
+                None => self.ended && self.posted,
+            }
+    }
+}
+
 /// A file someone offered, being received or received.
 struct Download {
     id: u64,
@@ -239,8 +251,12 @@ impl Desktop {
                 servers: servers.clone(),
             };
             let worker = match started {
-                Ok(worker) if worker.commands.try_send(request).is_ok() => worker,
-                Ok(_) => continue,
+                // A worker that cannot take the request has exited: its
+                // offer ends before its first code (see `apply_transfer`).
+                Ok(worker) => {
+                    let _ = worker.commands.try_send(request);
+                    worker
+                }
                 Err(error) => {
                     server.set_notice(format!("File transfer is unavailable: {error}"));
                     continue;
@@ -479,6 +495,9 @@ impl Desktop {
             .find(|offer| offer.id == id)
         {
             let mut announce = false;
+            // An offer that fails before its first code ends, with a note:
+            // its card appears only with that code.
+            let mut failed = None;
             match update {
                 Update::Event(TransferEvent::Code { code })
                     if valid_code(&code) && !offer.ended =>
@@ -505,16 +524,27 @@ impl Desktop {
                     if let Some(peer) = peer {
                         offer.sending.remove(&peer);
                     }
+                    if offer.codes.is_empty() && !offer.ended {
+                        failed = Some(tidy(&reason));
+                    }
                     offer.problem = Some(tidy(&reason));
                 }
                 Update::Event(_) | Update::Unsaved(_) => {}
                 Update::Finished(_) => {
+                    if offer.codes.is_empty() && !offer.ended {
+                        failed = Some("The transfer worker stopped.".into());
+                    }
                     announce = !offer.ended && offer.posted;
                     offer.ended = true;
                     offer.commands = None;
                     offer.stop = None;
                     offer.sending.clear();
                 }
+            }
+            if let Some(reason) = failed {
+                let note = format!("Could not offer {}: {reason}", offer.offer.name);
+                self.attach_note = Some(((offer.server.clone(), offer.channel), note));
+                self.stop_offer(id, cx);
             }
             if announce {
                 self.announce(id, cx);
@@ -831,14 +861,19 @@ pub fn card(
 ) -> Option<AnyElement> {
     let message = channel.timeline.messages.get(position)?;
     let offer = message.offer.as_ref()?;
+    let ours = this.transfers.offers.iter().rev().find(|outgoing| {
+        outgoing.server == server.id && outgoing.channel == channel.id && outgoing.owns(offer)
+    });
+    // Ours by what each offer posted, anyone else's by sender and file: a
+    // stopped offer keeps its card when another offer of the same file goes on.
     let replaced = channel.timeline.messages[position + 1..]
         .iter()
         .any(|later| {
             later.author == message.author
-                && later
-                    .offer
-                    .as_ref()
-                    .is_some_and(|later| later.same_file(offer))
+                && later.offer.as_ref().is_some_and(|later| match ours {
+                    Some(outgoing) => outgoing.owns(later),
+                    None => later.same_file(offer),
+                })
         });
     if replaced {
         return Some(
@@ -852,15 +887,6 @@ pub fn card(
                 .into_any_element(),
         );
     }
-    let ours = this.transfers.offers.iter().rev().find(|outgoing| {
-        outgoing.server == server.id
-            && outgoing.channel == channel.id
-            && outgoing.offer.same_file(offer)
-            && match &offer.code {
-                Some(code) => outgoing.codes.contains(code),
-                None => outgoing.ended,
-            }
-    });
     let own_name = server
         .own_session
         .and_then(|session| server.users.get(&session))
@@ -1421,6 +1447,50 @@ mod tests {
             ));
             relayed.abort();
         });
+    }
+
+    #[test]
+    fn each_of_our_offers_owns_only_what_it_posted() {
+        let message = |code: Option<&str>| super::Offer {
+            name: "notes.txt".into(),
+            size: 6,
+            code: code.map(Into::into),
+            rendezvous: None,
+        };
+        let offer = |codes: &[&str], ended| super::Outgoing {
+            id: 0,
+            server: "server".into(),
+            channel: 1,
+            offer: message(None),
+            codes: codes.iter().map(|code| (*code).to_owned()).collect(),
+            posted: true,
+            sending: Default::default(),
+            sent: 0,
+            problem: None,
+            ended,
+            commands: None,
+            stop: None,
+            direct: false,
+        };
+        // The same file offered twice; the second is stopped.
+        let (going, stopped) = (offer(&["1-a", "2-a"], false), offer(&["3-b"], true));
+        let end = message(None);
+        assert!(stopped.owns(&message(Some("3-b"))) && stopped.owns(&end));
+        // The first offer's new code belongs to the first offer alone, and
+        // the stopped one's end to the stopped one alone.
+        assert!(!stopped.owns(&message(Some("2-a"))));
+        assert!(going.owns(&message(Some("2-a"))) && !going.owns(&end));
+        let other = super::Offer {
+            name: "other.txt".into(),
+            ..message(Some("1-a"))
+        };
+        assert!(!going.owns(&other));
+        // One that ended before its first code has an end only in a note.
+        let failed = super::Outgoing {
+            posted: false,
+            ..offer(&[], true)
+        };
+        assert!(!failed.owns(&end));
     }
 
     #[test]

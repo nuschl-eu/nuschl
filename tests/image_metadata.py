@@ -24,8 +24,16 @@ Settings' image quality is Low. Checks that:
   metadata, with the same scan data and an EXIF that holds only the
   orientation; the next message is at Low with the box ticked again;
 - at Original with the box unticked, the peer downloads the same bytes;
+- an image whose file reads empty after Send brings its message back to
+  the composer with a note, its text and its choice; sent again, it goes;
 - at High, a noisy picture far over the server's limit reaches the peer
-  within it.
+  within it;
+- Stop offering ends an offer while a receiver is asked whether to accept
+  and while one is receiving; an offer of the same file that goes on keeps
+  to its own card; stopped offers stay stopped through a reconnect;
+- an offer that cannot reach the magic-wormhole server ends with a note;
+  the same file offered again once the server is back, and stopped, stays
+  stopped.
 
 python3 tests/image_metadata.py target/debug --murmur <mumble-server>
     --at-spi <at-spi2-core> --wormhole-python <python with magic-wormhole servers>
@@ -259,6 +267,40 @@ def main():
                            check=True, timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return target.read_bytes()
 
+        def card(name, status):
+            """The newest card of an offer of `name` whose status line has `status`."""
+            def cards():
+                return [node for node, role, label, _ in items(nuschl) if role == "panel" and status in label
+                        and label.split(" ", 1)[-1].startswith(f"{name}, ")]
+            return eventually(lambda: (cards() or [None])[-1], f"no card of {name}: {status}", timeout=30)
+
+        def offered(path):
+            """Offer the file at `path`; its code, once the peer has it."""
+            attach(path)
+            find(lambda _, role, name, __: role == "list item" and name.startswith(f"File {path.name}"),
+                 f"{path.name} is not in the tray")
+            send()
+            offer = peer.wait(lambda e: e["kind"] == "text" and path.name in e.get("body", "")
+                              and "receive " in e["body"], timeout=60)
+            code = re.search(r"receive (\S+)</code>", offer["body"])[1]
+            find(lambda _, role, name, __: role == "list item" and code in name, "the offer is not in the timeline")
+            return code
+
+        def stopped(name, status="Waiting for someone to download"):
+            """Stop offering `name` from its card: the conversation is told, and
+            15 s later the end is still its last message and its card ended."""
+            def button():
+                return next((node for node, role, label, _ in items(card(name, status), subtree=True)
+                             if role == "push button" and label == "Stop offering"), None)
+            eventually(button, f"no Stop offering for {name}").press()
+            peer.wait(lambda e: e["kind"] == "text" and name in e.get("body", "")
+                      and "no longer available" in e["body"], timeout=30)
+            time.sleep(15)
+            later = [e["body"] for e in peer.events if e["kind"] == "text" and name in e.get("body", "")]
+            assert "no longer available" in later[-1], later[-3:]
+            ended = card(name, "No longer available")
+            assert not any(label == "Stop offering" for _, _, label, _ in items(ended, subtree=True))
+
         photo = root / "IMG_20261103_143012.png"
         with photo.open("wb") as file:
             file.write(b"\x89PNG\r\n\x1a\n")
@@ -390,6 +432,51 @@ def main():
         assert hashlib.sha256(original).digest() == hashlib.sha256(turned.read_bytes()).digest()
         print("Original, unticked: the peer downloaded the same bytes.", flush=True)
 
+        # Original, ticked, sent with text while its file is read, and the
+        # read finds the file empty (as a document a portal is still
+        # exporting can be): the message comes back to the composer with a
+        # note, its text and its choice. Sent again, it goes.
+        late = turned_photo(root / "IMG_0044.jpg")
+        attach(late)
+        find(lambda _, role, name, __: name.startswith(f"Image {late.name}, ")
+             and not name.endswith("being prepared"), "the photo was not prepared")
+        os.mkfifo(root / "pipe")
+        os.replace(root / "pipe", late)
+        choose("Original")
+        composer = find(lambda _, role, name, __: role in ("text", "entry") and name == "Message",
+                        "no composer")[0]
+        composer.call("Component", "GrabFocus")
+        time.sleep(0.5)
+        shell.type("Look")
+        time.sleep(0.5)
+        send()
+        find(lambda _, __, name, ___: name == "Preparing the image…", "the message is not waiting for its image")
+
+        def reader():
+            try:
+                return os.open(late, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                return None
+        os.close(eventually(reader, "nothing reads the photo"))
+        find(lambda _, __, name, ___: name.startswith(f"Could not attach {late.name}: "),
+             "the image that could not be prepared left no note")
+        assert chosen() == ["Original"], chosen()
+        assert checkbox()[3] & CHECKED, "Strip metadata is not ticked for the returned message"
+        time.sleep(3)
+        assert not any(e.get("body") == "Look" or late.name in e.get("body", "")
+                       for e in peer.events if e["kind"] == "text"), offers()
+        os.remove(late)
+        turned_photo(late)
+        attach(late)
+        find(lambda _, role, name, __: name.startswith(f"File {late.name}, "), "the photo is not in the tray as a file")
+        # Sent again with the text the composer kept. The next message, an
+        # image alone, shows that the composer is clear afterwards.
+        send()
+        peer.wait(lambda e: e["kind"] == "text" and e.get("body") == "Look", timeout=60)
+        assert without_metadata(download(late.name))
+        print("An image that could not be prepared after Send brought its message back with a note; "
+              "sent again, it went.", flush=True)
+
         # High, far over the server's image limit: smaller, within it.
         noisy = root / "noise.png"
         with noisy.open("wb") as file:
@@ -407,6 +494,85 @@ def main():
         assert len(body) <= LIMIT, len(body)
         print(f"High: a {noisy.stat().st_size}-byte picture arrived as a {len(body)}-byte image "
               f"within the {LIMIT}-byte limit.", flush=True)
+
+        # Stop offering while a receiver is asked whether to accept, and while
+        # one is receiving: the pickup ends, and the offer stays stopped.
+        (root / "received").mkdir(exist_ok=True)
+        asked = root / "asked.bin"
+        asked.write_bytes(os.urandom(100_000))
+        receiver = subprocess.Popen(wormhole.cli("receive", "-o", str(root / "received" / asked.name),
+                                                 offered(asked)),
+                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        card(asked.name, "Sending to 1 person")
+        stopped(asked.name, "Sending to 1 person")
+        receiver.kill()
+        receiver.wait()
+        moving = root / "moving.bin"
+        with moving.open("wb") as file:
+            file.truncate(300 * 1000 * 1000)
+        into = root / "receiving"
+        into.mkdir()
+        receiver = subprocess.Popen(wormhole.cli("receive", "--accept-file", "--hide-progress", "-o",
+                                                 str(into / moving.name), offered(moving)),
+                                    cwd=into, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        eventually(lambda: any(part.stat().st_size > 5_000_000 for part in into.iterdir()), "nothing arrived")
+        os.kill(receiver.pid, signal.SIGSTOP)
+        stopped(moving.name, "Sending to 1 person")
+        os.kill(receiver.pid, signal.SIGCONT)
+        assert receiver.wait(timeout=60) != 0, "the stopped transfer finished"
+        print("Stopped while a receiver was asked and while one was receiving, the offers stayed stopped.",
+              flush=True)
+
+        # The same file offered twice, and the second stopped: when the first
+        # posts a new code after a pickup, the stopped one keeps its card.
+        twice = root / "twice.txt"
+        twice.write_text("twice\n")
+        first = offered(twice)
+        offered(twice)
+        stopped(twice.name)
+        subprocess.run(wormhole.cli("receive", "--accept-file", "--hide-progress", "-o",
+                                    str(root / "received" / twice.name), first),
+                       check=True, timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        peer.wait(lambda e: e["kind"] == "text" and twice.name in e.get("body", "")
+                  and "receive " in e["body"], timeout=60)
+        card(twice.name, "sent to 1 person")
+        card(twice.name, "No longer available")
+        print("The same file offered again went on after a pickup; the stopped offer kept its card.", flush=True)
+
+        # A reconnect keeps them stopped.
+        peer.close()
+        server.stop()
+        server.start()
+        peer = Client(args.binaries, "127.0.0.1", port, pin, "Receiver", root / "peer")
+        peer.send(kind="join", channel=2)
+        peer.wait(lambda e: e["kind"] == "user" and e["user"]["name"] == "Sender"
+                  and e["user"]["channel"] == 2, timeout=120)
+        time.sleep(5)
+        for name in (asked.name, moving.name, twice.name):
+            card(name, "No longer available")
+        assert not offers(), offers()
+        print("After a reconnect, the stopped offers stayed stopped.", flush=True)
+
+        # The magic-wormhole server is down when a file is first offered: the
+        # offer ends with a note. Offered again once the server is back, and
+        # stopped, it stays stopped, and so does the first offer.
+        notes = root / "notes.txt"
+        notes.write_text("notes\n")
+        with wormhole.mailbox_down():
+            attach(notes)
+            find(lambda _, role, name, __: role == "list item" and name.startswith(f"File {notes.name}"),
+                 "the file is not in the tray")
+            send()
+            note = find(lambda _, __, name, ___: name.startswith(f"Could not offer {notes.name}: "),
+                        "the offer that failed left no note")[2]
+        attach(notes)
+        find(lambda _, role, name, __: role == "list item" and name.startswith(f"File {notes.name}"),
+             "the file is not in the tray")
+        send()
+        download(notes.name)
+        stopped(notes.name)
+        print(f"An offer without a magic-wormhole server ended with a note ({note!r}); offered again "
+              "and stopped, it stayed stopped.", flush=True)
     finally:
         if peer:
             peer.close()
