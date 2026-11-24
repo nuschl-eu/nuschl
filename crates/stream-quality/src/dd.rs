@@ -326,7 +326,16 @@ impl Layers {
                 self.bytes[target] += size as u64;
             }
         }
-        // A late packet of an earlier temporal unit leaves the frame rate.
+        // A jump back of over a second, as from a new stream on the same
+        // source, starts the frame rate's units over; a late packet of an
+        // earlier temporal unit leaves them.
+        if self
+            .units
+            .back()
+            .is_some_and(|&last| timestamp + CLOCK < last)
+        {
+            self.units.clear();
+        }
         if frame.start && self.units.back().is_none_or(|&last| timestamp > last) {
             self.units.push_back(timestamp);
             if self.units.len() > RATE_UNITS + 1 {
@@ -415,8 +424,19 @@ impl Layers {
             fdiffs,
             chains,
         };
-        if new.is_some() {
-            self.structure = new;
+        if let Some(new) = new {
+            // Rates measured for other targets are stale.
+            if self
+                .structure
+                .as_ref()
+                .is_none_or(|old| old.targets != new.targets)
+            {
+                self.rates = [0; 32];
+                self.bytes = [0; 32];
+                self.measured = false;
+                self.window = None;
+            }
+            self.structure = Some(new);
         }
         if let (Some(structure), Some(active)) = (&mut self.structure, active) {
             structure.active = active;
@@ -580,23 +600,24 @@ pub fn pick(
 ) -> (usize, Wanted) {
     let groups: Vec<u32> = choices.iter().map(|c| u32::from(c.kept(smooth))).collect();
     let point = match pace {
+        // A source whose rates are being measured again keeps the pace.
+        _ if !measured => ceiling,
         Some(pace) => {
             if choices.get(pace.stepper.current()).map(|c| c.layer) != Some(pace.layer) {
                 pace.stepper.seat(pace.seat(choices));
             }
             pace.stepper.update(&groups, ceiling, now)
         }
-        None if measured => {
+        None => {
             let mut stepper = Stepper::new(ceiling);
             let point = stepper.update(&groups, ceiling, now);
             let layer = choices[point].layer;
             *pace = Some(Pace { stepper, layer });
             point
         }
-        None => ceiling,
     };
     let choice = &choices[point.min(choices.len() - 1)];
-    if let Some(pace) = pace {
+    if let Some(pace) = pace.as_mut().filter(|_| measured) {
         pace.layer = choice.layer;
     }
     (point, (choice.target, choice.layer.spatial))
@@ -1419,6 +1440,46 @@ mod tests {
         }
         layers.structure.as_mut().expect("structure").active = 0b011;
         assert_eq!(targets(&layers, Kind::Screen, 0), [0]);
+    }
+
+    #[test]
+    fn a_new_target_list_measures_the_rates_again() {
+        let mut layers = Layers::default();
+        for number in 0..61u16 {
+            l1t3_at(&mut layers, number, u64::from(number) * 1000 / 30);
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 1).len(), 3);
+        let mut pace = None;
+        let choices = layers.choices(Kind::Screen, 1, false, 0);
+        let at = Duration::from_secs;
+        assert_eq!(pick(&choices, 2, false, true, &mut pace, at(3)).0, 2);
+        // The same structure again keeps the rates; another one does not.
+        l1t3_at(&mut layers, 0, 2034);
+        assert!(layers.measured());
+        let descriptor = l2t2_key(0, 2, true);
+        layers.packet(&descriptor, 1000, 2067 * 90, Duration::from_millis(2067));
+        assert!(!layers.measured());
+        // The pace waits for the new rates.
+        let lowest = layers.choices(Kind::Screen, 1, false, 0);
+        assert_eq!(pick(&lowest, 0, false, false, &mut pace, at(4)).0, 0);
+        assert_eq!(pick(&choices, 2, false, true, &mut pace, at(5)).0, 2);
+    }
+
+    #[test]
+    fn a_jump_back_in_time_measures_the_frame_rate_again() {
+        // 30 fps late in a stream, then a new stream from time 0 at 15 fps.
+        let mut layers = Layers::default();
+        for number in 0..61u16 {
+            l1t3_at(&mut layers, number, 100_000 + u64::from(number) * 1000 / 30);
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+        for number in 61..80u16 {
+            let id = [0, 2, 1, 2][usize::from(number) % 4];
+            let media = u64::from(number - 61) * 6000;
+            let at = Duration::from_millis(102_100 + u64::from(number - 61) * 1000 / 15);
+            layers.packet(&l1t3(id, number, false), 1000, media, at);
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1, 2]);
     }
 
     #[test]

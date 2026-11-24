@@ -320,17 +320,20 @@ Measurements, per source:
   short pause inside a window leaves the median. A slower window, from a
   static or slow source, keeps the measurement. Until the first active window,
   the latest slow window's median counts, and before 9 units the source counts
-  as 60 fps, the highest rate any tier asks for. A target whose highest temporal layer is t of T has
-  2^(t−T) of the source's frame rate: WebRTC's scalability modes double the
-  frame rate with each temporal layer.
+  as 60 fps, the highest rate any tier asks for. A jump back in media time of
+  over a second, as from a new stream, starts the units over. A target whose
+  highest temporal layer is t of the active targets' top T has 2^(t−T) of the
+  source's frame rate: WebRTC's scalability modes double the frame rate with
+  each temporal layer.
 - The bitrate of each target is its bytes over one-second windows from the
   source's first frame. A window across a pause of over a second keeps the
-  previous rates.
+  previous rates. A new set of targets starts the windows over.
 
 Choices, per viewer: a target is eligible when its spatial layer's height
 belongs to the viewer's tier or a lower one and its frame rate is at most 1.25
-times the tier's. The lowest active target is always eligible, and until the
-first bitrate window ends it is the only one. A Sharp source's eligible
+times the tier's. The lowest active target is always eligible, and until a
+bitrate window ends, after the source's first frame or a new set of targets,
+it is the only one; meanwhile the viewer's stepper waits. A Sharp source's eligible
 targets go by spatial, then temporal layer; a Smooth source's go along its
 lowest spatial layer by temporal layer, then along its top temporal layer by
 spatial layer. Each step of a late queue removes the top choice, down to the
