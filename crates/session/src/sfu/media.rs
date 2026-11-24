@@ -12,7 +12,7 @@ use nuschl_ipc::rtc::{
     self, Command, Description, Event, LegRole, Reply, SFU_PUBLISH_LEG as PUBLISH,
     SFU_SUBSCRIBE_LEG as SUBSCRIBE, Track, Worker,
 };
-use nuschl_protocol::sfu::VideoLimit;
+use nuschl_protocol::sfu::{Mode, VideoLimit};
 use nuschl_stream_quality::{QualityRequest, Throttle};
 use std::{
     collections::{HashMap, HashSet},
@@ -215,6 +215,7 @@ pub struct Media {
     sequence: [AtomicU64; 2],
     quality: watch::Sender<QualityRequests>,
     sources: watch::Sender<Sources>,
+    modes: watch::Sender<[Mode; 2]>,
     events: mpsc::Receiver<Result<QueuedEvent, Error>>,
     keyframes: [mpsc::Receiver<()>; 2],
     limits: watch::Receiver<SourceCaps>,
@@ -340,6 +341,15 @@ impl Media {
         self.sources
             .send(sources)
             .map_err(|_| Error::Protocol("media ended"))
+    }
+
+    /// Set a camera's or screen's Sharp/Smooth and Low latency mode. The SFU
+    /// hears the mode of each published video source.
+    pub fn set_mode(&self, purpose: Purpose, mode: Mode) -> Result<(), Error> {
+        let index = video_index(purpose)?;
+        self.modes
+            .send_if_modified(|modes| std::mem::replace(&mut modes[index], mode) != mode);
+        Ok(())
     }
 
     /// Set the ceiling for a subscribed video source. Auto fits the tile's
@@ -541,6 +551,8 @@ impl Connection {
         let ([camera, screen], frames) = frame_channels();
         let (quality, wanted) = watch::channel(Vec::new());
         let (sources, changes) = watch::channel(initial);
+        let (modes, mode_changes) =
+            watch::channel(VIDEO.map(|purpose| Mode::default_for(purpose == Purpose::ScreenVideo)));
         let (output, events) = mpsc::channel(4);
         let (requests, keyframes) = frame_channels();
         let (audio, audio_in) = mpsc::channel(AUDIO_QUEUE);
@@ -560,6 +572,7 @@ impl Connection {
                     audio: audio_in,
                     changes,
                     wanted,
+                    modes: mode_changes,
                 },
                 Output {
                     events: &output,
@@ -584,6 +597,7 @@ impl Connection {
             sequence: Default::default(),
             quality,
             sources,
+            modes,
             events,
             keyframes,
             limits,
@@ -903,6 +917,7 @@ struct Inputs {
     audio: mpsc::Receiver<Audio>,
     changes: watch::Receiver<Sources>,
     wanted: watch::Receiver<QualityRequests>,
+    modes: watch::Receiver<[Mode; 2]>,
 }
 
 fn frame_channels<T>() -> ([mpsc::Sender<T>; 2], [mpsc::Receiver<T>; 2]) {
@@ -1212,6 +1227,11 @@ async fn run(
                 if changed.is_err() { return Ok(()); }
                 pending_source = Some(*inputs.changes.borrow_and_update());
             }
+            changed = inputs.modes.changed() => {
+                if changed.is_err() { return Ok(()); }
+                let modes = publish_modes(&publish_tracks, *inputs.modes.borrow_and_update());
+                write(&mut connection.socket, &modes).await?;
+            }
             changed = inputs.wanted.changed() => {
                 if changed.is_err() { return Ok(()); }
                 quality.wanted.clone_from(&inputs.wanted.borrow_and_update());
@@ -1405,6 +1425,8 @@ async fn run(
             retreat |= attempting_direct;
             let description = offer_publish(connection, worker, source, next, update).await?;
             publish_tracks.clone_from(&description.tracks);
+            let modes = publish_modes(&publish_tracks, *inputs.modes.borrow());
+            write(&mut connection.socket, &modes).await?;
             offered = Some(description);
             source_change_deadline = Some(Instant::now() + HANDSHAKE);
             leg.wake = Some(Instant::now());
@@ -1667,6 +1689,17 @@ async fn set_subscriptions(
     leg.set_video_tracks(&next);
     *current = next;
     true
+}
+
+/// The SFU's `modes` message for the video tracks of the publish connection.
+fn publish_modes(tracks: &[Track], modes: [Mode; 2]) -> ClientMessage {
+    let modes = tracks.iter().filter_map(|track| {
+        let index = video_index(track.purpose).ok()?;
+        Some((track.mid.clone(), modes[index]))
+    });
+    ClientMessage::Modes {
+        modes: modes.collect(),
+    }
 }
 
 async fn offer_publish(
