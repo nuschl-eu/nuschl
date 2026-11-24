@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 nuschl-core.workspace = true
+nuschl-stream-quality = { path = "../stream-quality", version = "0.3.0" }
 str0m = { version = "0.25.0", default-features = false, features = [
   "rust-crypto",
 ] }

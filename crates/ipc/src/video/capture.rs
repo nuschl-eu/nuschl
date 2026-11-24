@@ -38,6 +38,9 @@ pub struct VideoFrame {
     /// Microseconds since this capture began, on the worker's monotonic clock.
     pub capture_time_us: u64,
     pub av1: Vec<u8>,
+    /// The frame's AV1 Dependency Descriptor for the RTP packets; empty when the
+    /// encoder sends none.
+    pub descriptor: Vec<u8>,
     pub keyframe: bool,
     pub hardware: bool,
     pub bitrate_bps: u32,
@@ -539,6 +542,10 @@ async fn read_frame(
             if settings.source != source || size == 0 || size > settings.packet_limit(header.key) {
                 return Err(invalid().into());
             }
+            let mut length = [0];
+            input.read_exact(&mut length).await?;
+            let mut descriptor = vec![0; usize::from(length[0])];
+            input.read_exact(&mut descriptor).await?;
             let mut av1 = vec![0; size];
             input.read_exact(&mut av1).await?;
             Ok(Some(VideoFrame {
@@ -547,6 +554,7 @@ async fn read_frame(
                 fps: settings.fps,
                 capture_time_us: header.id,
                 av1,
+                descriptor,
                 keyframe: header.key,
                 hardware: header.kind == Kind::HardwareFrame,
                 bitrate_bps: settings.bitrate,

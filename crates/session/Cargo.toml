@@ -61,6 +61,7 @@ call-test-roots = []
 
 [dev-dependencies]
 nuschl-testkit.workspace = true
+nuschl-video-encode.workspace = true
 tempfile = "3.27.0"
 # Paused-clock tests of the UDP probe timing.
 tokio = { version = "1.54.1", features = ["test-util"] }

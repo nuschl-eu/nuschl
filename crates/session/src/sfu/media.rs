@@ -205,6 +205,7 @@ struct Video {
     timestamp: u64,
     key_frame: bool,
     data: Vec<u8>,
+    descriptor: Vec<u8>,
 }
 
 pub struct Media {
@@ -260,6 +261,19 @@ impl Media {
         key_frame: bool,
         data: Vec<u8>,
     ) -> Result<bool, Error> {
+        self.send_described_frame(purpose, timestamp, key_frame, data, Vec::new())
+    }
+
+    /// [`Self::send_source_frame`] with a video frame's AV1 Dependency
+    /// Descriptor for its RTP packets.
+    pub fn send_described_frame(
+        &self,
+        purpose: Purpose,
+        timestamp: u64,
+        key_frame: bool,
+        data: Vec<u8>,
+        descriptor: Vec<u8>,
+    ) -> Result<bool, Error> {
         if purpose == Purpose::SystemAudio {
             let revision = self
                 .sources
@@ -297,6 +311,7 @@ impl Media {
             timestamp,
             key_frame,
             data,
+            descriptor,
         };
         match self.frames[index].try_send(frame) {
             Ok(()) => Ok(true),
@@ -1265,7 +1280,7 @@ async fn run(
                     && frame.queued.elapsed() <= MAX_PENDING_FRAME_AGE
                     && (sending_direct || publish.is_some())
                 {
-                    let command = Command::Write { purpose: Purpose::SystemAudio, timestamp: frame.timestamp, key_frame: false };
+                    let command = Command::Write { purpose: Purpose::SystemAudio, timestamp: frame.timestamp, key_frame: false, descriptor: Vec::new() };
                     match worker.exchange(command, frame.data).await?.kind {
                         Reply::Done => {
                             let now = Some(Instant::now());
@@ -1294,7 +1309,7 @@ async fn run(
                     }
                     sequence[index] = frame.sequence;
                     if frame.queued.elapsed() <= MAX_PENDING_FRAME_AGE && (!gate.awaiting_key || frame.key_frame) {
-                        let command = Command::Write { purpose: VIDEO[index], timestamp: frame.timestamp, key_frame: frame.key_frame };
+                        let command = Command::Write { purpose: VIDEO[index], timestamp: frame.timestamp, key_frame: frame.key_frame, descriptor: frame.descriptor };
                         match worker.exchange(command, frame.data).await?.kind {
                             Reply::Done => {
                                 gate.arrived(frame.key_frame);

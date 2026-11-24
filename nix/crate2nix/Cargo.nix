@@ -25936,6 +25936,10 @@ rec {
             packageId = "nuschl-core";
           }
           {
+            name = "nuschl-stream-quality";
+            packageId = "nuschl-stream-quality";
+          }
+          {
             name = "str0m";
             packageId = "str0m";
             usesDefaultFeatures = false;
@@ -26226,6 +26230,10 @@ rec {
           {
             name = "nuschl-testkit";
             packageId = "nuschl-testkit";
+          }
+          {
+            name = "nuschl-video-encode";
+            packageId = "nuschl-video-encode";
           }
           {
             name = "tempfile";
@@ -41871,8 +41879,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/ambiso/str0m";
-          rev = "942ad38e443915b762f10d3302e0f4a2a34a58de";
-          sha256 = "0fx1p0hbfrp650vh6jf6k2766av73xg7rrhaxnf768fkpfhf6108";
+          rev = "faa6cd05cac7d88bb4dfa46dfd87c13324dacafd";
+          sha256 = "1csmk7xvkwmhys4mbs85pfdfmp2xg1rgha1zc8cv5xagy0zq9xnw";
         };
         authors = [
           "Martin Algesten <martin@algesten.se>"

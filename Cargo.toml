@@ -75,7 +75,7 @@ speexdsp-resampler = { path = "vendor/speexdsp-resampler" }
 # Safe Rust terminal graphics encoding; source formats stay in workers.
 ratatui-image = { path = "vendor/ratatui-image" }
 # Send full TWCC padding bursts within their scheduled pacing slots.
-str0m = { git = "https://github.com/ambiso/str0m", rev = "942ad38e443915b762f10d3302e0f4a2a34a58de" }
+str0m = { git = "https://github.com/ambiso/str0m", rev = "faa6cd05cac7d88bb4dfa46dfd87c13324dacafd" }
 # Explicit RustCrypto DTLS provider and memory-safe certificate generation.
 str0m-rust-crypto = { path = "vendor/str0m-rust-crypto" }
 # Relay-only connections must not dial a peer's purported relay address.

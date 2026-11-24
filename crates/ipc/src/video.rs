@@ -29,6 +29,9 @@ const KIB: usize = 1024;
 /// The largest screen frame, keyframe or interframe. The largest keyframe
 /// measured from VA-API QVBR, of a 3840 × 2160 screen of noise, was 4.45 MB.
 pub const SCREEN_FRAME_BYTES: usize = 8 * 1024 * KIB;
+/// The longest AV1 Dependency Descriptor a capture frame carries; one length
+/// byte precedes it.
+pub const MAX_DESCRIPTOR: usize = u8::MAX as usize;
 const KEY: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

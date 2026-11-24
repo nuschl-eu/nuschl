@@ -248,6 +248,7 @@ async fn confined_workers_switch_udp_legs_without_reusing_the_sframe_counter() {
         purpose: Purpose::ScreenVideo,
         timestamp,
         key_frame,
+        descriptor: Vec::new(),
     };
     assert!(matches!(
         workers[0]
@@ -379,6 +380,7 @@ async fn confined_worker_sends_each_frame_once_on_every_direct_leg() {
         purpose: Purpose::ScreenVideo,
         timestamp,
         key_frame: true,
+        descriptor: Vec::new(),
     };
     assert!(matches!(
         workers[0]
@@ -408,6 +410,7 @@ async fn confined_worker_sends_each_frame_once_on_every_direct_leg() {
         purpose: Purpose::SystemAudio,
         timestamp: 960,
         key_frame: false,
+        descriptor: Vec::new(),
     };
     assert!(matches!(
         workers[0]

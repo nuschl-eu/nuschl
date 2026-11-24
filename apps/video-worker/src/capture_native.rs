@@ -93,6 +93,7 @@ fn capture(source: Source) -> Result<(), Error> {
                     timestamp,
                     true,
                     &packet,
+                    &[],
                 )?;
             }
         }

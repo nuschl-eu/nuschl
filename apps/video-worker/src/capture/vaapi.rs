@@ -589,6 +589,7 @@ fn write_frames(
             timestamp,
             keyframe,
             bytes.as_slice(),
+            &[],
         )?;
     }
 }

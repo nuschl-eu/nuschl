@@ -150,6 +150,7 @@ pub fn run() -> Result<(), Failure> {
                     capture_time_us,
                     true,
                     &packet,
+                    &[],
                 ) {
                     let _ = done.send(());
                     return Err(error.to_string());

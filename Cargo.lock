@@ -7781,6 +7781,7 @@ name = "nuschl-rtc"
 version = "0.3.0"
 dependencies = [
  "nuschl-core",
+ "nuschl-stream-quality",
  "str0m",
  "thiserror 2.0.21",
 ]
@@ -7845,6 +7846,7 @@ dependencies = [
  "nuschl-sandbox",
  "nuschl-stream-quality",
  "nuschl-testkit",
+ "nuschl-video-encode",
  "p12-keystore",
  "prost",
  "rcgen",
@@ -11921,7 +11923,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "str0m"
 version = "0.25.0"
-source = "git+https://github.com/ambiso/str0m?rev=942ad38e443915b762f10d3302e0f4a2a34a58de#942ad38e443915b762f10d3302e0f4a2a34a58de"
+source = "git+https://github.com/ambiso/str0m?rev=faa6cd05cac7d88bb4dfa46dfd87c13324dacafd#faa6cd05cac7d88bb4dfa46dfd87c13324dacafd"
 dependencies = [
  "arrayvec",
  "base64ct",
