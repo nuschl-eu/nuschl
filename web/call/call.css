@@ -39,18 +39,20 @@ body.standalone-call {
 .video-session #notice { color: var(--muted); }
 .video-session #notice.warning { color: var(--warning, var(--bad)); font-weight: 600; }
 .video-session .tile[data-own]:not([data-screen]) video { transform: scaleX(-1); }
-.video-session #stage { grid-area: stage; display: flex; flex-direction: column; gap: 8px; padding: 8px; min-height: 0; min-width: 0; }
+/* Tiles grow with the stage, so Auto asks for the camera tier a tile shows: grid
+   tiles at least 40 % of the stage height wide, strip tiles about a fifth of it tall. */
+.video-session #stage { grid-area: stage; display: flex; flex-direction: column; gap: 8px; padding: 8px; min-height: 0; min-width: 0; container-type: size; }
 .video-session #large { flex: 1; min-height: 0; display: flex; }
 .video-session #large .tile { flex: 1; aspect-ratio: auto; }
 .video-session #grid {
   display: grid;
   gap: 8px;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 16rem), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, max(16rem, 40cqh)), 1fr));
   align-content: start;
   overflow: auto;
   min-height: 0;
 }
-.video-session #large:not([hidden]) + #grid { flex: none; grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: 12rem; overflow-x: auto; }
+.video-session #large:not([hidden]) + #grid { flex: none; grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: max(12rem, 36cqh); overflow-x: auto; }
 .video-session #empty { margin: auto; color: var(--muted); }
 .video-session .tile { position: relative; margin: 0; aspect-ratio: 16 / 9; background: var(--tile, #000); border-radius: 8px; overflow: hidden; }
 .video-session .tile video { width: 100%; height: 100%; object-fit: contain; display: block; }
