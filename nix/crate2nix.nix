@@ -57,6 +57,11 @@ let
     rav1e = videoCodec;
     pipewire-sys = bindgen;
     libspa-sys = bindgen;
+    # Generates its libva bindings with bindgen and links libva and libva-drm.
+    cros-libva = _: {
+      nativeBuildInputs = pkgConfig ++ [ pkgs.rustPlatform.bindgenHook ];
+      buildInputs = [ pkgs.libva ];
+    };
     # Their build scripts probe the PipeWire version with pkg-config.
     pipewire = bindgen;
     libspa = bindgen;
@@ -98,7 +103,8 @@ let
       buildInputs = [
         pkgs.pipewire
       ]
-      ++ lib.optionals (builtins.elem "vaapi" (attrs.features or [ ])) gstLibraries;
+      ++ lib.optionals (builtins.elem "vaapi" (attrs.features or [ ])) gstLibraries
+      ++ lib.optionals (builtins.elem "va-encoder" (attrs.features or [ ])) [ pkgs.libva ];
       NUSCHL_VIDEO_GST_PLUGINS = lib.concatStringsSep ":" [
         "${lib.getLib gst.gstreamer}/lib/gstreamer-1.0/libgstcoreelements.so"
         "${gst.gst-plugins-base}/lib/gstreamer-1.0/libgstapp.so"

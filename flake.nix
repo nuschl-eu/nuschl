@@ -141,6 +141,8 @@
           pkgs.libxi
           pkgs.libxrandr
           pkgs.libxcb
+          # The video worker's VA-API encoder (feature va-encoder).
+          pkgs.libva
         ];
         # Twemoji images and emojibase names for both clients; the sources
         # are pinned together in nix/emoji.nix.
@@ -424,7 +426,10 @@
             pkgs.util-linux
           ];
           nuschl-video-worker = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            features = [ "vaapi" ];
+            features = [
+              "vaapi"
+              "va-encoder"
+            ];
             testInputs = [
               pkgs.bubblewrap
               pkgs.util-linux

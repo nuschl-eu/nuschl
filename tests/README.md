@@ -314,6 +314,15 @@ is local-only because it needs a DRM render node with AV1 hardware encode.
 Both capture tests feed synthetic frames, decode AV1, and verify that a new
 bitrate target persists across subsequent frames.
 
+The encoder core over VA-API (#558) has local-only unit tests, since they need a
+render node with AV1 encode (`NUSCHL_TEST_RENDER_NODE`, default
+`/dev/dri/renderD128`): `cargo test -p nuschl-video-worker --features va-encoder
+-- --ignored va_encoder`. They encode a synthetic camera and the README
+screenshot as a screen, decode every frame with rav1d at each operating point,
+and check the rate in each second, bitrate changes without keyframes, keyframes
+on request and the picture quality. With the `vaapi` feature too, one compares a
+still screen with today's GStreamer QVBR path.
+
 ## WebRTC transport trial
 
 `cargo test -p nuschl-rtc` exchanges ICE/DTLS/SRTP datagrams in memory with a virtual

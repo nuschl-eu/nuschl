@@ -19,9 +19,18 @@ mod rate;
 pub use av1::{FrameHeader, Sequence, temporal_delimiter};
 pub use layers::Layering;
 
-use av1::loop_filter;
+use av1::{ac_quantizer, loop_filter};
 use std::ops::RangeInclusive;
 use std::time::Duration;
+
+/// The quantizer for a refinement step of a still picture: half the
+/// reference's AC step.
+fn finer(reference: u8) -> u8 {
+    (0..reference)
+        .rev()
+        .find(|&q| 2 * ac_quantizer(q) <= ac_quantizer(reference))
+        .unwrap_or(0)
+}
 
 /// One frame for a backend to code.
 pub struct Frame<'a> {
@@ -88,6 +97,10 @@ pub struct Encoder<B> {
     pattern: layers::Pattern,
     rate: rate::Rate,
     keyframe: bool,
+    /// The quantizer of the frame each slot holds.
+    slot_qindex: [u8; 8],
+    /// Whether the picture has stayed still since a frame repeated it.
+    still: bool,
     /// Frames sent: the next frame's id, frame number and order hint.
     sent: u64,
 }
@@ -117,6 +130,8 @@ impl<B: Backend> Encoder<B> {
                 config.qindex,
             ),
             keyframe: true,
+            slot_qindex: [255; 8],
+            still: false,
             sent: 0,
         })
     }
@@ -144,7 +159,23 @@ impl<B: Backend> Encoder<B> {
         else {
             return Ok(None);
         };
+        // While the picture stays still, frames that replace the slot they
+        // predict from refine it step by step; the others take the reference's
+        // quantizer, so their loop filters keep its detail. A frame no other
+        // frame references never codes finer than its reference: the detail
+        // would be lost with it.
+        let reference = self.slot_qindex[usize::from(plan.reference)];
         let mut qindex = self.rate.qindex(class, target);
+        let persistent = plan.refresh >> plan.reference & 1 == 1;
+        let refining = self.still && persistent && !plan.key;
+        if !plan.key {
+            qindex = match (self.still, persistent) {
+                (true, true) => qindex.min(finer(reference)).max(self.rate.min_qindex()),
+                (true, false) => reference,
+                (false, _) if plan.refresh == 0 => qindex.max(reference),
+                (false, _) => qindex,
+            };
+        }
         let mut retried = false;
         loop {
             let header = FrameHeader {
@@ -183,8 +214,16 @@ impl<B: Backend> Encoder<B> {
                     return Ok(None);
                 }
             }
-            self.rate.sent(class, qindex, bits);
+            // The picture stays still through refinement steps and through
+            // frames within their target; a change exceeds it.
+            let tiny = self.rate.sent(class, qindex, bits);
+            self.still = tiny || (self.still && (refining || bits <= target));
             self.pattern.commit(plan, self.sent);
+            for (slot, held) in self.slot_qindex.iter_mut().enumerate() {
+                if plan.refresh >> slot & 1 == 1 {
+                    *held = qindex;
+                }
+            }
             let descriptor = dd::descriptor(
                 self.layering,
                 plan.template,
