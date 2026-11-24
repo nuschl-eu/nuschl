@@ -94,9 +94,11 @@ impl State {
             seen.listening_channel_remove.retain(|id| !hides(id));
             seen.listening_volume_adjustment
                 .retain(|adjustment| adjustment.listening_channel.is_none_or(|id| !hides(&id)));
+            // Nothing left but who it is about and who did it: nothing to say.
             if seen
                 != (proto::UserState {
                     session: message.session,
+                    actor: seen.actor,
                     ..Default::default()
                 })
             {

@@ -2911,6 +2911,33 @@ fn an_admission_notice_names_only_a_moderator_the_requester_sees() {
     );
 }
 
+/// Someone seen who starts listening to a hidden channel: those who do not
+/// see the channel hear nothing, as for a missing channel.
+#[test]
+fn listening_to_a_hidden_channel_sends_nothing_to_those_who_do_not_see_it() {
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let [_, admin, _, _, registered, _, _] = f.actors;
+    let listen = |f: &mut Fixture, channel: u32| {
+        f.received(registered);
+        f.handle(
+            admin,
+            kind::USER_STATE,
+            &proto::UserState {
+                listening_channel_add: vec![channel],
+                ..Default::default()
+            },
+        );
+        f.received(registered)
+    };
+    let missing = listen(&mut f, 999);
+    let hidden = listen(&mut f, SECRET);
+    assert!(f.state.users[&admin].listening.contains_key(&SECRET));
+    assert!(f.state.sees_user(registered, admin));
+    assert_eq!(hidden, missing);
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is
