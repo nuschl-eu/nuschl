@@ -107,7 +107,6 @@ export class Controls {
       for (const unwanted of extra) unwanted.stop();
       if (!shareAudio) audio?.stop();
       if (!track) throw new Error("no video in capture");
-      if (kind === "screen") track.contentHint = "detail";
       if (shareAudio) {
         track.addEventListener("capturehandlechange", () => {
           if (canShareAudio(track)) return;

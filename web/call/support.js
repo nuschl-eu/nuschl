@@ -12,6 +12,19 @@ export function support(scope = globalThis) {
   return codecs.length ? { codecs } : { refusal: "codecs" };
 }
 
+/** A video sender's track content hint and degradation preference: Sharp keeps
+ * detail and resolution, Smooth motion and frame rate. */
+export const HINTS = {
+  sharp: ["detail", "maintain-resolution"],
+  smooth: ["motion", "maintain-framerate"],
+};
+
+/** A receiver renders a Low latency source's frames at once and keeps its
+ * adaptive jitter buffer for other sources. */
+export function setLatency(receiver, mode) {
+  if (receiver && "jitterBufferTarget" in receiver) receiver.jitterBufferTarget = mode?.low_latency ? 0 : null;
+}
+
 const kept = {
   video: ["video/av1", "video/vp9", "video/rtx", "video/red", "video/ulpfec", "video/flexfec-03"],
   audio: ["audio/opus", "audio/red"],
