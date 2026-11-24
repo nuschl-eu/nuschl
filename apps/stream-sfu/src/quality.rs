@@ -19,7 +19,7 @@
 use crate::protocol::{Mode, Prefer, VideoLimit};
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
-    dd::{Frame, Layers, Pace, Selector},
+    dd::{self, Frame, Layers, Pace, Selector},
     receive,
 };
 use std::{
@@ -100,8 +100,8 @@ pub struct Backlog {
     dropped_through: Option<u64>,
     /// The layered frame left out whole.
     skipping: Option<u16>,
-    /// The timestamp of the latest temporal unit with a packet out.
-    unit: Option<u64>,
+    /// The timestamps of the latest temporal units with a packet out.
+    units: VecDeque<u64>,
     /// The bytes of the last key picture's temporal unit, and its timestamp
     /// while more of it is to come: the queue's bound grows by the time they
     /// take.
@@ -143,8 +143,11 @@ pub enum Layered {
 }
 
 impl Backlog {
+    /// Whether the packet at `timestamp` belongs to what the queue shed: the
+    /// unit at `dropped_through` and the second before it.
     pub fn dropped(&self, timestamp: u64) -> bool {
-        self.dropped_through.is_some_and(|last| timestamp <= last)
+        self.dropped_through
+            .is_some_and(|last| timestamp <= last && last - timestamp <= 90_000)
     }
 
     pub fn shed(&mut self, timestamp: u64, pause: Option<Instant>, limit: VideoLimit) {
@@ -237,7 +240,7 @@ impl Backlog {
                 self.key = (0, Some(timestamp));
             } else if delay > bound {
                 self.overloaded(VideoLimit::ForwardingBacklog);
-                if (discardable || delay > bound * 2) && self.unit != Some(timestamp) {
+                if (discardable || delay > bound * 2) && !self.out(timestamp) {
                     self.skipping = Some(frame.number);
                 }
             }
@@ -259,13 +262,12 @@ impl Backlog {
     /// Whether a packet of the temporal unit at `timestamp` is out: the
     /// unit's later packets go out too, the last one with the marker.
     pub fn out(&self, timestamp: u64) -> bool {
-        self.unit == Some(timestamp)
+        self.units.contains(&timestamp)
     }
 
-    /// A packet of the temporal unit at `timestamp` went out. A late packet
-    /// of an earlier unit leaves the latest unit.
+    /// A packet of the temporal unit at `timestamp` went out.
     pub fn enqueued(&mut self, payload: usize, cost: u64, marker: bool, timestamp: u64) {
-        self.unit = self.unit.max(Some(timestamp));
+        dd::push(&mut self.units, timestamp);
         self.unsampled_bytes += payload;
         if self.key.1 == Some(timestamp) {
             self.key = (self.key.0 + payload as u64, (!marker).then_some(timestamp));
@@ -659,6 +661,27 @@ mod tests {
         assert_eq!(admit(&mut backlog, &delta, 4, 150_000), Layered::Send);
         assert_eq!(admit(&mut backlog, &delta, 5, 30_000), Layered::Send);
         assert_eq!(admit(&mut backlog, &delta, 6, 150_000), Layered::Skip);
+    }
+
+    #[test]
+    fn late_packets_and_a_jump_back_keep_the_units() {
+        let second = 90_000;
+        let mut backlog = Backlog::default();
+        // A packet of a unit two seconds back, then one of a new stream from
+        // time 0: each unit keeps its later packets.
+        backlog.enqueued(1000, 1000, false, 10 * second);
+        backlog.enqueued(1000, 1000, true, 8 * second);
+        backlog.enqueued(1000, 1000, false, 0);
+        for unit in [10 * second, 8 * second, 0] {
+            assert!(backlog.out(unit), "{unit}");
+        }
+        // A shed takes its unit and the second before it.
+        backlog.shed(10 * second, None, VideoLimit::ForwardingBacklog);
+        assert!(backlog.dropped(10 * second));
+        assert!(backlog.dropped(9 * second));
+        assert!(!backlog.dropped(10 * second + 1));
+        assert!(!backlog.dropped(8 * second));
+        assert!(!backlog.dropped(0));
     }
 
     /// A key picture and a delta frame referencing the frame before it.
