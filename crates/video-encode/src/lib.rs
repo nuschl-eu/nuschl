@@ -140,6 +140,19 @@ impl<B: Backend> Encoder<B> {
         self.keyframe = true;
     }
 
+    /// The frames sent so far: an encoder opened for a new picture size
+    /// continues from them ([`Encoder::continuing`]).
+    pub fn sent(&self) -> u64 {
+        self.sent
+    }
+
+    /// Numbers frames on from an encoder that sent `sent`, so receivers read
+    /// the new stream's frames as new ones.
+    pub fn continuing(mut self, sent: u64) -> Self {
+        self.sent = sent;
+        self
+    }
+
     /// Applies to the next frame; the stream continues without a keyframe.
     pub fn set_bitrate(&mut self, bitrate: u32) {
         self.rate.set_bitrate(bitrate);
