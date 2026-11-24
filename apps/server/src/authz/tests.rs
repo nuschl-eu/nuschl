@@ -2803,6 +2803,31 @@ fn nobody_hears_or_reads_someone_they_do_not_see() {
     assert_eq!(muted(&mut f, anonymous), Some((Some(true), None)));
 }
 
+/// A direct message to someone whose only connection is in a hidden channel
+/// is allowed as when they are offline: stored, and delivered to their
+/// connections.
+#[test]
+fn a_direct_message_to_someone_in_a_hidden_channel_is_answered_as_when_they_are_offline() {
+    let mut f =
+        Fixture::new(Config::from_toml("message_limit = 1000\nmessage_burst = 1000\n").unwrap());
+    f.add_secret();
+    let [_, _, _, member, registered, _, _] = f.actors;
+    f.handle(
+        member,
+        kind::USER_STATE,
+        &proto::UserState {
+            channel_id: Some(SECRET),
+            ..Default::default()
+        },
+    );
+    assert!(!f.state.sees_user(registered, member));
+    let hidden = f.state.authorize(registered, Action::Send(&DIRECT));
+    f.state.disconnect(member, true);
+    let offline = f.state.authorize(registered, Action::Send(&DIRECT));
+    assert_eq!(offline, Ok(()));
+    assert_eq!(hidden, offline);
+}
+
 // ---- nothing else decides ----
 
 /// Within the server only authz evaluates ACLs (the engine is

@@ -1089,7 +1089,8 @@ impl State {
     /// Whether `session` may message account `peer` directly: both registered
     /// and different, the peer not deleted (its conversations are frozen), and
     /// Murmur's rule for a message to a user (TextMessage in their channel) for
-    /// each of the peer's connections.
+    /// each of the peer's connections that `session` sees; one in a hidden
+    /// channel counts as offline.
     fn may_message(&self, session: u32, peer: &Id) -> bool {
         let Some(user) = self.users.get(&session) else {
             return false;
@@ -1099,7 +1100,9 @@ impl State {
             && self
                 .users
                 .values()
-                .filter(|other| other.account == Some(*peer))
+                .filter(|other| {
+                    other.account == Some(*peer) && self.sees_user(session, other.session)
+                })
                 .all(|other| self.has(session, other.channel, perm::TEXT_MESSAGE))
     }
 

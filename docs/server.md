@@ -668,7 +668,9 @@ UDP socket ──► udp task ─────────┘  (handlers,└─�
   names only the channels and people its receiver sees. Knock notices and
   admissions name only people their recipient sees. Stored channel messages
   reach Nuschl readers of the channel with the author's name, as history
-  pages show them.
+  pages show them. A direct message to someone whose connections the sender
+  does not see is allowed as to someone offline: stored, and delivered to
+  those connections.
 - **Output.** Each connection has a queue bounded in bytes (`max_queued_bytes`).
   Control frames are never dropped: a client that lets the limit fill is
   disconnected. Voice frames are dropped once 64 KiB are waiting. Broadcasts
