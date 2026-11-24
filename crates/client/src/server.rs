@@ -842,6 +842,11 @@ impl ServerState {
     /// Replace a notice, invalidating any previous send-refusal lease even
     /// when the new text is identical. Frontends may read `notice` directly;
     /// production writers use these helpers to preserve its lifetime.
+    /// Counts notices set, such as the server's denials.
+    pub fn notice_revision(&self) -> u64 {
+        self.notice_revision
+    }
+
     pub fn set_notice(&mut self, notice: String) {
         self.notice_revision = self.notice_revision.wrapping_add(1);
         self.notice = Some(notice);
