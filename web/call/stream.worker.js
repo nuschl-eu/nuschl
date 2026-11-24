@@ -2,8 +2,10 @@
 // The call's stream worker (crates/stream-wasm, SECURITY.md): the one place that
 // holds the call link's secrets and every key. The page posts `{id, request}` and
 // receives `{id, reply}` or `{id, error}`; a trap posts `{fatal}` and ends the worker.
-// The page's encoded transforms run here: `{side: "receive", peer}` decrypts a
-// publisher's frames, `{side: "send", encoding}` encrypts this participant's.
+// The page's encoded transforms run here: `{side: "receive", peer, track}` decrypts a
+// publisher's frames, `{side: "send", encoding}` encrypts this participant's. For each
+// video keyframe whose Dependency Descriptor names its picture's size, a receive
+// transform posts `{picture: {track, width, height}}` (view.js crops to it).
 import init, { StreamWorker } from "./nuschl_stream_wasm.js";
 import { unsized } from "./frames.js";
 
@@ -48,7 +50,7 @@ addEventListener("message", async ({ data: { id, request } }) => {
 addEventListener("rtctransform", async ({ transformer }) => {
   const worker = await ready.catch(fatal);
   if (!worker) return;
-  const { side, peer, encoding, audio } = transformer.options;
+  const { side, peer, encoding, audio, track } = transformer.options;
   let code;
   if (side === "receive" && audio) {
     code = (frame) => frame.data.byteLength <= MAX_OPUS_PACKET + SFRAME_OVERHEAD ?
@@ -56,7 +58,13 @@ addEventListener("rtctransform", async ({ transformer }) => {
   } else if (side === "receive") {
     if (!receivers.has(peer)) receivers.set(peer, new Set());
     receivers.get(peer).add(transformer);
-    code = (frame) => worker.decrypt(peer, unsized(new Uint8Array(frame.data)), Date.now());
+    code = (frame) => {
+      if (frame.type === "key") {
+        const { width, height } = frame.getMetadata();
+        if (width && height) postMessage({ picture: { track, width, height } });
+      }
+      return worker.decrypt(peer, unsized(new Uint8Array(frame.data)), Date.now());
+    };
   } else {
     code = (frame) => encoding === TAB_AUDIO && frame.data.byteLength > MAX_OPUS_PACKET ? null :
       worker.encrypt(encoding, frame.type === "key", new Uint8Array(frame.data));

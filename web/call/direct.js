@@ -340,7 +340,9 @@ export class DirectPaths {
         const receiver = transceiver?.receiver;
         if (receiver?.track.kind !== "video") throw new Error("direct offer source is missing");
         transceiver.direction = "recvonly";
-        receiver.transform = new RTCRtpScriptTransform(call.stream.worker, { side: "receive", peer });
+        receiver.transform = new RTCRtpScriptTransform(call.stream.worker, {
+          side: "receive", peer, track: receiver.track.id,
+        });
         leg.tracks.set(source, { receiver, stream: new MediaStream([receiver.track]) });
       }
       await leg.pc.setLocalDescription();

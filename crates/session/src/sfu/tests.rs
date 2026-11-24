@@ -234,29 +234,46 @@ async fn two_native_peers_admit_and_signal_through_the_sfu_over_wss() {
     retired(&bob_worker, 3).await;
 }
 
-async fn red_keyframe(executable: std::path::PathBuf) -> Vec<u8> {
+async fn red_keyframe(executable: std::path::PathBuf, width: u16, height: u16) -> Vec<u8> {
     use nuschl_ipc::video::{Encoder, Output, Settings, Source};
 
     let mut encoder = Encoder::start(
         executable,
         Settings {
             source: Source::Screen,
-            width: 32,
-            height: 32,
+            width,
+            height,
             fps: 30,
             bitrate: 256_000,
         },
     )
     .unwrap();
     // Limited-range I420 for a uniform red picture.
-    let mut pixels = vec![81; 32 * 32];
-    pixels.extend([90; 16 * 16]);
-    pixels.extend([240; 16 * 16]);
+    let luma = usize::from(width) * usize::from(height);
+    let mut pixels = vec![81; luma];
+    pixels.extend(vec![90; luma / 4]);
+    pixels.extend(vec![240; luma / 4]);
     let Output::Keyframe(red) = encoder.encode(pixels).await.unwrap() else {
         panic!("expected a synthetic red keyframe");
     };
     encoder.stop().await.unwrap();
     red
+}
+
+/// Sends the same coded frame for every picture.
+struct Repeat(Vec<u8>);
+
+impl nuschl_video_encode::Backend for Repeat {
+    type Input = ();
+    type Error = std::convert::Infallible;
+
+    fn encode(
+        &mut self,
+        _: &(),
+        _: &nuschl_video_encode::Frame<'_>,
+    ) -> Result<Vec<u8>, Self::Error> {
+        Ok(self.0.clone())
+    }
 }
 
 #[tokio::test]
@@ -278,7 +295,24 @@ async fn native_publisher_in_call_page_vm() {
         .add(CertificateDer::from_pem_file(env::var_os("NUSCHL_NATIVE_CALL_CA").unwrap()).unwrap())
         .unwrap();
     let directory = nuschl_testkit::temp_dir();
-    let red = red_keyframe(fixture("nuschl-video-worker")).await;
+    let red = red_keyframe(fixture("nuschl-video-worker"), 32, 32).await;
+    // A 1080p camera as VCN 4 codes it: a 1920 × 1082 frame, with the
+    // picture's size in the Dependency Descriptor.
+    let mut camera = nuschl_video_encode::Encoder::new(
+        Repeat(red_keyframe(fixture("nuschl-video-worker"), 1920, 1082).await),
+        nuschl_video_encode::Config {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            bitrate: 8_000_000,
+            layering: nuschl_video_encode::Layering::L1T1,
+            screen: false,
+            frame_bytes: 256 << 10,
+            window: Duration::from_millis(300),
+            qindex: 1..=255,
+        },
+    )
+    .unwrap();
     let call = Connection::connect_with_roots(
         CryptoHandle::start(
             fixture("nuschl-crypto-worker"),
@@ -322,6 +356,7 @@ async fn native_publisher_in_call_page_vm() {
     let stop = state.join("stop");
     let switch = state.join("switch");
     let mut switched = false;
+    let started = std::time::Instant::now();
     timeout(Duration::from_secs(180), async {
         loop {
             tokio::select! {
@@ -335,7 +370,14 @@ async fn native_publisher_in_call_page_vm() {
                     }
                     if ready {
                         timestamp += 3_060;
-                        media.send_keyframe(timestamp, red.clone()).unwrap();
+                        if switched {
+                            camera.request_keyframe();
+                            if let Some(frame) = camera.encode(&(), started.elapsed()).unwrap() {
+                                media.send_described_frame(Purpose::Camera, timestamp, true, frame.data, frame.descriptor).unwrap();
+                            }
+                        } else {
+                            media.send_keyframe(timestamp, red.clone()).unwrap();
+                        }
                     }
                 }
                 _ = audio.tick() => {
@@ -515,7 +557,7 @@ async fn native_video_for_policy(relay_only: bool) {
         .unwrap();
 
     let mut decoder = Decoder::start(video.clone(), Source::Screen).unwrap();
-    let red = red_keyframe(video.clone()).await;
+    let red = red_keyframe(video.clone(), 32, 32).await;
 
     let mut phase = "publisher readiness";
     let playback = timeout(HANDSHAKE, async {

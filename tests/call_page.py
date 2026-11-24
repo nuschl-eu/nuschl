@@ -12,7 +12,8 @@ receiver video statistics. A pinned camera takes
 the large view; a publisher leaving takes its tile
 and roster row along. A native publisher shares its screen and a tone as shared
 audio before Chromium joins: the screen tile's speaker plays the tone, and muting
-it silences the player while the track goes on. A page user then publishes
+it silences the player while the track goes on. Its camera, a 1080p picture in a
+1920 × 1082 frame as VCN 4 codes it, shows at 1920 × 1080. A page user then publishes
 Chromium's fake camera and screen with Start camera and Share screen. Captures
 start at the buttons. The subscribers' tile of that screen shows "No shared
 audio" until an explicit audio opt-in shares a synthetic tab tone over the SFU,
@@ -412,6 +413,16 @@ def native_video(viewer):
                          screenshot="native-shared-audio.png")
             (state / "switch").touch()
             showing(viewer, {(int(peer), False): ((255, 0, 0), None)}, "native camera replaced screen in Chromium")
+            # The native camera codes 1920 × 1080 in a 1920 × 1082 frame, as VCN 4
+            # does; the tile shows the descriptor's 1920 × 1080.
+            shown = wait(viewer, f"""
+              const tile = document.querySelector('.tile[data-peer="{peer}"]:not([data-screen])');
+              const video = tile?.querySelector('video');
+              const box = video && getComputedStyle(video).objectViewBox;
+              return video?.videoHeight === 1082 && box !== 'none' && [video.videoWidth, video.videoHeight, box];
+            """, "native 1080p camera cropped in Chromium")
+            print("native camera", shown, flush=True)
+            assert shown == [1920, 1082, "inset(0px 0px 2px)"], shown
         finally:
             (state / "stop").touch()
             try:

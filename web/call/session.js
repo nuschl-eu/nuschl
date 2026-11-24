@@ -186,7 +186,9 @@ export class Call extends EventTarget {
       const known = this.tracks.get(transceiver.mid);
       const sameSource = known?.receiver === receiver && known.peer === track.peer && known.source === track.source;
       if (!sameSource) {
-        receiver.transform = new RTCRtpScriptTransform(this.stream.worker, { side: "receive", peer: track.peer, audio });
+        receiver.transform = new RTCRtpScriptTransform(this.stream.worker, {
+          side: "receive", peer: track.peer, audio, track: receiver.track.id,
+        });
         try {
           transceiver.setCodecPreferences(preferences(globalThis, receiver.track.kind));
         } catch {
