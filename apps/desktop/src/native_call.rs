@@ -24,7 +24,7 @@ use crate::{
 use futures_util::{FutureExt as _, StreamExt as _, future::BoxFuture};
 use gpui_kit::{prelude::*, *};
 use nuschl_client::native::sfu::{
-    Connect, Connection, Media, MediaEvent, MediaOptions, Purpose, Quality, VideoKind,
+    Connect, Connection, Media, MediaEvent, MediaOptions, Purpose, VideoKind,
 };
 use nuschl_core::{model::TextTarget, network::PeerPolicy};
 #[cfg(target_os = "linux")]
@@ -44,7 +44,7 @@ use std::{
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 pub(crate) use gallery::Feed;
-use gallery::{Selection, Sources, Stream, TILES};
+use gallery::{Preference, Selection, Sources, Stream, TILES};
 
 const SFU_PORT: u16 = 3479;
 static WORKERS: LazyLock<Option<(PathBuf, PathBuf)>> = LazyLock::new(|| {
@@ -1076,11 +1076,8 @@ fn panel_with_toolbar(
         })
         .when_some(local_feed, |actions, feed| {
             let target = MenuTarget::VideoQuality(generation, feed);
-            let quality = quality_readout(
-                feed.kind,
-                selection.preference(feed.kind).quality,
-                stats.as_deref(),
-            );
+            let quality =
+                quality_readout(feed.kind, selection.preference(feed.kind), stats.as_deref());
             actions.child(call_dropdown(
                 "native-call-quality",
                 format!("Quality · {quality}").into(),
@@ -1299,12 +1296,23 @@ impl Desktop {
             VideoChoice::Prefer(Prefer::Smooth),
             VideoChoice::LowLatency,
         ];
+        let max_fps = u16::from(kind.ladder()[kind.top()].fps);
         modes
             .into_iter()
             .chain(
-                std::iter::once(Quality::Auto)
-                    .chain((0..=kind.top() as u8).map(Quality::Tier))
-                    .map(VideoChoice::Quality),
+                std::iter::once(None)
+                    .chain(kind.ladder().iter().map(|tier| Some(tier.height)))
+                    .map(VideoChoice::Resolution),
+            )
+            .chain(
+                std::iter::once(None)
+                    .chain(
+                        [15, 30, 60]
+                            .into_iter()
+                            .filter(move |fps| *fps <= max_fps)
+                            .map(Some),
+                    )
+                    .map(VideoChoice::FrameRate),
             )
             .filter_map(move |choice| {
                 let preference = current?;
@@ -1319,13 +1327,22 @@ impl Desktop {
                         mode.prefer == prefer,
                     ),
                     VideoChoice::LowLatency => (choice, "Low latency".into(), mode.low_latency),
-                    VideoChoice::Quality(quality) => {
-                        let chosen = match preference.quality {
-                            Quality::Auto => Quality::Auto,
-                            Quality::Tier(tier) => Quality::Tier(tier.min(kind.top() as u8)),
-                        };
-                        (choice, quality_label(kind, quality), chosen == quality)
-                    }
+                    VideoChoice::Resolution(height) => (
+                        choice,
+                        height.map_or_else(
+                            || "Auto resolution".into(),
+                            |height| format!("Max {height}p"),
+                        ),
+                        preference.max_height == height,
+                    ),
+                    VideoChoice::FrameRate(fps) => (
+                        choice,
+                        fps.map_or_else(
+                            || "Auto frame rate".into(),
+                            |fps| format!("Max {fps} fps"),
+                        ),
+                        preference.max_fps == fps,
+                    ),
                 })
             })
     }
@@ -1346,7 +1363,8 @@ impl Desktop {
                     && selection.change_preference(feed.kind, |preference| {
                         let mode = preference.mode(feed.kind);
                         match choice {
-                            VideoChoice::Quality(quality) => preference.quality = quality,
+                            VideoChoice::Resolution(height) => preference.max_height = height,
+                            VideoChoice::FrameRate(fps) => preference.max_fps = fps,
                             VideoChoice::Prefer(prefer) => {
                                 preference.mode = Some(Mode { prefer, ..mode });
                             }
@@ -1511,24 +1529,18 @@ fn call_dropdown(
     layout::focusable_button(id, control, crate::dialogs::accessible_click(activate, cx))
 }
 
-fn quality_readout(kind: VideoKind, quality: Quality, stats: Option<&VideoStats>) -> String {
-    if quality == Quality::Auto
-        && let Some(encoder) = stats
+fn quality_readout(kind: VideoKind, preference: Preference, stats: Option<&VideoStats>) -> String {
+    match (preference.max_height, preference.max_fps) {
+        (Some(height), Some(fps)) => format!("Max {height}p · {fps} fps"),
+        (Some(height), None) => format!("Max {height}p"),
+        (None, Some(fps)) => format!("Max {fps} fps"),
+        (None, None) => stats
             .filter(|stats| stats.stream.feed == Feed::local(kind))
             .and_then(|stats| stats.encoder)
-    {
-        return format!("Auto ({}p{})", encoder.target.height, encoder.target.fps);
-    }
-    quality_label(kind, quality)
-}
-
-fn quality_label(kind: VideoKind, quality: Quality) -> String {
-    match quality {
-        Quality::Auto => "Auto".into(),
-        Quality::Tier(_) => {
-            let tier = kind.ladder()[kind.request(quality, 0)];
-            format!("Max {}p{}", tier.height, tier.fps)
-        }
+            .map_or_else(
+                || "Auto".into(),
+                |encoder| format!("Auto ({}p{})", encoder.target.height, encoder.target.fps),
+            ),
     }
 }
 
@@ -1537,8 +1549,8 @@ fn quality_label(kind: VideoKind, quality: Quality) -> String {
 pub(crate) enum VideoChoice {
     Prefer(Prefer),
     LowLatency,
-    /// Auto, or a tier limit.
-    Quality(Quality),
+    Resolution(Option<u16>),
+    FrameRate(Option<u16>),
 }
 
 /// Tells the SFU the mode of each own source.
@@ -2156,7 +2168,7 @@ fn text(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Instant, Quality, Source, SourceAction, SourceRequest, VideoKind, VideoStats,
+        Instant, Preference, Source, SourceAction, SourceRequest, VideoKind, VideoStats,
         next_source_action, publisher::CaptureAttempt, quality_readout, stats,
     };
     use futures_util::FutureExt as _;
@@ -2205,8 +2217,9 @@ mod tests {
             sample: measurements.sample(now + stats::INTERVAL),
             encoder: None,
         };
-        assert_eq!(quality_readout(kind, Quality::Auto, None), "Auto");
-        assert_eq!(quality_readout(kind, Quality::Auto, Some(&video)), "Auto");
+        let preference = Preference::default();
+        assert_eq!(quality_readout(kind, preference, None), "Auto");
+        assert_eq!(quality_readout(kind, preference, Some(&video)), "Auto");
         video.encoder = Some(stats::Encoder {
             requested: CaptureLimits {
                 height: 1440,
@@ -2224,7 +2237,7 @@ mod tests {
             hardware: None,
         });
         assert_eq!(
-            quality_readout(kind, Quality::Auto, Some(&video)),
+            quality_readout(kind, preference, Some(&video)),
             "Auto (1440p60)"
         );
     }

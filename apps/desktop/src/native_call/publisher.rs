@@ -2,7 +2,7 @@
 //! Each enabled source has its own capture worker, encoder and preview.
 
 use super::{
-    Display, Feed, Grant, Latest, Quality, Selection, Stream, TILES, purpose, stats, text,
+    Display, Feed, Grant, Latest, Preference, Selection, Stream, TILES, purpose, stats, text,
     video_kind,
 };
 use futures_util::{FutureExt as _, future::BoxFuture, stream::FuturesUnordered};
@@ -157,7 +157,7 @@ impl Publisher {
             hardware: None,
             capture_format: None,
         };
-        let applied = encoding.ceiling(selection.preference(encoding.kind).quality);
+        let applied = encoding.ceiling(selection.preference(encoding.kind));
         let (pictures, mut previews) = mpsc::channel(1);
         #[cfg(target_os = "linux")]
         let (capture, has_preview) = if attempt.mode == CaptureMode::Hardware {
@@ -380,8 +380,8 @@ impl Publisher {
         let camera_ceiling = self.slots[index(Source::Camera)]
             .as_ref()
             .map_or(0, |track| {
-                let quality = selection.preference(VideoKind::Camera).quality;
-                u64::from(track.encoding.ceiling(quality).bitrate)
+                let preference = selection.preference(VideoKind::Camera);
+                u64::from(track.encoding.ceiling(preference).bitrate)
             });
         // Reserve packet and SFrame overhead, then give each source the rate
         // it can use. Under congestion, an active camera and screen share it.
@@ -391,20 +391,19 @@ impl Publisher {
                 continue;
             };
             let feed = Feed::local(track.encoding.kind);
-            let quality = selection.preference(feed.kind).quality;
+            let preference = selection.preference(feed.kind);
             track.encoding.bitrate_estimate = available.map(|total| {
-                let camera = camera_ceiling.min(total / 2);
                 let bitrate = match source {
-                    Source::Camera if has_screen => camera,
-                    Source::Screen => total - camera,
+                    Source::Camera if has_screen => total / 2,
+                    Source::Screen => total - camera_ceiling.min(total / 2),
                     Source::Camera => total,
                 };
                 bitrate.min(nuschl_protocol::sfu::MAX_SCREEN_BITRATE) as u32
             });
             let next = if upload_decreased {
-                track.encoding.upload_drop_limits(quality, track.applied)
+                track.encoding.upload_drop_limits(preference, track.applied)
             } else {
-                track.encoding.limits(quality, track.applied)
+                track.encoding.limits(preference, track.applied)
             };
             // A sharp cut can strand the previous picture in the network.
             // Count successive decreases toward the next refresh.
@@ -429,8 +428,8 @@ impl Publisher {
                     },
                     sample,
                     Some(stats::Encoder {
-                        requested: track.encoding.preferred(quality),
-                        limit: track.encoding.active_limit(quality, track.applied),
+                        requested: track.encoding.preferred(preference),
+                        limit: track.encoding.active_limit(preference, track.applied),
                         budget_bps: track.encoding.bitrate_estimate,
                         target: track.applied,
                         ceiling: track.encoding.remote.filter(|_| !track.encoding.direct),
@@ -565,11 +564,17 @@ struct Encoding {
 }
 
 impl Encoding {
-    fn preferred(&self, quality: Quality) -> CaptureLimits {
-        let tier = self.kind.ladder()[self.kind.request(quality, u32::MAX)];
+    fn preferred(&self, preference: Preference) -> CaptureLimits {
+        let ladder = self.kind.ladder();
+        let top = ladder[self.kind.top()];
+        let height = preference.max_height.unwrap_or(top.height);
+        let tier = ladder[self.kind.tier_of(height.into())];
         CaptureLimits {
             height: tier.height,
-            fps: tier.fps.into(),
+            fps: preference
+                .max_fps
+                .unwrap_or(top.fps.into())
+                .min(top.fps.into()),
             bitrate: video_rate(match self.kind {
                 VideoKind::Camera => tier.ceiling,
                 VideoKind::Screen => nuschl_protocol::sfu::MAX_SCREEN_BITRATE,
@@ -577,38 +582,39 @@ impl Encoding {
         }
     }
 
-    fn ceiling(&self, quality: Quality) -> CaptureLimits {
-        let local = self.preferred(quality);
+    fn path_bitrate(&self) -> u32 {
         let initial_bitrate = match self.kind {
             VideoKind::Camera => 2_000_000,
             VideoKind::Screen => 4_000_000,
         };
-        let remote = self.remote.unwrap_or(CaptureLimits {
-            bitrate: initial_bitrate,
-            ..local
-        });
-        let bitrate = if self.direct && self.kind == VideoKind::Screen {
-            self.bitrate_estimate
-                .map_or(initial_bitrate, |_| local.bitrate)
+        if self.direct && self.kind == VideoKind::Screen {
+            self.bitrate_estimate.map_or(initial_bitrate, |_| {
+                video_rate(nuschl_protocol::sfu::MAX_SCREEN_BITRATE)
+            })
         } else {
-            remote.bitrate
-        };
-        CaptureLimits {
-            height: local.height.min(remote.height),
-            fps: local.fps.min(remote.fps),
-            bitrate: local.bitrate.min(bitrate),
+            self.remote.map_or(initial_bitrate, |remote| remote.bitrate)
         }
     }
 
-    fn active_limit(&self, quality: Quality, applied: CaptureLimits) -> &'static str {
-        let ceiling = self.ceiling(quality);
+    fn ceiling(&self, preference: Preference) -> CaptureLimits {
+        let local = self.preferred(preference);
+        let remote = self.remote.unwrap_or(local);
+        CaptureLimits {
+            height: local.height.min(remote.height),
+            fps: local.fps.min(remote.fps),
+            bitrate: local.bitrate.min(self.path_bitrate()),
+        }
+    }
+
+    fn active_limit(&self, preference: Preference, applied: CaptureLimits) -> &'static str {
+        let ceiling = self.ceiling(preference);
         if applied != ceiling
             && self
                 .bitrate_estimate
                 .is_some_and(|estimate| estimate < ceiling.bitrate)
         {
             "Sender upload"
-        } else if ceiling != self.preferred(quality) {
+        } else if ceiling != self.preferred(preference) {
             match (self.remote, self.remote_limit) {
                 (None, _) => "Initial encoder ceiling",
                 (_, Some(VideoLimit::WithinTarget)) if self.kind == VideoKind::Screen => {
@@ -634,19 +640,22 @@ impl Encoding {
         }
     }
 
-    fn upload_drop_limits(&self, quality: Quality, applied: CaptureLimits) -> CaptureLimits {
+    fn upload_drop_limits(&self, preference: Preference, applied: CaptureLimits) -> CaptureLimits {
         CaptureLimits {
-            bitrate: self.limits(quality, applied).bitrate.min(applied.bitrate),
+            bitrate: self.limits(preference, applied).bitrate.min(applied.bitrate),
             ..applied
         }
     }
 
-    fn limits(&self, quality: Quality, applied: CaptureLimits) -> CaptureLimits {
-        let mut limits = self.ceiling(quality);
+    fn limits(&self, preference: Preference, applied: CaptureLimits) -> CaptureLimits {
+        let mut limits = self.ceiling(preference);
         let Some(upload) = self.bitrate_estimate else {
             return limits;
         };
-        let budget = u64::from(limits.bitrate.min(upload));
+        // The camera's local resolution tier caps encoding bitrate. Use the
+        // path budget to decide whether the connection can also sustain the
+        // requested cadence.
+        let budget = u64::from(self.path_bitrate().min(upload));
         let current = self.kind.tier_of(u32::from(applied.height));
         let affordable = self.kind.affordable(budget);
         // Reserve headroom for an upgrade to keep small estimates from repeatedly
@@ -671,10 +680,10 @@ impl Encoding {
         };
         limits.height = limits.height.min(height);
         limits.fps = limits.fps.min(u16::from(fps));
-        limits.bitrate = video_rate(match self.kind {
+        limits.bitrate = limits.bitrate.min(video_rate(match self.kind {
             VideoKind::Camera => budget.min(tier.ceiling),
             VideoKind::Screen => budget,
-        });
+        }));
         limits
     }
 }
@@ -687,7 +696,7 @@ fn video_rate(bitrate: u64) -> u32 {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::{CaptureFailure, CaptureMode, Error, recoverable};
-    use super::{CaptureLimits, Encoding, Publisher, Quality, Source, VideoKind, VideoLimit};
+    use super::{CaptureLimits, Encoding, Preference, Publisher, Source, VideoKind, VideoLimit};
     use futures_util::FutureExt as _;
     use std::future::pending;
     #[cfg(target_os = "linux")]
@@ -774,6 +783,36 @@ mod tests {
     }
 
     #[test]
+    fn camera_can_publish_its_lowest_resolution_at_full_frame_rate() {
+        let encoding = Encoding {
+            kind: VideoKind::Camera,
+            remote: Some(CaptureLimits {
+                height: 1080,
+                fps: 30,
+                bitrate: 4_000_000,
+            }),
+            remote_limit: Some(VideoLimit::WithinTarget),
+            direct: false,
+            bitrate_estimate: Some(4_000_000),
+            hardware: None,
+            capture_format: None,
+        };
+        let preference = Preference {
+            max_height: Some(180),
+            max_fps: Some(30),
+            ..Preference::default()
+        };
+        assert_eq!(
+            encoding.limits(preference, encoding.ceiling(preference)),
+            CaptureLimits {
+                height: 180,
+                fps: 30,
+                bitrate: 200_000,
+            }
+        );
+    }
+
+    #[test]
     fn a_constrained_screen_reduces_dimensions_and_cadence_then_recovers() {
         let mut encoding = Encoding {
             kind: VideoKind::Screen,
@@ -788,7 +827,10 @@ mod tests {
             hardware: None,
             capture_format: None,
         };
-        let quality = Quality::Tier(2);
+        let quality = Preference {
+            max_height: Some(1440),
+            ..Preference::default()
+        };
         let full = encoding.ceiling(quality);
         assert_eq!((full.height, full.fps, full.bitrate), (1440, 60, 8_000_000));
         encoding.capture_format = Some((1440, 60));

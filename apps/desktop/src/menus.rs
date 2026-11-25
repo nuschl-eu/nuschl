@@ -18,7 +18,7 @@ use gpui_kit::{
     prelude::*,
     *,
 };
-use nuschl_client::native::{Presences, UserKey, sfu::Quality};
+use nuschl_client::native::{Presences, UserKey};
 use nuschl_session::{
     connection::{ActionSubject, Command, CommandAuthority, TextTarget, User},
     model::{ChannelEdit, UserAction, VoiceTargetSpec, permission as perm},
@@ -867,9 +867,12 @@ impl Desktop {
         }
         if let MenuTarget::VideoQuality(generation, feed) = menu.target {
             for (video, label, selected) in self.video_quality_commands(generation, feed) {
-                if video == VideoChoice::LowLatency
-                    || video == VideoChoice::Quality(Quality::Auto) && !entries.is_empty()
-                {
+                if matches!(
+                    video,
+                    VideoChoice::LowLatency
+                        | VideoChoice::Resolution(None)
+                        | VideoChoice::FrameRate(None)
+                ) {
                     entries.push(Entry::Separator);
                 }
                 let mut entry = local_item(label, "check", move |this, _, _, cx| {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Source identity, quality choices and the bounded set of visible tiles.
 
-use nuschl_client::native::sfu::{Purpose, Quality, VideoKind};
+use nuschl_client::native::sfu::{Purpose, VideoKind};
 use nuschl_ipc::video::Source;
 use nuschl_protocol::sfu::Mode;
 
@@ -114,20 +114,12 @@ impl Sources {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Preference {
-    pub(super) quality: Quality,
+    pub(super) max_height: Option<u16>,
+    pub(super) max_fps: Option<u16>,
     /// An own source's mode; `None` for its kind's default.
     pub(super) mode: Option<Mode>,
-}
-
-impl Default for Preference {
-    fn default() -> Self {
-        Self {
-            quality: Quality::Auto,
-            mode: None,
-        }
-    }
 }
 
 impl Preference {
@@ -189,7 +181,7 @@ fn preference_index(kind: VideoKind) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Feed, Purpose, Quality, Selection, Sources, Stream, VideoKind};
+    use super::{Feed, Purpose, Selection, Sources, Stream, VideoKind};
 
     fn stream(feed: Feed, serial: u64) -> Stream {
         Stream {
@@ -231,14 +223,11 @@ mod tests {
         let guest = stream(Feed::remote(1, Purpose::Camera).unwrap(), 1);
         sources.remote[0] = Some(guest);
         let mut selection = Selection::default();
-        assert!(selection.change_preference(kind, |choice| choice.quality = Quality::Tier(2)));
+        assert!(selection.change_preference(kind, |choice| choice.max_height = Some(720)));
         assert!(selection.resize_tile(guest, &sources, 720));
         assert!(!selection.resize_tile(guest, &sources, 720));
-        assert_eq!(selection.preference(kind).quality, Quality::Tier(2));
-        assert_eq!(
-            selection.preference(VideoKind::Screen).quality,
-            Quality::Auto
-        );
+        assert_eq!(selection.preference(kind).max_height, Some(720));
+        assert_eq!(selection.preference(VideoKind::Screen).max_height, None);
         assert_eq!(selection.tile_pixels(0, guest), 720);
         assert_eq!(selection.tile_pixels(0, stream(guest.feed, 2)), 0);
     }
