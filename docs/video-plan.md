@@ -194,8 +194,9 @@ when bandwidth or CPU is short; Smooth keeps the frame rate and lowers the
 resolution. Screens start Sharp, cameras Smooth. Low latency bounds each
 viewer's queue at the SFU to 50 ms, and receivers render its frames at once
 (`jitterBufferTarget` 0 in browsers). Resolution and frame rate follow the
-bandwidth and the source; a publisher may limit a source to a §5.1 tier under
-Advanced, and each viewer automatically requests a tier that fits its tile.
+bandwidth and the source. A publisher can set independent resolution and
+frame-rate ceilings. Each viewer automatically requests a tier that fits its
+tile.
 Quality and path changes leave keys and relay-only untouched.
 
 ### 5.1 Tiers

@@ -248,10 +248,10 @@ to return to chat. **Minimize call** hides the video while the call continues.
 **Return to call** restores the panel from the call's chat card or the
 return strip in other conversations.
 
-Presenters can set a resolution and frame-rate ceiling in the **Quality**
-dropdown. With **Auto**, the dropdown shows the current encoder target.
-A 1440p tier can carry 3440 × 1440 when the capture, encoder and connection
-support it. Open **Video options** and choose
+Presenters can set independent resolution and frame-rate ceilings in the
+**Quality** dropdown. The effective encoder target also follows the capture
+source, available upload, and SFU limits. A 1440p ceiling can carry
+3440 × 1440 when those limits allow it. Open **Video options** and choose
 **Video stats** for delivered dimensions, frame rate, encoded payload rate
 and the current route. On the call server, the route names the reason, such
 as "relay-only" or "upload too low for direct". Presenters also see the server
