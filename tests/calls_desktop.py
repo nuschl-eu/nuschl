@@ -132,10 +132,11 @@ class CallTest(VoiceTest):
         assert chat.extents() == chat_bounds, "opening the quality menu moved the chat"
         for choice in choices:
             role = AT_SPI_CHECK_MENU_ITEM if choice == "Low latency" else AT_SPI_RADIO_MENU_ITEM
-            item = eventually(lambda: self.find(menu, role, choice, subtree=True),
+            item = eventually(lambda: self.find(app, role, choice),
                               f"quality menu item missing: {choice}")
             item.press()
-            eventually(lambda: item.call("Accessible", "GetState")[0][0] & AT_SPI_CHECKED,
+            eventually(lambda: any(item_role == role and label == choice and state & AT_SPI_CHECKED
+                                   for _, item_role, label, state in items(app)),
                        f"quality menu item did not become checked: {choice}")
             assert self.find(app, "menu", "Video quality"), f"selecting {choice} closed the menu"
         self.control(app, f"Quality · {result}")
@@ -440,14 +441,18 @@ class CallTest(VoiceTest):
             self.video_stats(andi, show=True)
             self.select_quality(andi, "Auto", ("Sharp", "Low latency", "Max 180p", "Max 30 fps"),
                                 result="Max 180p · 30 fps")
-            self.video_stats(andi, show=False)
+            assert self.witness_link()[0] == {"kind": "channel", "id": 1}
+            self.press(andi, "End call")
+
             height = self.resize_desktop(andi_pid, 520)
             settings = self.root / "Andi" / "config/settings.json"
             for _ in range(2):
                 self.shell.chord("Control_L", "equal")
             eventually(lambda: json.loads(settings.read_text()).get("appearance", {}).get("zoom") == 1.25,
                        "the short fixture window did not reach 125% zoom", timeout=15)
-            self.select_quality(andi, "Max 180p · 30 fps", ("Auto resolution", "Auto frame rate"), result="Auto")
+            self.press(andi, "Start camera")
+            self.inline(andi)
+            self.select_quality(andi, "Auto", ("Max 180p", "Auto frame rate"), result="Max 180p")
             self.shell.chord("Control_L", "0")
             self.resize_desktop(andi_pid, height)
             self.inline(andi)
