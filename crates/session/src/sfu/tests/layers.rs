@@ -25,28 +25,30 @@ async fn a_viewer_at_the_lowest_screen_tier_receives_the_lower_temporal_layers()
     nuschl_testkit::sandbox();
     let crypto = fixture("nuschl-crypto-worker");
     let rtc = fixture("nuschl-rtc-worker");
-    let sfu = nuschl_testkit::sfu::start(fixture("nuschl-stream-sfu"), "");
+    let turn = nuschl_testkit::turn::start();
+    let sfu = nuschl_testkit::sfu::start_with_turn(fixture("nuschl-stream-sfu"), "", &turn.url);
     let (host, roots) = tls_proxy(&sfu).await;
     let directory = nuschl_testkit::temp_dir();
     let posted = format!("https://{host}/call#{LINK}");
     let owner = format!("{posted}&p={OWNER}");
-    let connect = |link| Connect {
+    let connect = |link, relay_only| Connect {
         generation: 1,
         host: &host,
         link,
         codecs: &[Codec::Av1],
-        policy: PeerPolicy { relay_only: false },
+        policy: PeerPolicy { relay_only },
     };
     let mut alice = Connection::connect_with_roots(
         CryptoHandle::start(crypto.clone(), directory.path().join("alice")),
-        connect(&owner),
+        connect(&owner, false),
         roots.clone(),
     )
     .await
     .unwrap();
+    // The SFU selects temporal layers for this relayed viewer.
     let bob = Connection::connect_with_roots(
         CryptoHandle::start(crypto, directory.path().join("bob")),
-        connect(&posted),
+        connect(&posted, true),
         roots,
     )
     .await
@@ -103,7 +105,7 @@ async fn a_viewer_at_the_lowest_screen_tier_receives_the_lower_temporal_layers()
     let lower = |counts: &[u32; 3]| counts[0] > 0 && counts[1] > 0 && counts[2] == 0;
     while !seconds.windows(3).any(|w| lower(&w[0]) && lower(&w[1])) {
         assert!(
-            started.elapsed() < Duration::from_secs(60),
+            started.elapsed() < Duration::from_secs(20),
             "layers per second: {seconds:?}"
         );
         tokio::select! {
