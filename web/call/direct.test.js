@@ -173,11 +173,12 @@ test("available upload above the screen tier baseline can offer direct despite a
   globalThis.RTCRtpScriptTransform = class {};
   const host = call(1);
   host.screenRate = true;
+  host.publishLimits = { screen: { height: 1440, fps: 30 } };
   const initial = Connection.opened.length;
   let upload = 9_900_000;
   host.publisher = { getStats: async () => bitrates(upload) };
   host.sources.set("screen", {
-    track, tier: "2", remoteCap: [2160, 60, 24_000_000],
+    track, remoteCap: [2160, 60, 24_000_000],
     transceiver: { mid: "s0", sender: sender(track, { maxBitrate: 24_000_000 }, () => {}) },
   });
   const publish = new DirectPaths(host);

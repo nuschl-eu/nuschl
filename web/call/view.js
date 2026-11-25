@@ -4,7 +4,7 @@
 // strings (the stream host requires Trusted Types). This page's own sources show as
 // tiles too; `controls.js` starts and stops them.
 
-import { TIERS, fitTier, publishTier, qualityRequest } from "./signal.js";
+import { TIERS, fitTier, publishCaps, qualityRequest } from "./signal.js";
 import { VideoStats } from "./receiver-stats.js";
 
 const endings = {
@@ -332,7 +332,7 @@ export class View {
     } : {
       source: track.source,
       sender: () => this.call.direct.sender(track.source.transceiver.sender),
-      requested: () => publishTier(kind, track.source.tier),
+      requested: () => publishCaps(kind, this.call.publishLimits[kind]),
       screenRate: kind === "screen" && this.call.screenRate,
     }) };
     details.addEventListener("toggle", () => {

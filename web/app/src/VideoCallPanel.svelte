@@ -63,8 +63,10 @@
           <label hidden><input type="checkbox" id="screen-audio"> Share browser tab audio</label>
           <details id="advanced">
             <summary>Advanced</summary>
-            <label>Camera limit <select id="camera-quality"></select></label>
-            <label>Screen limit <select id="screen-quality"></select></label>
+            <label>Camera max resolution <select id="camera-resolution"></select></label>
+            <label>Camera max frame rate <select id="camera-frame-rate"></select></label>
+            <label>Screen max resolution <select id="screen-resolution"></select></label>
+            <label>Screen max frame rate <select id="screen-frame-rate"></select></label>
           </details>
           <span id="notice" role="status" hidden></span>
         </div>

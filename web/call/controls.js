@@ -6,15 +6,14 @@
 
 import { TIERS } from "./signal.js";
 
-function qualityOptions(select, kind) {
+function limitOptions(select, choices, label) {
   const option = (label, value) => {
     const entry = select.ownerDocument.createElement("option");
     entry.textContent = label;
     entry.value = value;
     return entry;
   };
-  select.replaceChildren(option("Auto", ""), ...TIERS[kind].map(([height, fps], index) =>
-    option(`${height}p${fps}`, index)));
+  select.replaceChildren(option("Auto", ""), ...Array.from(choices, value => option(label(value), value)));
 }
 
 const capture = {
@@ -74,10 +73,12 @@ export class Controls {
     this.sources = {};
     for (const kind of ["camera", "screen"]) {
       const button = $(kind);
-      const quality = $(`${kind}-quality`);
+      const resolution = $(`${kind}-resolution`);
+      const frameRate = $(`${kind}-frame-rate`);
       const prefer = $(`${kind}-prefer`);
       const latency = $(`${kind}-latency`);
-      qualityOptions(quality, kind);
+      limitOptions(resolution, TIERS[kind].map(([height]) => height), height => `${height}p`);
+      limitOptions(frameRate, new Set(TIERS[kind].map(([, fps]) => fps)), fps => `${fps} fps`);
       prefer.replaceChildren(...[["sharp", "Sharp"], ["smooth", "Smooth"]].map(([value, label]) => {
         const entry = document.createElement("option");
         entry.value = value;
@@ -89,9 +90,13 @@ export class Controls {
       const mode = () => call.setMode(kind, { prefer: prefer.value, low_latency: latency.checked }).catch(() => {});
       prefer.addEventListener("change", mode);
       latency.addEventListener("change", mode);
-      quality.addEventListener("change", () => call.setPublishTier(kind, quality.value));
+      const limits = () => call.setPublishLimits(kind, {
+        height: Number(resolution.value) || undefined, fps: Number(frameRate.value) || undefined,
+      });
+      resolution.addEventListener("change", limits);
+      frameRate.addEventListener("change", limits);
       button.addEventListener("click", () => this.toggle(kind));
-      this.sources[kind] = { button, quality };
+      this.sources[kind] = button;
     }
     this.changed = () => this.render();
     call.addEventListener("change", this.changed);
@@ -130,7 +135,7 @@ export class Controls {
         track.addEventListener("ended", () => audio.stop(), { once: true });
       }
       try {
-        await this.call.publish(kind, track, this.sources[kind].quality.value);
+        await this.call.publish(kind, track);
         if (shareAudio) await this.call.publish("audio", audio);
       } catch (error) {
         audio?.stop();
@@ -155,7 +160,7 @@ export class Controls {
 
   render() {
     const { call } = this;
-    for (const [kind, { button }] of Object.entries(this.sources)) {
+    for (const [kind, button] of Object.entries(this.sources)) {
       const on = call.sources.has(kind);
       button.textContent = labels[kind][Number(on)];
       button.setAttribute("aria-pressed", String(on));

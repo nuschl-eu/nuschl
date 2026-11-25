@@ -2,7 +2,7 @@
 // One optional WebRTC leg per publisher in a two-person call. Signalling goes
 // through the stream worker's authenticated pair, and the SFU stays available
 // for fallback. A direct leg negotiates with detached senders.
-import { MAX_VIDEO_BITRATE, TIERS, fitTier, publishTier } from "./signal.js";
+import { MAX_VIDEO_BITRATE, TIERS, fitTier, publishCaps } from "./signal.js";
 import { sendCodecs, setLatency } from "./support.js";
 
 const GATHER_TIMEOUT = 3000;
@@ -81,9 +81,9 @@ function desiredRate(call, sources) {
     if (kind === "screen" && call.screenRate) {
       const source = call.sources.get(kind);
       if (source?.transceiver.sender !== local.sender) return 0;
-      const [height] = publishTier(kind, source.tier);
+      const [height] = publishCaps(kind, call.publishLimits[kind]);
       const remoteHeight = source.remoteCap?.[0] ?? height;
-      // Route selection uses the selected tier's bitrate baseline.
+      // Route selection uses the effective resolution's bitrate baseline.
       const baseline = TIERS.screen[fitTier(kind, Math.min(height, remoteHeight))][2];
       total += baseline;
     } else {

@@ -41,6 +41,7 @@ from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select
 
 ORIGIN = "https://stream.test"
 OUT = Path(sys.argv[1])
@@ -536,6 +537,14 @@ try:
     # buttons. Nothing is captured before a button, and nothing asks for audio.
     user.get(f"{ORIGIN}/call{LINK}")
     wait(user, "return !document.getElementById('camera').disabled", "Start camera ready")
+    advanced = user.find_element(By.CSS_SELECTOR, "#advanced > summary")
+    advanced.click()
+    for limit, maximum in [("camera-resolution", "1080p"), ("camera-frame-rate", "30 fps"),
+                           ("screen-resolution", "2160p"), ("screen-frame-rate", "60 fps")]:
+        control = Select(user.find_element(By.ID, limit))
+        assert control.first_selected_option.text == "Auto"
+        assert control.options[-1].text == maximum
+    advanced.click()
     time.sleep(3)
     assert user.execute_script("return window.captures") == [], "a capture before the button"
     user.find_element(By.ID, "camera").click()
