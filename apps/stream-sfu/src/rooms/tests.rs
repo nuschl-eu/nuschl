@@ -24,7 +24,7 @@ fn join(nonce: &Nonce, host: bool, create: bool) -> Join {
         create: create.then_some((ADMIT, HOST)),
         decoders: crate::protocol::Decoders::default(),
         video_limits: false,
-        screen_rate: false,
+        screen_rate: None,
     }
 }
 

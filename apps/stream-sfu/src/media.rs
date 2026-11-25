@@ -12,8 +12,8 @@
 use crate::{
     config::Config,
     protocol::{
-        self, ClientMessage, Decoders, MAX_SCREEN_BITRATE, Mode, PeerInfo, ServerMessage, Track,
-        TurnCredentials, VideoLimit, Welcome,
+        self, ClientMessage, Decoders, Mode, PeerInfo, ServerMessage, Track, TurnCredentials,
+        VideoLimit, Welcome,
     },
     quality,
     rooms::{self, Bucket, Join, Nonce, PeerId, Refusal, RoomId, Rooms},
@@ -139,7 +139,7 @@ struct Peer {
     decode: DecodeCapacity,
     decode_throttle: Throttle,
     video_limits: bool,
-    screen_rate: bool,
+    screen_rate: Option<u64>,
 }
 
 impl Source {
@@ -1159,8 +1159,9 @@ impl Core {
                     };
                 demand.request(tier, publisher_limit);
                 demand.wanted = demand.wanted.max(requested);
-                let raised = video.kind == Kind::Screen && publisher.screen_rate;
-                let single_layer = (raised || backlog.limited()) && video.layers.targets() <= 1;
+                let screen_rate = publisher.screen_rate.filter(|_| video.kind == Kind::Screen);
+                let single_layer =
+                    (screen_rate.is_some() || backlog.limited()) && video.layers.targets() <= 1;
                 if backlog.limited() && single_layer {
                     let (configured, configured_limit) =
                         if self.config.receiver_bitrate <= self.config.room_bitrate {
@@ -1177,7 +1178,7 @@ impl Core {
                     demand.shared_cap = demand.shared_cap.min(cap);
                 }
                 let mut probe = video.kind.ladder()[requested].ceiling;
-                if raised {
+                if let Some(screen_rate) = screen_rate {
                     let viewer = viewers[&id];
                     let (configured, configured_limit) = [
                         (host.rate(limits.host), VideoLimit::SfuHost),
@@ -1185,9 +1186,7 @@ impl Core {
                         (viewer.rate(limits.receiver), VideoLimit::SfuViewer),
                     ]
                     .into_iter()
-                    .fold((MAX_SCREEN_BITRATE, VideoLimit::WithinTarget), |a, b| {
-                        a.min(b)
-                    });
+                    .fold((u64::MAX, VideoLimit::WithinTarget), std::cmp::min);
                     let policy = if self.step > 0 {
                         let step = self.step.min(video.kind.top() as u64) as usize;
                         let index = video.kind.top() - step;
@@ -1196,13 +1195,16 @@ impl Core {
                             VideoLimit::TrafficBudget,
                         )
                     } else {
-                        (MAX_SCREEN_BITRATE, VideoLimit::WithinTarget)
+                        (screen_rate, VideoLimit::WithinTarget)
                     };
                     // Probe independently of payload and leave room for packet headers.
                     probe = configured.min(policy.0.saturating_mul(10).div_ceil(9));
-                    let network = viewer.rate(peer.estimate).min(MAX_SCREEN_BITRATE);
-                    let mut cap = (configured * 9 / 10, configured_limit)
-                        .min((network * 9 / 10, VideoLimit::ReceiverBandwidth))
+                    let network = viewer.rate(peer.estimate);
+                    let mut cap = (configured.saturating_mul(9) / 10, configured_limit)
+                        .min((
+                            network.saturating_mul(9) / 10,
+                            VideoLimit::ReceiverBandwidth,
+                        ))
                         .min(policy);
                     // The forwarding queue can temporarily cap the encoder at
                     // the receiver's reduced tier.

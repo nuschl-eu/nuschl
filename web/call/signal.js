@@ -11,7 +11,7 @@ export const MAX_PEERS = 256;
 export const MAX_TRACKS = 3 * MAX_PEERS;
 /** A key message in hex (16 KiB). */
 const MAX_KEY = 2 * 16 * 1024;
-export const MAX_VIDEO_BITRATE = 50_000_000;
+export const MAX_VIDEO_BITRATE = 100_000_000;
 
 const id = (value) => Number.isSafeInteger(value) && value >= 0;
 const limit = (max) => (value) => Number.isInteger(value) && value > 0 && value <= max;
@@ -50,6 +50,7 @@ const messages = {
     nonce: hex(64, 64),
     video_limits: optional((value) => typeof value === "boolean"),
     screen_rate: optional((value) => typeof value === "boolean"),
+    max_screen_bitrate: optional(limit(Number.MAX_SAFE_INTEGER)),
   },
   welcome: {
     peer: id,
@@ -122,7 +123,7 @@ export function linkOf(location) {
 
 /** The SFU `join` from the stream worker's `opened` and `admitted` replies and the
  * codecs this browser decodes. */
-export function join(opened, admitted, codecs, { videoLimits, screenRate } = {}) {
+export function join(opened, admitted, codecs, { videoLimits, screenRate, maxScreenBitrate } = {}) {
   return {
     type: "join",
     room: opened.room,
@@ -133,5 +134,6 @@ export function join(opened, admitted, codecs, { videoLimits, screenRate } = {})
     codecs,
     ...(videoLimits ? { video_limits: true } : {}),
     ...(screenRate ? { screen_rate: true } : {}),
+    ...(screenRate && maxScreenBitrate && { max_screen_bitrate: Math.min(maxScreenBitrate, MAX_VIDEO_BITRATE) }),
   };
 }

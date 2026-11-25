@@ -200,7 +200,7 @@ impl Settings {
     }
 
     pub fn valid_bitrate(bitrate: u32) -> bool {
-        (64_000..=50_000_000).contains(&bitrate)
+        (64_000..=100_000_000).contains(&bitrate)
     }
 
     pub fn packet_limit(self, key: bool) -> usize {

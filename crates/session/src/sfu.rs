@@ -219,6 +219,7 @@ impl Connection {
                 nonce,
                 video_limits,
                 screen_rate,
+                max_screen_bitrate,
             } = read(&mut socket).await?
             else {
                 return Err(Error::Protocol("expected a challenge"));
@@ -246,6 +247,8 @@ impl Connection {
                     codecs: options.codecs.to_vec(),
                     video_limits,
                     screen_rate,
+                    max_screen_bitrate: max_screen_bitrate
+                        .map(|rate| rate.min(sfu::MAX_SCREEN_BITRATE)),
                 },
             )
             .await?;

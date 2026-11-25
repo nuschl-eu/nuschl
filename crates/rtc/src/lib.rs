@@ -32,7 +32,8 @@ pub const MAX_OPUS_BYTES: usize = 1275;
 pub const MAX_VIDEO_BYTES: usize = 256 * 1024;
 const INITIAL_BITRATE: u64 = 2_000_000;
 const CALL_INITIAL_BITRATE: u64 = 5_000_000;
-const CALL_MAX_BITRATE: u64 = 50_000_000;
+// The estimate includes packet overhead and leaves headroom for the video target.
+const CALL_MAX_BITRATE: u64 = 150_000_000;
 const CALL_VIDEO_WINDOW: Duration = Duration::from_millis(300);
 const CALL_RTP_PACKETS: usize = 1024;
 /// The microphone role's reservation, including the overhead `write` charges:

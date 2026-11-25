@@ -365,9 +365,10 @@ impl Publisher {
     pub fn retune(&mut self, display: &Display<'_>, selection: Selection, report: Option<Feed>) {
         let count = self.slots.iter().flatten().count().max(1) as u64;
         // RTC charges packet and SFrame overhead and splits the video budget across enabled sources.
-        let share = self
-            .estimate
-            .map(|rate| (rate.saturating_mul(72) / 100 / count).min(50_000_000) as u32);
+        let share = self.estimate.map(|rate| {
+            (rate.saturating_mul(72) / 100 / count).min(nuschl_protocol::sfu::MAX_SCREEN_BITRATE)
+                as u32
+        });
         for source in SOURCES {
             let Some(track) = self.slots[index(source)].as_mut() else {
                 continue;
@@ -633,7 +634,7 @@ impl Encoding {
 }
 
 fn video_rate(bitrate: u64) -> u32 {
-    bitrate.clamp(64_000, 50_000_000) as u32
+    bitrate.clamp(64_000, nuschl_protocol::sfu::MAX_SCREEN_BITRATE) as u32
 }
 
 #[cfg(test)]
