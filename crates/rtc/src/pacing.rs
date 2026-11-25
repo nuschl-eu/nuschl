@@ -32,9 +32,16 @@ impl Bucket {
         self.available(now, rate) >= bits.min(rate as f64 * self.window.as_secs_f64())
     }
 
-    /// A frame longer than the window takes the full window's tokens.
-    pub fn spend(&mut self, now: Instant, rate: u64, bits: f64) {
-        self.tokens = (self.available(now, rate) - bits).max(0.0);
+    /// Spend credit accruing during one bounded interval while RTP is paced.
+    pub fn admits_paced(&self, now: Instant, rate: u64, bits: f64) -> bool {
+        self.available(now, rate) + rate as f64 * self.window.as_secs_f64() >= bits
+    }
+
+    pub fn spend(&mut self, now: Instant, rate: u64, bits: f64, paced: bool) {
+        let remaining = self.available(now, rate) - bits;
+        // Paced frames repay their full cost from subsequent video credit.
+        // An ordinary oversized frame consumes the current window.
+        self.tokens = if paced { remaining } else { remaining.max(0.0) };
         self.updated = now;
     }
 }

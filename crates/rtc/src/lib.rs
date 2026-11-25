@@ -121,6 +121,7 @@ struct TrackState {
     timestamp: Option<u64>,
     /// The bytes of a call video frame longer than the window while they drain.
     oversized: usize,
+    last_keyframe: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -243,19 +244,28 @@ impl Peer {
     /// Configure the call's video codec while retaining Opus for audio. Socket
     /// adapters enforce the connection policy before creating a host candidate.
     pub fn with_video(address: SocketAddr, now: Instant, video: VideoCodec) -> Result<Self, Error> {
-        Self::build(address, now, video, None, false)
+        Self::build(address, now, video, None, false, false)
     }
 
     /// Video-call legs carry bounded encrypted frames and let the RTP pacer
     /// spread a keyframe across the send interval of subsequent frames.
+    /// SFU publishers can enable sustained upload measurement.
     pub fn for_call(
         address: SocketAddr,
         now: Instant,
         video: VideoCodec,
         video_limit: usize,
         relayed: bool,
+        sustained_upload: bool,
     ) -> Result<Self, Error> {
-        Self::build(address, now, video, Some(video_limit), relayed)
+        Self::build(
+            address,
+            now,
+            video,
+            Some(video_limit),
+            relayed,
+            sustained_upload,
+        )
     }
 
     fn build(
@@ -264,6 +274,7 @@ impl Peer {
         video: VideoCodec,
         call_video_limit: Option<usize>,
         relayed: bool,
+        sustained_upload: bool,
     ) -> Result<Self, Error> {
         if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
             return Err(Error::Address);
@@ -286,6 +297,7 @@ impl Peer {
             .enable_av1(video == VideoCodec::Av1)
             .enable_vp9(video == VideoCodec::Vp9)
             .enable_vp8(video == VideoCodec::Vp8)
+            .set_bwe_sustained_delivery(sustained_upload)
             .set_fingerprint_verification(true)
             .set_mtu(1200..=1200)
             .set_reordering_size_audio(8)
@@ -674,6 +686,7 @@ impl Peer {
                     next: self.now,
                     timestamp: None,
                     oversized: 0,
+                    last_keyframe: None,
                 }
             })
             .collect();
@@ -742,6 +755,31 @@ impl Peer {
         data: Arc<[u8]>,
         descriptor: &[u8],
     ) -> Result<(), Error> {
+        self.write_frame(track, timestamp, now, data, descriptor, false)
+    }
+
+    /// Submit a call keyframe. The RTP pacer can send it using video credit
+    /// that accrues within the queue's latency bound.
+    pub fn write_keyframe(
+        &mut self,
+        track: Track,
+        timestamp: u64,
+        now: Instant,
+        data: Arc<[u8]>,
+        descriptor: &[u8],
+    ) -> Result<(), Error> {
+        self.write_frame(track, timestamp, now, data, descriptor, true)
+    }
+
+    fn write_frame(
+        &mut self,
+        track: Track,
+        timestamp: u64,
+        now: Instant,
+        data: Arc<[u8]>,
+        descriptor: &[u8],
+        keyframe: bool,
+    ) -> Result<(), Error> {
         if !self.is_connected() {
             return Err(Error::NotConnected);
         }
@@ -754,7 +792,7 @@ impl Peer {
         if data.is_empty()
             || data.len() > self.frame_limit(kind)
             || descriptor.len() > usize::from(u8::MAX)
-            || (!descriptor.is_empty() && kind != Kind::Video)
+            || ((!descriptor.is_empty() || keyframe) && kind != Kind::Video)
             || self.tracks[index]
                 .timestamp
                 .is_some_and(|last| timestamp <= last)
@@ -766,12 +804,27 @@ impl Peer {
         // Include a conservative packet overhead estimate, on top of the 20%
         // transport headroom. Small audio packets must not bypass the budget.
         let bits = ((data.len() + data.len().div_ceil(1000) * 80) * 8) as f64;
-        if rate == 0
-            || now < self.tracks[index].next
-            || !self.total_budget.admits(now, total, bits)
-            || !self.tracks[index].bucket.admits(now, rate, bits)
-            || (kind == Kind::Video && !self.video_budget.admits(now, video, bits))
-        {
+        let call = self.call_video_limit.is_some();
+        let state = &self.tracks[index];
+        let window = rate as f64 * CALL_VIDEO_WINDOW.as_secs_f64();
+        let recent_keyframe = state
+            .last_keyframe
+            .is_some_and(|at| now - at < CALL_VIDEO_WINDOW);
+        let recovering = keyframe || recent_keyframe;
+        // A call partitions its total allocation into video and audio shares.
+        // Recovery and its dependent frames can use future video credit while
+        // the pacer drains the bounded RTP queue.
+        let funded = (call || self.total_budget.admits(now, total, bits))
+            && state.bucket.admits(now, rate, bits)
+            && (kind != Kind::Video || self.video_budget.admits(now, video, bits));
+        let paced = call
+            && kind == Kind::Video
+            && !funded
+            && bits <= window
+            && recovering
+            && state.bucket.admits_paced(now, rate, bits)
+            && self.video_budget.admits_paced(now, video, bits);
+        if rate == 0 || now < state.next || (!funded && !paced) {
             return Err(Error::Backpressure);
         }
         // Audio frames arrive on the encoder's cadence, and constrained VBR
@@ -780,7 +833,7 @@ impl Peer {
         // Spacing each frame by its own size would refuse on-time frames.
         let interval = if kind == Kind::Audio {
             Duration::from_micros(2500)
-        } else if self.call_video_limit.is_some() {
+        } else if call {
             let queued = self
                 .rtc
                 .direct_api()
@@ -793,18 +846,19 @@ impl Peer {
             // A frame longer than the window, such as a large key frame, goes
             // out when the queue is empty; the frames behind it may queue for
             // as long as it takes, up to its size more.
-            let window = rate as f64 * CALL_VIDEO_WINDOW.as_secs_f64();
             let state = &mut self.tracks[index];
             let (bytes, oldest) = queued.unwrap_or((0, None));
             if (bytes * 8) as f64 <= window {
                 state.oversized = 0;
             }
-            let late =
-                oldest.is_some_and(|at| now.saturating_duration_since(at) >= CALL_VIDEO_WINDOW);
+            // Recovery uses the remaining bytes to bound the wait. An old
+            // packet can linger in the queue while awaiting retransmission.
+            let late = !recovering
+                && oldest.is_some_and(|at| now.saturating_duration_since(at) >= CALL_VIDEO_WINDOW);
             let fits = bits + (bytes * 8) as f64 <= window + (state.oversized * 8) as f64;
             if bytes == 0 && bits > window {
                 state.oversized = data.len();
-            } else if (late && state.oversized == 0) || !fits {
+            } else if !fits || (late && state.oversized == 0) {
                 return Err(Error::Backpressure);
             }
             Duration::from_millis(1)
@@ -828,14 +882,19 @@ impl Peer {
             MediaTime::new(timestamp, params.spec().clock_rate),
             data,
         )?;
-        self.total_budget.spend(now, total, bits);
+        if !call {
+            self.total_budget.spend(now, total, bits, false);
+        }
         if kind == Kind::Video {
-            self.video_budget.spend(now, video, bits);
+            self.video_budget.spend(now, video, bits, paced);
         }
         let state = &mut self.tracks[index];
-        state.bucket.spend(now, rate, bits);
+        state.bucket.spend(now, rate, bits, paced);
         state.next = now + interval;
         state.timestamp = Some(timestamp);
+        if keyframe {
+            state.last_keyframe = Some(now);
+        }
         Ok(())
     }
 

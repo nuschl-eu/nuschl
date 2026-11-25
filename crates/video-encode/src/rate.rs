@@ -27,6 +27,7 @@ const FACTORS: [f64; 4] = [150.0, 15.0, 15.0, 15.0];
 pub struct Rate {
     bitrate: f64,
     window: f64,
+    enforce_credit: bool,
     qindex: RangeInclusive<u8>,
     pixels: f64,
     credit: f64,
@@ -52,14 +53,22 @@ impl Rate {
         window: Duration,
         pixels: u32,
         qindex: RangeInclusive<u8>,
+        enforce_credit: bool,
     ) -> Self {
         let bitrate = f64::from(bitrate);
+        let window = window.as_secs_f64();
+        let initial = if enforce_credit {
+            OPTIMAL.min(window)
+        } else {
+            OPTIMAL
+        };
         Self {
             bitrate,
-            window: window.as_secs_f64(),
+            window,
+            enforce_credit,
             qindex: (*qindex.start()).max(1)..=*qindex.end(),
             pixels: f64::from(pixels),
-            credit: OPTIMAL * bitrate,
+            credit: initial * bitrate,
             previous: None,
             interval: 1.0 / f64::from(fps.max(1)),
             factors: FACTORS,
@@ -68,12 +77,32 @@ impl Rate {
 
     pub fn set_bitrate(&mut self, bitrate: u32) {
         self.bitrate = f64::from(bitrate);
-        self.credit = self.credit.min(CAP * self.bitrate);
+        self.credit = self.credit.min(self.burst_limit());
     }
 
-    /// The largest frame, in bits.
-    pub fn frame_limit(&self) -> f64 {
-        self.bitrate * self.window
+    fn burst_limit(&self) -> f64 {
+        let seconds = if self.enforce_credit {
+            CAP.min(self.window)
+        } else {
+            CAP
+        };
+        self.bitrate * seconds
+    }
+
+    /// Size limit in bits for a frame. Discardable deltas use their remaining credit.
+    pub fn frame_limit(&self, key: bool) -> f64 {
+        let limit = self.bitrate * self.window;
+        if self.enforce_credit && !key {
+            limit.min(self.credit)
+        } else {
+            limit
+        }
+    }
+
+    /// With a full window, one whole frame can go out and repay its full cost.
+    /// This lets the encoder advance even if a scene cannot fit at maximum QP.
+    pub fn admits_delta(&self, bits: f64) -> bool {
+        !self.enforce_credit || bits <= self.frame_limit(false) || self.credit >= self.burst_limit()
     }
 
     /// Credits the time since the previous frame and returns the target size of
@@ -82,19 +111,19 @@ impl Rate {
     pub fn target(&mut self, now: Duration, key: bool, weight: f64) -> Option<f64> {
         if let Some(previous) = self.previous {
             let elapsed = now.saturating_sub(previous).as_secs_f64().min(1.0);
-            self.credit = (self.credit + self.bitrate * elapsed).min(CAP * self.bitrate);
+            self.credit = (self.credit + self.bitrate * elapsed).min(self.burst_limit());
             self.interval += (elapsed - self.interval) / 8.0;
         }
         self.previous = Some(now);
         if key {
-            return Some(KEY_SHARE * self.frame_limit());
+            return Some(KEY_SHARE * self.frame_limit(true));
         }
         if self.credit < 0.0 {
             return None;
         }
         let optimal = OPTIMAL * self.bitrate;
         let scale = (1.0 + (self.credit - optimal) / (2.0 * optimal)).clamp(0.5, 1.5);
-        Some((self.bitrate * self.interval * weight * scale).min(self.frame_limit()))
+        Some((self.bitrate * self.interval * weight * scale).min(self.frame_limit(false)))
     }
 
     /// The quantizer the model expects to code a frame of `class` in `target` bits.
@@ -147,6 +176,7 @@ mod tests {
             Duration::from_millis(300),
             640 * 360,
             1..=255,
+            true,
         );
         rate.target(Duration::ZERO, false, 1.0);
         rate.sent(1, 100, 400_000.0);
@@ -159,7 +189,7 @@ mod tests {
         // Idle seconds leave at most the cap.
         rate.target(Duration::from_secs(10), false, 1.0);
         rate.target(Duration::from_secs(20), false, 1.0);
-        assert_eq!(rate.credit, CAP * 1_000_000.0);
+        assert_eq!(rate.credit, 300_000.0);
     }
 
     #[test]
@@ -170,6 +200,7 @@ mod tests {
             Duration::from_millis(300),
             1280 * 720,
             1..=255,
+            true,
         );
         let start = rate.qindex(1, 50_000.0);
         // Frames twice the prediction push the quantizer up.

@@ -134,6 +134,7 @@ impl<B: Backend> Encoder<B> {
                 config.window,
                 u32::from(config.width) * u32::from(config.height),
                 config.qindex,
+                B::DISCARDS,
             ),
             keyframe: true,
             slot_qindex: [255; 8],
@@ -219,7 +220,8 @@ impl<B: Backend> Encoder<B> {
             let data = self.backend.encode(input, &frame)?;
             let bits = data.len() as f64 * 8.0;
             let fits = data.len() <= self.frame_bytes;
-            if !fits || bits > self.rate.frame_limit() {
+            let over_budget = bits > self.rate.frame_limit(plan.key);
+            if !fits || over_budget {
                 // A sudden change after small frames: code it again with the
                 // measured model, once.
                 if B::DISCARDS && !retried && qindex < self.rate.max_qindex() {
@@ -228,7 +230,7 @@ impl<B: Backend> Encoder<B> {
                     retried = true;
                     continue;
                 }
-                if !fits {
+                if !fits || (!plan.key && !self.rate.admits_delta(bits)) {
                     self.rate.oversized(class, qindex, bits);
                     // The backend's slots now hold the frame it cannot send.
                     self.keyframe |= !B::DISCARDS;

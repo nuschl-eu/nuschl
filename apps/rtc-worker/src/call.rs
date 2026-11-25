@@ -249,8 +249,15 @@ impl Call {
                     Codec::Av1 => VideoCodec::Av1,
                     Codec::Vp9 => VideoCodec::Vp9,
                 };
-                let peer =
-                    Peer::for_call(local, now, codec, MAX_WIRE_VIDEO, relayed).map_err(|_| ())?;
+                let peer = Peer::for_call(
+                    local,
+                    now,
+                    codec,
+                    MAX_WIRE_VIDEO,
+                    relayed,
+                    matches!(role, LegRole::SfuPublish),
+                )
+                .map_err(|_| ())?;
                 self.legs.insert(
                     leg,
                     Leg {
@@ -440,10 +447,14 @@ impl Call {
         for leg in &self.active {
             let live = self.legs.get_mut(leg).ok_or(())?;
             let track = live.peer.track_for(to_purpose(purpose)).ok_or(())?;
-            written &= live
-                .peer
-                .write(track, timestamp, now, encrypted.clone(), descriptor)
-                .is_ok();
+            let result = if key_frame {
+                live.peer
+                    .write_keyframe(track, timestamp, now, encrypted.clone(), descriptor)
+            } else {
+                live.peer
+                    .write(track, timestamp, now, encrypted.clone(), descriptor)
+            };
+            written &= result.is_ok();
         }
         if !written {
             self.keyframe[index] = false;

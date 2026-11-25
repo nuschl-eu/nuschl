@@ -2005,9 +2005,9 @@ async fn meeting(
                 };
                 let Some(event) = audio.event(event).await else { continue };
                 let retune = matches!(event, MediaEvent::SourceLimits { .. } | MediaEvent::Route(_));
-                publisher.event(&event);
-                if retune {
-                    publisher.retune(display, selection, None);
+                let upload_decreased = publisher.event(&event);
+                if retune || upload_decreased {
+                    publisher.retune(display, selection, None, upload_decreased);
                 }
                 viewer.handle(media, event)?;
                 continue;
@@ -2022,7 +2022,7 @@ async fn meeting(
                     Err(error) => SourceChange::Failed(source, error),
                 };
                 changes.report(change).await?;
-                publisher.retune(display, selection, None);
+                publisher.retune(display, selection, None, false);
                 continue;
             }
             action = next_source_action(&mut source_requests, &mut publisher.reopening) => {
@@ -2039,7 +2039,7 @@ async fn meeting(
                             publisher.retire(source);
                             media.set_source(purpose(source), false).map_err(text)?;
                             changes.report(SourceChange::Stopped(source)).await?;
-                            publisher.retune(display, selection, None);
+                            publisher.retune(display, selection, None, false);
                         }
                     }
                     SourceAction::Reopened(attempt, grant) => {
@@ -2054,7 +2054,7 @@ async fn meeting(
                         let worker_started = matches!(change, SourceChange::Active { .. });
                         tracing::info!(target: "nuschl_capture", attempt = attempt.number, worker_started, "screen capture reopen result");
                         changes.report(change).await?;
-                        publisher.retune(display, selection, None);
+                        publisher.retune(display, selection, None, false);
                     }
                 }
                 continue;
@@ -2085,12 +2085,12 @@ async fn meeting(
             Ok(()) = display.quality.changed() => {
                 selection = *display.quality.borrow_and_update();
                 apply_modes(media, selection)?;
-                publisher.retune(display, selection, None);
+                publisher.retune(display, selection, None, false);
                 continue;
             }
             _ = timer.tick() => {
                 let report = sources.featured(selection.view).map(|stream| stream.feed);
-                publisher.retune(display, selection, report);
+                publisher.retune(display, selection, report, false);
                 if let Some(feed) = report {
                     viewer.report(display, feed);
                 }
@@ -2118,7 +2118,7 @@ async fn meeting(
                     SourceChange::Failed(source, error)
                 };
                 changes.report(change).await?;
-                publisher.retune(display, selection, None);
+                publisher.retune(display, selection, None, false);
             }
         }
     }

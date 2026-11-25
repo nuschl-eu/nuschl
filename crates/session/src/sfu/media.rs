@@ -39,6 +39,8 @@ const UDP_BURST: usize = 64;
 const DRAIN_SLICE: Duration = Duration::from_millis(5);
 const MAX_PENDING_FRAME_AGE: Duration = Duration::from_millis(150);
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
+// Give the RTC video window time to drain after rejecting a recovery picture.
+const KEYFRAME_RETRY: Duration = Duration::from_millis(300);
 // A subscription accepts 48 SDP sections, including its control channel and first source.
 const MAX_SOURCE_CHANGES: u8 = 46;
 const VIDEO: [Purpose; 2] = [Purpose::Camera, Purpose::ScreenVideo];
@@ -494,6 +496,16 @@ impl Media {
                 biased;
                 event = self.events.recv() => event,
                 Some(frame) = self.audio_frames.recv() => return Some(Ok(frame)),
+                changed = self.bandwidth.changed() => {
+                    if changed.is_err() {
+                        self.events.recv().await
+                    } else {
+                        if let Some(bitrate) = *self.bandwidth.borrow_and_update() {
+                            return Some(Ok(MediaEvent::BandwidthEstimate { bitrate }));
+                        }
+                        continue;
+                    }
+                }
                 (index, requested) = next_source(&mut self.keyframes) => {
                     if requested.is_some() {
                         return Some(Ok(MediaEvent::SourceKeyframeRequired { purpose: VIDEO[index] }));
@@ -504,16 +516,6 @@ impl Media {
                     if changed.is_err() {
                         self.events.recv().await
                     } else {
-                        continue;
-                    }
-                }
-                changed = self.bandwidth.changed() => {
-                    if changed.is_err() {
-                        self.events.recv().await
-                    } else {
-                        if let Some(bitrate) = *self.bandwidth.borrow_and_update() {
-                            return Some(Ok(MediaEvent::BandwidthEstimate { bitrate }));
-                        }
                         continue;
                     }
                 }
@@ -901,33 +903,35 @@ impl Output<'_> {
 
 struct FrameGate {
     awaiting_key: bool,
-    requested: Option<Instant>,
+    next_request: Option<Instant>,
 }
 
 impl FrameGate {
     fn new() -> Self {
         Self {
             awaiting_key: true,
-            requested: None,
+            next_request: None,
         }
     }
 
     fn request(&mut self) -> bool {
         let now = Instant::now();
-        if self
-            .requested
-            .is_some_and(|at| now - at < KEYFRAME_INTERVAL)
-        {
+        if self.next_request.is_some_and(|at| now < at) {
             return false;
         }
-        self.requested = Some(now);
+        self.next_request = Some(now + KEYFRAME_INTERVAL);
         true
+    }
+
+    fn retry_rejected_keyframe(&mut self) {
+        let retry = Instant::now() + KEYFRAME_RETRY;
+        self.next_request = Some(self.next_request.map_or(retry, |at| at.min(retry)));
     }
 
     fn arrived(&mut self, key_frame: bool) {
         if key_frame {
             self.awaiting_key = false;
-            self.requested = None;
+            self.next_request = None;
         }
     }
 }
@@ -1345,15 +1349,19 @@ async fn run(
                 let allowed = Some(frame.revision) == inputs.changes.borrow().tracks[index];
                 if allowed && Some(frame.revision) == sending[index] && (sending_direct || publish.is_some()) {
                     let gate = &mut send_gates[index];
+                    let purpose = VIDEO[index];
+                    let age = frame.queued.elapsed();
+                    let timestamp = frame.timestamp;
+                    let key = frame.key_frame;
                     if frame.sequence != sequence[index].wrapping_add(1) {
                         gate.awaiting_key = true;
                     }
                     sequence[index] = frame.sequence;
-                    if frame.queued.elapsed() <= MAX_PENDING_FRAME_AGE && (!gate.awaiting_key || frame.key_frame) {
-                        let command = Command::Write { purpose: VIDEO[index], timestamp: frame.timestamp, key_frame: frame.key_frame, descriptor: frame.descriptor };
+                    if age <= MAX_PENDING_FRAME_AGE && (!gate.awaiting_key || key) {
+                        let command = Command::Write { purpose, timestamp, key_frame: key, descriptor: frame.descriptor };
                         match worker.exchange(command, frame.data).await?.kind {
                             Reply::Done => {
-                                gate.arrived(frame.key_frame);
+                                gate.arrived(key);
                                 let now = Some(Instant::now());
                                 if sending_direct {
                                     for attempt in direct.iter_mut().flat_map(|direct| &mut direct.legs) {
@@ -1364,7 +1372,11 @@ async fn run(
                                 }
                                 continue;
                             }
-                            Reply::Rejected => {}
+                            Reply::Rejected => {
+                                if key {
+                                    gate.retry_rejected_keyframe();
+                                }
+                            }
                             _ => return Err(Error::Protocol("invalid RTC write reply")),
                         }
                     }
@@ -1916,19 +1928,64 @@ async fn drain(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_pending_upload_drop_precedes_a_keyframe_request() {
+        let (_events, events) = mpsc::channel(1);
+        let (_audio_frames, audio_frames) = mpsc::channel(1);
+        let (_limits, limits) = watch::channel([None; 2]);
+        let (requests, keyframes) = frame_channels();
+        let (upload, bandwidth) = watch::channel(Some(56_200_000));
+        let mut media = Media {
+            input: mpsc::channel(1).0,
+            frames: frame_channels().0,
+            audio: mpsc::channel(1).0,
+            audio_frames,
+            sequence: Default::default(),
+            quality: watch::channel(Vec::new()).0,
+            sources: watch::channel(Sources {
+                tracks: [None; 2],
+                audio: None,
+                revision: 0,
+            })
+            .0,
+            modes: watch::channel(
+                VIDEO.map(|purpose| Mode::default_for(purpose == Purpose::ScreenVideo)),
+            )
+            .0,
+            events,
+            keyframes,
+            limits,
+            reported_limits: [None; 2],
+            bandwidth,
+            task: tokio::spawn(async {}),
+        };
+        requests[1].try_send(()).unwrap();
+        upload.send_replace(Some(9_300_000));
+        assert!(matches!(
+            media.next().await,
+            Some(Ok(MediaEvent::BandwidthEstimate { bitrate: 9_300_000 }))
+        ));
+        assert!(matches!(
+            media.next().await,
+            Some(Ok(MediaEvent::SourceKeyframeRequired {
+                purpose: Purpose::ScreenVideo
+            }))
+        ));
+    }
+
     #[test]
     fn an_accepted_keyframe_starts_a_fresh_recovery_window() {
         let mut gate = FrameGate::new();
-        let request = Instant::now();
-        gate.requested = Some(request);
+        assert!(gate.request());
+        let next_request = gate.next_request;
 
         gate.arrived(false);
         assert!(gate.awaiting_key);
-        assert_eq!(gate.requested, Some(request));
+        assert_eq!(gate.next_request, next_request);
 
         gate.arrived(true);
         assert!(!gate.awaiting_key);
-        assert_eq!(gate.requested, None);
+        assert_eq!(gate.next_request, None);
         assert!(gate.request());
     }
 }

@@ -204,6 +204,7 @@ impl Publisher {
             preview_id,
             encoding,
             applied,
+            refresh_reference: applied.bitrate,
             stats,
             ready: false,
             #[cfg(target_os = "linux")]
@@ -311,7 +312,8 @@ impl Publisher {
         }
     }
 
-    pub fn event(&mut self, event: &MediaEvent) {
+    /// Apply a media event and report whether the upload budget decreased.
+    pub fn event(&mut self, event: &MediaEvent) -> bool {
         match *event {
             MediaEvent::SourceReady { purpose } => {
                 if let Some(source) = source(purpose)
@@ -346,7 +348,12 @@ impl Publisher {
                     });
                 }
             }
-            MediaEvent::BandwidthEstimate { bitrate } => self.estimate = Some(bitrate),
+            MediaEvent::BandwidthEstimate { bitrate } => {
+                return self
+                    .estimate
+                    .replace(bitrate)
+                    .is_none_or(|old| bitrate < old);
+            }
             MediaEvent::Route(route) => {
                 let direct = route == Route::Direct;
                 if direct != (self.route == Route::Direct) {
@@ -360,9 +367,16 @@ impl Publisher {
             }
             _ => {}
         }
+        false
     }
 
-    pub fn retune(&mut self, display: &Display<'_>, selection: Selection, report: Option<Feed>) {
+    pub fn retune(
+        &mut self,
+        display: &Display<'_>,
+        selection: Selection,
+        report: Option<Feed>,
+        upload_decreased: bool,
+    ) {
         let has_screen = self.slots[index(Source::Screen)].is_some();
         let camera_ceiling = self.slots[index(Source::Camera)]
             .as_ref()
@@ -388,10 +402,23 @@ impl Publisher {
                 };
                 bitrate.min(nuschl_protocol::sfu::MAX_SCREEN_BITRATE) as u32
             });
-            let next = track.encoding.limits(quality, track.applied);
+            let next = if upload_decreased {
+                track.encoding.upload_drop_limits(quality, track.applied)
+            } else {
+                track.encoding.limits(quality, track.applied)
+            };
+            // A sharp cut can strand the previous picture in the network.
+            // Count successive decreases toward the next refresh.
+            let refresh = upload_decreased && next.bitrate <= track.refresh_reference / 2;
             // Capture closure is reported by Capture::next.
             if next != track.applied && track.capture.set_limits(next).is_ok() {
                 track.applied = next;
+                if refresh {
+                    track.refresh_reference = next.bitrate;
+                    track.capture.request_keyframe();
+                } else {
+                    track.refresh_reference = track.refresh_reference.max(next.bitrate);
+                }
             }
             if report == Some(feed) {
                 let sample = track.stats.sample(Instant::now());
@@ -470,6 +497,7 @@ pub(super) struct LocalVideo {
     preview_id: u64,
     encoding: Encoding,
     applied: CaptureLimits,
+    refresh_reference: u32,
     stats: stats::Stats,
     ready: bool,
     #[cfg(target_os = "linux")]
@@ -604,6 +632,13 @@ impl Encoding {
             },
             Some(_) => "Within selected quality",
             None => "Unavailable",
+        }
+    }
+
+    fn upload_drop_limits(&self, quality: Quality, applied: CaptureLimits) -> CaptureLimits {
+        CaptureLimits {
+            bitrate: self.limits(quality, applied).bitrate.min(applied.bitrate),
+            ..applied
         }
     }
 
@@ -785,6 +820,13 @@ mod tests {
             }
         );
         encoding.bitrate_estimate = Some(100_000);
+        assert_eq!(
+            encoding.upload_drop_limits(quality, full),
+            CaptureLimits {
+                bitrate: 100_000,
+                ..full
+            }
+        );
         let reduced = encoding.limits(quality, full);
         assert_eq!(
             (reduced.height, reduced.fps, reduced.bitrate),
@@ -794,6 +836,7 @@ mod tests {
         encoding.bitrate_estimate = Some(450_000);
         assert_eq!(encoding.limits(quality, reduced).height, 360);
         encoding.bitrate_estimate = Some(6_000_000);
+        assert_eq!(encoding.upload_drop_limits(quality, reduced), reduced);
         assert_eq!(
             encoding.limits(quality, reduced),
             CaptureLimits {

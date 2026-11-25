@@ -48,8 +48,11 @@ use tokio::{
 /// The payload types of the AV1 format with level-idx 9, unused by str0m's defaults.
 const PT_AV1_LEVEL_9: u8 = 47;
 const PT_AV1_LEVEL_9_RTX: u8 = 48;
-/// One keyframe request per source in this interval reaches its publisher.
+/// Regular keyframe requests share this cooldown across a source's viewers.
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
+/// Give the publisher time to answer and let RTX fill any gaps in that picture.
+const KEYFRAME_RETRY: Duration = Duration::from_millis(500);
+const KEYFRAME_REPAIR_GRACE: Duration = Duration::from_millis(125);
 /// Per-packet overhead counted against media budgets (IP, UDP, SRTP).
 const PACKET_OVERHEAD: usize = 48;
 /// The largest UDP datagram read; longer ones are dropped.
@@ -99,7 +102,84 @@ struct Source {
     video: Option<quality::Video>,
     /// The simulcast layer forwarded, fixed by the first packet.
     layer: Option<Option<Rid>>,
-    keyframe_asked: Option<Instant>,
+    keyframes: Keyframes,
+}
+
+#[derive(Default)]
+struct Keyframes {
+    last: Option<Instant>,
+    replacement: Option<Replacement>,
+    awaiting: bool,
+}
+
+struct Replacement {
+    id: (u64, u16),
+    first: u64,
+    highest: u64,
+    packets: u64,
+    end: bool,
+    missing_since: Option<Instant>,
+}
+
+impl Keyframes {
+    fn regular(&self, now: Instant) -> bool {
+        self.last
+            .is_none_or(|at| now.saturating_duration_since(at) >= KEYFRAME_INTERVAL)
+    }
+
+    fn retry(&self, now: Instant) -> bool {
+        self.last
+            .is_some_and(|at| now.saturating_duration_since(at) >= KEYFRAME_RETRY)
+            && self
+                .replacement
+                .as_ref()
+                .and_then(|picture| picture.missing_since)
+                .is_some_and(|at| now.saturating_duration_since(at) >= KEYFRAME_REPAIR_GRACE)
+    }
+
+    fn sent(&mut self, now: Instant) {
+        self.awaiting = self.regular(now);
+        if self.awaiting {
+            self.last = Some(now);
+        }
+        self.replacement = None;
+    }
+
+    /// Observe the publisher's original sequence space. str0m emits each
+    /// sequence once and gives a repaired packet its original number.
+    fn packet(&mut self, frame: dd::Frame, timestamp: u64, seq: u64, now: Instant) {
+        if !self.awaiting || frame.layer.spatial != 0 || frame.references().next().is_some() {
+            return;
+        }
+        let id = (timestamp, frame.number);
+        if let Some(picture) = &mut self.replacement
+            && picture.id == id
+            && seq >= picture.first
+        {
+            picture.highest = picture.highest.max(seq);
+            picture.packets += 1;
+            picture.end |= frame.end;
+            if picture.packets <= picture.highest - picture.first {
+                picture.missing_since.get_or_insert(now);
+            } else {
+                picture.missing_since = None;
+                if picture.end {
+                    self.awaiting = false;
+                    self.replacement = None;
+                }
+            }
+        } else if frame.start && !frame.late {
+            self.awaiting = !frame.end;
+            self.replacement = self.awaiting.then_some(Replacement {
+                id,
+                first: seq,
+                highest: seq,
+                packets: 1,
+                end: false,
+                missing_since: None,
+            });
+        }
+    }
 }
 
 struct Forward {
@@ -934,7 +1014,7 @@ impl Core {
             kind,
             video,
             layer: None,
-            keyframe_asked: None,
+            keyframes: Keyframes::default(),
         });
         let label = peer.sources.last().expect("pushed").label();
         let room = peer.room;
@@ -1005,6 +1085,7 @@ impl Core {
         else {
             return;
         };
+        let native_screen = publisher.screen_rate.is_some();
         let Some(source) = publisher.sources.iter_mut().find(|s| s.mid == mid) else {
             return;
         };
@@ -1044,9 +1125,20 @@ impl Core {
             .map_or(quality::QUEUE_BOUND, quality::Video::bound);
         let payload = packet.payload.len();
         let cost = (payload + PACKET_OVERHEAD) as u64;
-        let can_request = source
-            .keyframe_asked
-            .is_none_or(|at| now.saturating_duration_since(at) >= KEYFRAME_INTERVAL);
+        if native_screen
+            && params.spec().codec == Codec::Av1
+            && source
+                .video
+                .as_ref()
+                .is_some_and(|video| video.kind == Kind::Screen)
+            && let Some(Some(frame)) = frame
+        {
+            source
+                .keyframes
+                .packet(frame, timestamp, *packet.seq_no, now);
+        }
+        let retry = source.keyframes.retry(now);
+        let can_request = retry || source.keyframes.regular(now);
         let receivers: Vec<PeerId> = self.rooms.get(&room).map_or_else(Vec::new, |r| {
             r.peers
                 .iter()
@@ -1123,7 +1215,7 @@ impl Core {
             );
             self.dirty.push((id, Leg::Subscribe));
         }
-        if keyframe {
+        if keyframe || retry {
             self.keyframe(from, mid, now);
         }
     }
@@ -1462,8 +1554,8 @@ impl Core {
         }
     }
 
-    /// Asks a publisher for a keyframe of a video source, at most once per
-    /// [`KEYFRAME_INTERVAL`].
+    /// A source can retry once when its replacement picture has unrepaired
+    /// ingress loss. All viewers share that retry and the regular cooldown.
     fn keyframe(&mut self, from: PeerId, mid: Mid, now: Instant) {
         let Some(peer) = self.peers.get_mut(&from) else {
             return;
@@ -1472,18 +1564,16 @@ impl Core {
             return;
         };
         if source.kind != MediaKind::Video
-            || source
-                .keyframe_asked
-                .is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL)
+            || !(source.keyframes.regular(now) || source.keyframes.retry(now))
         {
             return;
         }
-        source.keyframe_asked = Some(now);
         let rid = source.layer.flatten();
         if let Some(rtc) = peer.publish.as_mut()
             && let Some(stream) = rtc.direct_api().stream_rx_by_mid(mid, rid)
         {
             stream.request_keyframe(KeyframeRequestKind::Pli);
+            source.keyframes.sent(now);
             self.dirty.push((from, Leg::Publish));
         }
     }
@@ -1662,6 +1752,49 @@ fn forward(from: PeerId, source: Mid, kind: MediaKind, label: &'static str) -> F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gap_in_a_requested_keyframe_has_one_early_retry() {
+        let descriptor = include_str!("../tests/fixtures/chrome-l2t2-key.txt")
+            .lines()
+            .find(|line| line.starts_with("0 "))
+            .unwrap()
+            .split_whitespace()
+            .nth(5)
+            .unwrap();
+        let start = dd::Layers::default()
+            .packet(&hex::decode(descriptor).unwrap(), 1000, 0, Duration::ZERO)
+            .unwrap();
+        let mut middle = start;
+        middle.start = false;
+        let mut end = middle;
+        end.end = true;
+
+        for repair in [false, true] {
+            let now = Instant::now();
+            let mut requests = Keyframes::default();
+            assert!(requests.regular(now));
+            requests.sent(now);
+            requests.packet(start, 10, 100, now);
+            requests.packet(end, 10, 103, now + Duration::from_millis(420));
+            assert!(!requests.retry(now + KEYFRAME_RETRY));
+            let ready = now + Duration::from_millis(420) + KEYFRAME_REPAIR_GRACE;
+            if repair {
+                middle.late = true;
+                requests.packet(middle, 10, 102, ready);
+                requests.packet(middle, 10, 101, ready);
+            }
+            assert!(!requests.regular(ready));
+            assert_eq!(requests.retry(ready), !repair);
+            if !repair {
+                requests.sent(ready);
+                requests.packet(start, 20, 104, ready);
+                requests.packet(end, 20, 106, ready);
+                assert!(!requests.retry(ready + KEYFRAME_RETRY));
+                assert!(requests.regular(now + KEYFRAME_INTERVAL));
+            }
+        }
+    }
 
     #[test]
     fn screen_reservations_leave_room_for_a_camera_and_two_active_shares() {

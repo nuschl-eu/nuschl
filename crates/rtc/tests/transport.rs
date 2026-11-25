@@ -11,6 +11,46 @@ use std::{
     time::{Duration, Instant},
 };
 
+struct Link {
+    bitrate: u64,
+    free: Instant,
+    packets: VecDeque<(Instant, SocketAddr, Vec<u8>)>,
+    dropped: usize,
+    receiver_paused_until: Option<Instant>,
+    burst_credit: Option<f64>,
+}
+
+impl Link {
+    fn send(&mut self, now: Instant, source: SocketAddr, data: Vec<u8>) {
+        let start = self.free.max(now);
+        if start - now > Duration::from_millis(20) {
+            self.dropped += 1;
+            return;
+        }
+        let mut rate = self.bitrate;
+        if let Some(credit) = &mut self.burst_credit {
+            // Unused capacity permits short bursts at twice the sustained rate.
+            let extra_bits = (data.len() * 4) as f64;
+            *credit = (*credit + (start - self.free).as_secs_f64() * rate as f64).min(2_000_000.0);
+            if *credit >= extra_bits {
+                *credit -= extra_bits;
+                rate *= 2;
+            }
+        }
+        self.free =
+            start + Duration::from_nanos((data.len() as u64 * 8_000_000_000).div_ceil(rate));
+        self.packets
+            .push_back((self.free + Duration::from_millis(20), source, data));
+    }
+
+    fn next_delivery(&self) -> Option<Instant> {
+        self.packets.front().map(|&(at, ..)| {
+            self.receiver_paused_until
+                .map_or(at, |resume| at.max(resume))
+        })
+    }
+}
+
 struct Pair {
     peers: [Peer; 2],
     addresses: [SocketAddr; 2],
@@ -24,6 +64,8 @@ struct Pair {
     dropped: usize,
     loss_ssrc: Option<[u8; 4]>,
     keyframes: [Vec<Track>; 2],
+    link: Option<Link>,
+    upload: Vec<u64>,
 }
 
 impl Pair {
@@ -59,7 +101,9 @@ impl Pair {
             "127.0.0.1:41001".parse().unwrap(),
         ];
         let mut peers = addresses.map(|address| match call_video_limit {
-            Some(limit) => Peer::for_call(address, now, codec, limit, false).unwrap(),
+            Some(limit) => {
+                Peer::for_call(address, now, codec, limit, false, address == addresses[0]).unwrap()
+            }
             None => Peer::with_video(address, now, codec).unwrap(),
         });
         let offer = if purposes.is_empty() {
@@ -120,6 +164,8 @@ impl Pair {
             dropped: 0,
             loss_ssrc: None,
             keyframes: [vec![], vec![]],
+            link: None,
+            upload: Vec::new(),
         }
     }
 
@@ -158,10 +204,19 @@ impl Pair {
                             }
                         }
                     }
-                    self.wire.push_back((1 - from, source, data));
+                    if from == 0
+                        && let Some(link) = &mut self.link
+                    {
+                        link.send(self.now, source, data);
+                    } else {
+                        self.wire.push_back((1 - from, source, data));
+                    }
                 }
                 Output::Event(Event::Frame(frame)) => self.frames[from].push(frame),
                 Output::Event(Event::RequestKeyframe(track)) => self.keyframes[from].push(track),
+                Output::Event(Event::BandwidthEstimate(rate)) if from == 0 => {
+                    self.upload.push(rate)
+                }
                 _ => {}
             }
         }
@@ -172,6 +227,12 @@ impl Pair {
         self.drain(0)?;
         self.drain(1)?;
         for _ in 0..8192 {
+            if let Some(link) = &mut self.link
+                && link.next_delivery().is_some_and(|at| at <= self.now)
+                && let Some((_, source, data)) = link.packets.pop_front()
+            {
+                self.wire.push_back((1, source, data));
+            }
             let Some((to, source, data)) = self.wire.pop_front() else {
                 return Ok(());
             };
@@ -184,9 +245,16 @@ impl Pair {
     fn advance(&mut self, duration: Duration) -> Result<(), Error> {
         let end = self.now + duration;
         self.flush()?;
-        // One-ms virtual-clock steps let both peers service deadlines fairly.
         while self.now < end {
-            self.now = (self.now + Duration::from_millis(1)).min(end);
+            let next = if let Some(link) = &self.link {
+                // Service probe packet deadlines at their actual cadence.
+                let wake = self.wake[0].min(self.wake[1]);
+                let due = link.next_delivery().map_or(wake, |at| at.min(wake));
+                due.max(self.now + Duration::from_micros(10))
+            } else {
+                self.now + Duration::from_millis(1)
+            };
+            self.now = next.min(end);
             for peer in 0..2 {
                 if self.now >= self.wake[peer] {
                     self.peers[peer].timeout(self.now)?;
@@ -307,6 +375,97 @@ fn call_video_paces_a_fragmented_keyframe_alongside_following_frames() {
         assert_eq!(frame.timestamp, 9_900 + i as u64 * 900);
         assert_eq!(frame.data, delta);
     }
+}
+
+#[test]
+fn recovery_keyframe_uses_paced_video_credit_without_delaying_audio() {
+    let mut pair = Pair::setup(
+        true,
+        false,
+        &[Purpose::Microphone, Purpose::ScreenVideo],
+        VideoCodec::Av1,
+        Some(1024 * 1024 + 64),
+    );
+    for _ in 0..100 {
+        pair.advance(Duration::from_millis(1)).unwrap();
+        if pair.peers.iter().all(Peer::is_connected) {
+            break;
+        }
+    }
+    assert!(pair.peers.iter().all(Peer::is_connected));
+    let screen = pair.peers[0].track_for(Purpose::ScreenVideo).unwrap();
+    let mut first = vec![0x2a, 0x80, 0xc0, 0x07];
+    first.resize(120 * 1024 + 4, 0x42);
+    let first: Arc<[u8]> = first.into();
+    pair.write(0, Kind::Video, 9_000, first.clone());
+    // Drain the sender without feedback so the estimate stays at its seed.
+    // Most of the first picture has left before video credit refills.
+    for _ in 0..170 {
+        pair.now += Duration::from_millis(1);
+        if pair.now >= pair.wake[0] {
+            pair.peers[0].timeout(pair.now).unwrap();
+        }
+        pair.drain(0).unwrap();
+    }
+
+    let mut key = vec![0x0a, 0x80, 0x80, 0x06];
+    key.resize(96 * 1024 + 4, 0x43);
+    let key: Arc<[u8]> = key.into();
+    let ordinary = pair.peers[0].write(screen, 9_900, pair.now, key.clone(), &[]);
+    assert!(matches!(ordinary, Err(Error::Backpressure)), "{ordinary:?}");
+    pair.peers[0]
+        .write_keyframe(screen, 9_900, pair.now, key.clone(), &[])
+        .unwrap();
+    pair.now += Duration::from_millis(1);
+    let delta: Arc<[u8]> = [0x2a, 0x01, 0x5a].into();
+    pair.write(0, Kind::Video, 10_800, delta.clone());
+    pair.write(0, Kind::Audio, 0, Arc::from([0xf8, 0xff, 0xfe]));
+    pair.advance(Duration::from_millis(20)).unwrap();
+    assert!(pair.frames[1].iter().any(|f| f.kind == Kind::Audio));
+    pair.advance(Duration::from_millis(280)).unwrap();
+    let video: Vec<_> = pair.frames[1]
+        .iter()
+        .filter(|f| f.kind == Kind::Video)
+        .collect();
+    assert_eq!(video.len(), 3);
+    assert_eq!(video[0].data, first);
+    assert_eq!(video[1].timestamp, 9_900);
+    assert_eq!(video[1].data, key);
+    assert_eq!(video[2].timestamp, 10_800);
+    assert_eq!(video[2].data, delta);
+}
+
+#[test]
+fn recovery_keyframe_can_follow_old_packets_inside_the_byte_window() {
+    let mut pair = Pair::setup(
+        true,
+        false,
+        &[Purpose::ScreenVideo],
+        VideoCodec::Av1,
+        Some(1024 * 1024 + 64),
+    );
+    pair.connect();
+    let screen = pair.peers[0].track_for(Purpose::ScreenVideo).unwrap();
+    let mut first = vec![0x2a, 0x80, 0x80, 0x06];
+    first.resize(96 * 1024 + 4, 0x42);
+    pair.write(0, Kind::Video, 9_000, first.into());
+    pair.advance(Duration::from_millis(1)).unwrap();
+    assert!(pair.frames[1].is_empty());
+    // During the pause the unsent packets get old, without growing the queue.
+    pair.now += Duration::from_millis(400);
+
+    let replacement: Arc<[u8]> = [0x0a, 0x01, 0x43].into();
+    let normal = pair.peers[0].write(screen, 9_900, pair.now, replacement.clone(), &[]);
+    assert!(matches!(normal, Err(Error::Backpressure)), "{normal:?}");
+    pair.peers[0]
+        .write_keyframe(screen, 9_900, pair.now, replacement.clone(), &[])
+        .unwrap();
+    pair.advance(Duration::from_millis(300)).unwrap();
+    assert!(
+        pair.frames[1]
+            .iter()
+            .any(|frame| frame.timestamp == 9_900 && frame.data == replacement)
+    );
 }
 
 #[test]
@@ -950,4 +1109,159 @@ fn a_flooded_system_audio_track_cannot_spend_the_microphone_or_video_allocations
             12
         );
     }
+}
+
+fn padded_av1_frame(size: usize) -> Arc<[u8]> {
+    let mut frame = vec![0x2a];
+    let mut length = size;
+    while length >= 128 {
+        frame.push((length as u8 & 0x7f) | 0x80);
+        length >>= 7;
+    }
+    frame.push(length as u8);
+    frame.resize(frame.len() + size, 0x42);
+    frame.into()
+}
+
+/// A quiet screen's short probe bursts encounter temporary link credit.
+/// Sustained video should resume without an estimate collapse, while a
+/// persistent bottleneck still brings the estimate down.
+#[test]
+fn a_quiet_screen_keeps_its_upload_rate_when_motion_resumes() {
+    let mut pair = Pair::setup(
+        true,
+        false,
+        &[Purpose::ScreenVideo],
+        VideoCodec::Av1,
+        Some(1024 * 1024),
+    );
+    pair.link = Some(Link {
+        bitrate: 60_000_000,
+        free: pair.now,
+        packets: VecDeque::new(),
+        dropped: 0,
+        receiver_paused_until: None,
+        burst_credit: Some(2_000_000.0),
+    });
+    pair.connect();
+    let track = pair.peers[0].track(Kind::Video).unwrap();
+    let [quiet, busy, burst] = [
+        padded_av1_frame(768),
+        padded_av1_frame(12 * 1024),
+        padded_av1_frame(64 * 1024),
+    ];
+    let motion = |pair: &Pair, initial| {
+        let estimate = pair.upload.last().copied().unwrap_or(initial);
+        let bitrate = (estimate * 72 / 100).min(95_000_000);
+        padded_av1_frame((bitrate * 33 / 8_000) as usize)
+    };
+    let mut timestamp = 0;
+    let mut tick = |pair: &mut Pair, picture: &Arc<[u8]>, millis: u64| {
+        timestamp += millis * 90;
+        pair.advance(Duration::from_millis(millis)).unwrap();
+        let received = pair.frames[1].len();
+        let delivered = pair.frames[1]
+            .drain(..)
+            .map(|frame| frame.data.len())
+            .sum::<usize>();
+        let admitted = match pair.peers[0].write(track, timestamp, pair.now, picture.clone(), &[]) {
+            Ok(()) => true,
+            Err(Error::Backpressure) => false,
+            Err(error) => panic!("screen write failed: {error}"),
+        };
+        (admitted, received, delivered)
+    };
+    for _ in 0..606 {
+        let picture = motion(&pair, 5_000_000);
+        tick(&mut pair, &picture, 33);
+    }
+    let warmed = *pair.upload.last().expect("publisher has TWCC estimates");
+    assert!(warmed >= 40_000_000, "warm estimate {warmed}");
+    let warm_drops = pair.link.as_ref().unwrap().dropped;
+    pair.upload.clear();
+    let mut declined = 0;
+    for frame in 0..375 {
+        // Briefly hold deliveries to exercise TWCC through receiver scheduling delays.
+        if frame % 7 == 2 {
+            pair.link.as_mut().unwrap().receiver_paused_until =
+                Some(pair.now + Duration::from_millis(20 + (frame / 7 % 4) * 10));
+        }
+        let picture = if frame % 75 == 0 { &burst } else { &quiet };
+        declined += usize::from(!tick(&mut pair, picture, 67).0);
+    }
+    let quiet_drops = pair.link.as_ref().unwrap().dropped - warm_drops;
+    let lowest = pair.upload.iter().copied().min().unwrap_or(warmed);
+    eprintln!("warm {warmed} b/s, quiet low {lowest} b/s, {quiet_drops} dropped packets");
+    assert_eq!(declined, 0, "quiet frames rejected");
+    assert!(
+        lowest >= warmed / 2,
+        "upload estimate fell to {lowest} during sparse motion"
+    );
+    let mut held = pair.upload.last().copied().unwrap_or(warmed);
+    for (index, seconds) in [8, 8, 15].into_iter().enumerate() {
+        let cycle = index + 1;
+        pair.upload.clear();
+        if index > 0 {
+            for _ in 0..120 {
+                assert!(tick(&mut pair, &quiet, 67).0, "quiet frame rejected");
+            }
+            held = pair.upload.last().copied().unwrap_or(held);
+        }
+        for second in 1..=seconds {
+            let mut admitted = 0;
+            let mut received = 0;
+            let mut delivered = 0;
+            for frame in 0..30 {
+                // Batch receiver wakeups while enough media is flowing to
+                // distinguish temporary scheduling delay from queue growth.
+                if (second * 30 + frame) % 17 == 0 {
+                    pair.link.as_mut().unwrap().receiver_paused_until =
+                        Some(pair.now + Duration::from_millis(45));
+                }
+                let picture = motion(&pair, held);
+                let (accepted, frames, bytes) = tick(&mut pair, &picture, 33);
+                admitted += usize::from(accepted);
+                received += frames;
+                delivered += bytes;
+            }
+            assert!(
+                admitted >= 27 && received >= 24 && delivered >= 3_000_000,
+                "motion cycle {cycle}, second {second}: admitted {admitted}, received {received}, delivered {delivered} bytes"
+            );
+        }
+        let lowest = pair.upload.iter().copied().min().unwrap_or(held);
+        assert!(
+            lowest >= warmed / 2,
+            "upload estimate fell to {lowest} in cycle {cycle}"
+        );
+        held = pair.upload.last().copied().unwrap_or(held);
+    }
+
+    // Apply a bottleneck to the same negotiated sender and keep offering motion.
+    let link = pair.link.as_mut().unwrap();
+    let previous_drops = link.dropped;
+    link.bitrate = 900_000;
+    link.burst_credit = None;
+    for _ in 0..240 {
+        tick(&mut pair, &busy, 33);
+    }
+    let reduced = *pair.upload.last().expect("congested upload estimate");
+    let dropped = pair.link.as_ref().unwrap().dropped - previous_drops;
+    eprintln!("shaped: {reduced}, dropped: {dropped}");
+    assert!(dropped > 0, "the shaped link saturated");
+    assert!(reduced < 2_000_000, "congested estimate {reduced}");
+
+    // Restore part of the path's throughput and continue offering motion.
+    pair.link.as_mut().unwrap().bitrate = 30_000_000;
+    pair.upload.clear();
+    for _ in 0..900 {
+        let picture = motion(&pair, reduced);
+        tick(&mut pair, &picture, 33);
+    }
+    let recovered = pair.upload.last().copied().unwrap_or(reduced);
+    eprintln!("restored: {recovered} b/s");
+    assert!(
+        recovered >= 8_000_000,
+        "upload estimate only recovered from {reduced} to {recovered}"
+    );
 }
