@@ -293,11 +293,9 @@ screen-rate capability, the SFU supplies a separate encoder ceiling. The
 ceiling leaves packet overhead and a share of the host, room and viewer
 budgets for each forwarded screen alongside camera and audio. A single-layer
 source uses the tightest viewer path; layered sources can keep higher rates for
-viewers that can receive them. A screen with one spatial layer sends every
-viewer the same picture, so its rate stops at the ceiling of that picture's
-tier (from the Dependency Descriptor's layer size) or of the viewer's tier,
-whichever is lower. The SFU probes within configured limits while
-actual payload varies with screen motion. The traffic pacing tier also caps
+viewers that can receive them. A backed-up forwarding queue caps the encoder at
+the viewer's reduced tier until the queue recovers. The SFU probes within
+configured limits while actual payload varies with screen motion. The traffic pacing tier also caps
 screen bitrate whenever pacing is active. Direct screen publishers use their
 direct congestion controller for bitrate.
 

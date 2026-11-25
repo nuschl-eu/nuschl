@@ -1204,11 +1204,9 @@ impl Core {
                     let mut cap = (configured * 9 / 10, configured_limit)
                         .min((network * 9 / 10, VideoLimit::ReceiverBandwidth))
                         .min(policy);
-                    // A screen with one picture for every viewer gets at most the
-                    // ceiling of that picture's tier, or of the viewer's tier when lower.
-                    let picture = video.layers.picture_tier(video.kind);
-                    if backlog.limited() || single_layer || picture.is_some() {
-                        let tier = picture.map_or(tier, |picture| picture.min(tier));
+                    // The forwarding queue can temporarily cap the encoder at
+                    // the receiver's reduced tier.
+                    if backlog.limited() {
                         cap = cap.min((video.kind.ladder()[tier].ceiling, limit));
                     }
                     demand.screen_rate(cap, single_layer);

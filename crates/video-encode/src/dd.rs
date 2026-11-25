@@ -65,10 +65,7 @@ pub fn descriptor(
 mod tests {
     use super::*;
     use crate::layers::Pattern;
-    use nuschl_stream_quality::{
-        Kind,
-        dd::{Dti, Layers},
-    };
+    use nuschl_stream_quality::dd::{Dti, Layers};
     use std::time::Duration;
 
     /// The descriptors of `count` frames with a keyframe first.
@@ -113,7 +110,6 @@ mod tests {
                 }
             }
             assert!(layers.layered());
-            assert_eq!(layers.picture_tier(Kind::Screen), Some(2));
         }
     }
 
