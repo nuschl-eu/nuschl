@@ -36,7 +36,9 @@ from local_murmur import Murmur, eventually, free_port  # noqa: E402
 from mumble_client import Client  # noqa: E402
 from voice_servers import VoiceTest  # noqa: E402
 
+AT_SPI_CHECK_MENU_ITEM = "role 8"
 AT_SPI_RADIO_MENU_ITEM = "role 45"
+AT_SPI_CHECKED = 1 << 4
 
 
 class CallTest(VoiceTest):
@@ -111,7 +113,7 @@ class CallTest(VoiceTest):
                    "the fixture window did not resize", timeout=15)
         return previous
 
-    def select_quality(self, app, current, selected, *, above):
+    def select_quality(self, app, current, choices, *, above):
         trigger = self.control(app, f"Quality · {current}")
         chat = self.timeline(app)
         chat_bounds = chat.extents()
@@ -126,11 +128,18 @@ class CallTest(VoiceTest):
         else:
             assert menu_y >= trigger_y + trigger_height, f"quality menu should fit below: {geometry}"
         assert chat.extents() == chat_bounds, "opening the quality menu moved the chat"
-        eventually(lambda: self.find(menu, AT_SPI_RADIO_MENU_ITEM, selected),
-                   f"quality radio menu item missing: {selected}").press()
-        self.control(app, f"Quality · {selected}")
+        for choice in choices:
+            role = AT_SPI_CHECK_MENU_ITEM if choice == "Low latency" else AT_SPI_RADIO_MENU_ITEM
+            item = eventually(lambda: self.find(menu, role, choice, subtree=True),
+                              f"quality menu item missing: {choice}")
+            item.press()
+            eventually(lambda: item.call("Accessible", "GetState")[0][0] & AT_SPI_CHECKED,
+                       f"quality menu item did not become checked: {choice}")
+            assert self.find(app, "menu", "Video quality"), f"selecting {choice} closed the menu"
+        self.control(app, f"Quality · {choices[-1]}")
+        self.shell.key("Escape")
         eventually(lambda: not self.find(app, "menu", "Video quality"),
-                   "video quality dropdown did not close")
+                   "Escape did not close the video quality dropdown")
         assert chat.extents() == chat_bounds, "selecting a quality moved the chat"
 
     def toggle_quality(self, app):
@@ -427,7 +436,7 @@ class CallTest(VoiceTest):
             self.control(andi, "Open in browser", shown=False)
             self.toggle_quality(andi)
             self.video_stats(andi, show=True)
-            self.select_quality(andi, "Auto", "720p30", above=True)
+            self.select_quality(andi, "Auto", ("Sharp", "Low latency", "Max 720p30"), above=True)
             self.video_stats(andi, show=False)
             height = self.resize_desktop(andi_pid, 520)
             settings = self.root / "Andi" / "config/settings.json"
@@ -435,7 +444,7 @@ class CallTest(VoiceTest):
                 self.shell.chord("Control_L", "equal")
             eventually(lambda: json.loads(settings.read_text()).get("appearance", {}).get("zoom") == 1.25,
                        "the short fixture window did not reach 125% zoom", timeout=15)
-            self.select_quality(andi, "720p30", "Auto", above=False)
+            self.select_quality(andi, "Max 720p30", ("Auto",), above=False)
             self.shell.chord("Control_L", "0")
             self.resize_desktop(andi_pid, height)
             self.inline(andi)
