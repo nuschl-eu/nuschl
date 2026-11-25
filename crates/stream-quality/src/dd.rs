@@ -400,9 +400,11 @@ impl Layers {
                 let mut intervals: Vec<u64> = (1..self.units.len())
                     .map(|i| self.units[i] - self.units[i - 1])
                     .collect();
-                // The shorter median: a pause inside the window leaves it.
+                // Use both middle intervals so alternating short and long
+                // gaps count at their average cadence.
                 intervals.sort_unstable();
-                let median = Some(intervals[RATE_UNITS / 2 - 1]);
+                let middle = RATE_UNITS / 2;
+                let median = Some(intervals[middle - 1].midpoint(intervals[middle]));
                 if timestamp - self.units[0] <= CLOCK {
                     self.interval = median;
                 } else if self.interval.is_none() {
@@ -1860,6 +1862,18 @@ mod tests {
             Duration::from_millis(3300),
         );
         assert_eq!(targets(&layers, Kind::Screen, 0), [0, 1]);
+    }
+
+    #[test]
+    fn uneven_sixty_fps_cadence_keeps_the_full_temporal_layer() {
+        let mut layers = Layers::default();
+        // Over two frames the source takes 33 ms. Individual gaps alternate
+        // between 10 ms and 23–24 ms, as on a decimated capture clock.
+        for number in 0..121u16 {
+            let millis = u64::from(number / 2) * 1000 / 30 + u64::from(number % 2) * 10;
+            l1t3_at(&mut layers, number, millis);
+        }
+        assert_eq!(targets(&layers, Kind::Screen, 2), [0, 1, 2]);
     }
 
     #[test]
