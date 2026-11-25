@@ -195,7 +195,7 @@ resolution. Screens start Sharp, cameras Smooth. Low latency bounds each
 viewer's queue at the SFU to 50 ms, and receivers render its frames at once
 (`jitterBufferTarget` 0 in browsers). Resolution and frame rate follow the
 bandwidth and the source; a publisher may limit a source to a §5.1 tier under
-Advanced, and a viewer's Auto fits the tile within an optional tier limit.
+Advanced, and each viewer automatically requests a tier that fits its tile.
 Quality and path changes leave keys and relay-only untouched.
 
 ### 5.1 Tiers
@@ -271,9 +271,9 @@ and pacing use measured payload rates.
 
 ### 5.3 Adaptation
 
-- Receivers send a fixed-size `QualityRequest` per source, at most once a
-  second; "Auto" asks for the tile's size. They report decode capacity under the
-  channel key and step down after 3 s below 90 % of the target frame rate.
+- Receivers send a fixed-size `QualityRequest` per source when the tile changes
+  size, at most once a second. The SFU also accepts decode-capacity reports.
+  Automatic feedback from the decoder remains planned.
 - The SFU picks layers per receiver from the DD (below), so a slow receiver
   lowers only its own quality; it tells each publisher the largest demand per
   source. A demand below the tier receivers want keeps that tier's height for a
