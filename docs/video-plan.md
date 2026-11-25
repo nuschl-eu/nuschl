@@ -280,9 +280,10 @@ and pacing use measured payload rates.
   Sharp source and its frame rate for a Smooth one. Browser senders set the
   track's `contentHint` (`detail` or `motion`) and the sender's
   `degradationPreference` (`maintain-resolution` or `maintain-framerate`).
-- Congestion control is GCC/TWCC on every leg. A publisher's target is
-  min(upload estimate × 0.85, largest demand), split across its sources with
-  the screen first.
+- Congestion control is GCC/TWCC on every leg. The native publisher budgets
+  72% of its upload estimate for video. When both sources run, the camera gets
+  up to its encoder ceiling or half the budget, whichever is lower. The
+  screen gets the rest. Rate changes reach the running encoder directly.
 - Step-down order: bitrate, then what the mode gives up, then what it keeps (at
   most once per 10 s): frame rate before resolution for Sharp, resolution before
   frame rate for Smooth. Step-up needs 1.3× the next point's floor for 10 s

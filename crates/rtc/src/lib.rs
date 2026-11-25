@@ -13,6 +13,7 @@
 //! ownership/consent, relay, or end-to-end media encryption implementation.
 
 use nuschl_core::network::{Destination, PeerPolicy};
+use nuschl_stream_quality::CAMERA;
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
@@ -26,12 +27,20 @@ use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event as RtcEvent, Input, Output as RtcOutput, Rtc};
 use thiserror::Error;
 
+fn camera_share(video: u64) -> u64 {
+    // The desktop camera's largest target plus transport overhead.
+    (CAMERA[CAMERA.len() - 1].ceiling * 10)
+        .div_ceil(9)
+        .min(video / 2)
+}
+
 pub const MAX_SDP_BYTES: usize = 32 * 1024;
 pub const MAX_DATAGRAM_BYTES: usize = 2048;
 pub const MAX_OPUS_BYTES: usize = 1275;
 pub const MAX_VIDEO_BYTES: usize = 256 * 1024;
 const INITIAL_BITRATE: u64 = 2_000_000;
 const CALL_INITIAL_BITRATE: u64 = 5_000_000;
+const CALL_INITIAL_PROBE_CEILING: u64 = 50_000_000;
 // The estimate includes packet overhead and leaves headroom for the video target.
 const CALL_MAX_BITRATE: u64 = 150_000_000;
 const CALL_VIDEO_WINDOW: Duration = Duration::from_millis(300);
@@ -290,7 +299,7 @@ impl Peer {
         if call_video_limit.is_some() {
             rtc.bwe().set_bitrate(
                 str0m::bwe::Bitrate::ZERO,
-                str0m::bwe::Bitrate::bps(CALL_MAX_BITRATE),
+                str0m::bwe::Bitrate::bps(CALL_INITIAL_PROBE_CEILING),
             );
         }
         let candidate = if relayed {
@@ -854,14 +863,13 @@ impl Peer {
         let role_rate = match purpose {
             Purpose::Microphone => microphone * total.min(audio) / audio.max(1),
             Purpose::SystemAudio => system * total.min(audio) / audio.max(1),
-            Purpose::Camera | Purpose::ScreenVideo => {
-                let count = self
-                    .tracks
-                    .iter()
-                    .filter(|t| t.purpose.kind() == Kind::Video)
-                    .count() as u64;
-                video / count.max(1)
+            Purpose::Camera if self.track_for(Purpose::ScreenVideo).is_some() => {
+                camera_share(video)
             }
+            Purpose::ScreenVideo if self.track_for(Purpose::Camera).is_some() => {
+                video - camera_share(video)
+            }
+            Purpose::Camera | Purpose::ScreenVideo => video,
         };
         (total, video, role_rate)
     }
@@ -975,6 +983,18 @@ impl Peer {
                             str0m::bwe::BweKind::Remb { estimate, .. } => estimate.as_u64(),
                             _ => continue,
                         };
+                        // Only raise the probe target after the path has shown
+                        // capacity for the next range.
+                        let probe_upgrade = CALL_INITIAL_PROBE_CEILING * 4 / 5;
+                        if self.call_video_limit.is_some()
+                            && self.bandwidth_bps < probe_upgrade
+                            && rate >= probe_upgrade
+                        {
+                            self.rtc.bwe().set_bitrate(
+                                str0m::bwe::Bitrate::ZERO,
+                                str0m::bwe::Bitrate::bps(CALL_MAX_BITRATE),
+                            );
+                        }
                         self.bandwidth_bps = rate;
                         return Ok(Output::Event(Event::BandwidthEstimate(rate)));
                     }
@@ -1001,5 +1021,17 @@ impl Peer {
         }
         self.now = now;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    #[test]
+    fn a_camera_leaves_the_remaining_rate_for_a_screen() {
+        assert_eq!(camera_share(2_000_000), 1_000_000);
+        let total = CALL_MAX_BITRATE * 4 / 5;
+        assert!(total - camera_share(total) >= 100_000_000);
     }
 }
