@@ -274,16 +274,10 @@ impl View {
         } else if !charge(room) {
             Some(VideoLimit::SfuRoom)
         } else {
-            host.and_then(|(bucket, limit)| {
-                if charge(bucket) {
-                    None
-                } else {
-                    [*viewer, *room] = previous;
-                    Some(limit)
-                }
-            })
+            host.and_then(|(bucket, limit)| (!charge(bucket)).then_some(limit))
         };
         if let Some(limit) = limit {
+            [*viewer, *room] = previous;
             if video {
                 return (None, skip(self, Some(limit), rest || carried) || keyframe);
             }
@@ -956,6 +950,39 @@ mod tests {
         assert!(!backlog.dropped(10 * second + 1));
         assert!(!backlog.dropped(8 * second));
         assert!(!backlog.dropped(0));
+    }
+
+    #[test]
+    fn a_room_budget_drop_keeps_the_viewers_credit() {
+        let now = Instant::now();
+        let mut view = View::default();
+        let mut viewer = Bucket::new(0.0, 1000.0, now);
+        let mut room = Bucket::new(0.0, 0.0, now);
+        let packet = Arrival {
+            frame: None,
+            video: true,
+            seq: 1,
+            timestamp: 1,
+            marker: true,
+            payload: 952,
+            cost: 1000,
+            bound: QUEUE_BOUND,
+            can_request: true,
+            targets: None,
+        };
+        assert!(
+            view.admit(
+                &packet,
+                None,
+                1_000_000,
+                [&mut viewer, &mut room],
+                None,
+                now
+            )
+            .0
+            .is_none()
+        );
+        assert_eq!(viewer.level().0, 1000.0);
     }
 
     #[test]
