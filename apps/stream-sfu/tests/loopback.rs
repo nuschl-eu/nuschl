@@ -79,6 +79,7 @@ struct Leg {
     /// Drops every nth incoming AV1 media packet; retransmissions pass.
     loss: Option<(u64, u64)>,
     link: Option<Link>,
+    received_bytes: usize,
 }
 
 /// A downlink in front of a test peer: `rate` bits per second, a drop-tail
@@ -134,6 +135,7 @@ impl Leg {
             arrived: Instant::now(),
             loss: None,
             link: None,
+            received_bytes: 0,
         }
     }
 
@@ -173,6 +175,7 @@ impl Leg {
         let local = self.socket.local_addr().expect("address");
         let mut buffer = [0; 2048];
         while let Ok((length, source)) = self.socket.recv_from(&mut buffer) {
+            self.received_bytes += length + 28; // IPv4 and UDP on loopback.
             if self.lost(&buffer[..length]) {
                 continue;
             }
@@ -1354,32 +1357,33 @@ async fn admits_a_base_layer_when_it_fits_the_room_budget() {
     assert_eq!(welcome["type"], "welcome", "{welcome}");
 }
 
-/// At its traffic budget the SFU refuses new peers, and the count is on disk.
+/// The persistent quota bounds real UDP output, including WebRTC handshakes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_traffic_budget_refuses_new_video() {
-    let sfu = start("traffic_budget = 30000\nperiod = \"day\"\nstate_directory = \"{directory}\"");
-    let url = sfu.url.as_str();
-    let (mut host, _) = join(url, &ADMIT, true, true).await;
-    let (mut receiver, _) = join(url, &ADMIT, false, false).await;
+async fn the_traffic_budget_bounds_egress_and_refuses_after_restart() {
+    let state = nuschl_testkit::temp_dir();
+    let settings = format!(
+        "traffic_budget = 600\nperiod = \"month\"\nstate_directory = {:?}",
+        state.path()
+    );
+    let sfu = start(&settings);
+    let (mut host, welcome) = join(&sfu.url, &ADMIT, true, true).await;
+    assert_eq!(welcome["type"], "welcome");
     host.start_publishing(Codec::Av1);
-    // About 20 kB a second reach the receiver; the count is saved each second.
-    let count = sfu.directory.path().join("traffic");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        for peer in [&mut host, &mut receiver] {
-            peer.step();
-        }
-        host.send_frame();
-        let sent = std::fs::read_to_string(&count)
-            .ok()
-            .and_then(|text| text.split_whitespace().nth(1)?.parse::<u64>().ok());
-        if sent.is_some_and(|sent| sent >= 30_000) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "{sent:?}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        host.step();
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let (_, refused) = join(url, &ADMIT, false, false).await;
+    let (publish, ..) = host.publish.as_ref().expect("publish leg");
+    let received =
+        publish.received_bytes + host.subscribe.as_ref().map_or(0, |leg| leg.received_bytes);
+    assert!((1..=600).contains(&received), "received {received} bytes");
+    let count = std::fs::read_to_string(state.path().join("traffic")).expect("reserved count");
+    assert_eq!(count.split_whitespace().nth(1), Some("600"));
+    drop(sfu);
+
+    let sfu = start(&settings);
+    let (_, refused) = join(&sfu.url, &ADMIT, true, true).await;
     assert_eq!(refused, json!({"type": "error", "reason": "traffic"}));
 }
 

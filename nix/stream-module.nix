@@ -118,13 +118,10 @@ in
         default = null;
         example = 20000000000000;
         description = ''
-          Egress budget in bytes per period, or null for no budget. The paced
-          share is the budget times the elapsed fraction of the period.
-          Unused share allows bursts at normal quality. Above it the SFU lowers
-          video tiers step by step. At the budget it refuses joins and
-          publishing offers. Established media keeps forwarding under the
-          paced limits and can exceed the nominal budget. The count survives
-          restarts in the state directory.
+          Hard SFU UDP egress budget in bytes per UTC period, or null for no
+          budget. The rate follows the remaining budget and time, with burst
+          credit from unused elapsed share. Media stops when the budget is
+          spent. Reservations persist in the state directory.
         '';
       };
       period = mkOption {

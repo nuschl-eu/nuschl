@@ -183,8 +183,8 @@ pub struct Core {
     /// The origin of the quality logic's time.
     origin: Instant,
     traffic: Option<Traffic>,
-    /// How many tiers the traffic budget lowers every receiver's caps.
-    step: u64,
+    traffic_rate: Option<u64>,
+    host_budget: Bucket,
 }
 
 fn canonical(address: SocketAddr) -> SocketAddr {
@@ -201,7 +201,7 @@ impl Core {
         config: Arc<Config>,
         socket: Arc<UdpSocket>,
         turn: Option<Turn>,
-        traffic: Option<Traffic>,
+        mut traffic: Option<Traffic>,
     ) -> std::io::Result<Self> {
         let port = socket.local_addr()?.port();
         let local = config
@@ -209,6 +209,11 @@ impl Core {
             .iter()
             .map(|ip| SocketAddr::new(*ip, port))
             .collect();
+        let origin = Instant::now();
+        let traffic_rate = traffic
+            .as_mut()
+            .map(|traffic| traffic.allowance_bps(unix_seconds()));
+        let host_budget = rooms::media_budget(Self::host_limit(&config, traffic_rate).0, origin);
         Ok(Self {
             rooms: Rooms::new(rooms::Limits {
                 rooms: config.max_rooms,
@@ -228,9 +233,10 @@ impl Core {
             timers: BinaryHeap::new(),
             dirty: Vec::new(),
             kicks: Vec::new(),
-            origin: Instant::now(),
+            origin,
             traffic,
-            step: 0,
+            traffic_rate,
+            host_budget,
         })
     }
 
@@ -840,8 +846,19 @@ impl Core {
                 Ok(Output::Transmit(transmit)) => {
                     self.routing.learn(transmit.destination, (id, leg), now);
                     if let Some(traffic) = &mut self.traffic {
-                        // With the IPv4 and UDP headers.
-                        traffic.add(transmit.contents.len() + 28);
+                        let overhead = if transmit.destination.is_ipv4() {
+                            28
+                        } else {
+                            48
+                        };
+                        match traffic.charge(transmit.contents.len() + overhead, unix_seconds()) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => {
+                                tracing::warn!(%error, "reserving the SFU traffic budget");
+                                continue;
+                            }
+                        }
                     }
                     let mut destination = transmit.destination;
                     if let (IpAddr::V4(v4), Ok(local)) =
@@ -1038,6 +1055,7 @@ impl Core {
                 .collect()
         });
         let mut keyframe = matches!(frame, Some(None));
+        let (_, host_limit) = Self::host_limit(&self.config, self.traffic_rate);
         for id in receivers {
             let Some(peer) = self.peers.get_mut(&id) else {
                 continue;
@@ -1079,10 +1097,14 @@ impl Core {
             };
             let bitrate = peer.estimate.min(self.config.receiver_bitrate);
             let budgets = [&mut peer.budget, room_budget];
-            let (out, wants) =
-                forward
-                    .view
-                    .admit(&arrival, stream.queue_info(), bitrate, budgets, now);
+            let (out, wants) = forward.view.admit(
+                &arrival,
+                stream.queue_info(),
+                bitrate,
+                budgets,
+                Some((&mut self.host_budget, host_limit)),
+                now,
+            );
             keyframe |= wants;
             let Some((seq, marker)) = out else {
                 continue;
@@ -1112,6 +1134,7 @@ impl Core {
         let mut planned = Vec::new();
         let limits = self.limits();
         let (host, rooms, viewers) = self.screen_shares();
+        let (_, host_limit) = Self::host_limit(&self.config, self.traffic_rate);
         for (&id, peer) in &self.peers {
             for (index, forward) in peer.forwards.iter().enumerate() {
                 if forward.stopping {
@@ -1128,8 +1151,7 @@ impl Core {
                 else {
                     continue;
                 };
-                let (requested, mut limit) =
-                    quality::tier(video.kind, &forward.view, peer.decode, self.step);
+                let (requested, mut limit) = quality::tier(video.kind, &forward.view, peer.decode);
                 let backlog = &forward.view.backlog;
                 let tier = backlog.tier(requested);
                 if let Some(active) = backlog
@@ -1141,15 +1163,9 @@ impl Core {
                 // A late queue takes away what the source's mode gives up; the
                 // budgets lower the rest.
                 let smooth = video.smooth();
-                let mut choices =
-                    video
-                        .layers
-                        .choices(video.kind, requested, smooth, backlog.steps());
-                // Past the lowest tier the traffic budget leaves base layers only.
-                if self.step > video.kind.top() as u64 && choices.len() > 1 {
-                    choices.truncate(1);
-                    limit = VideoLimit::TrafficBudget;
-                }
+                let choices = video
+                    .layers
+                    .choices(video.kind, requested, smooth, backlog.steps());
                 let demand = demands.entry((forward.from, forward.source)).or_default();
                 let publisher_limit =
                     if limit == VideoLimit::WithinTarget && tier < video.kind.top() {
@@ -1181,31 +1197,18 @@ impl Core {
                 if let Some(screen_rate) = screen_rate {
                     let viewer = viewers[&id];
                     let (configured, configured_limit) = [
-                        (host.rate(limits.host), VideoLimit::SfuHost),
+                        (host.rate(limits.host), host_limit),
                         (rooms[&peer.room].rate(limits.room), VideoLimit::SfuRoom),
                         (viewer.rate(limits.receiver), VideoLimit::SfuViewer),
                     ]
                     .into_iter()
                     .fold((u64::MAX, VideoLimit::WithinTarget), std::cmp::min);
-                    let policy = if self.step > 0 {
-                        let step = self.step.min(video.kind.top() as u64) as usize;
-                        let index = video.kind.top() - step;
-                        (
-                            video.kind.ladder()[index].ceiling,
-                            VideoLimit::TrafficBudget,
-                        )
-                    } else {
-                        (screen_rate, VideoLimit::WithinTarget)
-                    };
-                    // Probe independently of payload and leave room for packet headers.
-                    probe = configured.min(policy.0.saturating_mul(10).div_ceil(9));
-                    let network = viewer.rate(peer.estimate);
-                    let mut cap = (configured.saturating_mul(9) / 10, configured_limit)
-                        .min((
-                            network.saturating_mul(9) / 10,
-                            VideoLimit::ReceiverBandwidth,
-                        ))
-                        .min(policy);
+                    let (ceiling, mut cap) = screen_budget(
+                        (configured, configured_limit),
+                        viewer.rate(peer.estimate),
+                        screen_rate,
+                    );
+                    probe = ceiling;
                     // The forwarding queue can temporarily cap the encoder at
                     // the receiver's reduced tier.
                     if backlog.limited() {
@@ -1254,8 +1257,7 @@ impl Core {
                 match forward.label {
                     "screen" => usage.screens += 1,
                     "camera" => {
-                        let (tier, _) =
-                            quality::tier(Kind::Camera, &forward.view, peer.decode, self.step);
+                        let (tier, _) = quality::tier(Kind::Camera, &forward.view, peer.decode);
                         usage.reserved += Kind::Camera.ladder()[tier].ceiling;
                     }
                     _ => usage.reserved += 256_000,
@@ -1268,9 +1270,18 @@ impl Core {
         (host, rooms, viewers)
     }
 
+    fn host_limit(config: &Config, traffic_rate: Option<u64>) -> (u64, VideoLimit) {
+        let upload = config.upload_bitrate / 10 * 7;
+        traffic_rate
+            .filter(|&rate| rate < upload)
+            .map_or((upload, VideoLimit::SfuHost), |rate| {
+                (rate, VideoLimit::TrafficBudget)
+            })
+    }
+
     fn limits(&self) -> budget::Limits {
         budget::Limits {
-            host: self.config.upload_bitrate / 10 * 7,
+            host: Self::host_limit(&self.config, self.traffic_rate).0,
             room: self.config.room_bitrate,
             receiver: self.config.receiver_bitrate,
         }
@@ -1314,15 +1325,14 @@ impl Core {
     fn quality(&mut self, now: Instant) {
         let since = now.saturating_duration_since(self.origin);
         if let Some(traffic) = &mut self.traffic {
-            let step = traffic.step(unix_seconds());
-            if step != self.step {
-                tracing::info!(step, sent = traffic.sent(), "traffic budget step");
-                self.step = step;
-            }
-            if let Err(error) = traffic.save() {
-                tracing::warn!("saving the traffic count: {error}");
+            self.traffic_rate = Some(traffic.allowance_bps(unix_seconds()));
+            if let Err(error) = traffic.publish_usage() {
+                tracing::warn!(%error, "writing the SFU traffic usage");
             }
         }
+        let (host_rate, host_limit) = Self::host_limit(&self.config, self.traffic_rate);
+        self.host_budget
+            .retune(rooms::media_budget(host_rate, now), now);
         for peer in self.peers.values_mut() {
             for forward in &mut peer.forwards {
                 forward.view.backlog.tick(now);
@@ -1339,7 +1349,7 @@ impl Core {
             let forward = &mut peer.forwards[planned.forward];
             let view = &mut forward.view;
             let mut limit = match share.limited_by {
-                Some(budget::Limit::Host) => VideoLimit::SfuHost,
+                Some(budget::Limit::Host) => host_limit,
                 Some(budget::Limit::Room) => VideoLimit::SfuRoom,
                 Some(budget::Limit::Viewer) => VideoLimit::SfuViewer,
                 Some(budget::Limit::Network) => VideoLimit::ReceiverBandwidth,
@@ -1419,9 +1429,7 @@ impl Core {
                     let (tier, bitrate, limit) = demand.cap(video.kind);
                     let limit = peer.video_limits.then_some(limit);
                     let (height, fps) = demand.picture(video.kind, tier, video.smooth());
-                    let cap = Some((tier, height, fps, bitrate, limit));
-                    if cap != video.demand && video.throttle.allow(since) {
-                        video.demand = cap;
+                    if video.update_demand((tier, height, fps, bitrate, limit), since) {
                         let request = QualityRequest {
                             publisher: id,
                             kind: video.kind,
@@ -1495,6 +1503,22 @@ impl ScreenShare {
     fn rate(self, wire_budget: u64) -> u64 {
         wire_budget.saturating_sub(self.reserved * 10 / 9) / self.screens.max(1)
     }
+}
+
+/// A wire-rate probe and a video payload ceiling, with space for packet headers.
+fn screen_budget(
+    configured: (u64, VideoLimit),
+    estimated: u64,
+    encoder: u64,
+) -> (u64, (u64, VideoLimit)) {
+    let probe = configured.0.min(encoder.saturating_mul(10).div_ceil(9));
+    let cap = (configured.0.saturating_mul(9) / 10, configured.1)
+        .min((
+            estimated.saturating_mul(9) / 10,
+            VideoLimit::ReceiverBandwidth,
+        ))
+        .min((encoder, VideoLimit::WithinTarget));
+    (probe, cap)
 }
 
 /// One receiver's stream of one video source, for the budgets.
@@ -1642,6 +1666,25 @@ mod tests {
         room.reserve(usage);
         assert_eq!(room.rate(25_000_000), 8_055_556);
         assert_eq!(room.rate(3_000_000), 0);
+    }
+
+    #[test]
+    fn screen_budget_leaves_wire_headroom_and_keeps_the_negotiated_payload_ceiling() {
+        let configured = (112_000_000, VideoLimit::SfuViewer);
+        for encoder in [
+            protocol::LEGACY_MAX_SCREEN_BITRATE,
+            protocol::MAX_SCREEN_BITRATE,
+        ] {
+            let (probe, cap) = screen_budget(configured, 112_000_000, encoder);
+            assert!(probe > encoder);
+            assert_eq!(cap, (encoder, VideoLimit::WithinTarget));
+        }
+        let (_, cap) = screen_budget(
+            (0, VideoLimit::TrafficBudget),
+            112_000_000,
+            protocol::MAX_SCREEN_BITRATE,
+        );
+        assert_eq!(cap, (0, VideoLimit::TrafficBudget));
     }
 
     #[test]

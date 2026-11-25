@@ -117,6 +117,14 @@ impl Bucket {
         true
     }
 
+    /// Changes the rate and burst while preserving accumulated credit or debt.
+    pub fn retune(&mut self, budget: Self, now: Instant) {
+        self.take(0.0, now);
+        self.rate = budget.rate;
+        self.burst = budget.burst;
+        self.tokens = self.tokens.min(self.burst);
+    }
+
     pub fn burst(&self) -> f64 {
         self.burst
     }
