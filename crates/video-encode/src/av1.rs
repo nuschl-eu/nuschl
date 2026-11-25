@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! AV1 sequence and frame headers (AV1 specification §5.5 and §5.9) for the
-//! encoder's subset: 8-bit 4:2:0 Main profile, one tile, shown frames, single
+//! encoder's subset: 8-bit 4:2:0 Main profile, up to two tile rows, shown frames, single
 //! reference prediction, coding tools a hardware encoder decides inside its frame.
 //! The tool flags match what Mesa's radeonsi writes, so its rewritten headers and
 //! a driver that sends ours describe the same stream.
@@ -25,6 +25,9 @@ pub struct Sequence {
     pub layers: u8,
     /// `seq_level_idx` (Annex A.3).
     pub level: u8,
+    pub high_tier: bool,
+    /// Width of the tile size field when a frame uses two rows.
+    tile_size_bytes: Option<u8>,
     /// Whether frames choose screen content tools (palette, intra block copy).
     pub screen: bool,
 }
@@ -46,9 +49,32 @@ impl Sequence {
             width,
             height,
             layers,
-            level: level(width, height, fps),
+            level: level(width, height, fps, 0).0,
+            high_tier: false,
+            tile_size_bytes: None,
             screen,
         })
+    }
+
+    /// Widens the sequence's envelope as the capture rate rises. Returns
+    /// whether the next frame needs a new sequence header.
+    pub(crate) fn expand(&mut self, fps: u16, bitrate: u32, tile_size_bytes: Option<u8>) -> bool {
+        let current = (self.level, self.high_tier);
+        let next = current.max(level(self.width, self.height, fps, bitrate));
+        let tiles = self.tile_size_bytes.or(tile_size_bytes.filter(|size| {
+            (1..=4).contains(size) && self.height.div_ceil(64) > 1
+        }));
+        let changed = current != next || tiles != self.tile_size_bytes;
+        (self.level, self.high_tier) = next;
+        self.tile_size_bytes = tiles;
+        changed
+    }
+
+    /// Superblock heights of the two uniform tile rows, when enabled.
+    pub fn tile_rows(&self) -> Option<[u16; 2]> {
+        let rows = self.height.div_ceil(64);
+        let first = rows.div_ceil(2);
+        self.tile_size_bytes.map(|_| [first, rows - first])
     }
 
     /// The sequence header OBU.
@@ -71,7 +97,7 @@ impl Sequence {
             bits.put(idc, 12);
             bits.put(u32::from(self.level), 5);
             if self.level > 7 {
-                bits.flag(false); // seq_tier: Main
+                bits.flag(self.high_tier); // seq_tier
             }
         }
         let width_bits = significant_bits(self.width - 1);
@@ -195,13 +221,20 @@ impl FrameHeader {
         if !self.disable_cdf_update {
             bits.flag(false); // disable_frame_end_update_cdf
         }
-        // tile_info(): uniform spacing at the minimum of one tile.
+        // tile_info(): one full-width tile, or two uniform full-width tiles.
         let (columns, rows) = superblocks(sequence.width, sequence.height);
         bits.flag(true); // uniform_tile_spacing_flag
         if columns > 1 {
             bits.flag(false); // increment_tile_cols_log2
         }
-        if rows > 1 {
+        if let Some(size) = sequence.tile_size_bytes {
+            bits.flag(true); // increment_tile_rows_log2
+            if rows > 2 {
+                bits.flag(false); // stop at two rows
+            }
+            bits.flag(false); // context_update_tile_id: first tile
+            bits.put(u32::from(size - 1), 2); // tile_size_bytes_minus_1
+        } else if rows > 1 {
             bits.flag(false); // increment_tile_rows_log2
         }
         // quantization_params()
@@ -286,32 +319,34 @@ fn significant_bits(value: u16) -> u32 {
     (u16::BITS - value.leading_zeros()).max(1)
 }
 
-/// The lowest Main-tier level whose picture size and display rate hold the
-/// sequence (Annex A.3); 31, the unconstrained level, beyond them.
-fn level(width: u16, height: u16, fps: u16) -> u8 {
-    // seq_level_idx, MaxPicSize, MaxHSize, MaxVSize, MaxDisplayRate
-    const LEVELS: [(u8, u64, u16, u16, u64); 10] = [
-        (0, 147_456, 2048, 1152, 4_423_680),
-        (1, 278_784, 2816, 1584, 8_363_520),
-        (4, 665_856, 4352, 2448, 19_975_680),
-        (5, 1_065_024, 5504, 3096, 31_950_720),
-        (8, 2_359_296, 6144, 3456, 70_778_880),
-        (9, 2_359_296, 6144, 3456, 141_557_760),
-        (12, 8_912_896, 8192, 4352, 267_386_880),
-        (13, 8_912_896, 8192, 4352, 534_773_760),
-        (14, 8_912_896, 8192, 4352, 1_069_547_520),
-        (16, 35_651_584, 16384, 8704, 1_069_547_520),
+/// The lowest level and tier that hold the sequence (AV1 Annex A.3).
+fn level(width: u16, height: u16, fps: u16, bitrate: u32) -> (u8, bool) {
+    // seq_level_idx, MaxPicSize, MaxHSize, MaxVSize, MaxDisplayRate, MainMbps, HighMbps
+    const LEVELS: [(u8, u64, u16, u16, u64, u32, u32); 10] = [
+        (0, 147_456, 2048, 1152, 4_423_680, 1, 0),
+        (1, 278_784, 2816, 1584, 8_363_520, 3, 0),
+        (4, 665_856, 4352, 2448, 19_975_680, 6, 0),
+        (5, 1_065_024, 5504, 3096, 31_950_720, 10, 0),
+        (8, 2_359_296, 6144, 3456, 70_778_880, 12, 30),
+        (9, 2_359_296, 6144, 3456, 141_557_760, 20, 50),
+        (12, 8_912_896, 8192, 4352, 267_386_880, 30, 100),
+        (13, 8_912_896, 8192, 4352, 534_773_760, 40, 160),
+        (14, 8_912_896, 8192, 4352, 1_069_547_520, 60, 240),
+        (16, 35_651_584, 16384, 8704, 1_069_547_520, 60, 240),
     ];
     let picture = u64::from(width) * u64::from(height);
     LEVELS
         .iter()
-        .find(|&&(_, size, max_width, max_height, rate)| {
+        .find(|&&(_, size, max_width, max_height, rate, main, high)| {
             picture <= size
                 && width <= max_width
                 && height <= max_height
                 && picture * u64::from(fps) <= rate
+                && bitrate <= main.max(high) * 1_000_000
         })
-        .map_or(31, |&(index, ..)| index)
+        .map_or((31, false), |&(index, _, _, _, _, main, _)| {
+            (index, bitrate > main * 1_000_000)
+        })
 }
 
 #[cfg(test)]
@@ -320,13 +355,28 @@ mod tests {
 
     #[test]
     fn levels_follow_size_and_rate() {
-        assert_eq!(level(1280, 720, 30), 5);
-        assert_eq!(level(1920, 1080, 30), 8);
-        assert_eq!(level(1920, 1080, 60), 9);
-        assert_eq!(level(3440, 1440, 30), 12);
-        assert_eq!(level(3440, 1440, 60), 13);
-        assert_eq!(level(3840, 2160, 60), 13);
-        assert_eq!(level(3840, 2160, 120), 14);
+        assert_eq!(level(1280, 720, 30, 0), (5, false));
+        assert_eq!(level(1920, 1080, 30, 0), (8, false));
+        assert_eq!(level(1920, 1080, 60, 0), (9, false));
+        assert_eq!(level(3440, 1440, 30, 0), (12, false));
+        assert_eq!(level(3440, 1440, 60, 0), (13, false));
+        assert_eq!(level(3440, 1440, 100, 50_000_000), (13, true));
+        assert_eq!(level(3840, 2160, 60, 0), (13, false));
+        assert_eq!(level(3840, 2160, 100, 100_000_000), (14, true));
+        assert_eq!(level(3840, 2160, 120, 100_000_000), (14, true));
+    }
+
+    #[test]
+    fn high_rate_sequence_stays_stable_when_the_budget_falls() {
+        let mut sequence = Sequence::new(3840, 2160, 30, 3, true).unwrap();
+        assert!(sequence.expand(120, 100_000_000, Some(4)));
+        assert_eq!(sequence.level, 14);
+        assert!(sequence.high_tier);
+        assert_eq!(sequence.tile_rows(), Some([17, 17]));
+        let high = sequence.obu();
+        assert!(!sequence.expand(30, 4_000_000, None));
+        assert_eq!(sequence.obu(), high);
+        assert_eq!(sequence.tile_rows(), Some([17, 17]));
     }
 
     #[test]
