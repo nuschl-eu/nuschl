@@ -1219,10 +1219,16 @@ impl Core {
                         limit = cap.1;
                     }
                 }
+                let screen_rate_cap = screen_rate.is_some()
+                    && choices
+                        .first()
+                        .zip(choices.last())
+                        .is_some_and(|(first, last)| first.layer.spatial == last.layer.spatial);
                 planned.push(Planned {
                     receiver: id,
                     forward: index,
                     choices,
+                    screen_rate_cap,
                     measured: video.layers.measured(),
                     meanwhile: forward
                         .view
@@ -1312,6 +1318,7 @@ impl Core {
                 receiver,
                 rates,
                 current: pace.map_or(0, |p| p.seat(&planned.choices) + 1),
+                screen_rate_cap: planned.screen_rate_cap,
             });
         }
         (estimates, streams)
@@ -1511,7 +1518,7 @@ fn screen_budget(
     estimated: u64,
     encoder: u64,
 ) -> (u64, (u64, VideoLimit)) {
-    let probe = configured.0.min(encoder.saturating_mul(10).div_ceil(9));
+    let probe = configured.0.min(budget::wire_rate(encoder));
     let cap = (configured.0.saturating_mul(9) / 10, configured.1)
         .min((
             estimated.saturating_mul(9) / 10,
@@ -1528,6 +1535,7 @@ struct Planned {
     forward: usize,
     /// The decode targets its tier allows, lowest first; none without a descriptor.
     choices: Vec<Choice>,
+    screen_rate_cap: bool,
     /// Whether a full second has measured the source's rates.
     measured: bool,
     /// The target to forward while a spatial downswitch waits for a key

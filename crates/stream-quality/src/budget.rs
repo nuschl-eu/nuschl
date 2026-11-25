@@ -6,6 +6,11 @@
 use crate::adapt::step_up_cost;
 use std::{cmp::Reverse, collections::BinaryHeap};
 
+/// Wire rate for a payload budget that reserves a tenth for packet headers.
+pub fn wire_rate(payload: u64) -> u64 {
+    payload.saturating_add(payload.div_ceil(9))
+}
+
 /// Egress limits in bits per second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -36,9 +41,10 @@ pub struct Stream<'a> {
     /// The rate of each layer choice, lowest first, each including the layers
     /// below it ([`crate::dd::Layers::choices`]).
     pub rates: &'a [u64],
-    /// Choices forwarded now: the base and these cost their rate, higher
-    /// choices [`step_up_cost`].
+    /// Choices forwarded now: the base and these cost their rate.
     pub current: usize,
+    /// Same-resolution upgrades for an adaptive screen use the wire rate.
+    pub screen_rate_cap: bool,
 }
 
 impl Stream<'_> {
@@ -46,6 +52,7 @@ impl Stream<'_> {
         match choices {
             0 => 0,
             n if n <= self.current.max(1) => self.rates[n - 1],
+            n if self.screen_rate_cap => wire_rate(self.rates[n - 1]),
             n => step_up_cost(self.rates[n - 1]),
         }
     }
@@ -148,6 +155,7 @@ mod tests {
             receiver,
             rates: &LAYERS,
             current,
+            screen_rate_cap: false,
         }
     }
 
@@ -275,6 +283,19 @@ mod tests {
             allocate(&wide(100, 100), &[u64::MAX], &[stream(0, 0, 0)]),
             [1]
         );
+    }
+
+    #[test]
+    fn an_adaptive_screen_can_restore_frame_rate_at_its_wire_budget() {
+        let rates = [1_800_000, 3_600_000, 7_200_000];
+        let screen = Stream {
+            rates: &rates,
+            screen_rate_cap: true,
+            ..stream(0, 0, 2)
+        };
+        let limits = wide(u64::MAX, u64::MAX);
+        assert_eq!(allocate(&limits, &[8_000_000], &[screen]), [3]);
+        assert_eq!(allocate(&limits, &[7_999_999], &[screen]), [2]);
     }
 
     #[test]
