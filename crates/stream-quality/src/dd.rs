@@ -2554,6 +2554,7 @@ mod model {
             receiver: 0,
             rates: &rates,
             current,
+            screen_rate_cap: false,
         };
         let given = budget::allocate(&limits, &[viewer.budget], &[stream])[0].layers;
         let wanted = given.checked_sub(1).map(|ceiling| {
