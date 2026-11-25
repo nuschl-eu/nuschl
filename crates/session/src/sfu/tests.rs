@@ -296,9 +296,14 @@ async fn native_publisher_in_call_page_vm() {
         .unwrap();
     let directory = nuschl_testkit::temp_dir();
     let red = red_keyframe(fixture("nuschl-video-worker"), 32, 32).await;
-    // A 1080p camera as VCN 4 codes it: a 1920 × 1082 frame, with the
-    // picture's size in the Dependency Descriptor.
-    let mut camera_keyframe = red_keyframe(fixture("nuschl-video-worker"), 1920, 1082).await;
+    // A synthetic red 1920 × 1082 AV1 keyframe models the coded dimensions
+    // from VCN 4. The Dependency Descriptor carries the 1920 × 1080 picture.
+    // Encoded with FFmpeg libaom-av1, 30 fps, yuv420p, with planes 81/90/240.
+    let mut camera_keyframe = hex::decode(concat!(
+        "12000a0b00000042abbfc3972be401322e100090000000a000200c80adfddb2e813776734d81ffbf",
+        "a6cd65dd9b4095933eec951a5ac2f3e2ca81ee085cb740",
+    ))
+    .unwrap();
     // A 4096-byte AV1 padding OBU makes the encrypted keyframe span several RTP packets.
     camera_keyframe.extend([0x7a, 0x80, 0x20, 0x80]);
     camera_keyframe.resize(camera_keyframe.len() + 4095, 0);
