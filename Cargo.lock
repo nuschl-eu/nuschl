@@ -12005,7 +12005,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "str0m"
 version = "0.25.0"
-source = "git+https://github.com/ambiso/str0m?rev=240d8aa6c45b7cb250b0b5fa62fdf866f7c6fe9f#240d8aa6c45b7cb250b0b5fa62fdf866f7c6fe9f"
+source = "git+https://github.com/ambiso/str0m?rev=7a178effe8d1ffe5200752ae0a66371f4409c81e#7a178effe8d1ffe5200752ae0a66371f4409c81e"
 dependencies = [
  "arrayvec",
  "base64ct",
