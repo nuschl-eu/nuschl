@@ -738,21 +738,22 @@ async fn shared_audio(late: bool) {
     nuschl_testkit::sandbox();
     let crypto = fixture("nuschl-crypto-worker");
     let rtc = fixture("nuschl-rtc-worker");
-    let sfu = nuschl_testkit::sfu::start(fixture("nuschl-stream-sfu"), "");
+    let turn = nuschl_testkit::turn::start();
+    let sfu = nuschl_testkit::sfu::start_with_turn(fixture("nuschl-stream-sfu"), "", &turn.url);
     let (host, roots) = tls_proxy(&sfu).await;
     let directory = nuschl_testkit::temp_dir();
     let posted = format!("https://{host}/call#{LINK}");
     let owner = format!("{posted}&p={OWNER}");
-    let connect = |link| Connect {
+    let connect = |link, relay_only| Connect {
         generation: 1,
         host: &host,
         link,
         codecs: &[Codec::Av1],
-        policy: PeerPolicy::default(),
+        policy: PeerPolicy { relay_only },
     };
     let mut alice = Connection::connect_with_roots(
         CryptoHandle::start(crypto.clone(), directory.path().join("alice")),
-        connect(&owner),
+        connect(&owner, false),
         roots.clone(),
     )
     .await
@@ -760,7 +761,7 @@ async fn shared_audio(late: bool) {
     let join = async || {
         Connection::connect_with_roots(
             CryptoHandle::start(crypto.clone(), directory.path().join("bob")),
-            connect(&posted),
+            connect(&posted, true),
             roots.clone(),
         )
         .await
@@ -843,6 +844,7 @@ async fn shared_audio(late: bool) {
         .await
         .unwrap();
     let mut available = false;
+    let mut relayed = false;
     let mut received = Vec::new();
     // Two packets at once every 40 ms, as an encoder fed by an audio graph's
     // quantum delivers them.
@@ -865,6 +867,7 @@ async fn shared_audio(late: bool) {
                     screen |= matches!(event.expect("publisher remains live").expect("RTC publisher"), MediaEvent::SourceReady { purpose: Purpose::ScreenVideo });
                 }
                 event = bob.next() => match event.expect("viewer remains live").expect("RTC viewer") {
+                    MediaEvent::Route(Route::Sfu(Reason::RelayOnly)) => relayed = true,
                     MediaEvent::SourceAvailable { publisher: from, purpose: Purpose::SystemAudio } => {
                         assert_eq!(from, publisher);
                         available = true;
@@ -883,6 +886,7 @@ async fn shared_audio(late: bool) {
     })
     .await
     .expect("shared audio reaches the viewer");
+    assert!(relayed, "the viewer receives shared audio through the SFU");
     assert!(available, "the viewer subscribes to the audio track");
     // Every packet arrives, and the receiver's clock advances 960 ticks per
     // packet, as the sender's did.
