@@ -113,7 +113,7 @@ class CallTest(VoiceTest):
                    "the fixture window did not resize", timeout=15)
         return previous
 
-    def select_quality(self, app, current, choices, *, above):
+    def select_quality(self, app, current, choices):
         trigger = self.control(app, f"Quality · {current}")
         chat = self.timeline(app)
         chat_bounds = chat.extents()
@@ -123,7 +123,9 @@ class CallTest(VoiceTest):
                            "video quality dropdown did not open")
         _, menu_y, _, menu_height = menu.extents()
         geometry = f"trigger at {trigger_y} with height {trigger_height}, menu at {menu_y} with height {menu_height}"
-        if above:
+        # The dropdown prefers the space above the trigger when its measured
+        # rows fit with the four-pixel gap and eight-pixel viewport margin.
+        if menu_height + 12 <= trigger_y:
             assert menu_y + menu_height <= trigger_y, f"quality menu should open above: {geometry}"
         else:
             assert menu_y >= trigger_y + trigger_height, f"quality menu should fit below: {geometry}"
@@ -436,7 +438,7 @@ class CallTest(VoiceTest):
             self.control(andi, "Open in browser", shown=False)
             self.toggle_quality(andi)
             self.video_stats(andi, show=True)
-            self.select_quality(andi, "Auto", ("Sharp", "Low latency", "Max 720p30"), above=True)
+            self.select_quality(andi, "Auto", ("Sharp", "Low latency", "Max 720p30"))
             self.video_stats(andi, show=False)
             height = self.resize_desktop(andi_pid, 520)
             settings = self.root / "Andi" / "config/settings.json"
@@ -444,7 +446,7 @@ class CallTest(VoiceTest):
                 self.shell.chord("Control_L", "equal")
             eventually(lambda: json.loads(settings.read_text()).get("appearance", {}).get("zoom") == 1.25,
                        "the short fixture window did not reach 125% zoom", timeout=15)
-            self.select_quality(andi, "Max 720p30", ("Auto",), above=False)
+            self.select_quality(andi, "Max 720p30", ("Auto",))
             self.shell.chord("Control_L", "0")
             self.resize_desktop(andi_pid, height)
             self.inline(andi)
