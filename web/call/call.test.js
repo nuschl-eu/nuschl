@@ -191,44 +191,29 @@ test("viewer quality uses tile pixels and the v1 request layout", () => {
   assert.equal(qualityRequest(23, "camera", 0).request, "0100000000000000170000");
 });
 
-test("a receive limit applies before layout and caps the tile's tier", () => {
-  class Element extends EventTarget {
-    constructor(ownerDocument) {
-      super();
-      this.ownerDocument = ownerDocument;
-      this.children = [];
-    }
-    setAttribute() {}
-    replaceChildren(...children) { this.children = children; }
-    append(...children) { this.children.push(...children); }
-  }
-  const document = { createElement: () => new Element(document) };
+test("automatic receive quality follows a visible tile's size", () => {
   const track = { peer: 4, screen: true };
   const video = {};
   const sent = [];
   const view = {
-    document,
     call: { tracks: new Map([["source", track]]), send: (message) => sent.push(message) },
-    tiers: new Map(),
     sentTiers: new WeakMap(),
     sizes: new Map(),
     observer: { observe() {} },
   };
-  const { control, requested } = View.prototype.viewerQuality.call(view, "source", video, track, "Screen");
+  const requested = View.prototype.requestTileQuality.call(view, "source", video, track);
+  const size = view.sizes.get(video);
+  size.resize(0);
   assert.equal(requested(), undefined);
   assert.deepEqual(sent, []);
-  const select = control.children[1];
-  select.value = "2";
-  select.dispatchEvent(new Event("change"));
+  size.resize(1200);
   assert.equal(requested(), TIERS.screen[2]);
   assert.deepEqual(sent, [{ type: "quality", request: "0100000000000000040102" }]);
-  view.sizes.get(video).resize(400);
+  size.resize(400);
   assert.equal(requested(), TIERS.screen[0]);
-  view.sizes.get(video).resize(4000);
-  assert.equal(requested(), TIERS.screen[2]);
-  select.value = "";
-  select.dispatchEvent(new Event("change"));
+  size.resize(4000);
   assert.equal(requested(), TIERS.screen[3]);
+  size.cancel();
 });
 
 test("negotiated video limits follow only the accepted video track", async () => {

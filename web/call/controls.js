@@ -6,7 +6,7 @@
 
 import { TIERS } from "./signal.js";
 
-export function qualityOptions(select, kind) {
+function qualityOptions(select, kind) {
   const option = (label, value) => {
     const entry = select.ownerDocument.createElement("option");
     entry.textContent = label;

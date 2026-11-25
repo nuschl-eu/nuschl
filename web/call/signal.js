@@ -28,7 +28,7 @@ const optional = (check) => (value) => value === undefined || check(value);
 
 const videoLimits = new Map([
   ["within_target", "Within selected quality"],
-  ["receiver_quality", "Viewer quality selection"],
+  ["receiver_quality", "Viewer quality target"],
   ["receiver_decode", "Viewer decoding capacity"],
   ["receiver_bandwidth", "Viewer connection"],
   ["sfu_host", "SFU host upload cap"],

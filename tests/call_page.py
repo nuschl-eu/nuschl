@@ -41,7 +41,6 @@ from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import Select
 
 ORIGIN = "https://stream.test"
 OUT = Path(sys.argv[1])
@@ -477,7 +476,7 @@ try:
     chrome.save_screenshot(str(OUT / "large-screen.png"))
     fox.save_screenshot(str(OUT / "large-screen-firefox.png"))
 
-    # Strip tiles grow with the window, and Auto asks for the camera tier they show.
+    # Strip tiles grow with the window, and the viewer asks for the camera tier they show.
     camera_tier = f"return window.qualityRequests.filter(r => r.startsWith('01{b:016x}00')).at(-1)"
     wait(chrome, f"{camera_tier} === '01{b:016x}0000'", "180p for a strip tile in a small window")
     chrome.set_window_size(2560, 1440)
@@ -488,17 +487,14 @@ try:
     # Actual receiver measurements become available on the selected tile.
     screen_stats = chrome.find_element(By.CSS_SELECTOR, "#large .video-stats")
     screen_stats.find_element(By.TAG_NAME, "summary").click()
-    quality = Select(screen_stats.find_element(By.TAG_NAME, "select"))
-    assert quality.first_selected_option.text == "Auto"
-    # In a larger window Auto fits the large tile above 720p15; a limit caps it.
-    chrome.set_window_size(2560, 1600)
+    assert not screen_stats.find_elements(By.TAG_NAME, "select")
     lowest = f"01{c:016x}0100"
     latest = f"return window.qualityRequests.filter(r => r.startsWith('{lowest[:-2]}')).at(-1)"
+    wait(chrome, f"{latest} === '{lowest}'", "720p15 for the screen in a small window")
+    chrome.set_window_size(2560, 1600)
     wait(chrome, f"{latest} !== '{lowest}'", "receive quality fits the tile")
-    quality.select_by_value("0")
-    wait(chrome, f"{latest} === '{lowest}'", "receive limit")
-    quality.select_by_value("")
     chrome.set_window_size(1280, 800)
+    wait(chrome, f"{latest} === '{lowest}'", "720p15 again in a small window")
     wait(chrome, """
       const panel = document.querySelector('#large .video-stats[open]');
       if (!panel) return false;

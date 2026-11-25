@@ -41,7 +41,7 @@ body.standalone-call {
 .video-session #notice { color: var(--muted); }
 .video-session #notice.warning { color: var(--warning, var(--bad)); font-weight: 600; }
 .video-session .tile[data-own]:not([data-screen]) video { transform: scaleX(-1); }
-/* Tiles grow with the stage, so Auto asks for the camera tier a tile shows: grid
+/* Tiles grow with the stage, so the viewer asks for the camera tier a tile shows: grid
    tiles at least 40 % of the stage height wide, strip tiles about a fifth of it tall. */
 .video-session #stage { grid-area: stage; display: flex; flex-direction: column; gap: 8px; padding: 8px; min-height: 0; min-width: 0; container-type: size; }
 .video-session #large { flex: 1; min-height: 0; display: flex; }
@@ -91,7 +91,6 @@ body.standalone-call {
 .video-session .video-stats[open] { max-width: calc(100% - 16px); }
 .video-session .video-stats summary { cursor: pointer; display: list-item; padding: 10px 8px; }
 .video-session .video-stats summary:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
-.video-session .viewer-quality { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 0 8px 6px; }
 .video-session .video-stats p { color: var(--muted); margin: 0; padding: 0 8px; }
 .video-session .video-stats dl { display: grid; grid-template-columns: auto auto; gap: 2px 8px; margin: 0; padding: 0 8px 6px; }
 .video-session .video-stats dt { color: var(--muted); }
