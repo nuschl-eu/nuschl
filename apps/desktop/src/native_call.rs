@@ -445,9 +445,7 @@ impl Surface {
                                 let height = fitted.size.width.min(fitted.size.height);
                                 let pixels = (f32::from(height) * window.scale_factor()) as u32;
                                 preferences.send_if_modified(|selection| {
-                                    selection.change(stream.feed, &sources, |preference| {
-                                        preference.pixels = pixels
-                                    })
+                                    selection.resize_tile(stream, &sources, pixels)
                                 });
                             },
                         )
@@ -1034,13 +1032,15 @@ fn panel_with_toolbar(
     let has_video_area = surface.sources.iter().next().is_some();
     let selection = *call.quality.borrow();
     let stream = surface.sources.featured(selection.view);
-    let featured = call.featured(&surface.sources, selection);
+    let local_feed = call
+        .featured(&surface.sources, selection)
+        .filter(|feed| feed.publisher.is_none());
     let stats = surface
         .stats
         .as_ref()
         .filter(|stats| Some(stats.stream) == stream)
         .cloned();
-    let owned = featured.is_some_and(|feed| feed.publisher.is_none());
+    let owned = local_feed.is_some();
     let many_sources = surface.sources.iter().nth(1).is_some();
     let menu_target = this.menu.as_ref().map(|menu| menu.target);
     let actions = layout::actions()
@@ -1074,11 +1074,11 @@ fn panel_with_toolbar(
                 cx,
             ))
         })
-        .when_some(featured, |actions, feed| {
+        .when_some(local_feed, |actions, feed| {
             let target = MenuTarget::VideoQuality(generation, feed);
             let quality = quality_readout(
                 feed.kind,
-                selection.preference(feed).quality,
+                selection.preference(feed.kind).quality,
                 stats.as_deref(),
             );
             actions.child(call_dropdown(
@@ -1279,28 +1279,28 @@ impl Desktop {
         }
     }
 
-    /// The featured feed's menu: Sharp, Smooth and Low latency for an own
-    /// source, then Auto and the tier limits.
+    /// The featured local feed's menu: Sharp, Smooth, Low latency and quality limits.
     pub(crate) fn video_quality_commands(
         &self,
         generation: u64,
         feed: Feed,
     ) -> impl Iterator<Item = (VideoChoice, String, bool)> {
         let kind = feed.kind;
-        let current = self.call_with_generation(generation).and_then(|call| {
-            let selection = *call.quality.borrow();
-            (call.featured(&call.updates.sources(), selection) == Some(feed))
-                .then(|| selection.preference(feed))
-        });
+        let current = self
+            .call_with_generation(generation)
+            .filter(|_| feed.publisher.is_none())
+            .and_then(|call| {
+                let selection = *call.quality.borrow();
+                (call.featured(&call.updates.sources(), selection) == Some(feed))
+                    .then(|| selection.preference(kind))
+            });
         let modes = [
             VideoChoice::Prefer(Prefer::Sharp),
             VideoChoice::Prefer(Prefer::Smooth),
             VideoChoice::LowLatency,
         ];
-        let own = feed.publisher.is_none();
         modes
             .into_iter()
-            .filter(move |_| own)
             .chain(
                 std::iter::once(Quality::Auto)
                     .chain((0..=kind.top() as u8).map(Quality::Tier))
@@ -1337,11 +1337,13 @@ impl Desktop {
         choice: VideoChoice,
         cx: &mut Context<Self>,
     ) {
-        if let Some(call) = self.call_with_generation(generation) {
+        if feed.publisher.is_none()
+            && let Some(call) = self.call_with_generation(generation)
+        {
             let sources = call.updates.sources();
             call.quality.send_if_modified(|selection| {
                 call.featured(&sources, *selection) == Some(feed)
-                    && selection.change(feed, &sources, |preference| {
+                    && selection.change_preference(feed.kind, |preference| {
                         let mode = preference.mode(feed.kind);
                         match choice {
                             VideoChoice::Quality(quality) => preference.quality = quality,
@@ -1511,14 +1513,11 @@ fn call_dropdown(
 
 fn quality_readout(kind: VideoKind, quality: Quality, stats: Option<&VideoStats>) -> String {
     if quality == Quality::Auto
-        && let Some(stats) = stats.filter(|stats| stats.stream.feed.kind == kind)
+        && let Some(encoder) = stats
+            .filter(|stats| stats.stream.feed == Feed::local(kind))
+            .and_then(|stats| stats.encoder)
     {
-        if let Some(encoder) = stats.encoder {
-            return format!("Auto ({}p{})", encoder.target.height, encoder.target.fps);
-        }
-        if let Some(height) = stats.sample.height() {
-            return format!("Auto ({height}p)");
-        }
+        return format!("Auto ({}p{})", encoder.target.height, encoder.target.fps);
     }
     quality_label(kind, quality)
 }
@@ -1547,7 +1546,7 @@ fn apply_modes(media: &Media, selection: Selection) -> Result<(), String> {
     for kind in [VideoKind::Camera, VideoKind::Screen] {
         let feed = Feed::local(kind);
         media
-            .set_mode(feed.purpose(), selection.preference(feed).mode(kind))
+            .set_mode(feed.purpose(), selection.preference(kind).mode(kind))
             .map_err(text)?;
     }
     Ok(())
@@ -2192,7 +2191,7 @@ mod tests {
     use nuschl_ipc::video::CaptureLimits;
 
     #[test]
-    fn auto_quality_shows_the_current_encoder_target_or_received_resolution() {
+    fn auto_quality_shows_the_current_encoder_target() {
         let now = Instant::now();
         let kind = VideoKind::Screen;
         let mut measurements = stats::Stats::new(false, now);
@@ -2207,10 +2206,7 @@ mod tests {
             encoder: None,
         };
         assert_eq!(quality_readout(kind, Quality::Auto, None), "Auto");
-        assert_eq!(
-            quality_readout(kind, Quality::Auto, Some(&video)),
-            "Auto (1080p)"
-        );
+        assert_eq!(quality_readout(kind, Quality::Auto, Some(&video)), "Auto");
         video.encoder = Some(stats::Encoder {
             requested: CaptureLimits {
                 height: 1440,

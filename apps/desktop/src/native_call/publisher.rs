@@ -157,8 +157,7 @@ impl Publisher {
             hardware: None,
             capture_format: None,
         };
-        let feed = Feed::local(encoding.kind);
-        let applied = encoding.ceiling(selection.preference(feed).quality);
+        let applied = encoding.ceiling(selection.preference(encoding.kind).quality);
         let (pictures, mut previews) = mpsc::channel(1);
         #[cfg(target_os = "linux")]
         let (capture, has_preview) = if attempt.mode == CaptureMode::Hardware {
@@ -185,7 +184,7 @@ impl Publisher {
         );
         let preview = has_preview.then(|| {
             let stream = Stream {
-                feed,
+                feed: Feed::local(encoding.kind),
                 serial: preview_id,
                 preview: true,
             };
@@ -381,7 +380,7 @@ impl Publisher {
         let camera_ceiling = self.slots[index(Source::Camera)]
             .as_ref()
             .map_or(0, |track| {
-                let quality = selection.preference(Feed::local(VideoKind::Camera)).quality;
+                let quality = selection.preference(VideoKind::Camera).quality;
                 u64::from(track.encoding.ceiling(quality).bitrate)
             });
         // Reserve packet and SFrame overhead, then give each source the rate
@@ -392,7 +391,7 @@ impl Publisher {
                 continue;
             };
             let feed = Feed::local(track.encoding.kind);
-            let quality = selection.preference(feed).quality;
+            let quality = selection.preference(feed.kind).quality;
             track.encoding.bitrate_estimate = available.map(|total| {
                 let camera = camera_ceiling.min(total / 2);
                 let bitrate = match source {

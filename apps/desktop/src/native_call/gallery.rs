@@ -6,7 +6,6 @@ use nuschl_ipc::video::Source;
 use nuschl_protocol::sfu::Mode;
 
 pub(super) const REMOTE_SOURCES: usize = 16;
-const SOURCES: usize = 2 + REMOTE_SOURCES;
 pub(super) const REMOTE_TILES: usize = 2;
 pub(super) const TILES: usize = 2 + REMOTE_TILES;
 
@@ -118,7 +117,6 @@ impl Sources {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Preference {
     pub(super) quality: Quality,
-    pub(super) pixels: u32,
     /// An own source's mode; `None` for its kind's default.
     pub(super) mode: Option<Mode>,
 }
@@ -127,7 +125,6 @@ impl Default for Preference {
     fn default() -> Self {
         Self {
             quality: Quality::Auto,
-            pixels: 0,
             mode: None,
         }
     }
@@ -144,45 +141,49 @@ impl Preference {
 pub(super) struct Selection {
     pub(super) view: Option<Feed>,
     pub(super) tiled: bool,
-    preferences: [Option<(Feed, Preference)>; SOURCES],
+    preferences: [Preference; 2],
+    tile_pixels: [Option<(Stream, u32)>; REMOTE_SOURCES],
 }
 
 impl Selection {
-    pub(super) fn preference(&self, feed: Feed) -> Preference {
-        self.preferences
-            .iter()
-            .flatten()
-            .find_map(|(key, settings)| (*key == feed).then_some(*settings))
-            .unwrap_or_default()
+    pub(super) fn preference(&self, kind: VideoKind) -> Preference {
+        self.preferences[preference_index(kind)]
     }
 
-    pub(super) fn change(
+    pub(super) fn change_preference(
         &mut self,
-        feed: Feed,
-        sources: &Sources,
+        kind: VideoKind,
         change: impl FnOnce(&mut Preference),
     ) -> bool {
-        let previous = self.preference(feed);
-        let mut preference = previous;
-        change(&mut preference);
-        if preference == previous {
-            return false;
-        }
-        if let Some(index) = self
-            .preferences
+        let preference = &mut self.preferences[preference_index(kind)];
+        let previous = *preference;
+        change(preference);
+        *preference != previous
+    }
+
+    pub(super) fn tile_pixels(&self, slot: usize, stream: Stream) -> u32 {
+        self.tile_pixels[slot]
+            .filter(|(current, _)| *current == stream)
+            .map_or(0, |(_, pixels)| pixels)
+    }
+
+    pub(super) fn resize_tile(&mut self, stream: Stream, sources: &Sources, pixels: u32) -> bool {
+        let Some(slot) = sources
+            .remote
             .iter()
-            .position(|entry| entry.is_some_and(|(key, _)| key == feed))
-            .or_else(|| {
-                self.preferences.iter().position(|entry| {
-                    entry.is_none_or(|(key, _)| !sources.iter().any(|stream| stream.feed == key))
-                })
-            })
-        {
-            self.preferences[index] = Some((feed, preference));
-            true
-        } else {
-            false
-        }
+            .position(|source| *source == Some(stream))
+        else {
+            return false;
+        };
+        let measurement = Some((stream, pixels));
+        std::mem::replace(&mut self.tile_pixels[slot], measurement) != measurement
+    }
+}
+
+fn preference_index(kind: VideoKind) -> usize {
+    match kind {
+        VideoKind::Camera => 0,
+        VideoKind::Screen => 1,
     }
 }
 
@@ -224,17 +225,21 @@ mod tests {
     }
 
     #[test]
-    fn two_cameras_keep_separate_quality_and_pixel_requests() {
+    fn sender_quality_and_viewer_tile_sizes_are_independent() {
         let mut sources = Sources::default();
-        let camera = Feed::local(VideoKind::Camera);
-        let guest = Feed::remote(1, Purpose::Camera).unwrap();
-        sources.local[0] = Some(stream(camera, 1));
-        sources.remote[0] = Some(stream(guest, 1));
+        let kind = VideoKind::Camera;
+        let guest = stream(Feed::remote(1, Purpose::Camera).unwrap(), 1);
+        sources.remote[0] = Some(guest);
         let mut selection = Selection::default();
-        assert!(selection.change(camera, &sources, |choice| choice.quality = Quality::Tier(2)));
-        assert!(selection.change(guest, &sources, |choice| choice.pixels = 720));
-        assert_eq!(selection.preference(camera).quality, Quality::Tier(2));
-        assert_eq!(selection.preference(guest).quality, Quality::Auto);
-        assert_eq!(selection.preference(guest).pixels, 720);
+        assert!(selection.change_preference(kind, |choice| choice.quality = Quality::Tier(2)));
+        assert!(selection.resize_tile(guest, &sources, 720));
+        assert!(!selection.resize_tile(guest, &sources, 720));
+        assert_eq!(selection.preference(kind).quality, Quality::Tier(2));
+        assert_eq!(
+            selection.preference(VideoKind::Screen).quality,
+            Quality::Auto
+        );
+        assert_eq!(selection.tile_pixels(0, guest), 720);
+        assert_eq!(selection.tile_pixels(0, stream(guest.feed, 2)), 0);
     }
 }
