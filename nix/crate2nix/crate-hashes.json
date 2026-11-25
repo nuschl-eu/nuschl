@@ -1,6 +1,6 @@
 {
   "git+https://github.com/ambiso/opus-rs#0.1.42": "088db5q9mwjm161ckvjcdpfnss0q66fp4gdfvcx59mfmqi0nrh4p",
-  "git+https://github.com/ambiso/str0m?rev=faa6cd05cac7d88bb4dfa46dfd87c13324dacafd#0.25.0": "1csmk7xvkwmhys4mbs85pfdfmp2xg1rgha1zc8cv5xagy0zq9xnw",
+  "git+https://github.com/ambiso/str0m?rev=7a178effe8d1ffe5200752ae0a66371f4409c81e#0.25.0": "09plcp93y6q7mx7c8fwbzpd4l80xln5zd51vp97kk2ha0rflhinl",
   "git+https://github.com/chromeos/cros-libva?rev=59384456ac2ae78c0c3e5515f41ef1efd9b802cf#0.0.13": "02k4432vc2pn7h6l6bw73vy05dg0r6rdp1xjkrqib5z3jd0hspz9",
   "git+https://github.com/memorysafety/rav1d?rev=2e7216c20ac2a75de204d6c8d7268b75a45959b4#1.1.1": "1llirkmg890d4r0pwx0flbbix9lk5qhk7jy1lqzk56k1hw3h3n5g"
 }

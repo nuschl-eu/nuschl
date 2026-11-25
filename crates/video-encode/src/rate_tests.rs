@@ -222,6 +222,64 @@ fn drops_frames_under_a_tight_budget() {
 }
 
 #[test]
+fn an_over_budget_delta_keeps_the_next_frames_references() {
+    struct FixedSize;
+
+    impl Backend for FixedSize {
+        type Input = usize;
+        type Error = Infallible;
+
+        fn encode(&mut self, len: &usize, _: &Frame<'_>) -> Result<Vec<u8>, Infallible> {
+            Ok(vec![0; *len])
+        }
+    }
+
+    let config = Config {
+        fps: 60,
+        frame_bytes: 1 << 20,
+        ..camera(7_200_000, Layering::L1T3)
+    };
+    let mut encoder = Encoder::new(FixedSize, config).unwrap();
+    let key = encoder.encode(&64, Duration::ZERO).unwrap().unwrap();
+    assert!(key.keyframe);
+    let first = encoder
+        .encode(&180_000, Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    // The scene change consumed 180 kB of the 270 kB quiet credit. One
+    // frame interval adds about 15 kB, which leaves the next burst unfunded.
+    assert!(
+        encoder
+            .encode(&180_000, Duration::from_millis(1017))
+            .unwrap()
+            .is_none()
+    );
+    let resumed = encoder
+        .encode(&1024, Duration::from_millis(1034))
+        .unwrap()
+        .unwrap();
+    assert!(!resumed.keyframe);
+    let frame_number =
+        |frame: Encoded| u16::from_be_bytes([frame.descriptor[1], frame.descriptor[2]]);
+    assert_eq!(frame_number(resumed), frame_number(first) + 1);
+
+    // A picture bigger than a full window can still go out after a quiet
+    // period. Its cost prevents another burst until the credit recovers.
+    let oversized = encoder
+        .encode(&300_000, Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert!(!oversized.keyframe);
+    assert_eq!(oversized.data.len(), 300_000);
+    assert!(
+        encoder
+            .encode(&1024, Duration::from_millis(2017))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn a_still_screen_refines_and_a_change_keeps_the_window() {
     let config = Config {
         width: 1920,

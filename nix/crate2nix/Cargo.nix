@@ -42186,8 +42186,8 @@ rec {
         workspace_member = null;
         src = pkgs.fetchgit {
           url = "https://github.com/ambiso/str0m";
-          rev = "faa6cd05cac7d88bb4dfa46dfd87c13324dacafd";
-          sha256 = "1csmk7xvkwmhys4mbs85pfdfmp2xg1rgha1zc8cv5xagy0zq9xnw";
+          rev = "7a178effe8d1ffe5200752ae0a66371f4409c81e";
+          sha256 = "09plcp93y6q7mx7c8fwbzpd4l80xln5zd51vp97kk2ha0rflhinl";
         };
         authors = [
           "Martin Algesten <martin@algesten.se>"

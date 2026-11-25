@@ -296,9 +296,14 @@ async fn native_publisher_in_call_page_vm() {
         .unwrap();
     let directory = nuschl_testkit::temp_dir();
     let red = red_keyframe(fixture("nuschl-video-worker"), 32, 32).await;
-    // A 1080p camera as VCN 4 codes it: a 1920 × 1082 frame, with the
-    // picture's size in the Dependency Descriptor.
-    let mut camera_keyframe = red_keyframe(fixture("nuschl-video-worker"), 1920, 1082).await;
+    // A synthetic red 1920 × 1082 AV1 keyframe models the coded dimensions
+    // from VCN 4. The Dependency Descriptor carries the 1920 × 1080 picture.
+    // Encoded with FFmpeg libaom-av1, 30 fps, yuv420p, with planes 81/90/240.
+    let mut camera_keyframe = hex::decode(concat!(
+        "12000a0b00000042abbfc3972be401322e100090000000a000200c80adfddb2e813776734d81ffbf",
+        "a6cd65dd9b4095933eec951a5ac2f3e2ca81ee085cb740",
+    ))
+    .unwrap();
     // A 4096-byte AV1 padding OBU makes the encrypted keyframe span several RTP packets.
     camera_keyframe.extend([0x7a, 0x80, 0x20, 0x80]);
     camera_keyframe.resize(camera_keyframe.len() + 4095, 0);
@@ -401,6 +406,11 @@ async fn native_publisher_in_call_page_vm() {
 async fn native_video_crosses_the_sfu_between_confined_rtc_workers() {
     let _media = MEDIA_TEST.lock().await;
     native_video_for_policy(false).await;
+}
+
+#[tokio::test]
+async fn relay_only_native_video_recovers_after_a_rejected_keyframe() {
+    let _media = MEDIA_TEST.lock().await;
     native_video_for_policy(true).await;
 }
 
@@ -462,43 +472,56 @@ async fn native_video_for_policy(relay_only: bool) {
 
     async fn rendered(media: &mut Media, publisher: u64, key: bool) -> (u64, Vec<u8>) {
         loop {
-            if let MediaEvent::Frame {
-                publisher: sender,
-                purpose,
-                key_frame,
-                timestamp,
-                data,
-                ..
-            } = media
+            match media
                 .next()
                 .await
                 .expect("viewer remains live")
                 .expect("RTC viewer")
             {
-                assert_eq!(sender, publisher);
-                assert_eq!(purpose, Purpose::ScreenVideo);
-                if key_frame == key {
-                    return (timestamp, data);
+                MediaEvent::Route(route) => assert!(matches!(route, Route::Sfu(_))),
+                MediaEvent::Frame {
+                    publisher: sender,
+                    purpose,
+                    key_frame,
+                    timestamp,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(sender, publisher);
+                    assert_eq!(purpose, Purpose::ScreenVideo);
+                    if key_frame == key {
+                        return (timestamp, data);
+                    }
                 }
+                _ => {}
             }
         }
     }
+
+    async fn keyframe_requested(publisher: &mut Media) {
+        while !matches!(
+            publisher
+                .next()
+                .await
+                .expect("publisher remains live")
+                .expect("RTC publisher"),
+            MediaEvent::SourceKeyframeRequired { .. }
+        ) {}
+    }
+
     nuschl_testkit::sandbox();
     let crypto = fixture("nuschl-crypto-worker");
     let rtc = fixture("nuschl-rtc-worker");
     let video = fixture("nuschl-video-worker");
-    let turn = relay_only.then(nuschl_testkit::turn::start);
-    let sfu = match &turn {
-        Some(turn) => {
-            nuschl_testkit::sfu::start_with_turn(fixture("nuschl-stream-sfu"), "", &turn.url)
-        }
-        None => nuschl_testkit::sfu::start(fixture("nuschl-stream-sfu"), ""),
-    };
+    // A relay-only viewer keeps the SFU route while the test presents
+    // dependent AV1 frames. The publisher exercises both connection policies.
+    let turn = nuschl_testkit::turn::start();
+    let sfu = nuschl_testkit::sfu::start_with_turn(fixture("nuschl-stream-sfu"), "", &turn.url);
     let (host, roots) = tls_proxy(&sfu).await;
     let directory = nuschl_testkit::temp_dir();
     let posted = format!("https://{host}/call#{LINK}");
     let owner = format!("{posted}&p={OWNER}");
-    let connect = |link| Connect {
+    let connect = |link, relay_only| Connect {
         generation: 1,
         host: &host,
         link,
@@ -507,7 +530,7 @@ async fn native_video_for_policy(relay_only: bool) {
     };
     let mut alice = Connection::connect_with_roots(
         CryptoHandle::start(crypto.clone(), directory.path().join("alice")),
-        connect(&owner),
+        connect(&owner, relay_only),
         roots.clone(),
     )
     .await
@@ -522,7 +545,7 @@ async fn native_video_for_policy(relay_only: bool) {
     }
     let bob = Connection::connect_with_roots(
         CryptoHandle::start(crypto, directory.path().join("bob")),
-        connect(&posted),
+        connect(&posted, true),
         roots,
     )
     .await
@@ -599,7 +622,7 @@ async fn native_video_for_policy(relay_only: bool) {
                 .unwrap()
         );
         phase = "first dependent frame";
-        let (_, delta) = rendered(&mut bob, publisher, false).await;
+        let (delta_timestamp, delta) = rendered(&mut bob, publisher, false).await;
         assert_eq!(delta, DELTAS[0]);
         let next = decoder
             .decode(false, delta)
@@ -627,17 +650,24 @@ async fn native_video_for_policy(relay_only: bool) {
             .is_err()
         );
         phase = "keyframe request after a dropped sample";
-        loop {
-            if matches!(
-                alice
-                    .next()
-                    .await
-                    .expect("publisher remains live")
-                    .expect("RTC publisher"),
-                MediaEvent::SourceKeyframeRequired { .. }
-            ) {
-                break;
-            }
+        keyframe_requested(&mut alice).await;
+        if relay_only {
+            // Reuse the last accepted RTP timestamp to make the RTC worker
+            // reject the replacement keyframe on the same publishing leg.
+            assert!(alice.send_keyframe(delta_timestamp, KEY.to_vec()).unwrap());
+            timeout(Duration::from_millis(700), async {
+                loop {
+                    tokio::select! {
+                        () = keyframe_requested(&mut alice) => break,
+                        () = tokio::time::sleep(FRAME_INTERVAL) => {
+                            frame += 1;
+                            alice.send_frame(frame * 3_060, false, DELTAS[0].to_vec()).unwrap();
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("a rejected replacement keyframe needs a prompt retry");
         }
         phase = "recovery keyframe";
         send_until_keyframe(&mut alice, &mut bob, publisher, &mut frame, &KEY).await;

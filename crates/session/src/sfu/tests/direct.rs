@@ -570,7 +570,9 @@ async fn shared_audio_follows_the_screen_onto_the_direct_leg() {
     nuschl_testkit::sandbox();
     let crypto = fixture("nuschl-crypto-worker");
     let rtc = fixture("nuschl-rtc-worker");
-    let sfu = nuschl_testkit::sfu::start(fixture("nuschl-stream-sfu"), "");
+    // The host has no lease renewer in this test. Keep the room alive through
+    // both handshakes and the 60-second direct-audio assertion.
+    let sfu = nuschl_testkit::sfu::start(fixture("nuschl-stream-sfu"), "lease_secs = 90");
     let (host, roots) = tls_proxy(&sfu).await;
     let directory = nuschl_testkit::temp_dir();
     let posted = format!("https://{host}/call#{LINK}");
@@ -619,6 +621,8 @@ async fn shared_audio_follows_the_screen_onto_the_direct_leg() {
     let packet = |n: u64| [nuschl_core::audio::SILENT_OPUS.as_slice(), &n.to_be_bytes()].concat();
     let mut video = tokio::time::interval(Duration::from_millis(33));
     let mut audio = tokio::time::interval(Duration::from_millis(20));
+    video.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    audio.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (mut ready, mut timestamp, mut sent) = (false, 0, 0_u64);
     let mut routes = [None; 2];
     // The consecutive packets the viewer received while both endpoints were direct.
@@ -629,7 +633,17 @@ async fn shared_audio_follows_the_screen_onto_the_direct_leg() {
             let (index, event) = tokio::select! {
                 _ = video.tick(), if ready => {
                     timestamp += 2970;
-                    publisher.send_source_frame(Purpose::ScreenVideo, timestamp, true, picture.clone()).unwrap();
+                    if let Err(error) = publisher.send_source_frame(Purpose::ScreenVideo, timestamp, true, picture.clone()) {
+                        let terminal = timeout(HANDSHAKE, async {
+                            while let Some(event) = publisher.next().await {
+                                if let Err(error) = event {
+                                    return Some(error);
+                                }
+                            }
+                            None
+                        }).await;
+                        panic!("publisher send failed ({error}), terminal error {terminal:?}, routes {routes:?}");
+                    }
                     continue;
                 }
                 _ = audio.tick() => {

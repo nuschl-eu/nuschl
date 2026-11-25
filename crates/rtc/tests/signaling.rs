@@ -67,6 +67,7 @@ fn relay_offer_advertises_the_allocation_as_its_only_candidate() {
         VideoCodec::Av1,
         1024 * 1024,
         true,
+        true,
     )
     .unwrap();
     let offer = peer
