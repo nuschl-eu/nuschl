@@ -424,13 +424,13 @@ async fn native_video_follows_the_upload_and_relay_only_stays_relayed() {
     let crypto = fixture("nuschl-crypto-worker");
     let rtc = fixture("nuschl-rtc-worker");
     let turn = nuschl_testkit::turn::start();
-    // The SFU saves the bytes it sent once a second.
+    // The SFU publishes the charged byte count once a second.
     let sfu = nuschl_testkit::sfu::start_with_turn(
         fixture("nuschl-stream-sfu"),
         "traffic_budget = 1000000000000000\nstate_directory = \"{directory}\"",
         &turn.url,
     );
-    let traffic = sfu.directory.path().join("traffic");
+    let traffic = sfu.directory.path().join("traffic.usage");
     let sent = || -> u64 {
         let count = std::fs::read_to_string(&traffic).unwrap();
         count.split_whitespace().nth(1).unwrap().parse().unwrap()

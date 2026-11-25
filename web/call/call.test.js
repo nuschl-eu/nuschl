@@ -248,6 +248,9 @@ test("negotiated video limits follow only the accepted video track", async () =>
   await call.receive(parse(JSON.stringify({ ...hello, video_limits: true, screen_rate: true })));
   assert.equal(messages[1].video_limits, true);
   assert.equal(messages[1].screen_rate, true);
+  assert.equal(messages[1].max_screen_bitrate, undefined);
+  await call.receive(parse(JSON.stringify({ ...hello, video_limits: true, screen_rate: true, max_screen_bitrate: 100_000_000 })));
+  assert.equal(messages[2].max_screen_bitrate, 100_000_000);
   assert.throws(() => parse(JSON.stringify({ ...hello, screen_rate: 1 })), /malformed hello/);
   await call.receive(parse(JSON.stringify({ ...report, peer: 7 })));
   assert.equal(track.limit, undefined);
@@ -264,7 +267,7 @@ test("publisher quality applies bounded encoder limits to the matching MID", asy
   const request = "0100000000000000040100";
   const quality = { type: "quality", request, source: "3", max_height: 720, max_fps: 15, max_bitrate: 800_000 };
   assert.equal(parse(JSON.stringify({ type: "quality", request })), null);
-  for (const limits of [{ source: "x".repeat(17) }, { max_height: 0 }, { max_fps: 61 }, { max_bitrate: 1.5 }, { max_bitrate: 50_000_001 }]) {
+  for (const limits of [{ source: "x".repeat(17) }, { max_height: 0 }, { max_fps: 61 }, { max_bitrate: 1.5 }, { max_bitrate: 100_000_001 }]) {
     assert.throws(() => parse(JSON.stringify({ ...quality, ...limits })), /malformed quality/);
   }
 

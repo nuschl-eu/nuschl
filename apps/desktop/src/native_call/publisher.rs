@@ -363,18 +363,31 @@ impl Publisher {
     }
 
     pub fn retune(&mut self, display: &Display<'_>, selection: Selection, report: Option<Feed>) {
-        let count = self.slots.iter().flatten().count().max(1) as u64;
-        // RTC charges packet and SFrame overhead and splits the video budget across enabled sources.
-        let share = self
-            .estimate
-            .map(|rate| (rate.saturating_mul(72) / 100 / count).min(50_000_000) as u32);
+        let has_screen = self.slots[index(Source::Screen)].is_some();
+        let camera_ceiling = self.slots[index(Source::Camera)]
+            .as_ref()
+            .map_or(0, |track| {
+                let quality = selection.preference(Feed::local(VideoKind::Camera)).quality;
+                u64::from(track.encoding.ceiling(quality).bitrate)
+            });
+        // Reserve packet and SFrame overhead, then give each source the rate
+        // it can use. Under congestion, an active camera and screen share it.
+        let available = self.estimate.map(|rate| rate.saturating_mul(72) / 100);
         for source in SOURCES {
             let Some(track) = self.slots[index(source)].as_mut() else {
                 continue;
             };
             let feed = Feed::local(track.encoding.kind);
             let quality = selection.preference(feed).quality;
-            track.encoding.bitrate_estimate = share;
+            track.encoding.bitrate_estimate = available.map(|total| {
+                let camera = camera_ceiling.min(total / 2);
+                let bitrate = match source {
+                    Source::Camera if has_screen => camera,
+                    Source::Screen => total - camera,
+                    Source::Camera => total,
+                };
+                bitrate.min(nuschl_protocol::sfu::MAX_SCREEN_BITRATE) as u32
+            });
             let next = track.encoding.limits(quality, track.applied);
             // Capture closure is reported by Capture::next.
             if next != track.applied && track.capture.set_limits(next).is_ok() {
@@ -633,7 +646,7 @@ impl Encoding {
 }
 
 fn video_rate(bitrate: u64) -> u32 {
-    bitrate.clamp(64_000, 50_000_000) as u32
+    bitrate.clamp(64_000, nuschl_protocol::sfu::MAX_SCREEN_BITRATE) as u32
 }
 
 #[cfg(test)]

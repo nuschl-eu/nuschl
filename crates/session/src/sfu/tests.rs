@@ -298,8 +298,12 @@ async fn native_publisher_in_call_page_vm() {
     let red = red_keyframe(fixture("nuschl-video-worker"), 32, 32).await;
     // A 1080p camera as VCN 4 codes it: a 1920 × 1082 frame, with the
     // picture's size in the Dependency Descriptor.
+    let mut camera_keyframe = red_keyframe(fixture("nuschl-video-worker"), 1920, 1082).await;
+    // A 4096-byte AV1 padding OBU makes the encrypted keyframe span several RTP packets.
+    camera_keyframe.extend([0x7a, 0x80, 0x20, 0x80]);
+    camera_keyframe.resize(camera_keyframe.len() + 4095, 0);
     let mut camera = nuschl_video_encode::Encoder::new(
-        Repeat(red_keyframe(fixture("nuschl-video-worker"), 1920, 1082).await),
+        Repeat(camera_keyframe),
         nuschl_video_encode::Config {
             width: 1920,
             height: 1080,

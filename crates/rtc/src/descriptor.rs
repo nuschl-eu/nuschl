@@ -2,7 +2,8 @@
 //! The AV1 Dependency Descriptor header extension on sent video. The encoder
 //! writes one descriptor per frame with start and end of frame set; each
 //! packet keeps start of frame only on the frame's first packet and end of
-//! frame only on its last, as the SFU's layer selection reads them.
+//! frame only on its last. The encoder's optional template structure travels
+//! on the first packet.
 
 use std::sync::Arc;
 use str0m::rtp::{Extension, ExtensionSerializer, ExtensionValues, PacketPosition};
@@ -22,13 +23,17 @@ impl ExtensionSerializer for Serializer {
         let Some(Descriptor(bytes)) = ev.user_values.get::<Descriptor>() else {
             return 0;
         };
+        let position = ev.user_values.get::<PacketPosition>();
+        let bytes = if position.is_some_and(|position| !position.first) {
+            &bytes[..bytes.len().min(3)]
+        } else {
+            bytes.as_ref()
+        };
         let Some(out) = buf.get_mut(..bytes.len()) else {
             return 0;
         };
         out.copy_from_slice(bytes);
-        if let (Some(first), Some(position)) =
-            (out.first_mut(), ev.user_values.get::<PacketPosition>())
-        {
+        if let (Some(first), Some(position)) = (out.first_mut(), position) {
             if !position.first {
                 *first &= !0x80;
             }
@@ -68,19 +73,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_packet_marks_its_place_in_the_frame() {
+    fn only_the_first_packet_carries_the_keyframe_structure() {
         let mut values = ExtensionValues::default();
         values
             .user_values
-            .set(Descriptor(Arc::from(&[0xc1, 0x02, 0x03][..])));
-        let mut written = Vec::new();
-        for (first, last) in [(true, false), (false, false), (false, true)] {
+            .set(Descriptor(Arc::from(&[0xc1, 0x02, 0x03, 0x80, 0x04][..])));
+        for (first, last, expected) in [
+            (true, false, &[0x81, 0x02, 0x03, 0x80, 0x04][..]),
+            (false, false, &[0x01, 0x02, 0x03][..]),
+            (false, true, &[0x41, 0x02, 0x03][..]),
+            (true, true, &[0xc1, 0x02, 0x03, 0x80, 0x04][..]),
+        ] {
             values.user_values.set(PacketPosition { first, last });
             let mut buf = [0; 16];
-            assert_eq!(Serializer.write_to(&mut buf, &values), 3);
-            written.push(buf[0]);
+            let len = Serializer.write_to(&mut buf, &values);
+            assert_eq!(&buf[..len], expected);
         }
-        assert_eq!(written, [0x81, 0x01, 0x41]);
         let mut short = [0; 2];
         assert_eq!(Serializer.write_to(&mut short, &values), 0);
     }

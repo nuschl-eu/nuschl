@@ -23,7 +23,6 @@ use crate::{
 use nuschl_stream_quality::{
     DecodeCapacity, Kind, Throttle,
     dd::{Frame, Layers, Pace, Selector, Wanted},
-    receive,
 };
 use std::{
     collections::VecDeque,
@@ -43,14 +42,16 @@ pub const LOW_LATENCY_BOUND: Duration = Duration::from_millis(50);
 pub const MAX_KEY_BYTES: u64 = 8 * 1024 * 1024;
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Tier, height, frame rate, bitrate and limit.
+type PublisherDemand = (usize, u16, u8, u64, Option<VideoLimit>);
+
 /// A video source: its kind, its sender's mode and the demand last sent to its
 /// publisher.
 pub struct Video {
     pub kind: Kind,
     pub mode: Mode,
-    /// The tier, height, frame rate, bitrate and limit last asked of it.
-    pub demand: Option<(usize, u16, u8, u64, Option<VideoLimit>)>,
-    pub throttle: Throttle,
+    demand: Option<PublisherDemand>,
+    throttle: Throttle,
     pub layers: Layers,
 }
 
@@ -62,6 +63,24 @@ impl Video {
             demand: None,
             throttle: Throttle::default(),
             layers: Layers::default(),
+        }
+    }
+
+    /// A material rate change or a new picture format, at most once per second.
+    pub fn update_demand(&mut self, next: PublisherDemand, now: Duration) -> bool {
+        let (tier, height, fps, bitrate, limit) = next;
+        let changed =
+            self.demand
+                .is_none_or(|(old_tier, old_height, old_fps, old_rate, old_limit)| {
+                    (tier, height, fps, limit) != (old_tier, old_height, old_fps, old_limit)
+                        || (bitrate != old_rate && bitrate == 64_000)
+                        || bitrate.abs_diff(old_rate) >= (old_rate / 20).max(100_000)
+                });
+        if changed && self.throttle.allow(now) {
+            self.demand = Some(next);
+            true
+        } else {
+            false
         }
     }
 
@@ -119,7 +138,7 @@ pub struct Arrival {
 
 impl View {
     /// Admits `packet` past the selector, the queue (`queue` at the
-    /// receiver's `bitrate`) and the viewer's and room's `budgets`: the
+    /// receiver's `bitrate`) and the viewer, room and host budgets: the
     /// sequence number and marker it goes out with, or `None`; and whether
     /// the source is to send a key frame.
     pub fn admit(
@@ -128,6 +147,7 @@ impl View {
         queue: Option<&dyn StreamTxQueueInfo>,
         bitrate: u64,
         budgets: [&mut Bucket; 2],
+        host: Option<(&mut Bucket, VideoLimit)>,
         now: Instant,
     ) -> (Option<(u64, bool)>, bool) {
         let Arrival {
@@ -234,7 +254,11 @@ impl View {
         // The budgets lend what the unit carries, down to one burst, and each
         // unit at most one burst.
         let [viewer, room] = budgets;
-        let credit = viewer.burst().min(room.burst());
+        let previous = [*viewer, *room];
+        let credit = viewer.burst().min(room.burst()).min(
+            host.as_ref()
+                .map_or(f64::INFINITY, |(bucket, _)| bucket.burst()),
+        );
         let lend = (rest || carried) && self.backlog.lendable(timestamp, cost, credit);
         let charge = |bucket: &mut Bucket| {
             if lend {
@@ -250,7 +274,14 @@ impl View {
         } else if !charge(room) {
             Some(VideoLimit::SfuRoom)
         } else {
-            None
+            host.and_then(|(bucket, limit)| {
+                if charge(bucket) {
+                    None
+                } else {
+                    [*viewer, *room] = previous;
+                    Some(limit)
+                }
+            })
         };
         if let Some(limit) = limit {
             if video {
@@ -637,20 +668,15 @@ pub fn full_capacity() -> DecodeCapacity {
     }
 }
 
-/// The tier a receiver gets of a source of `kind`, with the caps lowered by
-/// `step` tiers (`traffic`).
-pub fn tier(kind: Kind, view: &View, decode: DecodeCapacity, step: u64) -> (usize, VideoLimit) {
+/// The receiver's selected tier within its decode capacity.
+pub fn tier(kind: Kind, view: &View, decode: DecodeCapacity) -> (usize, VideoLimit) {
     let top = kind.top();
     let requested = view.request.unwrap_or(top).min(top);
-    let policy = top.saturating_sub(usize::try_from(step).unwrap_or(usize::MAX));
-    let decode = decode.get(kind);
-    let tier = receive(requested, decode, top, policy);
+    let tier = requested.min(decode.get(kind));
     let limit = if tier == requested {
         VideoLimit::WithinTarget
-    } else if tier == decode {
-        VideoLimit::ReceiverDecode
     } else {
-        VideoLimit::TrafficBudget
+        VideoLimit::ReceiverDecode
     };
     (tier, limit)
 }
@@ -970,7 +996,7 @@ mod tests {
                 };
                 let budgets = [&mut viewer, &mut room];
                 if view
-                    .admit(&arrival, Some(&queue), u64::MAX, budgets, now)
+                    .admit(&arrival, Some(&queue), u64::MAX, budgets, None, now)
                     .0
                     .is_some()
                 {
@@ -1427,7 +1453,8 @@ mod tests {
                         };
                         let budgets = [&mut viewer.budget, &mut room];
                         let view = &mut viewer.views[sent.source];
-                        let (out, _) = view.admit(&arrival, Some(&sample), rate, budgets, now);
+                        let (out, _) =
+                            view.admit(&arrival, Some(&sample), rate, budgets, None, now);
                         for bucket in [&viewer.budget, &room] {
                             let (tokens, burst) = bucket.level();
                             assert!(tokens >= -burst - 1.0, "seed {seed}: {tokens} past {burst}");
@@ -1481,7 +1508,7 @@ mod tests {
                         let view = viewer.views.last_mut().expect("audio");
                         let budgets = [&mut viewer.budget, &mut room];
                         if view
-                            .admit(&arrival, None, viewer.rate, budgets, now)
+                            .admit(&arrival, None, viewer.rate, budgets, None, now)
                             .0
                             .is_some()
                         {
@@ -1704,28 +1731,31 @@ mod tests {
     }
 
     #[test]
-    fn traffic_steps_lower_the_tier() {
+    fn publisher_demand_absorbs_small_budget_changes() {
+        let mut video = Video::new(Kind::Screen, Mode::default_for(true));
+        let demand = |rate| (3, 2160, 60, rate, Some(VideoLimit::TrafficBudget));
+        assert!(video.update_demand(demand(100_000_000), Duration::ZERO));
+        assert!(!video.update_demand(demand(80_000_000), Duration::from_millis(500)));
+        assert!(!video.update_demand(demand(99_000_000), Duration::from_secs(1)));
+        assert!(video.update_demand(demand(94_000_000), Duration::from_secs(2)));
+        assert!(video.update_demand(demand(64_000), Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn viewer_quality_stays_within_decode_capacity() {
         let view = View::default();
         let full = full_capacity();
-        let tiers: Vec<usize> = (0..5)
-            .map(|step| tier(Kind::Camera, &view, full, step).0)
-            .collect();
-        assert_eq!(tiers, [3, 2, 1, 0, 0]);
         let asked = View {
             request: Some(1),
             ..View::default()
         };
         assert_eq!(
-            tier(Kind::Screen, &asked, full, 1),
+            tier(Kind::Screen, &asked, full),
             (1, VideoLimit::WithinTarget)
-        );
-        assert_eq!(
-            tier(Kind::Camera, &view, full, 1),
-            (Kind::Camera.top() - 1, VideoLimit::TrafficBudget)
         );
         let decode = DecodeCapacity { camera: 0, ..full };
         assert_eq!(
-            tier(Kind::Camera, &view, decode, 0),
+            tier(Kind::Camera, &view, decode),
             (0, VideoLimit::ReceiverDecode)
         );
     }

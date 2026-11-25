@@ -249,8 +249,7 @@ pkgs.testers.runNixOSTest {
           assert turn_credentials["urls"] == ["turn:turn.test:3478?transport=udp"], turn_credentials
           assert echoed(relay(turn_credentials["username"], "${sfu4}", password=turn_credentials["credential"])) == (3, 3)
           sfu.succeed("ss -lun | grep -q ':40010 '")
-          # The traffic count, saved each second in the state directory.
-          sfu.wait_until_succeeds("test -s /var/lib/nuschl-stream-sfu/traffic", timeout=10)
+          sfu.wait_until_succeeds("test -s /var/lib/nuschl-stream-sfu/traffic.usage", timeout=10)
           lease = lambda method, key: client.succeed(
               f"curl -sS -o /dev/null -w '%{{http_code}}' -X {method} http://stream.test/sfu/lease "
               f"--data '{{\"stream_id\": \"{'03' * 16}\", \"host_key\": \"{key}\"}}'"

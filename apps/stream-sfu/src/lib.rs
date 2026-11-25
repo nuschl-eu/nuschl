@@ -206,6 +206,7 @@ fn join(message: ClientMessage) -> Option<Join> {
         codecs,
         video_limits,
         screen_rate,
+        max_screen_bitrate,
     } = message
     else {
         return None;
@@ -223,7 +224,11 @@ fn join(message: ClientMessage) -> Option<Join> {
         },
         decoders: Decoders::new(&codecs)?,
         video_limits,
-        screen_rate,
+        screen_rate: screen_rate.then(|| {
+            max_screen_bitrate
+                .unwrap_or(protocol::LEGACY_MAX_SCREEN_BITRATE)
+                .min(protocol::MAX_SCREEN_BITRATE)
+        }),
     })
 }
 
@@ -309,6 +314,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
         nonce: hex::encode(nonce),
         video_limits: true,
         screen_rate: true,
+        max_screen_bitrate: Some(protocol::MAX_SCREEN_BITRATE),
     };
     if socket.send(text(&hello)).await.is_err() {
         return;

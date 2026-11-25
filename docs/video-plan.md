@@ -258,16 +258,16 @@ and pacing use measured payload rates.
   upload. Available capacity is shared max-min by dropping layers; a join
   fails when the base layers do not fit.
 - Traffic budget (Owner, #443): each SFU has a configurable egress budget per
-  period (module options `trafficBudget` and `period`; the project uses
-  Hetzner's 20 TB a month). The paced share is the budget times the elapsed
-  fraction of the period. Unused share accrues within the period, allowing
-  bursts at normal caps for as long as the running count fits that share.
-  Each started 1% of the period's budget above the share lowers the
-  available video tier by one, down to base layers only. At the nominal
-  budget, the SFU refuses joins and publishing offers. Established media
-  continues under the paced quality limits and can add egress beyond the
-  nominal budget. The counter lives in the SFU's state directory, survives
-  restarts and resets at the next UTC period.
+  period (module options `trafficBudget` and `period`). The shared rate is the
+  remaining bits divided by the seconds left in the period, plus an hourly
+  draw on traffic banked so far. Banked traffic is the elapsed share of
+  the budget minus bytes already used, with a floor of zero. The host upload
+  cap further bounds this rate. The SFU reserves outgoing UDP datagrams and
+  their IP headers against the hard byte limit before sending. Reservations
+  survive restarts and reset at the next UTC period. The reservation file can
+  be up to 64 MiB ahead of the live count, which the SFU writes to
+  `traffic.usage` once a second. HTTP and separately relayed TURN traffic
+  have their own limits.
 
 ### 5.3 Adaptation
 
@@ -280,9 +280,10 @@ and pacing use measured payload rates.
   Sharp source and its frame rate for a Smooth one. Browser senders set the
   track's `contentHint` (`detail` or `motion`) and the sender's
   `degradationPreference` (`maintain-resolution` or `maintain-framerate`).
-- Congestion control is GCC/TWCC on every leg. A publisher's target is
-  min(upload estimate × 0.85, largest demand), split across its sources with
-  the screen first.
+- Congestion control is GCC/TWCC on every leg. The native publisher budgets
+  72% of its upload estimate for video. When both sources run, the camera gets
+  up to its encoder ceiling or half the budget, whichever is lower. The
+  screen gets the rest. Rate changes reach the running encoder directly.
 - Step-down order: bitrate, then what the mode gives up, then what it keeps (at
   most once per 10 s): frame rate before resolution for Sharp, resolution before
   frame rate for Smooth. Step-up needs 1.3× the next point's floor for 10 s
@@ -293,13 +294,16 @@ screen-rate capability, the SFU supplies a separate encoder ceiling. The
 ceiling leaves packet overhead and a share of the host, room and viewer
 budgets for each forwarded screen alongside camera and audio. A single-layer
 source uses the tightest viewer path; layered sources can keep higher rates for
-viewers that can receive them. A screen with one spatial layer sends every
-viewer the same picture, so its rate stops at the ceiling of that picture's
-tier (from the Dependency Descriptor's layer size) or of the viewer's tier,
-whichever is lower. The SFU probes within configured limits while
-actual payload varies with screen motion. The traffic pacing tier also caps
-screen bitrate whenever pacing is active. Direct screen publishers use their
-direct congestion controller for bitrate.
+viewers that can receive them. A backed-up forwarding queue caps the encoder at
+the viewer's reduced tier until the queue recovers. The SFU probes within
+configured limits while actual payload varies with screen motion. The
+negotiated screen target can reach 100 Mb/s of video payload with sufficient
+egress and receiver capacity. Publishers using the original screen-rate
+capability retain their 50 Mb/s ceiling. The shared traffic rate also limits
+screen bitrate. With steady dimensions and frame rate, the SFU sends a new
+target for changes of at least 5% and 100 kb/s, or for the encoder's minimum
+rate, at most once per second. Direct screen publishers use their direct
+congestion controller for bitrate.
 
 #### Layer selection
 

@@ -102,6 +102,7 @@ export class Call extends EventTarget {
         }
         this.send(join(this.opened, admission, this.codecs, {
           videoLimits: this.videoLimitReports, screenRate: this.screenRate,
+          maxScreenBitrate: message.max_screen_bitrate,
         }));
         return;
       }

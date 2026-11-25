@@ -63,7 +63,7 @@ pub struct Join {
     pub create: Option<(Key, Key)>,
     pub decoders: crate::protocol::Decoders,
     pub video_limits: bool,
-    pub screen_rate: bool,
+    pub screen_rate: Option<u64>,
 }
 
 pub fn prove(key: &Key, label: &[u8], nonce: &Nonce) -> [u8; 32] {
@@ -115,6 +115,14 @@ impl Bucket {
         }
         self.tokens -= amount;
         true
+    }
+
+    /// Changes the rate and burst while preserving accumulated credit or debt.
+    pub fn retune(&mut self, budget: Self, now: Instant) {
+        self.take(0.0, now);
+        self.rate = budget.rate;
+        self.burst = budget.burst;
+        self.tokens = self.tokens.min(self.burst);
     }
 
     pub fn burst(&self) -> f64 {

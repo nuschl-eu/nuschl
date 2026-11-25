@@ -10,8 +10,8 @@
 //! transport up while no source is forwarded.
 //!
 //! ```text
-//! SFU → peer  hello {nonce, video_limits?, screen_rate?}
-//! peer → SFU  join {room, verifier, proof, host_proof?, create?: {admit_key, host_key}, codecs, video_limits?, screen_rate?}
+//! SFU → peer  hello {nonce, video_limits?, screen_rate?, max_screen_bitrate?}
+//! peer → SFU  join {room, verifier, proof, host_proof?, create?: {admit_key, host_key}, codecs, video_limits?, screen_rate?, max_screen_bitrate?}
 //! SFU → peer  welcome {peer, role, peers: [{id, role}], codec, turn?: {urls, username, credential}}
 //!             | error {reason}
 //! peer → SFU  offer {sdp, screens?: [mid]} publish connection; screens names
@@ -117,7 +117,10 @@ pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_KEY_MESSAGE: usize = 16 * 1024;
 
 /// Maximum bounded encoder target for a negotiated screen rate, in bits per second.
-pub const MAX_SCREEN_BITRATE: u64 = 50_000_000;
+pub const MAX_SCREEN_BITRATE: u64 = 100_000_000;
+
+/// Screen encoder target bound for peers using the original screen-rate capability.
+pub const LEGACY_MAX_SCREEN_BITRATE: u64 = 50_000_000;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -135,6 +138,8 @@ pub enum ClientMessage {
         video_limits: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         screen_rate: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_screen_bitrate: Option<u64>,
     },
     Offer {
         sdp: String,
@@ -274,6 +279,8 @@ pub enum ServerMessage {
         video_limits: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         screen_rate: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_screen_bitrate: Option<u64>,
     },
     Welcome(Welcome),
     Joined {
@@ -444,6 +451,7 @@ mod tests {
             ServerMessage::Hello {
                 video_limits: false,
                 screen_rate: false,
+                max_screen_bitrate: None,
                 ..
             }
         ));
@@ -480,6 +488,7 @@ mod tests {
                 create: Some(_),
                 video_limits: false,
                 screen_rate: false,
+                max_screen_bitrate: None,
                 ref codecs,
                 ..
             } if codecs == &[Codec::Vp9, Codec::Av1]
