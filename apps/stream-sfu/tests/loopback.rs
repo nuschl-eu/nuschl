@@ -389,7 +389,7 @@ fn decodable(packets: &[Received]) -> (Vec<(u16, u8)>, Vec<u16>) {
 /// templates T0, T1, T2 and decode targets for a quarter, half and all of the
 /// frame rate. T0 frames are switch points for all three, T1 frames for the
 /// full rate.
-fn l1t3(template: u32, number: u16, structure: bool) -> Vec<u8> {
+fn l1t3(template: u32, number: u16, structure: bool, size: Option<(u16, u16)>) -> Vec<u8> {
     let mut bits = Vec::new();
     let mut put = |value: u32, n: u32| {
         for i in (0..n).rev() {
@@ -409,7 +409,11 @@ fn l1t3(template: u32, number: u16, structure: bool) -> Vec<u8> {
         put(0b00_00_01, 6); // T2: discardable for full
         put(0, 3); // no frame diffs
         put(0, 2); // no chains
-        put(0, 1); // no resolutions
+        put(u32::from(size.is_some()), 1);
+        if let Some((width, height)) = size {
+            put(u32::from(width - 1), 16);
+            put(u32::from(height - 1), 16);
+        }
     }
     while bits.len() % 8 != 0 {
         bits.push(false);
@@ -432,6 +436,7 @@ struct Peer {
     seq: u64,
     frame: u32,
     frame_packets: usize,
+    picture_size: Option<(u16, u16)>,
     last_frame: Option<Instant>,
     replay: Option<Replay>,
     keyframe_requests: usize,
@@ -531,6 +536,7 @@ async fn join_decoding(
         seq: 0,
         frame: 0,
         frame_packets: 1,
+        picture_size: None,
         last_frame: None,
         replay: None,
         keyframe_requests: 0,
@@ -765,7 +771,7 @@ impl Peer {
             payload.extend_from_slice(&self.seq.to_be_bytes());
             payload.extend((0..600).map(|i| (i as u64 * 31 + self.seq) as u8));
             let descriptor = (*codec == Codec::Av1).then(|| {
-                let mut bytes = l1t3(template, number, template == 0 && first);
+                let mut bytes = l1t3(template, number, template == 0 && first, self.picture_size);
                 bytes[0] = (bytes[0] & 0x3f) | (u8::from(first) << 7) | (u8::from(last) << 6);
                 Descriptor(bytes)
             });
@@ -1908,4 +1914,45 @@ async fn a_quiet_screen_reaches_its_tier_on_a_fast_link() {
         quiet_fps >= 24.0 && busy_fps >= 24.0,
         "{quiet_fps} fps quiet, {busy_fps} fps busy, limits {limits:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_720p_screen_gets_budget_to_upgrade_when_the_viewer_asks_for_1440p() {
+    let sfu = start("");
+    let (mut host, _) =
+        join_decoding(&sfu.url, &ADMIT, true, true, &["av1"], &["screen_rate"]).await;
+    let (mut viewer, _) = join(&sfu.url, &ADMIT, false, false).await;
+    host.picture_size = Some((1280, 720));
+    host.publish_source(Codec::Av1, true);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut asked = false;
+    loop {
+        host.step();
+        viewer.step();
+        host.send_frame();
+        if !asked && viewer.count(host.id) > 0 {
+            viewer.send(source_request(host.id, Kind::Screen, 2));
+            asked = true;
+        }
+        if asked
+            && host.messages.iter().any(|m| {
+                m["type"] == "quality"
+                    && m["max_height"] == 1440
+                    && m["max_bitrate"]
+                        .as_u64()
+                        .is_some_and(|rate| rate >= Kind::Screen.ladder()[1].floor)
+            })
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "encoder ceilings: {:?}",
+            host.messages
+                .iter()
+                .filter(|m| m["type"] == "quality")
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
