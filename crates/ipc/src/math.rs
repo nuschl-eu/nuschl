@@ -144,9 +144,7 @@ mod supervisor {
                 // A long-lived worker may have died in between (its lifetime
                 // CPU limit, say): one fresh attempt. A missed deadline is the
                 // formula's fault and is not retried.
-                Err(Error::Io(_) | Error::Frame(_) | Error::Json(_) | Error::InvalidResponse)
-                    if reused =>
-                {
+                Err(Error::Io(_) | Error::Frame(_) | Error::InvalidResponse) if reused => {
                     self.attempt(request).await
                 }
                 result => result,

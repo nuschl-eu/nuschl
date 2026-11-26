@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn maximal_pixel_reply_and_nested_tags_fit_the_frame_budget() {
+    fn maximal_pixel_reply_and_nested_preview_request_fit_the_frame_budgets() {
         let pixels = Pixels {
             width: MAX_IMAGE_WIDTH,
             height: MAX_IMAGE_HEIGHT,
@@ -287,12 +287,13 @@ mod tests {
             },
         ] {
             assert!(response.is_bounded());
-            let bytes = serde_json::to_vec(&crate::Envelope::new(
-                1,
-                crate::ContentResponse::Preview(response),
-            ))
+            let mut bytes = Vec::new();
+            crate::write_frame_within(
+                &mut bytes,
+                &crate::Envelope::new(1, crate::ContentResponse::Preview(response)),
+                MAX_RESPONSE_FRAME_BYTES,
+            )
             .unwrap();
-            assert!(bytes.len() <= MAX_RESPONSE_FRAME_BYTES);
         }
         let request = Request::Document {
             schema: SCHEMA,
@@ -301,15 +302,22 @@ mod tests {
             truncated: false,
         };
         assert!(request.is_bounded());
-        let bytes = serde_json::to_vec(&crate::Envelope::new(
-            1,
-            crate::ContentRequest::Preview(request),
-        ))
+        let mut bytes = Vec::new();
+        crate::write_frame_within(
+            &mut bytes,
+            &crate::Envelope::new(1, crate::ContentRequest::Preview(request)),
+            MAX_REQUEST_FRAME_BYTES,
+        )
         .unwrap();
-        assert!(bytes.len() <= MAX_REQUEST_FRAME_BYTES);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["payload"]["operation"],
-            "document"
-        );
+        let envelope = crate::read_frame_within::<crate::ContentRequest>(
+            &mut bytes.as_slice(),
+            MAX_REQUEST_FRAME_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            envelope.payload,
+            crate::ContentRequest::Preview(Request::Document { schema: SCHEMA, .. })
+        ));
     }
 }

@@ -1338,7 +1338,7 @@ mod tests {
     use crate::{Envelope, read_frame, write_frame};
 
     #[test]
-    fn requests_round_trip_with_base64_bytes() {
+    fn contact_proof_bytes_round_trip() {
         let request = CryptoRequest::Contact {
             witnessed: None,
             registration: Vec::new(),
@@ -1358,13 +1358,21 @@ mod tests {
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &Envelope::new(3, &request)).unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains("\"AQID\""));
         let back: Envelope<CryptoRequest> = read_frame(&mut bytes.as_slice()).unwrap().unwrap();
-        assert!(matches!(
-            back.payload,
-            CryptoRequest::Contact { direct: true, .. }
-        ));
+        assert_eq!(back.request_id, 3);
         assert!(back.payload.check().is_ok());
+        let CryptoRequest::Contact {
+            lookup,
+            record,
+            direct,
+            ..
+        } = back.payload
+        else {
+            panic!("expected a contact request");
+        };
+        assert!(direct);
+        assert_eq!(lookup, [1, 2, 3]);
+        assert_eq!(record.unwrap().devices, [vec![1], vec![2, 3]]);
     }
 
     #[test]
@@ -1393,9 +1401,13 @@ mod tests {
         };
         assert!(guest.check().is_ok());
         // Unknown fields and malformed base64 are refused.
-        let bad = br#"{"kind":"contact_status","server":"s","account":"!!"}"#;
-        assert!(serde_json::from_slice::<CryptoRequest>(bad).is_err());
-        let extra = br#"{"kind":"due","server":"s","connected":true,"more":1}"#;
-        assert!(serde_json::from_slice::<CryptoRequest>(extra).is_err());
+        for invalid in [
+            serde_json::json!({"kind":"contact_status","server":"s","account":"!!"}),
+            serde_json::json!({"kind":"due","server":"s","connected":true,"more":1}),
+        ] {
+            let mut frame = Vec::new();
+            write_frame(&mut frame, &Envelope::new(1, invalid)).unwrap();
+            assert!(read_frame::<CryptoRequest>(&mut frame.as_slice()).is_err());
+        }
     }
 }

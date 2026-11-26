@@ -142,7 +142,7 @@ fn chunks<T: Serialize>(rows: Vec<T>, wrap: fn(Vec<T>) -> MurmurFrame) -> Vec<Mu
     let mut batch = Vec::new();
     let mut size = 0;
     for row in rows {
-        let row_size = serde_json::to_vec(&row).map_or(0, |bytes| bytes.len());
+        let row_size = rmp_serde::to_vec_named(&row).map_or(0, |bytes| bytes.len());
         if !batch.is_empty() && size + row_size > FRAME_TARGET {
             frames.push(wrap(std::mem::take(&mut batch)));
             size = 0;

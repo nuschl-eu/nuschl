@@ -15,7 +15,7 @@ use tokio::{
 
 /// The largest Opus packet on a call's audio track.
 pub const MAX_OPUS: usize = 1275;
-/// One request or event with its JSON framing.
+/// One request or event and its worker envelope.
 pub const MAX_FRAME: usize = 8 * 1024;
 /// Requests queued for the worker; received packets leave room for control.
 const REQUESTS: usize = 64;
@@ -31,6 +31,7 @@ pub enum Request {
     Play {
         publisher: u64,
         timestamp: u64,
+        #[serde(with = "serde_bytes")]
         opus: Vec<u8>,
     },
     /// `publisher` stopped sharing audio.
@@ -44,7 +45,11 @@ pub enum Request {
 pub enum Event {
     /// 20 ms of the shared desktop audio as stereo Opus. The timestamp counts
     /// 48 kHz samples since the share started.
-    Packet { timestamp: u64, opus: Vec<u8> },
+    Packet {
+        timestamp: u64,
+        #[serde(with = "serde_bytes")]
+        opus: Vec<u8>,
+    },
     /// Sharing stopped by itself or could not start. Nothing more is sent.
     Stopped { reason: String },
 }
