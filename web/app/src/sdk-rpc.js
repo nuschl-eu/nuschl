@@ -51,7 +51,6 @@ export class SdkRpc {
   request(method,args=[],proof) {
     if(this.closed)return Promise.reject(new SdkUnavailableError());
     if(this.phase!=="ready")return Promise.reject(new Error("The client is still starting."));
-    // The SDK passes the same bounded proof into its Wasm validator.
     let context;
     if(proof!==undefined){
       try{context=JSON.stringify(proof);if(typeof context!=="string"||context.length>4096||new TextEncoder().encode(context).length>4096)throw new Error("Action context exceeds the browser limit.");}

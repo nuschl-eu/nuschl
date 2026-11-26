@@ -65,10 +65,13 @@ export class DocumentCache {
 
 const cache = new DocumentCache();
 const ticket=id=>typeof id==="string"&&/^[1-9][0-9]{0,19}$/.test(id);
-// The SDK ACK carries null or the admitted document and its cache charge.
-function completion(value) {
+// A normal content_complete result: bounded JSON text of null (nothing to
+// install) or exactly {token, charge, document, failed}. Anything else throws.
+function completion(raw) {
+  textBytes(raw,MAX_REPLY);
+  const value=JSON.parse(raw);
   if(value===null)return null;
-  if(!value||Object.getPrototypeOf(value)!==Object.prototype||Object.keys(value).length!==4||typeof value.token!=="string"||!Number.isSafeInteger(value.charge)||!value.document||typeof value.document!=="object"||typeof value.failed!=="boolean")throw new Error("Invalid content completion.");
+  if(typeof value!=="object"||Array.isArray(value)||Object.keys(value).length!==4||typeof value.token!=="string"||!Number.isSafeInteger(value.charge)||!value.document||typeof value.document!=="object"||typeof value.failed!=="boolean")throw new Error("Invalid content completion.");
   return value;
 }
 export function contentDocument(token) { return cache.get(token); }

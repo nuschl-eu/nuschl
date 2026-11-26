@@ -6,7 +6,6 @@ import {UI_METHODS,projectedAction} from "./action-context.js";
 import { StatePublication, stateFrame } from "./state-publication.js";
 import { createContentPublication } from "./content-publication.js";
 import { restoreOrder } from "./server-order.js";
-import { MAX_REPLY, textBytes } from "./content-protocol.js";
 let client;
 let history;
 let saved = null;
@@ -130,10 +129,8 @@ onmessage = async ({ data }) => {
         if(typeof request!=="string"||!/^[1-9][0-9]{0,19}$/.test(request))throw new Error("Invalid content request.");
         // An invalid codec reply is still this job's ACK: release its exact SDK
         // credit as a terminal failure instead of leaving the lease outstanding.
-        const valid=typeof reply==="string"&&reply.length<=MAX_REPLY&&new TextEncoder().encode(reply).length<=MAX_REPLY;
-        const result=client.content_complete(request,valid?reply:"");
-        textBytes(result,MAX_REPLY);
-        value=JSON.parse(result);
+        const valid=typeof reply==="string"&&reply.length<=2*1024*1024&&new TextEncoder().encode(reply).length<=2*1024*1024;
+        value=client.content_complete(request,valid?reply:"");
       } else if (data.method === "content_retire") {
         if(!["undelivered","protocol"].includes(data.args[0]))throw new Error("Invalid content lane retirement.");
         value=client.content_retire(data.args[0]);
@@ -153,8 +150,6 @@ onmessage = async ({ data }) => {
         if (!packet || !(packet.opus instanceof Uint8Array) || packet.opus.length > 960) throw new Error("Invalid voice packet.");
         const {opus,...context} = packet;
         value = client.voice_packet(JSON.stringify(context),opus);
-      } else if (data.method === "find") {
-        value = JSON.parse(client.find(...data.args));
       } else value = client[data.method](...data.args);
       if (data.id !== undefined) postMessage({ kind: "result", id: data.id, value });
       // Encoding is frequent; its route has already been admitted in Rust.

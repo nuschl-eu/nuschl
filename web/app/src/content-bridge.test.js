@@ -36,7 +36,7 @@ test("only the SDK accepted reply becomes visible, with no credential metadata i
     if(method==="content_request"){requests.push(id);if(admission instanceof Error)throw admission;return admission;}
     assert.equal(method,"content_complete");assert.equal(id,"7");
     assert.equal(JSON.parse(raw).plain_text,"safe");
-    return {token:"7",charge:1000,document,failed:false};
+    return JSON.stringify({token:"7",charge:1000,document,failed:false});
   },{service});
   try {
     assert.equal(bridge.handle({kind:"content_work",operations:[{kind:"render",request:"7",mode:"legacy",source:"<b>safe</b>"}]}),true);
@@ -73,7 +73,7 @@ const render=(request,source="x")=>({kind:"content_work",operations:[{kind:"rend
 test("an oversized codec reply is ACKed as a bounded failure, never forwarded",async()=>{
   const {ContentBridge}=await fresh();const acks=[];
   const service={render:async()=>({marked_text:"x".repeat(2*1024*1024+1),plain_text:"x",document}),dispose(){}};
-  const bridge=new ContentBridge(async(method,id,raw)=>{acks.push({method,id,raw});return null;},{service});
+  const bridge=new ContentBridge(async(method,id,raw)=>{acks.push({method,id,raw});return "null";},{service});
   bridge.handle(render("1"));await settle();
   assert.deepEqual(acks.map(({method,id,raw})=>({method,id,bytes:raw.length})),[{method:"content_complete",id:"1",bytes:0}]);
   assert.equal(bridge.pending.size,0);bridge.dispose();
@@ -109,7 +109,7 @@ test("rehydration keeps few SDK RPCs in flight and queued tokens are not denied"
 test("admitted renders reach the serial codec one at a time; a queued cancel ACKs at once",async()=>{
   const m=await fresh();const started=[],finish=new Map(),acks=[];
   const service={render:packet=>new Promise(resolve=>{started.push(packet.source);finish.set(packet.source,resolve);}),dispose(){}};
-  const bridge=new m.ContentBridge(async(method,id,raw)=>{acks.push([id,raw.length]);return null;},{service});
+  const bridge=new m.ContentBridge(async(method,id,raw)=>{acks.push([id,raw.length]);return "null";},{service});
   bridge.handle({kind:"content_work",operations:["1","2","3","4"].map(request=>({kind:"render",request,mode:"plain",source:`s${request}`}))});
   await settle();assert.deepEqual(started,["s1"],"one codec job at a time; later work waits in the bridge");
   bridge.handle({kind:"content_work",operations:[{kind:"cancel",request:"4"}]});await settle();
@@ -127,7 +127,7 @@ test("a cancelled running job holds the next job and its own ACK until the worke
     if(packet.source==="s1")signal.addEventListener("abort",()=>{const error=new Error("Content processing was cancelled.");error.workerReleased=new Promise(done=>{releaseWorker=done;});reject(error);});
     else resolve({marked_text:"ok",plain_text:"ok",document});
   });},dispose(){}};
-  const bridge=new m.ContentBridge(async(method,id,raw)=>{acks.push([id,raw.length]);return null;},{service});
+  const bridge=new m.ContentBridge(async(method,id,raw)=>{acks.push([id,raw.length]);return "null";},{service});
   bridge.handle({kind:"content_work",operations:[{kind:"render",request:"1",mode:"plain",source:"s1"},{kind:"render",request:"2",mode:"plain",source:"s2"}]});
   bridge.handle({kind:"content_work",operations:[{kind:"cancel",request:"1"}]});await settle();
   assert.deepEqual(started,["s1"],"the next job does not start while the cancelled one still holds the worker");
@@ -150,7 +150,7 @@ test("a protocol-violating batch admits nothing, never throws, keeps credit, hon
   for(const [name,operations] of Object.entries(cases)) {
     const m=await fresh();const started=[],signals=new Map(),calls=[];
     const service={render(packet,{signal}){started.push(packet.source);signals.set(packet.source,signal);return new Promise(()=>{});},dispose(){}};
-    const bridge=new m.ContentBridge(async(method,...args)=>{calls.push([method,...args]);return null;},{service});
+    const bridge=new m.ContentBridge(async(method,...args)=>{calls.push([method,...args]);return "null";},{service});
     assert.equal(bridge.handle({kind:"content_work",operations:four}),true);await settle();
     assert.equal(bridge.handle({kind:"content_work",operations}),true,`${name}: consumed without throwing`);await settle();
     assert.equal(bridge.pending.size,4,`${name}: admitted credit stays held`);
@@ -162,7 +162,7 @@ test("a protocol-violating batch admits nothing, never throws, keeps credit, hon
     assert.deepEqual(calls,[["content_retire","protocol"]]);bridge.dispose();
   }
   const m=await fresh();const calls=[];
-  const bridge=new m.ContentBridge(async(method,...args)=>{calls.push(method);return null;},{service:{render:async()=>ok,dispose(){}}});
+  const bridge=new m.ContentBridge(async(method,...args)=>{calls.push(method);return "null";},{service:{render:async()=>ok,dispose(){}}});
   assert.equal(bridge.handle({kind:"content_work",operations:"not a list"}),true);await settle();
   assert.equal(m.contentUnavailable("1"),true);assert.deepEqual(calls,["content_retire"]);bridge.dispose();
 });
@@ -185,7 +185,7 @@ test("a remote exception before the SDK reaches the job keeps credit and retires
 
 test("a falsy or malformed normal completion never installs content and keeps the job's credit",async()=>{
   const valid={token:"1",charge:1000,document,failed:false};
-  for(const raw of [undefined,"",false,0,"null",[],{},{token:"1"},{...valid,extra:true},{...valid,charge:"1000"},{...valid,document:null}]) {
+  for(const raw of [null,undefined,"",false,0,"false","1","[1,2,3,4]","{}",JSON.stringify({token:"1"}),JSON.stringify({...valid,extra:true}),JSON.stringify({...valid,charge:"1000"}),JSON.stringify({...valid,document:null}),"x".repeat(2*1024*1024+1)]) {
     const m=await fresh();const calls=[];
     const service={render:async()=>({marked_text:"ok",plain_text:"ok",document}),dispose(){}};
     const bridge=new m.ContentBridge(async(method,...args)=>{calls.push(method);return method==="content_complete"?raw:true;},{service});
@@ -195,7 +195,7 @@ test("a falsy or malformed normal completion never installs content and keeps th
     assert.deepEqual(calls,["content_complete","content_retire"]);bridge.dispose();
   }
   const m=await fresh();
-  const bridge=new m.ContentBridge(async()=>null,{service:{render:async()=>({marked_text:"ok",plain_text:"ok",document}),dispose(){}}});
+  const bridge=new m.ContentBridge(async()=>"null",{service:{render:async()=>({marked_text:"ok",plain_text:"ok",document}),dispose(){}}});
   bridge.handle(render("1"));await settle();
   assert.equal(bridge.pending.size,0,"a normal null result is the ACK");assert.equal(m.contentUnavailable("1"),false);bridge.dispose();
 });
@@ -231,7 +231,7 @@ test("a retired codec service retires the lane once, after ACKing the job that a
   const service={retired:false,render(packet){started.push(packet.source);return packet.source==="s1"?Promise.reject(Object.assign(new Error("Content processing is unavailable. Reload to try again."),{code:"worker-unavailable"})).finally(()=>{}):new Promise(()=>{});},dispose(){}};
   const original=service.render.bind(service);
   service.render=packet=>{const promise=original(packet);if(packet.source==="s1")service.retired=true;return promise;};
-  const bridge=new m.ContentBridge(async(method,...args)=>{calls.push([method,...args]);return method==="content_complete"?null:true;},{service});
+  const bridge=new m.ContentBridge(async(method,...args)=>{calls.push([method,...args]);return method==="content_complete"?"null":true;},{service});
   bridge.handle({kind:"content_work",operations:[{kind:"render",request:"1",mode:"plain",source:"s1"},{kind:"render",request:"2",mode:"plain",source:"s2"}]});
   await settle();await settle();
   assert.deepEqual(calls,[["content_complete","1",""],["content_retire","undelivered"]],"the settled job is ACKed, then one notice");

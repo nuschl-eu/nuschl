@@ -432,7 +432,7 @@
   }
   function find(query) {
     const request = ++findRequest; finder.query = query;
-    finding = command("find", query).then(items => { if (finder && request === findRequest) { finder.items = items; finder.selected = 0; } }, reason => setError(String(reason?.message || reason)));
+    finding = command("find", query).then(raw => { if (finder && request === findRequest) { finder.items = JSON.parse(raw); finder.selected = 0; } }, reason => setError(String(reason?.message || reason)));
   }
   async function findKey(event) {
     const step = {ArrowDown:1, ArrowUp:-1, PageDown:8, PageUp:-8}[event.key];

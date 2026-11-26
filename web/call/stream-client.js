@@ -42,7 +42,7 @@ export class StreamClient {
   request(request) {
     if (this.#closed) return Promise.reject(new Error("Stream worker ended"));
     const id = ++this.#next;
-    this.worker.postMessage({ id, request: { v: 1, ...request } });
+    this.worker.postMessage({ id, request: JSON.stringify({ v: 1, ...request }) });
     return new Promise((resolve, reject) => this.#pending.set(id, { resolve, reject }));
   }
 

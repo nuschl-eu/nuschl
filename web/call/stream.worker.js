@@ -35,7 +35,7 @@ function run(worker, call) {
 addEventListener("message", async ({ data: { id, request } }) => {
   const worker = await ready.catch(fatal);
   if (!worker) return;
-  const { value: reply, error, trapped } = run(worker, (w) => JSON.parse(w.handle(JSON.stringify(request), Date.now())));
+  const { value: reply, error, trapped } = run(worker, (w) => JSON.parse(w.handle(request, Date.now())));
   if (trapped) return;
   if (error !== undefined) return postMessage({ id, error });
   postMessage({ id, reply });

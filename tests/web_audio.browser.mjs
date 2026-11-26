@@ -16,7 +16,7 @@ let origin;
 const routes={"/audio.js":join(source,"web/app/src/audio.js"),"/audio-protocol.js":join(source,"web/app/src/audio-protocol.js"),
   "/audio-codec.worker.js":join(source,"web/app/src/audio-codec.worker.js"),"/audio-worklet.js":join(source,"web/app/src/audio-worklet.js"),
   "/fixture.mjs":join(source,"tests/web_audio.fixture.mjs")};
-for(const name of ["sdk.worker.js","history.js","server-order.js","action-context.js","state-publication.js","content-publication.js","content-protocol.js"])
+for(const name of ["sdk.worker.js","history.js","server-order.js","action-context.js","state-publication.js","content-publication.js"])
   routes["/"+name]=join(sdkSource,name);
 const server=createServer(async(req,res)=>{
   const path=new URL(req.url,"http://127.0.0.1").pathname;
