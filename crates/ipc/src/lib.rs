@@ -4,6 +4,7 @@
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod call_audio;
 pub mod crypto;
+mod framing;
 #[cfg(not(target_family = "wasm"))]
 pub mod host;
 pub mod math;
@@ -19,15 +20,18 @@ pub mod thumbnail;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod video;
 
-use std::io::{self, Read, Write};
-
+pub use framing::{
+    Error, decode_postcard_body, encode_postcard_body, read_frame, read_frame_async,
+    read_frame_within, read_postcard_frame, read_postcard_frame_async, write_frame,
+    write_frame_within, write_postcard_frame,
+};
 use nuschl_core::{ChatMessage, ContentBlock, HistoryPage, MessageDocument};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use serde::{Deserialize, Serialize};
 
+/// Version of the fixed binary video and media epoch headers.
 pub const PROTOCOL_VERSION: u16 = 1;
-/// Large enough for a maximal message (256 KiB) after worst-case JSON escaping.
+/// Version of the typed worker envelopes.
+pub const FRAME_VERSION: u16 = 2;
 /// Large enough for the image viewer's RGBA reply (1600×1000, base64).
 pub const MAX_FRAME_BYTES: usize = 12 * 1024 * 1024;
 
@@ -42,7 +46,7 @@ pub struct Envelope<T> {
 impl<T> Envelope<T> {
     pub fn new(request_id: u64, payload: T) -> Self {
         Self {
-            version: PROTOCOL_VERSION,
+            version: FRAME_VERSION,
             request_id,
             payload,
         }
@@ -127,7 +131,7 @@ pub enum ContentResponse {
     Rejected(String),
 }
 
-/// A PNG thumbnail, base64-encoded for the JSON frame.
+/// A PNG thumbnail encoded as base64.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThumbnailPng {
@@ -225,8 +229,13 @@ pub enum StorageResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MediaRequest {
-    DecodeOpus { packet: Vec<u8> },
-    EncodeOpus { samples: Vec<f32> },
+    DecodeOpus {
+        #[serde(with = "serde_bytes")]
+        packet: Vec<u8>,
+    },
+    EncodeOpus {
+        samples: Vec<f32>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -238,7 +247,7 @@ pub enum MediaRequest {
 )]
 pub enum MediaResponse {
     Samples(Vec<f32>),
-    Packet(Vec<u8>),
+    Packet(#[serde(with = "serde_bytes")] Vec<u8>),
     Rejected(String),
 }
 
@@ -312,130 +321,6 @@ pub enum TransferEvent {
     },
 }
 
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("worker frame exceeds {MAX_FRAME_BYTES} bytes")]
-    TooLarge,
-    #[error("unsupported worker protocol version {0}")]
-    Version(u16),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-}
-
-/// An I/O error stays itself; the others become [`io::ErrorKind::Other`].
-impl From<Error> for io::Error {
-    fn from(error: Error) -> Self {
-        match error {
-            Error::Io(error) => error,
-            error => io::Error::other(error),
-        }
-    }
-}
-
-pub fn read_frame<T: DeserializeOwned>(
-    reader: &mut impl Read,
-) -> Result<Option<Envelope<T>>, Error> {
-    read_frame_within(reader, MAX_FRAME_BYTES)
-}
-
-/// A frame of at most `maximum` bytes; the length is checked before allocation
-/// or deserialization. `None` at a clean end of input.
-pub fn read_frame_within<T: DeserializeOwned>(
-    reader: &mut impl Read,
-    maximum: usize,
-) -> Result<Option<Envelope<T>>, Error> {
-    let mut header = [0; 4];
-    match reader.read_exact(&mut header[..1]) {
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        result => result?,
-    }
-    reader.read_exact(&mut header[1..])?;
-    let length = u32::from_be_bytes(header) as usize;
-    if length > maximum {
-        return Err(Error::TooLarge);
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body)?;
-    parse_frame(&body).map(Some)
-}
-
-/// Async [`read_frame_within`] for a worker's replies; a closed pipe is an
-/// [`Error::Io`].
-pub async fn read_frame_async<T: DeserializeOwned>(
-    reader: &mut (impl AsyncRead + Unpin),
-    maximum: usize,
-) -> Result<Envelope<T>, Error> {
-    let length = reader.read_u32().await? as usize;
-    if length > maximum {
-        return Err(Error::TooLarge);
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).await?;
-    parse_frame(&body)
-}
-
-fn parse_frame<T: DeserializeOwned>(body: &[u8]) -> Result<Envelope<T>, Error> {
-    let envelope: Envelope<T> = serde_json::from_slice(body)?;
-    if envelope.version != PROTOCOL_VERSION {
-        return Err(Error::Version(envelope.version));
-    }
-    Ok(envelope)
-}
-
-pub fn write_frame<T: Serialize>(
-    writer: &mut impl Write,
-    value: &Envelope<T>,
-) -> Result<(), Error> {
-    write_frame_within(writer, value, MAX_FRAME_BYTES)
-}
-
-/// Serialize into a buffer capped at `maximum` bytes before writing any bytes to the pipe.
-pub fn write_frame_within<T: Serialize>(
-    writer: &mut impl Write,
-    value: &Envelope<T>,
-    maximum: usize,
-) -> Result<(), Error> {
-    let mut buffer = CappedBuffer {
-        bytes: Vec::new(),
-        maximum,
-        full: false,
-    };
-    if let Err(error) = serde_json::to_writer(&mut buffer, value) {
-        return Err(if buffer.full {
-            Error::TooLarge
-        } else {
-            Error::Json(error)
-        });
-    }
-    writer.write_all(&(buffer.bytes.len() as u32).to_be_bytes())?;
-    writer.write_all(&buffer.bytes)?;
-    writer.flush()?;
-    Ok(())
-}
-
-struct CappedBuffer {
-    bytes: Vec<u8>,
-    maximum: usize,
-    full: bool,
-}
-
-impl Write for CappedBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) {
-            self.full = true;
-            return Err(io::Error::other("worker frame too large"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,14 +344,14 @@ mod tests {
         write_frame(
             &mut bytes,
             &Envelope {
-                version: 2,
+                version: 1,
                 request_id: 1,
                 payload: 3_u8,
             },
         )?;
         assert!(matches!(
             read_frame::<u8>(&mut &bytes[..]),
-            Err(Error::Version(2))
+            Err(Error::Version(1))
         ));
         bytes.pop();
         assert!(matches!(
@@ -524,6 +409,7 @@ pub enum LiveMediaRequest {
         stream: u32,
         sender: u32,
         sequence: u64,
+        #[serde(with = "serde_bytes")]
         opus: Vec<u8>,
         end: bool,
         /// Product of the sender's volume adjustment, the local per-user
@@ -563,6 +449,7 @@ pub enum LiveMediaEvent {
     Packet {
         epoch: u64,
         sequence: u64,
+        #[serde(with = "serde_bytes")]
         opus: Vec<u8>,
         end: bool,
     },
@@ -630,8 +517,7 @@ pub enum LiveMediaEvent {
     },
 }
 
-/// Cost of JSON framing for live voice, which decides whether a binary audio
-/// IPC is worth its extra parsing surface. Run with
+/// In-memory framing cost for live voice. Run with
 /// `cargo test --release -p nuschl-ipc -- --ignored --nocapture voice_ipc_cost`.
 #[cfg(test)]
 mod voice_ipc_cost {
@@ -641,8 +527,8 @@ mod voice_ipc_cost {
     #[test]
     #[ignore = "measurement, not a check"]
     fn voice_ipc_cost() {
-        // A 20 ms Opus voice packet at 40 kb/s is about 100 bytes.
-        let opus: Vec<u8> = (0..100_u8).map(|byte| byte.wrapping_mul(37)).collect();
+        // A 20 ms Opus voice packet at 128 kb/s averages 320 bytes.
+        let opus: Vec<u8> = (0..320_u16).map(|byte| (byte * 37) as u8).collect();
         let event = Envelope::new(
             0,
             LiveMediaEvent::Packet {
@@ -678,16 +564,11 @@ mod voice_ipc_cost {
                 read_frame(&mut bytes.as_slice()).unwrap().unwrap();
             std::hint::black_box(decoded);
         }
-        let per_packet = started.elapsed().as_secs_f64() / rounds as f64;
-        // Each round encodes and decodes one outgoing and one incoming packet;
-        // 50 packets/s each way, with four people talking at once.
-        let per_second = per_packet * 50. * 4.;
+        let per_pair = started.elapsed().as_secs_f64() / rounds as f64;
         println!(
-            "JSON voice frame: {} bytes; {:.2} µs to encode and decode one packet each way; \
-             {:.3}% of one core with four simultaneous talkers",
+            "MessagePack playback frame: {} bytes; {:.2} µs to encode and decode one packet each way",
             bytes.len(),
-            per_packet * 1e6,
-            per_second * 100.
+            per_pair * 1e6,
         );
     }
 }
@@ -697,10 +578,35 @@ mod hostile_frames {
     use super::*;
 
     #[test]
-    fn playback_without_a_stream_is_stream_zero() -> Result<(), serde_json::Error> {
-        let request: LiveMediaRequest = serde_json::from_str(
-            r#"{"kind":"playback","sender":3,"sequence":2,"opus":[1],"end":false,"volume":1.0}"#,
+    fn playback_without_a_stream_is_stream_zero() -> Result<(), Error> {
+        #[derive(Serialize)]
+        struct Playback {
+            kind: &'static str,
+            sender: u32,
+            sequence: u64,
+            #[serde(with = "serde_bytes")]
+            opus: &'static [u8],
+            end: bool,
+            volume: f32,
+        }
+        let mut frame = Vec::new();
+        write_frame(
+            &mut frame,
+            &Envelope::new(
+                0,
+                Playback {
+                    kind: "playback",
+                    sender: 3,
+                    sequence: 2,
+                    opus: &[1],
+                    end: false,
+                    volume: 1.0,
+                },
+            ),
         )?;
+        let request = read_frame::<LiveMediaRequest>(&mut frame.as_slice())?
+            .unwrap()
+            .payload;
         assert!(matches!(
             request,
             LiveMediaRequest::Playback {

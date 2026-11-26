@@ -12,6 +12,7 @@ let
   nuschl = flake.packages.${system}.default;
   rtcProbe = flake.packages.${system}.rtc-probe;
   python = "${pkgs.python3}/bin/python3";
+  workerPython = "${pkgs.python3.withPackages (p: [ p.msgpack ])}/bin/python3";
   opus = "--opus-library ${pkgs.libopus}/lib/libopus.so";
 
   # The tests of an existing VM check, `runs` times each on its node's only core
@@ -50,7 +51,7 @@ let
     };
   mediaLive =
     part:
-    "su - tester -c 'NUSCHL_MEDIA_ONLY=${part} NUSCHL_AUDIO_TIMING=1 ${python} ${./tests}/media_live.py ${nuschl}/bin --pulse-bin ${pkgs.pulseaudio}/bin ${opus} --delay-plugin ${pkgs.ladspa-sdk}/lib/ladspa/delay.so'";
+    "su - tester -c 'NUSCHL_MEDIA_ONLY=${part} NUSCHL_AUDIO_TIMING=1 ${workerPython} ${./tests}/media_live.py ${nuschl}/bin --pulse-bin ${pkgs.pulseaudio}/bin ${opus} --delay-plugin ${pkgs.ladspa-sdk}/lib/ladspa/delay.so'";
 in
 {
   # Instructions per second of audio of the capture chain and Opus encoder, and
@@ -78,7 +79,7 @@ in
       media-double-talk = mediaLive "double_talk";
       # Transmits continuously: capture-to-send latency.
       media-sounds = mediaLive "sounds";
-      rtc-probe = "su - tester -c '${python} ${./tests}/rtc_probe.py ${nuschl}/bin --probe ${rtcProbe}/bin/nuschl-rtc-probe ${opus}'";
+      rtc-probe = "su - tester -c '${workerPython} ${./tests}/rtc_probe.py ${nuschl}/bin --probe ${rtcProbe}/bin/nuschl-rtc-probe ${opus}'";
       desktop-recovery = "su - tester -c 'xvfb-run -a -s \"-screen 0 1120x850x24\" ${python} ${./tests}/desktop_recovery.py ${nuschl}/bin --murmur ${pkgs.murmur}/bin/mumble-server --pulse-bin ${pkgs.pulseaudio}/bin ${opus} --at-spi ${pkgs.at-spi2-core} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --output $(mktemp -d)'";
     };
   };

@@ -55,11 +55,12 @@ mod windows {
 
     use nuschl_ipc::{
         ContentRequest, ContentResponse, Envelope, LiveMediaEvent, LiveMediaRequest,
-        StorageRequest, StorageResponse, TransferEvent, TransferRequest, WormholeServers,
+        MAX_FRAME_BYTES, StorageRequest, StorageResponse, TransferEvent, TransferRequest,
+        WormholeServers,
         crypto::{CryptoRequest, CryptoResponse},
         host,
         math::{MathRequest, MathResponse},
-        write_frame,
+        read_frame_async, write_frame,
     };
     use nuschl_sandbox::{Containment, Role, command, contain, windows_policy::IN_JOB};
     use serde_json::{Value, json};
@@ -684,17 +685,13 @@ mod windows {
         seconds: u64,
     ) -> Result<T, String> {
         let output = child.stdout.as_mut().ok_or("no stdout")?;
-        let read = async {
-            let size = usize::try_from(output.read_u32().await?).map_err(std::io::Error::other)?;
-            let mut bytes = vec![0; size];
-            output.read_exact(&mut bytes).await?;
-            std::io::Result::Ok(bytes)
-        };
-        let bytes = timeout(Duration::from_secs(seconds), read)
-            .await
-            .map_err(|_| format!("no answer within {seconds} s"))?
-            .map_err(|error| format!("worker closed its output: {error}"))?;
-        let envelope: Envelope<T> = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let envelope = timeout(
+            Duration::from_secs(seconds),
+            read_frame_async::<T>(output, MAX_FRAME_BYTES),
+        )
+        .await
+        .map_err(|_| format!("no answer within {seconds} s"))?
+        .map_err(|error| format!("invalid worker reply: {error}"))?;
         Ok(envelope.payload)
     }
 

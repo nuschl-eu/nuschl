@@ -7,6 +7,7 @@
 }:
 let
   inherit (pkgs.lib) fileset;
+  testPython = pkgs.python3.withPackages (p: [ p.msgpack ]);
   testScripts = {
     accessibility = ../tests/accessibility.py;
     desktopMumble = ../tests/desktop_mumble.py;
@@ -34,6 +35,7 @@ let
         ../tests/local_murmur.py
         ../tests/quarantine.py
         ../tests/quarantine.txt
+        ../tests/worker_ipc.py
       ]
     );
   };
@@ -50,7 +52,7 @@ pkgs.testers.runNixOSTest {
         imports = [ module ];
         environment.systemPackages = [
           nuschl
-          pkgs.python3
+          testPython
         ];
         services.nuschl = {
           enable = true;
@@ -83,7 +85,7 @@ pkgs.testers.runNixOSTest {
       {
         environment.systemPackages = [
           nuschl
-          pkgs.python3
+          testPython
           pkgs.bubblewrap
           pkgs.util-linux
           pkgs.xvfb-run
@@ -130,44 +132,44 @@ pkgs.testers.runNixOSTest {
     client.succeed("nuschl --help")
     client.succeed("nuschld --help")
     # Run as an ordinary user so the sandbox test does not depend on root privileges.
-    client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.workers} ${nuschl}/bin --sandbox-server server'")
-    client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.rtcProbe} ${nuschl}/bin --probe ${rtcProbe}/bin/nuschl-rtc-probe --opus-library ${pkgs.libopus}/lib/libopus.so'")
-    client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.mumbleClient} ${nuschl}/bin --host server --opus-library ${pkgs.libopus}/lib/libopus.so'")
+    client.succeed("su - tester -c '${testPython}/bin/python3 ${tests.workers} ${nuschl}/bin --sandbox-server server'")
+    client.succeed("su - tester -c '${testPython}/bin/python3 ${tests.rtcProbe} ${nuschl}/bin --probe ${rtcProbe}/bin/nuschl-rtc-probe --opus-library ${pkgs.libopus}/lib/libopus.so'")
+    client.succeed("su - tester -c '${testPython}/bin/python3 ${tests.mumbleClient} ${nuschl}/bin --host server --opus-library ${pkgs.libopus}/lib/libopus.so'")
     # The desktop suites find controls over AT-SPI, on a private session bus of their own.
     # Screenshots, trees and logs are copied out on failure too (nix build --keep-failed).
     try:
-        client.succeed("su - tester -c 'xvfb-run -a -s \"-screen 0 1120x850x24\" ${pkgs.python3}/bin/python3 ${tests.desktopMumble} ${nuschl}/bin --host server --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --at-spi ${pkgs.at-spi2-core} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --output /tmp/nuschl-desktop-artifacts'")
+        client.succeed("su - tester -c 'xvfb-run -a -s \"-screen 0 1120x850x24\" ${testPython}/bin/python3 ${tests.desktopMumble} ${nuschl}/bin --host server --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --at-spi ${pkgs.at-spi2-core} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --output /tmp/nuschl-desktop-artifacts'")
     finally:
         client.copy_from_machine("/tmp/nuschl-desktop-artifacts", "desktop")
     # Encrypted UDP with forced TCP, a lossy network and blocked inbound UDP (root for tc/iptables).
-    client.succeed("${pkgs.python3}/bin/python3 ${tests.udpVoice} ${nuschl}/bin --host server --opus-library ${pkgs.libopus}/lib/libopus.so --netem --block-udp")
-    client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.protocolFeatures} ${nuschl}/bin --host server --opus-library ${pkgs.libopus}/lib/libopus.so --openssl ${pkgs.openssl.bin}/bin/openssl'")
+    client.succeed("${testPython}/bin/python3 ${tests.udpVoice} ${nuschl}/bin --host server --opus-library ${pkgs.libopus}/lib/libopus.so --netem --block-udp")
+    client.succeed("su - tester -c '${testPython}/bin/python3 ${tests.protocolFeatures} ${nuschl}/bin --host server --opus-library ${pkgs.libopus}/lib/libopus.so --openssl ${pkgs.openssl.bin}/bin/openssl'")
     # The echo test's room delays the speakers with the LADSPA SDK's example delay line.
     # print() puts every attempt's lines in the test log; the driver logs the output of failed commands.
-    print(client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.mediaLive} ${nuschl}/bin --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --delay-plugin ${pkgs.ladspa-sdk}/lib/ladspa/delay.so'"))
+    print(client.succeed("su - tester -c '${testPython}/bin/python3 ${tests.mediaLive} ${nuschl}/bin --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --delay-plugin ${pkgs.ladspa-sdk}/lib/ladspa/delay.so'"))
     # Private PipeWire session (virtual nodes only): restarts, host pinning, echo-cancel reuse.
-    client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.pipewireRecovery} ${nuschl}/bin --pipewire ${pkgs.pipewire} --wireplumber ${pkgs.wireplumber} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-pipewire-artifacts'")
+    client.succeed("su - tester -c '${testPython}/bin/python3 ${tests.pipewireRecovery} ${nuschl}/bin --pipewire ${pkgs.pipewire} --wireplumber ${pkgs.wireplumber} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-pipewire-artifacts'")
     client.copy_from_machine("/tmp/nuschl-pipewire-artifacts", "pipewire")
     # Desktop audio sharing in a private PipeWire session: applications only, never Nuschl's own playback.
-    client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.shareAudio} ${nuschl}/bin --pipewire ${pkgs.pipewire} --wireplumber ${pkgs.wireplumber} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-share-audio-artifacts'")
+    client.succeed("su - tester -c '${testPython}/bin/python3 ${tests.shareAudio} ${nuschl}/bin --pipewire ${pkgs.pipewire} --wireplumber ${pkgs.wireplumber} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-share-audio-artifacts'")
     # Pure-Rust Opus against reference libopus: decoder conformance, interop, hostile packets.
-    client.succeed("su - tester -c '${pkgs.python3}/bin/python3 ${tests.opusEval} ${nuschl}/bin --opus-library ${pkgs.libopus}/lib/libopus.so'")
-    client.succeed("su - tester -c 'xvfb-run -a -s \"-screen 0 1280x800x24\" ${pkgs.python3}/bin/python3 ${tests.stockClient} ${nuschl}/bin --mumble ${pkgs.mumble}/bin/mumble --host server --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-stock-artifacts'")
+    client.succeed("su - tester -c '${testPython}/bin/python3 ${tests.opusEval} ${nuschl}/bin --opus-library ${pkgs.libopus}/lib/libopus.so'")
+    client.succeed("su - tester -c 'xvfb-run -a -s \"-screen 0 1280x800x24\" ${testPython}/bin/python3 ${tests.stockClient} ${nuschl}/bin --mumble ${pkgs.mumble}/bin/mumble --host server --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --output /tmp/nuschl-stock-artifacts'")
     try:
-        client.succeed("su - tester -c 'xvfb-run -a -s \"-screen 0 1120x850x24\" ${pkgs.python3}/bin/python3 ${tests.desktopRecovery} ${nuschl}/bin --murmur ${pkgs.murmur}/bin/mumble-server --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --at-spi ${pkgs.at-spi2-core} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --output /tmp/nuschl-recovery-artifacts'")
+        client.succeed("su - tester -c 'xvfb-run -a -s \"-screen 0 1120x850x24\" ${testPython}/bin/python3 ${tests.desktopRecovery} ${nuschl}/bin --murmur ${pkgs.murmur}/bin/mumble-server --pulse-bin ${pkgs.pulseaudio}/bin --opus-library ${pkgs.libopus}/lib/libopus.so --at-spi ${pkgs.at-spi2-core} --dbus-daemon ${pkgs.dbus}/bin/dbus-daemon --output /tmp/nuschl-recovery-artifacts'")
     finally:
         client.copy_from_machine("/tmp/nuschl-recovery-artifacts", "recovery")
     # Screen-reader view over AT-SPI: names and roles, and operating Mute without a pointer.
     try:
-        client.succeed("su - tester -c '${pkgs.dbus}/bin/dbus-run-session -- xvfb-run -a -s \"-screen 0 1280x800x24\" ${pkgs.python3}/bin/python3 ${tests.accessibility} ${nuschl}/bin --murmur ${pkgs.murmur}/bin/mumble-server --at-spi ${pkgs.at-spi2-core} --pulse-bin ${pkgs.pulseaudio}/bin --output /tmp/nuschl-a11y-artifacts'")
+        client.succeed("su - tester -c '${pkgs.dbus}/bin/dbus-run-session -- xvfb-run -a -s \"-screen 0 1280x800x24\" ${testPython}/bin/python3 ${tests.accessibility} ${nuschl}/bin --murmur ${pkgs.murmur}/bin/mumble-server --at-spi ${pkgs.at-spi2-core} --pulse-bin ${pkgs.pulseaudio}/bin --output /tmp/nuschl-a11y-artifacts'")
     finally:
         client.copy_from_machine("/tmp/nuschl-a11y-artifacts", "accessibility")
     # Older stock servers use the legacy UDP packet format.
     for version, server_binary, extra in [("1.4", "${legacyServers."1.4"}", ""), ("1.3", "${legacyServers."1.3"}", " --no-listening")]:
-        client.succeed(f"su - tester -c '${pkgs.python3}/bin/python3 ${tests.withLocalMurmur} {server_binary} ${tests.udpVoice} ${nuschl}/bin --port PORT --opus-library ${pkgs.libopus}/lib/libopus.so'")
-        client.succeed(f"su - tester -c '${pkgs.python3}/bin/python3 ${tests.withLocalMurmur} {server_binary} ${tests.protocolFeatures} ${nuschl}/bin --port PORT --opus-library ${pkgs.libopus}/lib/libopus.so --openssl ${pkgs.openssl.bin}/bin/openssl{extra}'")
+        client.succeed(f"su - tester -c '${testPython}/bin/python3 ${tests.withLocalMurmur} {server_binary} ${tests.udpVoice} ${nuschl}/bin --port PORT --opus-library ${pkgs.libopus}/lib/libopus.so'")
+        client.succeed(f"su - tester -c '${testPython}/bin/python3 ${tests.withLocalMurmur} {server_binary} ${tests.protocolFeatures} ${nuschl}/bin --port PORT --opus-library ${pkgs.libopus}/lib/libopus.so --openssl ${pkgs.openssl.bin}/bin/openssl{extra}'")
         print(f"Stock Mumble {version}: UDP voice and protocol features passed.")
     database.wait_for_unit("nuschl.service")
-    database.succeed("su - postgres -c '${pkgs.python3}/bin/python3 ${tests.workers} ${nuschl}/bin --postgres-url-file ${postgresFixture}'")
+    database.succeed("su - postgres -c '${testPython}/bin/python3 ${tests.workers} ${nuschl}/bin --postgres-url-file ${postgresFixture}'")
   '';
 }

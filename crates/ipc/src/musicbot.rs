@@ -130,8 +130,8 @@ fn read_error(error: crate::Error) -> String {
     match error {
         crate::Error::Io(_) => "codec IPC read failed or truncated",
         crate::Error::TooLarge => "codec IPC frame exceeds its budget",
-        crate::Error::Json(_) => "invalid codec IPC message",
         crate::Error::Version(_) => "unsupported codec IPC version",
+        _ => "invalid codec IPC message",
     }
     .into()
 }

@@ -1268,7 +1268,7 @@
               pkgs.nixfmt
               pkgs.taplo
               pkgs.jujutsu
-              pkgs.python3
+              (pkgs.python3.withPackages (p: [ p.msgpack ]))
               pkgs.nodejs
             ]
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [

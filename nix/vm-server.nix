@@ -118,7 +118,7 @@ pkgs.testers.runNixOSTest {
       {
         environment.systemPackages = [
           nuschl
-          pkgs.python3
+          (pkgs.python3.withPackages (p: [ p.msgpack ]))
           pkgs.xvfb-run
           pkgs.pulseaudio
           pkgs.mumble

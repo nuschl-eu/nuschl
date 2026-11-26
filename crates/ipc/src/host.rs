@@ -700,9 +700,8 @@ pub(crate) async fn read_reply<T: DeserializeOwned>(
         .await
         .map_err(|error| match error {
             crate::Error::Io(error) => Error::Io(error),
-            crate::Error::Json(error) => Error::Json(error),
             crate::Error::Version(_) => Error::InvalidResponse,
-            error @ crate::Error::TooLarge => Error::Frame(error),
+            error => Error::Frame(error),
         })
 }
 #[cfg(test)]
