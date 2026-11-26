@@ -70,10 +70,7 @@ pub fn write_frame_within<T: Serialize>(
     write_body(writer, &encode_frame_body(value, maximum)?)
 }
 
-fn encode_frame_body<T: Serialize>(
-    value: &Envelope<T>,
-    maximum: usize,
-) -> Result<Vec<u8>, Error> {
+fn encode_frame_body<T: Serialize>(value: &Envelope<T>, maximum: usize) -> Result<Vec<u8>, Error> {
     let mut body = CappedBuffer::new(maximum);
     let result = postcard::to_io(value, &mut body).map(|_| ());
     if body.full {
@@ -93,7 +90,11 @@ pub(crate) fn decode_frame_body<T: DeserializeOwned>(body: &[u8]) -> Result<Enve
     if !remaining.is_empty() {
         return Err(Error::TrailingBytes);
     }
-    Ok(Envelope { version, request_id, payload })
+    Ok(Envelope {
+        version,
+        request_id,
+        payload,
+    })
 }
 
 fn read_body(reader: &mut impl Read, maximum: usize) -> Result<Option<Vec<u8>>, Error> {
@@ -147,8 +148,6 @@ impl CappedBuffer {
             full: false,
         }
     }
-
-
 }
 
 impl Write for CappedBuffer {
@@ -180,11 +179,7 @@ mod tests {
             decode_frame_body::<u8>(&body),
             Err(Error::TrailingBytes)
         ));
-        assert!(matches!(
-            encode_frame_body(&value, 1),
-            Err(Error::TooLarge)
-        ));
+        assert!(matches!(encode_frame_body(&value, 1), Err(Error::TooLarge)));
         Ok(())
     }
-
 }

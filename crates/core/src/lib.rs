@@ -20,7 +20,9 @@ macro_rules! wire_serde {
         }
 
         impl<'de> ::serde::Deserialize<'de> for $type {
-            fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            fn deserialize<D: ::serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Self, D::Error> {
                 if deserializer.is_human_readable() {
                     <$readable>::deserialize(deserializer)
                 } else {
@@ -192,7 +194,12 @@ impl MessageDocument {
 
 /// Renderers receive text and styles, never executable HTML or instructions to fetch URLs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    remote = "Self",
+    tag = "kind",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ContentBlock {
     Text {
         text: String,

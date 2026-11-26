@@ -25575,6 +25575,11 @@ rec {
             path = "src/bin/faulty-content-worker.rs";
             requiredFeatures = [ ];
           }
+          {
+            name = "worker-test-codec";
+            path = "src/bin/worker-test-codec.rs";
+            requiredFeatures = [ "test-codec" ];
+          }
         ];
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ../../crates/ipc; };
         libName = "nuschl_ipc";
@@ -25610,10 +25615,6 @@ rec {
             packageId = "postcard";
             usesDefaultFeatures = false;
             features = [ "use-std" ];
-          }
-          {
-            name = "rmp-serde";
-            packageId = "rmp-serde";
           }
           {
             name = "rustix";
@@ -25663,7 +25664,7 @@ rec {
         features = {
           "video-portal" = [ "dep:ashpd" "dep:futures-util" ];
         };
-        resolvedDefaultFeatures = [ "video-portal" ];
+        resolvedDefaultFeatures = [ "test-codec" "video-portal" ];
       };
       "nuschl-kt" = rec {
         crateName = "nuschl-kt";

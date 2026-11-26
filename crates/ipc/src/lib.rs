@@ -20,8 +20,10 @@ pub mod thumbnail;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod video;
 
-pub use framing::{Error, read_frame, read_frame_async, read_frame_within, write_frame, write_frame_within};
 pub(crate) use framing::decode_frame_body;
+pub use framing::{
+    Error, read_frame, read_frame_async, read_frame_within, write_frame, write_frame_within,
+};
 use nuschl_core::{ChatMessage, ContentBlock, HistoryPage, MessageDocument};
 use serde::{Deserialize, Serialize};
 
@@ -109,10 +111,7 @@ pub struct PreparedContent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentResponse {
     Rendered(MessageDocument),
     Prepared(PreparedContent),
@@ -203,10 +202,7 @@ pub enum StorageRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum StorageResponse {
     Appended(i64),
     Messages(Vec<ChatMessage>),
@@ -232,10 +228,7 @@ pub enum MediaRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MediaResponse {
     Samples(Vec<f32>),
     Packet(#[serde(with = "serde_bytes")] Vec<u8>),
