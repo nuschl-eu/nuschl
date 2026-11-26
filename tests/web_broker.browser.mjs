@@ -75,7 +75,7 @@ async function open(username,fault="",width=1280,trust=true) {
   globalThis.Worker=class extends NativeWorker {
    constructor(...args) {
     super(...args);fixture.workers.push(String(args[0]));
-    if(String(args[0]).includes("content-worker-"))this.addEventListener("message",({data})=>{fixture.codec.push({kind:data?.kind,error:data?.error,result_bytes:data?.result==null?null:new TextEncoder().encode(JSON.stringify(data.result)).length});if(fixture.codec.length>128)fixture.codec.shift();});
+    if(String(args[0]).includes("content-worker-"))this.addEventListener("message",({data})=>{fixture.codec.push({kind:data?.kind,error:data?.error,result_bytes:typeof data?.result==="string"?data.result.length:null});if(fixture.codec.length>128)fixture.codec.shift();});
     if(!String(args[0]).includes("sdk.worker-"))return;
     this.fixtureSdk=true;fixture.sdk=this;
     this.addEventListener("message",event=>{const {data}=event;
@@ -109,7 +109,7 @@ async function open(username,fault="",width=1280,trust=true) {
     if(data?.method==="state_applied"&&fixture.holdAck){fixture.heldAck=data.args[0];return;}
     if(data?.method==="state_applied")fixture.appliedPublication=data.args[0];
     if(this.fixtureSdk&&data?.id!==undefined){fixture.commands.set(data.id,data.method);if(fixture.commands.size>256)throw Error("fixture command bound");}
-    if(data?.method==="content_complete"){contentEvent({kind:"complete-post",id:data.id,request:data.args[0]});fixture.ackPosts++;fixture.pending.set(data.id,data.args[0]);fixture.completions.push({request:data.args[0],bytes:data.args[1]===null?0:new TextEncoder().encode(JSON.stringify(data.args[1])).length});if(fixture.completions.length>128)fixture.completions.shift();}
+    if(data?.method==="content_complete"){contentEvent({kind:"complete-post",id:data.id,request:data.args[0]});fixture.ackPosts++;fixture.pending.set(data.id,data.args[0]);fixture.completions.push({request:data.args[0],bytes:data.args[1]?.length});if(fixture.completions.length>128)fixture.completions.shift();}
     if(this.fixtureSdk&&data?.method==="content_request"&&data.id!==undefined){fixture.requestIds.add(data.id);fixture.requestsPeak=Math.max(fixture.requestsPeak,++fixture.requestsOutstanding);}
     if(this.fixtureSdk&&data?.method==="content_complete"&&fixture.dropAck) {
      // A lost ACK: the SDK never receives it, and the App sees a failed RPC.
@@ -152,7 +152,7 @@ async function rpc(page,method,...args) {
   const timer=setTimeout(()=>{worker.removeEventListener("message",listener);reject(new Error("fixture RPC timed out"));},5000);
   function listener({data}) {if(data?.kind!=="result"||data.id!==id)return;clearTimeout(timer);worker.removeEventListener("message",listener);if(data.error)reject(new Error(data.error));else resolve(data.value);}
   worker.addEventListener("message",listener);worker.postMessage({id,method,args,...(context===undefined?{}:{context})});
- }),{method,args,context:proof});
+ }),{method,args,context:proof===undefined?undefined:JSON.stringify(proof)});
 }
 // Stock-protocol direct text (TextMessage session=2, message=5) from a fixture peer.
 const wireVarint=value=>{const out=[];do{out.push((value&127)|(value>127?128:0));value=Math.floor(value/128);}while(value);return Buffer.from(out);};

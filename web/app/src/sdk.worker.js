@@ -121,9 +121,8 @@ onmessage = async ({ data }) => {
       const call=projectedAction(data.method,data.args);
       if(call){
         const projection=JSON.stringify(call);
-        const context=JSON.stringify(data.context);
-        if(projection.length>512||new TextEncoder().encode(projection).length>512||typeof context!=="string"||context.length>4096||new TextEncoder().encode(context).length>4096)throw new Error("This view changed. Your draft was kept; use the updated view and try again.");
-        client.validate_action(projection,context);
+        if(projection.length>512||new TextEncoder().encode(projection).length>512||typeof data.context!=="string"||data.context.length>4096||new TextEncoder().encode(data.context).length>4096)throw new Error("This view changed. Your draft was kept; use the updated view and try again.");
+        client.validate_action(projection,data.context);
       }else if(data.context!==undefined)throw new Error("Unexpected browser action context.");
       let value;
       if (data.method === "content_complete") {
@@ -131,16 +130,8 @@ onmessage = async ({ data }) => {
         if(typeof request!=="string"||!/^[1-9][0-9]{0,19}$/.test(request))throw new Error("Invalid content request.");
         // An invalid codec reply is still this job's ACK: release its exact SDK
         // credit as a terminal failure instead of leaving the lease outstanding.
-        let raw="";
-        if(reply!==null) {
-          try {
-            const json=JSON.stringify(reply);
-            textBytes(json,MAX_REPLY);
-            raw=json;
-          }
-          catch { /* The SDK retires this exact job as a content failure. */ }
-        }
-        const result=client.content_complete(request,raw);
+        const valid=typeof reply==="string"&&reply.length<=MAX_REPLY&&new TextEncoder().encode(reply).length<=MAX_REPLY;
+        const result=client.content_complete(request,valid?reply:"");
         textBytes(result,MAX_REPLY);
         value=JSON.parse(result);
       } else if (data.method === "content_retire") {

@@ -25,7 +25,8 @@ onmessage = ({data}) => {
       } else if (data.operation === "decode") result = processor.decode_image(data.bytes);
       else throw new Error("Invalid content operation.");
     }
-    postMessage({kind:"result", id, result:JSON.parse(result)});
+    // Forward the Wasm reply so the receiver can check its bytes before parsing.
+    postMessage({kind:"result", id, result});
   } catch (error) {
     if (error instanceof WebAssembly.RuntimeError) {
       // A trap (including exhausted linear memory) may leave Rust's execution

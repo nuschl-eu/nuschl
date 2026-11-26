@@ -83,21 +83,21 @@ test("content completion ACKs keep four of the 128 slots so ordinary command pre
  const {worker,clock,rpc}=fixture();const ordinary=[];
  for(let index=0;index<ORDINARY;index++)ordinary.push(rpc.request("content_request",[String(index+1)]).catch(error=>error));
  await assert.rejects(rpc.request("browse_server",[0]),/busy/);
- const acks=[];for(let index=0;index<4;index++)acks.push(rpc.request("content_complete",[String(index+1),null]).catch(error=>error));
+ const acks=[];for(let index=0;index<4;index++)acks.push(rpc.request("content_complete",[String(index+1),""]).catch(error=>error));
  assert.equal(worker.messages.filter(message=>message.method==="content_complete").length,4,"ACKs reach the SDK at the ordinary limit");
  assert.equal(rpc.size,SDK_RPC_LIMIT,"the aggregate table is not raised");
- await assert.rejects(rpc.request("content_complete",["5",null]),/busy/,"the reserve itself is bounded");
+ await assert.rejects(rpc.request("content_complete",["5",""]),/busy/,"the reserve itself is bounded");
  await assert.rejects(rpc.request("browse_server",[0]),/busy/,"ordinary work cannot borrow ACK slots");
  const ack=worker.messages.find(message=>message.method==="content_complete");
  assert.equal(rpc.accept({kind:"result",id:ack.id,value:null}),true);assert.equal(await acks[0],null);
- acks.push(rpc.request("content_complete",["5",null]).catch(error=>error));
+ acks.push(rpc.request("content_complete",["5",""]).catch(error=>error));
  assert.equal(worker.messages.filter(message=>message.method==="content_complete").length,5);
  clock.expire();assert.equal(rpc.size,0);await Promise.all(ordinary);await Promise.allSettled(acks);
 });
 test("the lane retirement notice shares the four ACK slots and is refused, not queued, when they are full",async()=>{
  const {worker,clock,rpc}=fixture();const ordinary=[];
  for(let index=0;index<ORDINARY;index++)ordinary.push(rpc.request("content_request",[String(index+1)]).catch(error=>error));
- const acks=[];for(let index=0;index<SDK_RPC_ACK_RESERVE;index++)acks.push(rpc.request("content_complete",[String(index+1),null]).catch(error=>error));
+ const acks=[];for(let index=0;index<SDK_RPC_ACK_RESERVE;index++)acks.push(rpc.request("content_complete",[String(index+1),""]).catch(error=>error));
  const posted=worker.messages.length;
  await assert.rejects(rpc.request("content_retire",["undelivered"]),/busy/);
  assert.equal(worker.messages.length,posted,"a refused notice posts nothing");assert.equal(rpc.size,SDK_RPC_LIMIT,"and takes no extra slot");

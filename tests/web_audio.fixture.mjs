@@ -19,7 +19,7 @@ function request(method,args=[],reference) {
   return new Promise((resolve,reject)=>{
     const timer=setTimeout(()=>{pending.delete(id);reject(new Error("SDK command timeout: "+method));},10000);
     pending.set(id,{resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}});
-    worker.postMessage({id,method,args,context:proof});
+    worker.postMessage({id,method,args,context:proof===undefined?undefined:JSON.stringify(proof)});
   });
 }
 const audio=new BrowserAudio({
