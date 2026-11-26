@@ -40,7 +40,7 @@ import wave
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
 from pipewire_recovery import PipeWire, Worker, defaults  # noqa: E402
-from worker_ipc import read_frame, write_frame  # noqa: E402
+from worker_ipc import WorkerCodec  # noqa: E402
 
 CALL_AUDIO_FRAME_LIMIT = 8 * 1024
 
@@ -107,6 +107,7 @@ class CallAudio:
 
     def __init__(self, command, pipewire, log):
         env = dict(pipewire.env) | {"PIPEWIRE_DEBUG": "2"}
+        self.codec = WorkerCodec("call_audio", command[0])
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=log.open("w"), env=env)
         self.events = []
@@ -114,14 +115,14 @@ class CallAudio:
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
-        while (event := read_frame(self.process.stdout, 0, limit=CALL_AUDIO_FRAME_LIMIT)) is not None:
+        while (event := self.codec.read_frame(self.process.stdout, 0, limit=CALL_AUDIO_FRAME_LIMIT)) is not None:
             event["received"] = time.monotonic()
             with self.lock:
                 self.events.append(event)
 
     def send(self, payload):
         with self.lock:
-            write_frame(self.process.stdin, 0, payload, limit=CALL_AUDIO_FRAME_LIMIT)
+            self.codec.write_frame(self.process.stdin, 0, payload, limit=CALL_AUDIO_FRAME_LIMIT)
 
     def packets(self, start, end):
         with self.lock:

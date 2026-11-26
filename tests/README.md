@@ -64,10 +64,12 @@ outside it are hidden, loopback connections fail and its environment holds only
 `PWD`.
 Windows/macOS runtime confinement remains outside this proof.
 
-Python suites that open native worker pipes use `worker_ipc.py` for version 2
-MessagePack frames. The development shell and VM suites provide Python's
-`msgpack` module. Opus travels as byte strings on worker pipes and as arrays
-of bytes in the CLI's JSON-lines fixtures.
+Python suites that open native worker pipes use `worker_ipc.py` and the
+test-only `worker-test-codec` binary. The helper converts fixture values to and
+from native Postcard frames with the production codec, while Python drives the
+worker itself. `just workers` builds the helper next to the workers. A packaged
+VM uses the helper from `PATH`. Set `NUSCHL_WORKER_TEST_CODEC` to select a
+separate test build.
 
 The iOS app track is cancelled/deferred by the user; its stopped environment experiment is documented in [ios-vm.md](../docs/ios-vm.md).
 `just ios-preflight` checks this Linux host without downloading VM media;

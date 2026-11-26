@@ -22,7 +22,7 @@ from pathlib import Path
 from local_murmur import Murmur, free_port
 from media_live import Pulse
 from mumble_client import Client, ReferenceOpus, certificate_pin
-from worker_ipc import read_frame, write_frame
+from worker_ipc import WorkerCodec
 
 
 class Worker:
@@ -33,6 +33,7 @@ class Worker:
         self.peer = peer
         self.first_wire_sequence = None
         self.stderr = log.open("wb")
+        self.codec = WorkerCodec("live_media", binary)
         self.process = subprocess.Popen(
             [str(binary), "--live"],
             stdin=subprocess.PIPE,
@@ -51,7 +52,7 @@ class Worker:
         self.reader.start()
 
     def read(self):
-        while (event := read_frame(self.process.stdout, 0, limit=1024 * 1024)) is not None:
+        while (event := self.codec.read_frame(self.process.stdout, 0, limit=1024 * 1024)) is not None:
             self.events.append((time.monotonic() - self.start, event))
             if self.peer is not None and event["kind"] == "packet":
                 if self.first_wire_sequence is None and not event["end"]:
@@ -66,7 +67,7 @@ class Worker:
                 self.peer.wire_sequence += 2
 
     def send(self, payload):
-        write_frame(self.process.stdin, 0, payload)
+        self.codec.write_frame(self.process.stdin, 0, payload)
 
     def wait(self, predicate, timeout=8):
         until = time.monotonic() + timeout

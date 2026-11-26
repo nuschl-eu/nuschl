@@ -27,7 +27,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
-from worker_ipc import read_frame, write_frame  # noqa: E402
+from worker_ipc import WorkerCodec  # noqa: E402
 
 RATE = 48000
 FRAME = 960  # 20 ms
@@ -55,13 +55,14 @@ class Worker:
     """The media worker's codec mode: one encoder and one decoder per process."""
 
     def __init__(self, binary):
+        self.codec = WorkerCodec("media", binary)
         self.process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self.request_id = 0
 
     def call(self, payload):
         self.request_id += 1
-        write_frame(self.process.stdin, self.request_id, payload)
-        reply = read_frame(self.process.stdout, self.request_id)
+        self.codec.write_frame(self.process.stdin, self.request_id, payload)
+        reply = self.codec.read_frame(self.process.stdout, self.request_id)
         if reply is None:
             raise AssertionError(f"media worker exited ({self.process.wait()}) on {payload['kind']}")
         return reply

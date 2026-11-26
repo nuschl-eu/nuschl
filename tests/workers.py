@@ -15,7 +15,7 @@ import sys
 import tempfile
 import zlib
 
-from worker_ipc import frame, read_frame
+from worker_ipc import WorkerCodec
 
 
 def png(width, height):
@@ -29,9 +29,11 @@ def png(width, height):
 
 
 def exchange(executable, payloads, arguments=()):
+    role = Path(executable).stem.removeprefix("nuschl-").removesuffix("-worker")
+    codec = WorkerCodec(role, executable)
     process = subprocess.run(
         [str(executable), *map(str, arguments)],
-        input=b"".join(frame(index + 1, payload) for index, payload in enumerate(payloads)),
+        input=b"".join(codec.frame(index + 1, payload) for index, payload in enumerate(payloads)),
         capture_output=True,
         timeout=30,
     )
@@ -42,7 +44,7 @@ def exchange(executable, payloads, arguments=()):
     stream = io.BytesIO(process.stdout)
     results = []
     for request_id in range(1, len(payloads) + 1):
-        payload = read_frame(stream, request_id, limit=1024 * 1024)
+        payload = codec.read_frame(stream, request_id, limit=1024 * 1024)
         assert payload is not None, process.stderr.decode(errors="replace")
         results.append(payload)
     assert stream.read() == b""
@@ -163,7 +165,7 @@ def check_workers(binaries):
 
     encoded, = exchange(binaries / "nuschl-media-worker", [{"kind": "encode_opus", "samples": [0.0] * 960}])
     assert encoded["status"] == "packet", encoded
-    assert isinstance(encoded["value"], bytes), "Opus uses a MessagePack byte string"
+    assert isinstance(encoded["value"], bytes)
     decoded, = exchange(binaries / "nuschl-media-worker", [{"kind": "decode_opus", "packet": encoded["value"]}])
     assert decoded["status"] == "samples", decoded
     assert len(decoded["value"]) == 960

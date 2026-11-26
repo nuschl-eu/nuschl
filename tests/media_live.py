@@ -39,7 +39,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
 import quarantine  # noqa: E402
-from worker_ipc import read_frame, write_frame  # noqa: E402
+from worker_ipc import WorkerCodec  # noqa: E402
 
 
 class Pulse:
@@ -87,17 +87,18 @@ class Worker:
         env = {"PULSE_SERVER": f"unix:{pulse.socket}", "XDG_RUNTIME_DIR": str(pulse.root),
                "NUSCHL_AUDIO_BACKEND": "pulse", "PATH": os.environ.get("PATH", ""),
                "NUSCHL_AUDIO_TIMING": os.environ.get("NUSCHL_AUDIO_TIMING", "")}
+        self.codec = WorkerCodec("live_media", binary)
         self.process = subprocess.Popen([str(binary), "--live"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
         self.events = []
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
 
     def _read(self):
-        while (event := read_frame(self.process.stdout, 0)) is not None:
+        while (event := self.codec.read_frame(self.process.stdout, 0)) is not None:
             self.events.append(event)
 
     def send(self, payload):
-        write_frame(self.process.stdin, 0, payload)
+        self.codec.write_frame(self.process.stdin, 0, payload)
 
     def wait(self, predicate, message, timeout=15):
         deadline = time.monotonic() + timeout

@@ -22,7 +22,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from local_murmur import eventually, free_port  # noqa: E402
-from worker_ipc import read_frame, write_frame  # noqa: E402
+from worker_ipc import WorkerCodec  # noqa: E402
 
 
 def listening(port):
@@ -85,6 +85,7 @@ class Worker:
 
     def __init__(self, binaries, request, file=None):
         command = [str(binaries / "nuschl"), "transfer-sandbox"] + (["--file", str(file)] if file else [])
+        self.codec = WorkerCodec("transfer", command[0])
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
         self.events = queue.Queue()
@@ -95,10 +96,10 @@ class Worker:
         self.send(request)
 
     def send(self, payload):
-        write_frame(self.process.stdin, 1, payload)
+        self.codec.write_frame(self.process.stdin, 1, payload)
 
     def _read(self):
-        while (event := read_frame(self.process.stdout, 0)) is not None:
+        while (event := self.codec.read_frame(self.process.stdout, 0)) is not None:
             if event["kind"] == "data":
                 self.data += base64.b64decode(event["bytes"])
                 time.sleep(self.slow)  # a slow disk: the pipe fills and the sender waits

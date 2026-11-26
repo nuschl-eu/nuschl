@@ -63,7 +63,7 @@ import wave
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
 import quarantine  # noqa: E402
-from worker_ipc import read_frame, write_frame  # noqa: E402
+from worker_ipc import WorkerCodec  # noqa: E402
 
 VIRTUAL_NODES = """# A raised quantum range, as PipeWire applies in virtual machines (and some users
 # configure): Nuschl must fit its buffer request into it.
@@ -254,6 +254,7 @@ class Worker:
         Worker.count += 1
         self.log = Worker.logs / f"worker-{Worker.count}.log"
         command = binary if isinstance(binary, list) else [str(binary), "--live"]
+        self.codec = WorkerCodec("live_media", command[0])
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.log.open("w"), env=env)
         self.events = []
@@ -267,12 +268,12 @@ class Worker:
             self.send({"kind": "set_state", "epoch": 1, "muted": muted, "deafened": False})
 
     def _read(self):
-        while (event := read_frame(self.process.stdout, 0)) is not None:
+        while (event := self.codec.read_frame(self.process.stdout, 0)) is not None:
             event["received"] = time.monotonic()
             self.events.append(event)
 
     def send(self, payload):
-        write_frame(self.process.stdin, 0, payload)
+        self.codec.write_frame(self.process.stdin, 0, payload)
 
     def wait(self, predicate, message, timeout=20, since=0):
         deadline = time.monotonic() + timeout
