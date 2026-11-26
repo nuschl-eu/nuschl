@@ -51,9 +51,8 @@ export class SdkRpc {
   request(method,args=[],proof) {
     if(this.closed)return Promise.reject(new SdkUnavailableError());
     if(this.phase!=="ready")return Promise.reject(new Error("The client is still starting."));
-    let context;
     if(proof!==undefined){
-      try{context=JSON.stringify(proof);if(typeof context!=="string"||context.length>4096||new TextEncoder().encode(context).length>4096)throw new Error("Action context exceeds the browser limit.");}
+      try{const context=JSON.stringify(proof);if(typeof context!=="string"||context.length>4096||new TextEncoder().encode(context).length>4096)throw new Error("Action context exceeds the browser limit.");}
       catch(error){return Promise.reject(error);}
     }
     const ack=ACK_METHODS.has(method);
@@ -66,7 +65,7 @@ export class SdkRpc {
     return new Promise((resolve,reject)=>{
       const timer=this.clock.setTimeout(()=>this.close("The browser worker did not respond. Reload to reconnect."),SDK_RPC_TIMEOUT);
       this.pending.set(id,{resolve,reject,timer,ack});if(ack)this.acks++;
-      try {this.worker.postMessage(context===undefined?{id,method,args}:{id,method,args,context});}
+      try {this.worker.postMessage(proof===undefined?{id,method,args}:{id,method,args,context:proof});}
       catch {this.close("The browser worker could not accept a command. Reload to reconnect.");}
     });
   }

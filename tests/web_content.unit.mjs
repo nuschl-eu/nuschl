@@ -9,7 +9,7 @@ const {MAX_IMAGE_INPUT,validateDocument,validateReply}=protocol;
 const ownerSource=(await readFile(new URL("../web/app/src/worker-owner.js",import.meta.url),"utf8")).replace(/^export /gm,"");
 const source=ownerSource+"\n"+(await readFile(new URL("../web/app/src/content-service.js",import.meta.url),"utf8"))
   .replace(/^import .*;\n/gm,"").replaceAll("import.meta.url",'"https://fixture.invalid/content-service.js"').replace(/^export /gm,"");
-const rendered=text=>JSON.stringify({marked_text:text,plain_text:text,document:{blocks:[{kind:"text",text}]}});
+const rendered=text=>({marked_text:text,plain_text:text,document:{blocks:[{kind:"text",text}]}});
 class Clock {
   now=0;next=0;jobs=new Map();
   setTimeout(callback,delay){const id=++this.next;this.jobs.set(id,{at:this.now+delay,callback});return id;}
@@ -149,7 +149,7 @@ test("factory/post failures, traps and malformed replies retire the one shared o
       if(failure==="post")f.workers[0].postMessage=()=>{throw new Error("clone failed");};
       f.workers[0].ready();
       if(failure==="trap")f.workers[0].emit({kind:"fatal"});
-      if(failure==="malformed")f.workers[0].emit({kind:"result",id:1,result:'{"unexpected":true}'});
+      if(failure==="malformed")f.workers[0].emit({kind:"result",id:1,result:{unexpected:true}});
     }
     assert.ok((await first).error);assert.equal(f.service.retired,true);await assert.rejects(new f.Service().render({source:"retry"}),/unavailable/);
     assert.equal(f.workers.length,failure==="factory"?0:1);
@@ -166,8 +166,8 @@ test("the receiving boundary rejects resource URLs, invalid pixels and split UTF
   for(const image of [{...pixel,source:"https://invalid.example/canary"},{...pixel,width:4096},{...pixel,rgba:"/wAA/w=A"}])assert.throws(()=>validateDocument({blocks:[image]}));
   assert.throws(()=>validateDocument({blocks:[{kind:"text",text:"🦀",spans:[{start:1,end:4}]}]}));
   assert.throws(()=>validateDocument({blocks:[{kind:"text",text:"link",spans:[{start:0,end:4,link:"javascript://alert(1)"}]}]}));
-  assert.throws(()=>validateReply("encode",JSON.stringify({html:'<img src="https://invalid.example/a" />',thumbnail:pixel}),10000));
-  assert.throws(()=>validateReply("encode",JSON.stringify({html:'<img src="data:image/png;base64,AA\" onerror=\"bad" />',thumbnail:pixel}),10000));
+  assert.throws(()=>validateReply("encode",{html:'<img src="https://invalid.example/a" />',thumbnail:pixel},10000));
+  assert.throws(()=>validateReply("encode",{html:'<img src="data:image/png;base64,AA\" onerror=\"bad" />',thumbnail:pixel},10000));
   const valid=validateReply("render",rendered("first\n\nsecond 🦀"));assert.equal(valid.plain_text,"first\n\nsecond 🦀");
 });
 test("documents carry the line breaks between blocks as breaks, on a budget of their own",()=>{

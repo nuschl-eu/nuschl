@@ -65,13 +65,10 @@ export class DocumentCache {
 
 const cache = new DocumentCache();
 const ticket=id=>typeof id==="string"&&/^[1-9][0-9]{0,19}$/.test(id);
-// A normal content_complete result: bounded JSON text of null (nothing to
-// install) or exactly {token, charge, document, failed}. Anything else throws.
-function completion(raw) {
-  textBytes(raw,MAX_REPLY);
-  const value=JSON.parse(raw);
+// The SDK ACK carries null or the admitted document and its cache charge.
+function completion(value) {
   if(value===null)return null;
-  if(typeof value!=="object"||Array.isArray(value)||Object.keys(value).length!==4||typeof value.token!=="string"||!Number.isSafeInteger(value.charge)||!value.document||typeof value.document!=="object"||typeof value.failed!=="boolean")throw new Error("Invalid content completion.");
+  if(!value||Object.getPrototypeOf(value)!==Object.prototype||Object.keys(value).length!==4||typeof value.token!=="string"||!Number.isSafeInteger(value.charge)||!value.document||typeof value.document!=="object"||typeof value.failed!=="boolean")throw new Error("Invalid content completion.");
   return value;
 }
 export function contentDocument(token) { return cache.get(token); }
@@ -170,7 +167,7 @@ export class ContentBridge {
     if(!entry)return; // its ACK has already reached the SDK
     const index=this.queue.indexOf(entry);
     if(index<0){entry.controller.abort();return;}
-    this.queue.splice(index,1);this.acknowledge(entry,""); // never reached the codec
+    this.queue.splice(index,1);this.acknowledge(entry,null); // never reached the codec
   }
   // The content service runs one job at a time and the SDK times only its oldest
   // unacknowledged job. Hand over the next job only after the previous one has
@@ -194,9 +191,9 @@ export class ContentBridge {
     // it first (its credit is really released) and only then stop the lane.
     const stopped=this.service.retired===true;
     if(!stopped)this.pump();
-    let reply="";
+    let reply=null;
     if(result!==undefined) {
-      try { const json=JSON.stringify(result);textBytes(json,MAX_REPLY);reply=json; }
+      try { textBytes(JSON.stringify(result),MAX_REPLY);reply=result; }
       catch { /* A bounded failure ACK never grants parser fallback. */ }
     }
     await this.acknowledge(entry,reply);

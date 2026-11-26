@@ -6,6 +6,7 @@ import {UI_METHODS,projectedAction} from "./action-context.js";
 import { StatePublication, stateFrame } from "./state-publication.js";
 import { createContentPublication } from "./content-publication.js";
 import { restoreOrder } from "./server-order.js";
+import { MAX_REPLY, textBytes } from "./content-protocol.js";
 let client;
 let history;
 let saved = null;
@@ -120,8 +121,9 @@ onmessage = async ({ data }) => {
       const call=projectedAction(data.method,data.args);
       if(call){
         const projection=JSON.stringify(call);
-        if(projection.length>512||new TextEncoder().encode(projection).length>512||typeof data.context!=="string"||data.context.length>4096||new TextEncoder().encode(data.context).length>4096)throw new Error("This view changed. Your draft was kept; use the updated view and try again.");
-        client.validate_action(projection,data.context);
+        const context=JSON.stringify(data.context);
+        if(projection.length>512||new TextEncoder().encode(projection).length>512||typeof context!=="string"||context.length>4096||new TextEncoder().encode(context).length>4096)throw new Error("This view changed. Your draft was kept; use the updated view and try again.");
+        client.validate_action(projection,context);
       }else if(data.context!==undefined)throw new Error("Unexpected browser action context.");
       let value;
       if (data.method === "content_complete") {
@@ -129,8 +131,18 @@ onmessage = async ({ data }) => {
         if(typeof request!=="string"||!/^[1-9][0-9]{0,19}$/.test(request))throw new Error("Invalid content request.");
         // An invalid codec reply is still this job's ACK: release its exact SDK
         // credit as a terminal failure instead of leaving the lease outstanding.
-        const valid=typeof reply==="string"&&reply.length<=2*1024*1024&&new TextEncoder().encode(reply).length<=2*1024*1024;
-        value=client.content_complete(request,valid?reply:"");
+        let raw="";
+        if(reply!==null) {
+          try {
+            const json=JSON.stringify(reply);
+            textBytes(json,MAX_REPLY);
+            raw=json;
+          }
+          catch { /* The SDK retires this exact job as a content failure. */ }
+        }
+        const result=client.content_complete(request,raw);
+        textBytes(result,MAX_REPLY);
+        value=JSON.parse(result);
       } else if (data.method === "content_retire") {
         if(!["undelivered","protocol"].includes(data.args[0]))throw new Error("Invalid content lane retirement.");
         value=client.content_retire(data.args[0]);
@@ -150,6 +162,8 @@ onmessage = async ({ data }) => {
         if (!packet || !(packet.opus instanceof Uint8Array) || packet.opus.length > 960) throw new Error("Invalid voice packet.");
         const {opus,...context} = packet;
         value = client.voice_packet(JSON.stringify(context),opus);
+      } else if (data.method === "find") {
+        value = JSON.parse(client.find(...data.args));
       } else value = client[data.method](...data.args);
       if (data.id !== undefined) postMessage({ kind: "result", id: data.id, value });
       // Encoding is frequent; its route has already been admitted in Rust.

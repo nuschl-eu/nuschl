@@ -5,7 +5,7 @@ import {UI_METHODS,projectedAction,actionProof,serverReference} from "./action-c
 const server={runtime_index:3,id:"original",catalog_instance:"9",generation:"15",own_instance:"21",muted:true,deafened:true,channels:[{id:7,instance:"24",peer:null}],users:[{session:4,instance:"32"}]};
 const timeline={server:"original",channel:7,instance:"24",peer:null};
 test("every allowed UI method has an explicit fixed argument/guard classification",()=>{
- const args={add_server:["","127.0.0.1",64738,"fixture",null],connect:[3],disconnect:[3],accept_certificate:[3,"a".repeat(64)],open:[3,7],browse_server:[3],open_direct:[3,4],send_text:["draft"],start_video_call:["link"],end_video_call:["link"],older:[],join:[3,7],move_user:[3,4,7],query_permissions:[3,7],toggle_mute:[3],toggle_deaf:[3],audio_ready:[{}],voice_packet:[{}],remove_server:[3],dismiss_notice:[3],dismiss_welcome:[3,"ticket"],connect_with_password:[3,"not-a-real-secret"],stop_audio:[],edit_server:[3,"","127.0.0.1",64738,"fixture",null],set_server_order:[["original"]],set_voice_bitrate:[128000],content_complete:["1",""],content_request:["1"],content_retire:["undelivered"],image_begin:[{}],image_send:[{}],image_cancel:["1"],find:["lob"]};
+ const args={add_server:["","127.0.0.1",64738,"fixture",null],connect:[3],disconnect:[3],accept_certificate:[3,"a".repeat(64)],open:[3,7],browse_server:[3],open_direct:[3,4],send_text:["draft"],start_video_call:["link"],end_video_call:["link"],older:[],join:[3,7],move_user:[3,4,7],query_permissions:[3,7],toggle_mute:[3],toggle_deaf:[3],audio_ready:[{}],voice_packet:[{}],remove_server:[3],dismiss_notice:[3],dismiss_welcome:[3,"ticket"],connect_with_password:[3,"not-a-real-secret"],stop_audio:[],edit_server:[3,"","127.0.0.1",64738,"fixture",null],set_server_order:[["original"]],set_voice_bitrate:[128000],content_complete:["1",null],content_request:["1"],content_retire:["undelivered"],image_begin:[{}],image_send:[{}],image_cancel:["1"],find:["lob"]};
  assert.deepEqual([...UI_METHODS].sort(),Object.keys(args).sort());
  const exempt=new Set(["add_server","set_server_order","set_voice_bitrate","stop_audio","audio_ready","voice_packet","content_complete","content_request","content_retire","image_begin","image_send","image_cancel","find","end_video_call","query_permissions"]);
  for(const [method,values] of Object.entries(args)){
@@ -40,13 +40,13 @@ test("newly configured form chain uses only its explicit returned local referenc
  assert.throws(()=>serverReference({...server,generation:15}));
 });
 
-test("RPC serializes bounded original proof before posting, without re-reading newer view state",async()=>{
+test("RPC clones bounded original proof when posting, without re-reading newer view state",async()=>{
  const {SdkRpc}=await import("./sdk-rpc.js");const messages=[];let next=0;
- const worker={postMessage:value=>messages.push(value),terminate(){}};
+ const worker={postMessage:value=>messages.push(structuredClone(value)),terminate(){}};
  const rpc=new SdkRpc(worker,{clock:{setTimeout:()=>++next,clearTimeout(){}}});rpc.initialize("ws://127.0.0.1/relay");rpc.acceptReady();messages.length=0;
  const proof=actionProof("send_text",["draft"],[server],timeline,null);
  const pending=rpc.request("send_text",["draft"],proof);proof.server.generation="999";
- assert.equal(JSON.parse(messages[0].context).server.generation,"15");
+ assert.equal(messages[0].context.server.generation,"15");
  rpc.accept({kind:"result",id:messages[0].id,error:"stale target"});await assert.rejects(pending,/stale target/);
  const before=messages.length;await assert.rejects(rpc.request("send_text",["draft"],{value:"🙂".repeat(1500)}),/limit/);assert.equal(messages.length,before);assert.equal(rpc.size,0);
  const lease=rpc.request("content_request",["1"]);assert.equal(Object.hasOwn(messages.at(-1),"context"),false);rpc.accept({kind:"result",id:messages.at(-1).id,value:null});await lease;rpc.close();

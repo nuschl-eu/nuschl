@@ -17,7 +17,8 @@ export function textBytes(value, limit) {
   return bytes;
 }
 function color(value, count) {
-  if (!Array.isArray(value) || value.length !== count || value.some(byte => !integer(byte, 0, 255))) fail();
+  if (!Array.isArray(value) || value.length !== count) fail();
+  for (const byte of value) if (!integer(byte, 0, 255)) fail();
 }
 function base64(value, bytes) {
   if (typeof value !== "string" || value.length !== Math.ceil(bytes / 3) * 4) fail();
@@ -109,9 +110,7 @@ export function validateDocument(document) {
   }
   return document;
 }
-export function validateReply(operation, json, limit) {
-  textBytes(json, MAX_REPLY);
-  const reply = JSON.parse(json);
+export function validateReply(operation, reply, limit) {
   if (operation === "render") {
     fields(reply, ["marked_text", "plain_text", "document"]);
     textBytes(reply.marked_text, MAX_SOURCE); textBytes(reply.plain_text, MAX_SOURCE);
@@ -131,5 +130,6 @@ export function validateReply(operation, json, limit) {
     image(reply.thumbnail, {pixels:0, images:0});
   } else if (operation === "decode") image(reply, {pixels:0, images:0});
   else fail();
+  textBytes(JSON.stringify(reply), MAX_REPLY);
   return reply;
 }

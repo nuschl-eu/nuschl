@@ -91,7 +91,7 @@ test("factory/post/trap/malformed/stale replies close one owner even across new 
     const first=outcome(service.render("first"));if(failure!=="factory"){
       if(failure==="post")workers[0].postMessage=()=>{throw new Error("clone");};workers[0].ready();
       if(failure==="trap")workers[0].onerror({preventDefault(){}});
-      if(failure==="malformed")workers[0].emit({kind:"result",id:1,tree:'{"tag":"math","attrs":{"href":"/canary"},"children":[]}'});
+      if(failure==="malformed")workers[0].emit({kind:"result",id:1,tree:{tag:"math",attrs:{href:"/canary"},children:[]}});
       if(failure==="stale")workers[0].finish("wrong",7);
     }
     assert.equal((await first).error.code,"worker-unavailable");assert.equal(service.retired,true);await assert.rejects(new Service().render("new"),e=>e.code==="worker-unavailable");
