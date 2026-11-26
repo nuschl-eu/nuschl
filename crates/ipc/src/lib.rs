@@ -573,7 +573,7 @@ mod hostile_frames {
                 state ^= state << 17;
                 bytes.push(state as u8);
             }
-            // Frequently claim a plausible length so JSON parsing is reached.
+            // Frequently claim a plausible length so decoding reaches the frame body.
             if bytes.len() >= 4 && state.is_multiple_of(3) {
                 let claimed = ((bytes.len() - 4) as u32).to_be_bytes();
                 bytes[..4].copy_from_slice(&claimed);

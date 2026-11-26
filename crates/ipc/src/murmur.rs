@@ -8,8 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The largest comment, description, texture or config value the reader
-/// passes on; larger values are reported and dropped. Keeps every row, even
-/// one of control characters escaped by JSON, below [`crate::MAX_FRAME_BYTES`].
+/// passes on. This keeps individual rows within the worker's frame budget.
 pub const MAX_BLOB_BYTES: usize = 1024 * 1024;
 /// Rows read per table; a table cut here is reported.
 pub const MAX_ROWS: usize = 200_000;

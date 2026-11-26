@@ -71,12 +71,14 @@ pub fn write_frame_within<T: Serialize>(
 }
 
 fn encode_frame_body<T: Serialize>(value: &Envelope<T>, maximum: usize) -> Result<Vec<u8>, Error> {
-    let mut body = CappedBuffer::new(maximum);
-    let result = postcard::to_io(value, &mut body).map(|_| ());
-    if body.full {
-        return Err(Error::TooLarge);
-    }
-    result?;
+    let body = CappedBuffer {
+        bytes: Vec::new(),
+        maximum,
+    };
+    let body = postcard::to_io(value, body).map_err(|error| match error {
+        postcard::Error::SerializeBufferFull => Error::TooLarge,
+        error => Error::Postcard(error),
+    })?;
     Ok(body.bytes)
 }
 
@@ -137,23 +139,11 @@ fn write_body(writer: &mut impl Write, body: &[u8]) -> Result<(), Error> {
 struct CappedBuffer {
     bytes: Vec<u8>,
     maximum: usize,
-    full: bool,
-}
-
-impl CappedBuffer {
-    fn new(maximum: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            maximum,
-            full: false,
-        }
-    }
 }
 
 impl Write for CappedBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) {
-            self.full = true;
             return Err(io::Error::other("worker frame too large"));
         }
         self.bytes.extend_from_slice(bytes);

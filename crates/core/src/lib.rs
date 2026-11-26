@@ -85,32 +85,20 @@ pub struct ChatMessage {
 
 /// A storage ID is meaningful only within its database and server/channel scope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryEntry {
     pub id: i64,
     pub message: ChatMessage,
     /// On a Nuschl server: the message's sequence number in its conversation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub seq: Option<i64>,
     /// When the author last edited it (Nuschl servers).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub edited_ms: Option<i64>,
     /// When it was deleted: a tombstone, whose text is gone (Nuschl servers).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub deleted_ms: Option<i64>,
 }
-
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "HistoryEntry")]
-struct BinaryHistoryEntry {
-    id: i64,
-    message: ChatMessage,
-    seq: Option<i64>,
-    edited_ms: Option<i64>,
-    deleted_ms: Option<i64>,
-}
-
-wire_serde!(HistoryEntry, HistoryEntry, BinaryHistoryEntry);
 
 /// A Nuschl server's message by its per-conversation sequence number, for
 /// the local cache (`message.channel` is the local storage key). A record
@@ -127,7 +115,7 @@ pub struct ServerRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(remote = "Self", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryPage {
     /// Chronological display order, including repeated messages with identical timestamps.
     pub messages: Vec<HistoryEntry>,
@@ -137,19 +125,9 @@ pub struct HistoryPage {
     /// Exclusive cursor for the next newer page of a page read around or after
     /// a message; None means the newest stored message is included (a page
     /// read backwards leaves it None).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub next_after: Option<i64>,
 }
-
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "HistoryPage")]
-struct BinaryHistoryPage {
-    messages: Vec<HistoryEntry>,
-    next_before: Option<i64>,
-    next_after: Option<i64>,
-}
-
-wire_serde!(HistoryPage, HistoryPage, BinaryHistoryPage);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
