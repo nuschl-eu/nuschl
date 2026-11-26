@@ -63,6 +63,7 @@ import wave
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
 import quarantine  # noqa: E402
+from worker_ipc import read_frame, write_frame  # noqa: E402
 
 VIRTUAL_NODES = """# A raised quantum range, as PipeWire applies in virtual machines (and some users
 # configure): Nuschl must fit its buffer request into it.
@@ -266,18 +267,12 @@ class Worker:
             self.send({"kind": "set_state", "epoch": 1, "muted": muted, "deafened": False})
 
     def _read(self):
-        while True:
-            header = self.process.stdout.read(4)
-            if len(header) < 4:
-                return
-            event = json.loads(self.process.stdout.read(struct.unpack(">I", header)[0]))["payload"]
+        while (event := read_frame(self.process.stdout, 0)) is not None:
             event["received"] = time.monotonic()
             self.events.append(event)
 
     def send(self, payload):
-        body = json.dumps({"version": 1, "request_id": 0, "payload": payload}).encode()
-        self.process.stdin.write(struct.pack(">I", len(body)) + body)
-        self.process.stdin.flush()
+        write_frame(self.process.stdin, 0, payload)
 
     def wait(self, predicate, message, timeout=20, since=0):
         deadline = time.monotonic() + timeout
@@ -370,7 +365,7 @@ def play_and_measure(worker, pipewire, packets, path, target="speakers"):
     start = time.monotonic()
     for index, opus in enumerate(packets):
         time.sleep(max(0, start + index * 0.02 - time.monotonic()))
-        worker.send({"kind": "playback", "sender": 9, "sequence": index * 2, "opus": opus,
+        worker.send({"kind": "playback", "sender": 9, "sequence": index * 2, "opus": bytes(opus),
                      "end": index == len(packets) - 1, "volume": 1.0})
     time.sleep(0.6)
     samples = recorder.stop()
@@ -619,7 +614,7 @@ def check_mute(binary, pipewire, packets, output, cycles):
         while not stop.is_set():
             time.sleep(max(0, start + index * 0.02 - time.monotonic()))
             worker.send({"kind": "playback", "stream": 1, "sender": 9, "sequence": index * 2,
-                         "opus": packets[index % len(packets)], "end": False, "volume": 1.0})
+                         "opus": bytes(packets[index % len(packets)]), "end": False, "volume": 1.0})
             index += 1
     path = output / "mute-playback.wav"
     recorder = pipewire.record(path)

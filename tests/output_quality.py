@@ -241,7 +241,7 @@ def playback(binary, pulse, packets, path, volume=1., packet_frames=FRAME, monit
             for index, packet in enumerate(packets):
                 time.sleep(max(0, at + index * packet_frames / RATE - time.monotonic()))
                 worker.send({"kind": "playback", "sender": 7, "sequence": index * (packet_frames // 480),
-                             "opus": list(packet), "end": index == len(packets) - 1, "volume": volume})
+                             "opus": bytes(packet), "end": index == len(packets) - 1, "volume": volume})
             time.sleep(.5)
     finally:
         if recorder and recorder.poll() is None:

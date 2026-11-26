@@ -64,6 +64,11 @@ outside it are hidden, loopback connections fail and its environment holds only
 `PWD`.
 Windows/macOS runtime confinement remains outside this proof.
 
+Python suites that open native worker pipes use `worker_ipc.py` for version 2
+MessagePack frames. The development shell and VM suites provide Python's
+`msgpack` module. Opus travels as byte strings on worker pipes and as arrays
+of bytes in the CLI's JSON-lines fixtures.
+
 The iOS app track is cancelled/deferred by the user; its stopped environment experiment is documented in [ios-vm.md](../docs/ios-vm.md).
 `just ios-preflight` checks this Linux host without downloading VM media;
 `just ios-vm-check` runs the host-side tooling tests. Guest inspection is bounded

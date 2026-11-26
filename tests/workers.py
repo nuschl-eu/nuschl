@@ -15,6 +15,8 @@ import sys
 import tempfile
 import zlib
 
+from worker_ipc import frame, read_frame
+
 
 def png(width, height):
     """A small gradient PNG, standard library only."""
@@ -24,11 +26,6 @@ def png(width, height):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
-
-
-def frame(request_id, payload):
-    body = json.dumps({"version": 1, "request_id": request_id, "payload": payload}).encode()
-    return struct.pack(">I", len(body)) + body
 
 
 def exchange(executable, payloads, arguments=()):
@@ -44,16 +41,10 @@ def exchange(executable, payloads, arguments=()):
     )
     stream = io.BytesIO(process.stdout)
     results = []
-    for index in range(len(payloads)):
-        header = stream.read(4)
-        assert len(header) == 4, process.stderr.decode(errors="replace")
-        size, = struct.unpack(">I", header)
-        assert size <= 1024 * 1024
-        body = stream.read(size)
-        assert len(body) == size
-        envelope = json.loads(body)
-        assert envelope["version"] == 1 and envelope["request_id"] == index + 1
-        results.append(envelope["payload"])
+    for request_id in range(1, len(payloads) + 1):
+        payload = read_frame(stream, request_id, limit=1024 * 1024)
+        assert payload is not None, process.stderr.decode(errors="replace")
+        results.append(payload)
     assert stream.read() == b""
     return results
 
@@ -146,6 +137,15 @@ def check_workers(binaries):
     )
     assert failed.returncode != 0, "oversized input must fail without a body allocation"
 
+    legacy_request = json.dumps({"version": 1, "request_id": 1,
+                                 "payload": {"kind": "render", "text": "old format"}}).encode()
+    failed = subprocess.run(
+        [str(binaries / "nuschl-content-worker")],
+        input=struct.pack(">I", len(legacy_request)) + legacy_request,
+        capture_output=True, timeout=10,
+    )
+    assert failed.returncode != 0 and not failed.stdout, "old JSON frames must be refused"
+
     message = {
         "server": "fixture-server", "channel": "general", "author": "fixture-user",
         "observed_at_ms": 123, "body": source,
@@ -163,6 +163,7 @@ def check_workers(binaries):
 
     encoded, = exchange(binaries / "nuschl-media-worker", [{"kind": "encode_opus", "samples": [0.0] * 960}])
     assert encoded["status"] == "packet", encoded
+    assert isinstance(encoded["value"], bytes), "Opus uses a MessagePack byte string"
     decoded, = exchange(binaries / "nuschl-media-worker", [{"kind": "decode_opus", "packet": encoded["value"]}])
     assert decoded["status"] == "samples", decoded
     assert len(decoded["value"]) == 960

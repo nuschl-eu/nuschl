@@ -19,16 +19,15 @@ libopus runs only in this test process, through ctypes, as a reference.
 """
 import argparse
 import ctypes
-import json
 import math
 from pathlib import Path
 import random
-import struct
 import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
+from worker_ipc import read_frame, write_frame  # noqa: E402
 
 RATE = 48000
 FRAME = 960  # 20 ms
@@ -61,15 +60,11 @@ class Worker:
 
     def call(self, payload):
         self.request_id += 1
-        body = json.dumps({"version": 1, "request_id": self.request_id, "payload": payload}).encode()
-        self.process.stdin.write(struct.pack(">I", len(body)) + body)
-        self.process.stdin.flush()
-        header = self.process.stdout.read(4)
-        if len(header) < 4:
+        write_frame(self.process.stdin, self.request_id, payload)
+        reply = read_frame(self.process.stdout, self.request_id)
+        if reply is None:
             raise AssertionError(f"media worker exited ({self.process.wait()}) on {payload['kind']}")
-        envelope = json.loads(self.process.stdout.read(struct.unpack(">I", header)[0]))
-        assert envelope["request_id"] == self.request_id
-        return envelope["payload"]
+        return reply
 
     def encode(self, samples):
         packets = []
@@ -82,7 +77,7 @@ class Worker:
     def decode(self, packets):
         out = []
         for packet in packets:
-            reply = self.call({"kind": "decode_opus", "packet": list(packet)})
+            reply = self.call({"kind": "decode_opus", "packet": bytes(packet)})
             assert reply["status"] == "samples", reply
             out.extend(reply["value"])
         return out
@@ -220,7 +215,7 @@ def check_hostile_packets(binary, reference, count):
             packet[0] = rng.randrange(256)
         else:  # random bytes of random length
             packet = bytearray(rng.randrange(256) for _ in range(rng.randint(1, 1275)))
-        reply = worker.call({"kind": "decode_opus", "packet": list(packet)})
+        reply = worker.call({"kind": "decode_opus", "packet": bytes(packet)})
         assert reply["status"] in outcomes, reply
         expected = (ctypes.c_float * 5760)()
         produced = lib.opus_decode_float(libopus, bytes(packet), len(packet), expected, 5760, 0)
@@ -232,7 +227,7 @@ def check_hostile_packets(binary, reference, count):
         else:
             agree += produced < 0
         outcomes[reply["status"]] += 1
-    reply = worker.call({"kind": "decode_opus", "packet": seeds[3]})
+    reply = worker.call({"kind": "decode_opus", "packet": bytes(seeds[3])})
     assert reply["status"] == "samples", "the decoder did not recover after hostile packets"
     worker.close()
     lib.opus_decoder_destroy(libopus)

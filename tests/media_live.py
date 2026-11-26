@@ -39,6 +39,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
 import quarantine  # noqa: E402
+from worker_ipc import read_frame, write_frame  # noqa: E402
 
 
 class Pulse:
@@ -92,16 +93,11 @@ class Worker:
         self.reader.start()
 
     def _read(self):
-        while True:
-            header = self.process.stdout.read(4)
-            if len(header) < 4:
-                return
-            self.events.append(json.loads(self.process.stdout.read(struct.unpack(">I", header)[0]))["payload"])
+        while (event := read_frame(self.process.stdout, 0)) is not None:
+            self.events.append(event)
 
     def send(self, payload):
-        body = json.dumps({"version": 1, "request_id": 0, "payload": payload}).encode()
-        self.process.stdin.write(struct.pack(">I", len(body)) + body)
-        self.process.stdin.flush()
+        write_frame(self.process.stdin, 0, payload)
 
     def wait(self, predicate, message, timeout=15):
         deadline = time.monotonic() + timeout
@@ -172,7 +168,7 @@ def check_jitter(binary, pulse, reference, output):
             if rng.random() < 0.05:
                 lost += 1
                 continue
-            worker.send({"kind": "playback", "sender": 7, "sequence": index * 2, "opus": packets[index],
+            worker.send({"kind": "playback", "sender": 7, "sequence": index * 2, "opus": bytes(packets[index]),
                          "end": index == len(packets) - 1, "volume": 1.0})
         time.sleep(0.8)
         os.killpg(recorder.pid, signal.SIGTERM)

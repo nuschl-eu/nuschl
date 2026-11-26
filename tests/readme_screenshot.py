@@ -310,7 +310,7 @@ def main():
             time.sleep(1.0)
 
             # Ada talks while Lena types.
-            packets = [packet["value"] for packet in exchange(
+            packets = [list(packet["value"]) for packet in exchange(
                 args.binaries / "nuschl-media-worker",
                 [{"kind": "encode_opus", "samples": tone(frame * 960, 960)} for frame in range(25)])]
             talker = threading.Thread(target=talk, args=(ada, packets, stop), daemon=True)

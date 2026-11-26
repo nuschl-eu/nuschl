@@ -13,7 +13,6 @@ import json
 import math
 import os
 import re
-import struct
 import subprocess
 import threading
 import time
@@ -23,6 +22,7 @@ from pathlib import Path
 from local_murmur import Murmur, free_port
 from media_live import Pulse
 from mumble_client import Client, ReferenceOpus, certificate_pin
+from worker_ipc import read_frame, write_frame
 
 
 class Worker:
@@ -51,13 +51,7 @@ class Worker:
         self.reader.start()
 
     def read(self):
-        while True:
-            header = self.process.stdout.read(4)
-            if len(header) != 4:
-                return
-            (length,) = struct.unpack(">I", header)
-            assert length <= 1024 * 1024
-            event = json.loads(self.process.stdout.read(length))["payload"]
+        while (event := read_frame(self.process.stdout, 0, limit=1024 * 1024)) is not None:
             self.events.append((time.monotonic() - self.start, event))
             if self.peer is not None and event["kind"] == "packet":
                 if self.first_wire_sequence is None and not event["end"]:
@@ -66,15 +60,13 @@ class Worker:
                     kind="voice",
                     target=31,
                     sequence=self.peer.wire_sequence,
-                    opus=event["opus"],
+                    opus=list(event["opus"]),
                     end=event["end"],
                 )
                 self.peer.wire_sequence += 2
 
     def send(self, payload):
-        data = json.dumps({"version": 1, "request_id": 0, "payload": payload}).encode()
-        self.process.stdin.write(struct.pack(">I", len(data)) + data)
-        self.process.stdin.flush()
+        write_frame(self.process.stdin, 0, payload)
 
     def wait(self, predicate, timeout=8):
         until = time.monotonic() + timeout
@@ -260,7 +252,7 @@ def measure(binary, pulse, root, reference, current, peer=None):
                         if e["kind"] == "packet" and e["epoch"] == 2
                     ]
                     assert endings and all(
-                        e["end"] and e["opus"] == [248, 255, 254] for e in endings
+                        e["end"] and e["opus"] == b"\xf8\xff\xfe" for e in endings
                     ), endings
                 results.append(
                     {

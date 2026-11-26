@@ -40,6 +40,9 @@ import wave
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
 from pipewire_recovery import PipeWire, Worker, defaults  # noqa: E402
+from worker_ipc import read_frame, write_frame  # noqa: E402
+
+CALL_AUDIO_FRAME_LIMIT = 8 * 1024
 
 APPLICATION, SECOND, VOICE, NAMED, RECEIVED, MICROPHONE = 550, 660, 1000, 1250, 1500, 440
 SHARE_NODE = "nuschl-shared-audio"
@@ -111,20 +114,14 @@ class CallAudio:
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
-        while True:
-            header = self.process.stdout.read(4)
-            if len(header) < 4:
-                return
-            event = json.loads(self.process.stdout.read(struct.unpack(">I", header)[0]))["payload"]
+        while (event := read_frame(self.process.stdout, 0, limit=CALL_AUDIO_FRAME_LIMIT)) is not None:
             event["received"] = time.monotonic()
             with self.lock:
                 self.events.append(event)
 
     def send(self, payload):
-        body = json.dumps({"version": 1, "request_id": 0, "payload": payload}).encode()
         with self.lock:
-            self.process.stdin.write(struct.pack(">I", len(body)) + body)
-            self.process.stdin.flush()
+            write_frame(self.process.stdin, 0, payload, limit=CALL_AUDIO_FRAME_LIMIT)
 
     def packets(self, start, end):
         with self.lock:
@@ -215,12 +212,12 @@ def check_share(command, binary, pipewire, opus, output, label):
     voice.ready()
     voice_packets = opus_tone(opus, VOICE, 50)
     voice_loop = Loop(lambda i: voice.send({"kind": "playback", "sender": 9, "sequence": 2 * i,
-                                            "opus": voice_packets[i % 50], "end": False, "volume": 1.0}))
+                                            "opus": bytes(voice_packets[i % 50]), "end": False, "volume": 1.0}))
     voice_loop.start()
     worker = CallAudio(command, pipewire, output / f"call-audio-{label}.log")
     received = opus_tone(opus, RECEIVED, 50, channels=2)
     received_loop = Loop(lambda i: worker.send({"kind": "play", "publisher": 7, "timestamp": 960 * i,
-                                                "opus": received[i % 50]}))
+                                                "opus": bytes(received[i % 50])}))
     received_loop.start()
     second = None
     try:
