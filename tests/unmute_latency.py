@@ -61,7 +61,7 @@ class Worker:
                     kind="voice",
                     target=31,
                     sequence=self.peer.wire_sequence,
-                    opus=list(event["opus"]),
+                    opus=event["opus"],
                     end=event["end"],
                 )
                 self.peer.wire_sequence += 2
@@ -253,7 +253,7 @@ def measure(binary, pulse, root, reference, current, peer=None):
                         if e["kind"] == "packet" and e["epoch"] == 2
                     ]
                     assert endings and all(
-                        e["end"] and e["opus"] == b"\xf8\xff\xfe" for e in endings
+                        e["end"] and e["opus"] == [248, 255, 254] for e in endings
                     ), endings
                 results.append(
                     {

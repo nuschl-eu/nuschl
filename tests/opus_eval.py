@@ -78,7 +78,7 @@ class Worker:
     def decode(self, packets):
         out = []
         for packet in packets:
-            reply = self.call({"kind": "decode_opus", "packet": bytes(packet)})
+            reply = self.call({"kind": "decode_opus", "packet": list(packet)})
             assert reply["status"] == "samples", reply
             out.extend(reply["value"])
         return out
@@ -216,7 +216,7 @@ def check_hostile_packets(binary, reference, count):
             packet[0] = rng.randrange(256)
         else:  # random bytes of random length
             packet = bytearray(rng.randrange(256) for _ in range(rng.randint(1, 1275)))
-        reply = worker.call({"kind": "decode_opus", "packet": bytes(packet)})
+        reply = worker.call({"kind": "decode_opus", "packet": list(packet)})
         assert reply["status"] in outcomes, reply
         expected = (ctypes.c_float * 5760)()
         produced = lib.opus_decode_float(libopus, bytes(packet), len(packet), expected, 5760, 0)
@@ -228,7 +228,7 @@ def check_hostile_packets(binary, reference, count):
         else:
             agree += produced < 0
         outcomes[reply["status"]] += 1
-    reply = worker.call({"kind": "decode_opus", "packet": bytes(seeds[3])})
+    reply = worker.call({"kind": "decode_opus", "packet": seeds[3]})
     assert reply["status"] == "samples", "the decoder did not recover after hostile packets"
     worker.close()
     lib.opus_decoder_destroy(libopus)

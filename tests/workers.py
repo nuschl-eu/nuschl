@@ -165,7 +165,6 @@ def check_workers(binaries):
 
     encoded, = exchange(binaries / "nuschl-media-worker", [{"kind": "encode_opus", "samples": [0.0] * 960}])
     assert encoded["status"] == "packet", encoded
-    assert isinstance(encoded["value"], bytes)
     decoded, = exchange(binaries / "nuschl-media-worker", [{"kind": "decode_opus", "packet": encoded["value"]}])
     assert decoded["status"] == "samples", decoded
     assert len(decoded["value"]) == 960

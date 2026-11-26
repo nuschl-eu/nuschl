@@ -196,9 +196,7 @@ try:
                         "pipewire:" if backend == "pipewire" else "pulseaudio:"
                     )
                     if args.upstream_echo:
-                        assert row["devices"]["echo"]["kind"] == "upstream", row[
-                            "devices"
-                        ]
+                        assert row["devices"]["echo"].keys() == {"upstream"}, row["devices"]
                     rows.append(row)
                     print(json.dumps(row), flush=True)
                 finally:

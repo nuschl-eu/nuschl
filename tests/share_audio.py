@@ -122,7 +122,7 @@ class CallAudio:
 
     def send(self, payload):
         with self.lock:
-            self.codec.write_frame(self.process.stdin, 0, payload, limit=CALL_AUDIO_FRAME_LIMIT)
+            self.codec.write_frame(self.process.stdin, 0, payload)
 
     def packets(self, start, end):
         with self.lock:
@@ -213,12 +213,12 @@ def check_share(command, binary, pipewire, opus, output, label):
     voice.ready()
     voice_packets = opus_tone(opus, VOICE, 50)
     voice_loop = Loop(lambda i: voice.send({"kind": "playback", "sender": 9, "sequence": 2 * i,
-                                            "opus": bytes(voice_packets[i % 50]), "end": False, "volume": 1.0}))
+                                            "opus": voice_packets[i % 50], "end": False, "volume": 1.0}))
     voice_loop.start()
     worker = CallAudio(command, pipewire, output / f"call-audio-{label}.log")
     received = opus_tone(opus, RECEIVED, 50, channels=2)
     received_loop = Loop(lambda i: worker.send({"kind": "play", "publisher": 7, "timestamp": 960 * i,
-                                                "opus": bytes(received[i % 50])}))
+                                                "opus": received[i % 50]}))
     received_loop.start()
     second = None
     try:

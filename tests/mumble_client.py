@@ -194,7 +194,7 @@ def check_codec(binaries, reference):
     assert all(packet["status"] == "packet" for packet in encoded)
     assert 0.02 < rms(reference.decode([packet["value"] for packet in encoded])) < 0.4
     decoded = exchange(Path(binaries) / "nuschl-media-worker", [
-        {"kind": "decode_opus", "packet": bytes(packet)} for packet in reference.encode_tone(30)
+        {"kind": "decode_opus", "packet": packet} for packet in reference.encode_tone(30)
     ])
     assert all(packet["status"] == "samples" for packet in decoded)
     assert 0.02 < rms([sample for packet in decoded for sample in packet["value"]]) < 0.4

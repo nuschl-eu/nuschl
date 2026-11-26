@@ -19,8 +19,7 @@ def check(binaries, opus_library, probe=None):
         {"kind": "encode_opus", "samples": samples},
     ])
     assert encoded["status"] == "packet", encoded
-    packet = encoded["value"]
-    assert isinstance(packet, bytes), packet
+    packet = bytes(encoded["value"])
     result = subprocess.run([
         str(probe or binaries / "nuschl-rtc-probe"), "--opus-hex", packet.hex(),
     ], capture_output=True, text=True, timeout=15)
@@ -34,7 +33,7 @@ def check(binaries, opus_library, probe=None):
     received = bytes.fromhex(report.pop("received_opus_hex"))
     assert received == packet, "encoded audio changed in transport"
     decoded, = exchange(binaries / "nuschl-media-worker", [
-        {"kind": "decode_opus", "packet": received},
+        {"kind": "decode_opus", "packet": list(received)},
     ])
     assert decoded["status"] == "samples", decoded
     pcm = decoded["value"]

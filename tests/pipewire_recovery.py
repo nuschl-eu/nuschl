@@ -366,7 +366,7 @@ def play_and_measure(worker, pipewire, packets, path, target="speakers"):
     start = time.monotonic()
     for index, opus in enumerate(packets):
         time.sleep(max(0, start + index * 0.02 - time.monotonic()))
-        worker.send({"kind": "playback", "sender": 9, "sequence": index * 2, "opus": bytes(opus),
+        worker.send({"kind": "playback", "sender": 9, "sequence": index * 2, "opus": opus,
                      "end": index == len(packets) - 1, "volume": 1.0})
     time.sleep(0.6)
     samples = recorder.stop()
@@ -615,7 +615,7 @@ def check_mute(binary, pipewire, packets, output, cycles):
         while not stop.is_set():
             time.sleep(max(0, start + index * 0.02 - time.monotonic()))
             worker.send({"kind": "playback", "stream": 1, "sender": 9, "sequence": index * 2,
-                         "opus": bytes(packets[index % len(packets)]), "end": False, "volume": 1.0})
+                         "opus": packets[index % len(packets)], "end": False, "volume": 1.0})
             index += 1
     path = output / "mute-playback.wav"
     recorder = pipewire.record(path)
@@ -696,7 +696,7 @@ def check_echo_cancel(binary, pipewire):
     worker = Worker(binary, pipewire, muted=False)
     devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
     worker.ready()
-    assert devices["echo"]["kind"] == "upstream", devices["echo"]
+    assert devices["echo"].keys() == {"upstream"}, devices["echo"]
     assert devices["output"].endswith(":echo-cancel-sink"), devices["output"]
     inputs = [entry["id"] for entry in devices["inputs"]]
     outputs = [entry["id"] for entry in devices["outputs"]]
@@ -745,7 +745,7 @@ def check_rnnoise_chain(binary, pipewire):
     status = worker.ready()
     graph = links(pipewire)
     assert devices["input"] == "pipewire:effect_output.rnnoise", devices["input"]
-    assert devices["echo"] == {"kind": "upstream", "device": "Echo-Cancel Source"}, \
+    assert devices["echo"] == {"upstream": "Echo-Cancel Source"}, \
         f"{devices['echo']}; links at the worker's start {sorted(started, key=str)}, " \
         f"once ready {sorted(graph, key=str)}"
     assert devices["noise"] == "Noise Canceling source", devices["noise"]
@@ -779,7 +779,7 @@ def check_room_echo(binary, pipewire, output):
     for run in range(3):
         worker = Worker(binary, pipewire, muted=False)
         devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-        assert devices["input"] == "pipewire:room.mic" and devices["echo"]["kind"] == "nuschl", devices
+        assert devices["input"] == "pipewire:room.mic" and devices["echo"] == "nuschl", devices
         worker.ready()
         worker.send({"kind": "echo_test"})
         report = worker.wait(lambda e: e["kind"] == "echo_test", "no echo test result", timeout=20)

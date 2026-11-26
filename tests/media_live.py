@@ -169,7 +169,7 @@ def check_jitter(binary, pulse, reference, output):
             if rng.random() < 0.05:
                 lost += 1
                 continue
-            worker.send({"kind": "playback", "sender": 7, "sequence": index * 2, "opus": bytes(packets[index]),
+            worker.send({"kind": "playback", "sender": 7, "sequence": index * 2, "opus": packets[index],
                          "end": index == len(packets) - 1, "volume": 1.0})
         time.sleep(0.8)
         os.killpg(recorder.pid, signal.SIGTERM)
@@ -213,7 +213,7 @@ def check_echo_routes(binary, pulse):
     pulse.ctl("set-default-source", "ec_source")
     worker = start(binary, pulse, muted=False)
     devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-    assert devices["echo"]["kind"] == "upstream", devices["echo"]
+    assert devices["echo"].keys() == {"upstream"}, devices["echo"]
     assert devices["output"].endswith(":ec_sink"), devices["output"]
     time.sleep(0.5)
     assert "ec_sink" in sink_of_our_stream(pulse), "playback did not go to the canceller's reference sink"
@@ -223,17 +223,17 @@ def check_echo_routes(binary, pulse):
     for mode, expected in (("on", "nuschl"), ("off", "none")):
         worker = start(binary, pulse, False, {"echo_cancellation": mode})
         devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-        assert devices["echo"]["kind"] == expected, (mode, devices["echo"])
+        assert devices["echo"] == expected, (mode, devices["echo"])
         worker.stop()
     override = {"device_overrides": {devices["input"]: "on"}}
     worker = start(binary, pulse, False, override)
     devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-    assert devices["echo"]["kind"] == "nuschl", devices["echo"]
+    assert devices["echo"] == "nuschl", devices["echo"]
     worker.stop()
     pulse.ctl("set-default-source", "mic.monitor")
     worker = start(binary, pulse, muted=False)
     devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-    assert devices["echo"]["kind"] == "nuschl" and devices["output"].endswith(":speakers"), devices
+    assert devices["echo"] == "nuschl" and devices["output"].endswith(":speakers"), devices
     worker.stop()
     pulse.ctl("unload-module", module)
     print("Echo modes, per-microphone override and plain microphones passed.", flush=True)
@@ -330,7 +330,7 @@ def check_echo_test(binary, pulse, delay_plugin):
             worker.wait(lambda e: e["kind"] == "status" and e["ready"], "audio did not start")
             devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
             # The canceller's reference is the recorded monitor of the speakers.
-            assert mode == "off" or (devices["echo"]["kind"] == "nuschl" and devices["reference"]), devices
+            assert mode == "off" or (devices["echo"] == "nuschl" and devices["reference"]), devices
             result = worker.echo_test()
             assert not any(e["kind"] == "packet" for e in worker.events), "a preview sent audio"
             worker.stop()
