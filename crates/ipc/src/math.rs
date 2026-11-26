@@ -21,12 +21,7 @@ pub struct MathRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(
-    tag = "status",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MathResponse {
     Rendered(MathImage),
     /// Not rendered, and why, in words for a tooltip.
@@ -144,9 +139,7 @@ mod supervisor {
                 // A long-lived worker may have died in between (its lifetime
                 // CPU limit, say): one fresh attempt. A missed deadline is the
                 // formula's fault and is not retried.
-                Err(Error::Io(_) | Error::Frame(_) | Error::Json(_) | Error::InvalidResponse)
-                    if reused =>
-                {
+                Err(Error::Io(_) | Error::Frame(_) | Error::InvalidResponse) if reused => {
                     self.attempt(request).await
                 }
                 result => result,

@@ -39,7 +39,7 @@ pub(super) async fn pipeline(
         executable,
         preview::Request::Document {
             schema: preview::SCHEMA,
-            body: document.body,
+            body: wire::encode_data(&document.body),
             charset: document.charset,
             truncated: false,
         },
@@ -102,7 +102,7 @@ async fn prepare_image(
         executable,
         preview::Request::PrepareImage {
             schema: preview::SCHEMA,
-            image: image.body,
+            image: wire::encode_data(&image.body),
             alt: alt.to_owned(),
         },
         cancel,
@@ -256,7 +256,7 @@ async fn http(
             let frame = wire::encode_request(
                 id,
                 &Request::Chunk {
-                    data: wire::encode_data(&bytes[..count]),
+                    data: bytes[..count].to_vec(),
                     eof: count == 0,
                 },
             )
@@ -266,7 +266,7 @@ async fn http(
                 Reply::More if count != 0 => {}
                 Reply::Complete(response) => {
                     response
-                        .decode_body(purpose)
+                        .validate(purpose)
                         .map_err(|_| Unavailable::Malformed)?;
                     break response;
                 }

@@ -22,7 +22,7 @@ class Worker {
   terminate(){this.terminated++;}
   emit(data){this.onmessage?.({data});}
   ready(){this.emit({kind:"ready"});}
-  finish(text="x",id=this.sent.at(-1).id){this.emit({kind:"result",id,tree:JSON.stringify(tree(text))});}
+  finish(text="x",id=this.sent.at(-1).id){this.emit({kind:"result",id,tree:tree(text)});}
   error(id=this.sent.at(-1).id){this.emit({kind:"error",id,message:"This formula could not be rendered. Its source is available."});}
 }
 function fixture(options={}) {
@@ -91,7 +91,7 @@ test("factory/post/trap/malformed/stale replies close one owner even across new 
     const first=outcome(service.render("first"));if(failure!=="factory"){
       if(failure==="post")workers[0].postMessage=()=>{throw new Error("clone");};workers[0].ready();
       if(failure==="trap")workers[0].onerror({preventDefault(){}});
-      if(failure==="malformed")workers[0].emit({kind:"result",id:1,tree:'{"tag":"math","attrs":{"href":"/canary"},"children":[]}'});
+      if(failure==="malformed")workers[0].emit({kind:"result",id:1,tree:{tag:"math",attrs:{href:"/canary"},children:[]}});
       if(failure==="stale")workers[0].finish("wrong",7);
     }
     assert.equal((await first).error.code,"worker-unavailable");assert.equal(service.retired,true);await assert.rejects(new Service().render("new"),e=>e.code==="worker-unavailable");
@@ -113,7 +113,7 @@ test("global immutable LRU survives disposal, counts duplicate keys once, and ev
   // Near the maximum serialized reply, with bounded text and many inert rows.
   const large={tag:"math",attrs:{},children:Array.from({length:900},()=>({tag:"mrow",attrs:{},children:[]}))};
   assert.ok(JSON.stringify(large).length<65536);
-  for(let i=0;i<80;i++){const next=outcome(other.render(`large ${i}`));workers[0].emit({kind:"result",id:workers[0].sent.at(-1).id,tree:JSON.stringify(large)});await next;}
+  for(let i=0;i<80;i++){const next=outcome(other.render(`large ${i}`));workers[0].emit({kind:"result",id:workers[0].sent.at(-1).id,tree:large});await next;}
   assert.ok(other.cacheEntries<64);assert.ok(other.cacheBytes<=2*1024*1024);assert.ok(other.cacheBytes>1900000);
 });
 test("retirement notifies mounted subscribers once; removals and throwing views cannot break cleanup or cached formulas",async()=>{

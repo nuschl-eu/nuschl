@@ -4,6 +4,35 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+/// Implement Serde using remote derives for the readable and binary schemas.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! wire_serde {
+    ($type:ty, $readable:ty, $binary:ty) => {
+        impl ::serde::Serialize for $type {
+            fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                if serializer.is_human_readable() {
+                    <$readable>::serialize(self, serializer)
+                } else {
+                    <$binary>::serialize(self, serializer)
+                }
+            }
+        }
+
+        impl<'de> ::serde::Deserialize<'de> for $type {
+            fn deserialize<D: ::serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Self, D::Error> {
+                if deserializer.is_human_readable() {
+                    <$readable>::deserialize(deserializer)
+                } else {
+                    <$binary>::deserialize(deserializer)
+                }
+            }
+        }
+    };
+}
+
 pub mod access;
 pub mod acl;
 pub mod admin;
@@ -61,13 +90,13 @@ pub struct HistoryEntry {
     pub id: i64,
     pub message: ChatMessage,
     /// On a Nuschl server: the message's sequence number in its conversation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub seq: Option<i64>,
     /// When the author last edited it (Nuschl servers).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub edited_ms: Option<i64>,
     /// When it was deleted: a tombstone, whose text is gone (Nuschl servers).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub deleted_ms: Option<i64>,
 }
 
@@ -96,7 +125,7 @@ pub struct HistoryPage {
     /// Exclusive cursor for the next newer page of a page read around or after
     /// a message; None means the newest stored message is included (a page
     /// read backwards leaves it None).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub next_after: Option<i64>,
 }
 
@@ -143,7 +172,12 @@ impl MessageDocument {
 
 /// Renderers receive text and styles, never executable HTML or instructions to fetch URLs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    remote = "Self",
+    tag = "kind",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ContentBlock {
     Text {
         text: String,
@@ -183,6 +217,35 @@ pub enum ContentBlock {
     /// together are at most the source's line breaks ([`MAX_BREAK_LINES`]).
     Break { count: u32 },
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "ContentBlock")]
+enum BinaryContentBlock {
+    Text {
+        text: String,
+        spans: Vec<Span>,
+        role: TextRole,
+    },
+    Code {
+        language: Option<String>,
+        runs: Vec<CodeRun>,
+    },
+    Image {
+        width: u32,
+        height: u32,
+        rgba: String,
+        source: Option<String>,
+    },
+    Math {
+        source: String,
+        tex: String,
+    },
+    Break {
+        count: u32,
+    },
+}
+
+wire_serde!(ContentBlock, ContentBlock, BinaryContentBlock);
 
 /// Blocks of every other kind per document (the content worker's limit).
 pub const MAX_BLOCKS: usize = 512;
@@ -237,7 +300,7 @@ impl TextRole {
 
 /// Formatting over the bytes `start..end` of a text block.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -251,6 +314,18 @@ pub struct Span {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub math: Option<String>,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Span")]
+struct BinarySpan {
+    start: usize,
+    end: usize,
+    style: Style,
+    link: Option<String>,
+    math: Option<String>,
+}
+
+wire_serde!(Span, Span, BinarySpan);
 
 /// Inline formatting from legacy Mumble rich text.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

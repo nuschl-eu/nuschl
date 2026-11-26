@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: EUPL-1.2
-import {formulaInput, parseMathReply, validateMathTree, MAX_TEX_BYTES} from "./math-render-protocol.js";
+import {formulaInput, validateMathTree, MAX_TEX_BYTES} from "./math-render-protocol.js";
 import {WorkerOwner,WorkerUnavailableError,bounded,workerSnapshot} from "./worker-owner.js";
 export {WorkerUnavailableError} from "./worker-owner.js";
 const CACHE_BYTES=2*1024*1024,CACHE_ENTRIES=64;
@@ -52,7 +52,7 @@ export class MathRenderService {
     if(this.retired)return Promise.reject(unavailable());
     sharedOwner??=new WorkerOwner(this.workerFactory,this.startupMs,{
       label:"Formula",maxJobs:8,maxBytes:8*MAX_TEX_BYTES,onRetire:notifyRetired,
-      validate:(_packet,data)=>freeze(parseMathReply(data.tree)),
+      validate:(_packet,data)=>freeze(validateMathTree(data.tree)),
     });
     return sharedOwner.enqueue(this,{tex,display},new TextEncoder().encode(tex).length,signal,this.timeoutMs).then(tree=>{
       // Canceled consumers reject, so their ACK never reattaches or caches a

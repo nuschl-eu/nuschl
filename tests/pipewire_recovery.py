@@ -63,6 +63,7 @@ import wave
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
 import quarantine  # noqa: E402
+from worker_ipc import WorkerCodec  # noqa: E402
 
 VIRTUAL_NODES = """# A raised quantum range, as PipeWire applies in virtual machines (and some users
 # configure): Nuschl must fit its buffer request into it.
@@ -253,6 +254,7 @@ class Worker:
         Worker.count += 1
         self.log = Worker.logs / f"worker-{Worker.count}.log"
         command = binary if isinstance(binary, list) else [str(binary), "--live"]
+        self.codec = WorkerCodec("live_media", command[0])
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.log.open("w"), env=env)
         self.events = []
@@ -266,18 +268,12 @@ class Worker:
             self.send({"kind": "set_state", "epoch": 1, "muted": muted, "deafened": False})
 
     def _read(self):
-        while True:
-            header = self.process.stdout.read(4)
-            if len(header) < 4:
-                return
-            event = json.loads(self.process.stdout.read(struct.unpack(">I", header)[0]))["payload"]
+        while (event := self.codec.read_frame(self.process.stdout, 0)) is not None:
             event["received"] = time.monotonic()
             self.events.append(event)
 
     def send(self, payload):
-        body = json.dumps({"version": 1, "request_id": 0, "payload": payload}).encode()
-        self.process.stdin.write(struct.pack(">I", len(body)) + body)
-        self.process.stdin.flush()
+        self.codec.write_frame(self.process.stdin, 0, payload)
 
     def wait(self, predicate, message, timeout=20, since=0):
         deadline = time.monotonic() + timeout
@@ -700,7 +696,7 @@ def check_echo_cancel(binary, pipewire):
     worker = Worker(binary, pipewire, muted=False)
     devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
     worker.ready()
-    assert devices["echo"]["kind"] == "upstream", devices["echo"]
+    assert devices["echo"].keys() == {"upstream"}, devices["echo"]
     assert devices["output"].endswith(":echo-cancel-sink"), devices["output"]
     inputs = [entry["id"] for entry in devices["inputs"]]
     outputs = [entry["id"] for entry in devices["outputs"]]
@@ -749,7 +745,7 @@ def check_rnnoise_chain(binary, pipewire):
     status = worker.ready()
     graph = links(pipewire)
     assert devices["input"] == "pipewire:effect_output.rnnoise", devices["input"]
-    assert devices["echo"] == {"kind": "upstream", "device": "Echo-Cancel Source"}, \
+    assert devices["echo"] == {"upstream": "Echo-Cancel Source"}, \
         f"{devices['echo']}; links at the worker's start {sorted(started, key=str)}, " \
         f"once ready {sorted(graph, key=str)}"
     assert devices["noise"] == "Noise Canceling source", devices["noise"]
@@ -783,7 +779,7 @@ def check_room_echo(binary, pipewire, output):
     for run in range(3):
         worker = Worker(binary, pipewire, muted=False)
         devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-        assert devices["input"] == "pipewire:room.mic" and devices["echo"]["kind"] == "nuschl", devices
+        assert devices["input"] == "pipewire:room.mic" and devices["echo"] == "nuschl", devices
         worker.ready()
         worker.send({"kind": "echo_test"})
         report = worker.wait(lambda e: e["kind"] == "echo_test", "no echo test result", timeout=20)

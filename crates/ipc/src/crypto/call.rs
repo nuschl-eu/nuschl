@@ -22,7 +22,7 @@ pub struct Request {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Open {
         host: String,
@@ -96,7 +96,7 @@ pub struct Reply {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Outcome {
     Opened {
         room: [u8; 16],

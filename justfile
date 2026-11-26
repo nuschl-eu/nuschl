@@ -54,11 +54,11 @@ musicbot-web:
     cd apps/musicbot/web && npm ci --no-audit --no-fund && npm test && npm run build
 
 workers:
-    cargo build --workspace
+    cargo build --workspace --features nuschl-ipc/test-codec
     python3 tests/workers.py
 
 rtc:
-    cargo build -p nuschl-rtc-probe -p nuschl-media-worker
+    cargo build -p nuschl-rtc-probe -p nuschl-media-worker -p nuschl-ipc --features nuschl-ipc/test-codec
     python3 tests/rtc_probe.py
 
 vm:
@@ -180,7 +180,7 @@ fuzz-build:
 # Shell on this machine's GPU: nothing of yours is read or shown. Look at the result.
 # Regenerate the README's screenshot, docs/images/nuschl.png (tests/readme_screenshot.py).
 readme-screenshot:
-    cargo build --workspace
+    cargo build --workspace --features nuschl-ipc/test-codec
     nix shell --inputs-from . nixpkgs#gnome-shell nixpkgs#glib.bin nixpkgs#dbus nixpkgs#imagemagick nixpkgs#oxipng \
         --command python3 tests/readme_screenshot.py "${CARGO_TARGET_DIR:-target}/debug" --output docs/images/nuschl.png
 

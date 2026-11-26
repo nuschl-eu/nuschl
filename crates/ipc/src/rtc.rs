@@ -97,7 +97,7 @@ impl Track {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Start {
         generation: u64,
@@ -107,7 +107,6 @@ pub enum Command {
         local: SocketAddr,
         codec: Codec,
         role: LegRole,
-        #[serde(default)]
         relayed: bool,
     },
     CloseLeg {
@@ -154,6 +153,7 @@ pub enum Command {
         key_frame: bool,
         /// The video frame's AV1 Dependency Descriptor for its RTP packets;
         /// empty for none.
+        #[serde(with = "serde_bytes")]
         descriptor: Vec<u8>,
     },
     RequestKeyframe {
@@ -216,7 +216,7 @@ impl Command {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
     Done,
     Rejected,
@@ -291,7 +291,7 @@ impl Reply {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     Connected,
     Disconnected,

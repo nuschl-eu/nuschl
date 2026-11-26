@@ -8,8 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The largest comment, description, texture or config value the reader
-/// passes on; larger values are reported and dropped. Keeps every row, even
-/// one of control characters escaped by JSON, below [`crate::MAX_FRAME_BYTES`].
+/// passes on. This keeps individual rows within the worker's frame budget.
 pub const MAX_BLOB_BYTES: usize = 1024 * 1024;
 /// Rows read per table; a table cut here is reported.
 pub const MAX_ROWS: usize = 200_000;
@@ -110,12 +109,7 @@ pub struct MurmurUser {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "rows",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MurmurFrame {
     Header(MurmurHeader),
     /// Key and value pairs of the selected server's `config` table.
@@ -142,7 +136,7 @@ fn chunks<T: Serialize>(rows: Vec<T>, wrap: fn(Vec<T>) -> MurmurFrame) -> Vec<Mu
     let mut batch = Vec::new();
     let mut size = 0;
     for row in rows {
-        let row_size = serde_json::to_vec(&row).map_or(0, |bytes| bytes.len());
+        let row_size = postcard::experimental::serialized_size(&row).unwrap_or(0);
         if !batch.is_empty() && size + row_size > FRAME_TARGET {
             frames.push(wrap(std::mem::take(&mut batch)));
             size = 0;

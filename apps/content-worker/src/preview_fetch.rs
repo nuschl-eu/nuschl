@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! HTTP/1 response parsing in the existing no-network content role. The trusted
 //! supervisor already wrote its fixed GET to exactly one approved connection.
-use base64::Engine as _;
 use nuschl_ipc::preview_fetch::{self as wire, Failure, Purpose, Reply, Request, Response};
 use std::io;
 use ureq_proto::{
@@ -50,9 +49,7 @@ pub fn run() -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidData, "preview parser ID exhaustion")
         })?;
         let result = match request.payload {
-            Request::Chunk { data, eof } => {
-                wire::decode_chunk(&data).and_then(|bytes| parser.push(&bytes, eof))
-            }
+            Request::Chunk { data, eof } => parser.push(&data, eof),
             Request::Start { .. } => Err(Failure::Malformed), // Cannot reset aggregate budgets.
         };
         let reply = match result {
@@ -113,7 +110,10 @@ impl Parser {
         })
     }
     fn push(&mut self, bytes: &[u8], eof: bool) -> Result<Option<Response>, Failure> {
-        if bytes.len() > wire::MAX_CHUNK_BYTES || (bytes.is_empty() && !eof) {
+        if bytes.len() > wire::MAX_CHUNK_BYTES {
+            return Err(Failure::TooLarge);
+        }
+        if bytes.is_empty() && !eof {
             return Err(Failure::Malformed);
         }
         self.chunks = self.chunks.checked_add(1).ok_or(Failure::TooLarge)?;
@@ -213,7 +213,7 @@ impl Parser {
                         location: field("location", 2048)?,
                         media_type,
                         charset,
-                        body: String::new(),
+                        body: Vec::new(),
                     });
                     if matches!(status, 301 | 302 | 303 | 307 | 308) {
                         if self
@@ -286,8 +286,8 @@ impl Parser {
     }
     fn complete(&mut self) -> Result<Option<Response>, Failure> {
         let mut response = self.response.take().ok_or(Failure::Malformed)?;
-        response.body = base64::engine::general_purpose::STANDARD.encode(&self.body);
-        response.decode_body(self.purpose)?; // Validate the exact reply before emitting it.
+        response.body = std::mem::take(&mut self.body);
+        response.validate(self.purpose)?;
         Ok(Some(response))
     }
 }
@@ -362,12 +362,13 @@ mod tests {
                 &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/html\r\n\r\npage"[..],
                 &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\npa\r\n2\r\nge\r\n0\r\n\r\n"[..],
                 &b"HTTP/1.0 200 OK\r\n\r\npage"[..],
-            ] {assert_eq!(parse(raw,Purpose::Document,width).unwrap().decode_body(Purpose::Document).unwrap(),b"page");}
+            ] {
+                assert_eq!(parse(raw, Purpose::Document, width).unwrap().body, b"page");
+            }
             assert_eq!(
                 parse(b"HTTP/1.1 204 No Content\r\n\r\n", Purpose::Document, width)
                     .unwrap()
-                    .decode_body(Purpose::Document)
-                    .unwrap(),
+                    .body,
                 b""
             );
         }
@@ -376,7 +377,7 @@ mod tests {
     fn redirect_returned_without_fetch_and_compression_ambiguous_or_truncated_rejected() {
         let reply=parse(b"HTTP/1.1 302 Found\r\nLocation: https://example.org/next\r\nContent-Length: 99999999\r\n\r\n",Purpose::Document,16).unwrap();
         assert_eq!(reply.location.as_deref(), Some("https://example.org/next"));
-        assert!(reply.decode_body(Purpose::Document).unwrap().is_empty());
+        assert!(reply.body.is_empty());
         for raw in [
             &b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n"[..],
             &b"HTTP/1.1 101 Switching Protocols\r\n\r\n"[..],
@@ -411,8 +412,7 @@ mod tests {
         ] {
             let body = parse(&raw, Purpose::Document, wire::MAX_CHUNK_BYTES)
                 .unwrap()
-                .decode_body(Purpose::Document)
-                .unwrap();
+                .body;
             assert_eq!(body, page[..limit]);
         }
         let image = Purpose::Image.body_limit() + 1;
@@ -437,7 +437,7 @@ mod tests {
         let response = parse(&raw, Purpose::Document, wire::MAX_CHUNK_BYTES).unwrap();
         crate::preview::answer(nuschl_ipc::preview::Request::Document {
             schema: nuschl_ipc::preview::SCHEMA,
-            body: response.body,
+            body: wire::encode_data(&response.body),
             charset: response.charset,
             truncated: false,
         })

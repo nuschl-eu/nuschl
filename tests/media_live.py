@@ -39,6 +39,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
 import quarantine  # noqa: E402
+from worker_ipc import WorkerCodec  # noqa: E402
 
 
 class Pulse:
@@ -86,22 +87,18 @@ class Worker:
         env = {"PULSE_SERVER": f"unix:{pulse.socket}", "XDG_RUNTIME_DIR": str(pulse.root),
                "NUSCHL_AUDIO_BACKEND": "pulse", "PATH": os.environ.get("PATH", ""),
                "NUSCHL_AUDIO_TIMING": os.environ.get("NUSCHL_AUDIO_TIMING", "")}
+        self.codec = WorkerCodec("live_media", binary)
         self.process = subprocess.Popen([str(binary), "--live"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
         self.events = []
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
 
     def _read(self):
-        while True:
-            header = self.process.stdout.read(4)
-            if len(header) < 4:
-                return
-            self.events.append(json.loads(self.process.stdout.read(struct.unpack(">I", header)[0]))["payload"])
+        while (event := self.codec.read_frame(self.process.stdout, 0)) is not None:
+            self.events.append(event)
 
     def send(self, payload):
-        body = json.dumps({"version": 1, "request_id": 0, "payload": payload}).encode()
-        self.process.stdin.write(struct.pack(">I", len(body)) + body)
-        self.process.stdin.flush()
+        self.codec.write_frame(self.process.stdin, 0, payload)
 
     def wait(self, predicate, message, timeout=15):
         deadline = time.monotonic() + timeout
@@ -216,7 +213,7 @@ def check_echo_routes(binary, pulse):
     pulse.ctl("set-default-source", "ec_source")
     worker = start(binary, pulse, muted=False)
     devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-    assert devices["echo"]["kind"] == "upstream", devices["echo"]
+    assert devices["echo"].keys() == {"upstream"}, devices["echo"]
     assert devices["output"].endswith(":ec_sink"), devices["output"]
     time.sleep(0.5)
     assert "ec_sink" in sink_of_our_stream(pulse), "playback did not go to the canceller's reference sink"
@@ -226,17 +223,17 @@ def check_echo_routes(binary, pulse):
     for mode, expected in (("on", "nuschl"), ("off", "none")):
         worker = start(binary, pulse, False, {"echo_cancellation": mode})
         devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-        assert devices["echo"]["kind"] == expected, (mode, devices["echo"])
+        assert devices["echo"] == expected, (mode, devices["echo"])
         worker.stop()
     override = {"device_overrides": {devices["input"]: "on"}}
     worker = start(binary, pulse, False, override)
     devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-    assert devices["echo"]["kind"] == "nuschl", devices["echo"]
+    assert devices["echo"] == "nuschl", devices["echo"]
     worker.stop()
     pulse.ctl("set-default-source", "mic.monitor")
     worker = start(binary, pulse, muted=False)
     devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
-    assert devices["echo"]["kind"] == "nuschl" and devices["output"].endswith(":speakers"), devices
+    assert devices["echo"] == "nuschl" and devices["output"].endswith(":speakers"), devices
     worker.stop()
     pulse.ctl("unload-module", module)
     print("Echo modes, per-microphone override and plain microphones passed.", flush=True)
@@ -333,7 +330,7 @@ def check_echo_test(binary, pulse, delay_plugin):
             worker.wait(lambda e: e["kind"] == "status" and e["ready"], "audio did not start")
             devices = worker.wait(lambda e: e["kind"] == "devices", "no device report")
             # The canceller's reference is the recorded monitor of the speakers.
-            assert mode == "off" or (devices["echo"]["kind"] == "nuschl" and devices["reference"]), devices
+            assert mode == "off" or (devices["echo"] == "nuschl" and devices["reference"]), devices
             result = worker.echo_test()
             assert not any(e["kind"] == "packet" for e in worker.events), "a preview sent audio"
             worker.stop()

@@ -33,7 +33,7 @@ export class StreamClient {
       if (!pending) return;
       this.#pending.delete(data.id);
       if ("error" in data) pending.reject(data.error);
-      else pending.resolve(JSON.parse(data.reply));
+      else pending.resolve(data.reply);
     });
     this.worker.addEventListener("error", fail);
   }

@@ -11,10 +11,11 @@ pub const SCHEMA: u16 = 1;
 pub const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_SOURCE_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_RGBA_BYTES: usize = MAX_IMAGE_WIDTH as usize * MAX_IMAGE_HEIGHT as usize * 4;
-const JSON_OVERHEAD_BYTES: usize = 4096;
+const FRAME_OVERHEAD_BYTES: usize = 4096;
 /// The largest request, a document in base64, exceeds [`crate::MAX_FRAME_BYTES`]:
 /// preview requests are written and read within this limit.
-pub const MAX_REQUEST_FRAME_BYTES: usize = MAX_DOCUMENT_BYTES.div_ceil(3) * 4 + JSON_OVERHEAD_BYTES;
+pub const MAX_REQUEST_FRAME_BYTES: usize =
+    MAX_DOCUMENT_BYTES.div_ceil(3) * 4 + FRAME_OVERHEAD_BYTES;
 const _: () = assert!(
     MAX_SOURCE_IMAGE_BYTES.div_ceil(3) * 4 + MAX_ALT_BYTES * 6
         <= MAX_DOCUMENT_BYTES.div_ceil(3) * 4
@@ -22,7 +23,7 @@ const _: () = assert!(
 pub const MAX_RESPONSE_FRAME_BYTES: usize = MAX_RGBA_BYTES.div_ceil(3) * 4
     + MAX_IMAGE_BYTES.div_ceil(3) * 4
     + MAX_ALT_BYTES * 6
-    + JSON_OVERHEAD_BYTES;
+    + FRAME_OVERHEAD_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,7 +63,7 @@ impl Charset {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Document {
         schema: u16,
@@ -166,7 +167,7 @@ pub enum Unavailable {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     Metadata { schema: u16, metadata: Metadata },
     Image { schema: u16, image: EmbeddedImage },
@@ -263,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn maximal_pixel_reply_and_nested_tags_fit_the_frame_budget() {
+    fn maximal_pixel_reply_and_nested_preview_request_fit_the_frame_budgets() {
         let pixels = Pixels {
             width: MAX_IMAGE_WIDTH,
             height: MAX_IMAGE_HEIGHT,
@@ -287,12 +288,13 @@ mod tests {
             },
         ] {
             assert!(response.is_bounded());
-            let bytes = serde_json::to_vec(&crate::Envelope::new(
-                1,
-                crate::ContentResponse::Preview(response),
-            ))
+            let mut bytes = Vec::new();
+            crate::write_frame_within(
+                &mut bytes,
+                &crate::Envelope::new(1, crate::ContentResponse::Preview(response)),
+                MAX_RESPONSE_FRAME_BYTES,
+            )
             .unwrap();
-            assert!(bytes.len() <= MAX_RESPONSE_FRAME_BYTES);
         }
         let request = Request::Document {
             schema: SCHEMA,
@@ -301,15 +303,22 @@ mod tests {
             truncated: false,
         };
         assert!(request.is_bounded());
-        let bytes = serde_json::to_vec(&crate::Envelope::new(
-            1,
-            crate::ContentRequest::Preview(request),
-        ))
+        let mut bytes = Vec::new();
+        crate::write_frame_within(
+            &mut bytes,
+            &crate::Envelope::new(1, crate::ContentRequest::Preview(request)),
+            MAX_REQUEST_FRAME_BYTES,
+        )
         .unwrap();
-        assert!(bytes.len() <= MAX_REQUEST_FRAME_BYTES);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["payload"]["operation"],
-            "document"
-        );
+        let envelope = crate::read_frame_within::<crate::ContentRequest>(
+            &mut bytes.as_slice(),
+            MAX_REQUEST_FRAME_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            envelope.payload,
+            crate::ContentRequest::Preview(Request::Document { schema: SCHEMA, .. })
+        ));
     }
 }

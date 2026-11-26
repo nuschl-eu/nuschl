@@ -2,6 +2,7 @@
   pkgs,
   nuschl,
   rtcProbe,
+  workerTestCodec,
   module,
   legacyServers,
 }:
@@ -34,6 +35,7 @@ let
         ../tests/local_murmur.py
         ../tests/quarantine.py
         ../tests/quarantine.txt
+        ../tests/worker_ipc.py
       ]
     );
   };
@@ -51,6 +53,7 @@ pkgs.testers.runNixOSTest {
         environment.systemPackages = [
           nuschl
           pkgs.python3
+          workerTestCodec
         ];
         services.nuschl = {
           enable = true;
@@ -84,6 +87,7 @@ pkgs.testers.runNixOSTest {
         environment.systemPackages = [
           nuschl
           pkgs.python3
+          workerTestCodec
           pkgs.bubblewrap
           pkgs.util-linux
           pkgs.xvfb-run

@@ -13,7 +13,7 @@ how they were evaluated and what the measurements show. All numbers are from
 | --- | --- |
 | Opus against libopus | `python3 tests/opus_eval.py <bin> --opus-library <libopus.so>` (also in the VM suite) |
 | AEC3 in a reverberant room, CPU cost | `cargo test --release -p nuschl-media-worker -- --ignored --nocapture evaluation` |
-| JSON IPC cost per voice packet | `cargo test --release -p nuschl-ipc -- --ignored --nocapture voice_ipc_cost` |
+| IPC framing cost per voice packet | `cargo test --release -p nuschl-ipc -- --ignored --nocapture voice_ipc_cost` |
 | Device callbacks never allocate | `cargo test -p nuschl-media-worker device_callbacks_never_allocate` |
 | Live controller, jitter buffer, echo routing | `tests/media_live.py` (VM suite) |
 
@@ -98,12 +98,10 @@ perceptual metric. No such corpus ships with the repository.
 - Decoding, mixing, DSP and encoding run on the worker thread, never in a
   device callback.
 
-## Binary IPC for audio: not warranted
+## Voice IPC framing
 
-JSON framing of a voice packet (about 100 bytes of Opus) produces a 479-byte
-frame. Encoding and decoding one packet each way costs 7.4 µs, which is
-**0.15% of one core** with four people talking at once. Over a local pipe that
-is about 24 kB/s per stream. A binary format would save little and add a second
-parser to the attack surface, so audio stays on the same bounded, versioned
-JSON framing as everything else. Revisit this if profiling on low-end
-hardware says otherwise.
+The 2026-11-10 benchmark measured 7.4 µs to serialize and parse two 100-byte
+Opus packets in memory with the former JSON protocol. One playback frame was
+479 bytes. The current benchmark uses 320-byte Opus packets, representative
+of 20 ms at 128 kbit/s. It reports the size of the Postcard playback
+frame and the time to encode and decode a pair of messages in memory.

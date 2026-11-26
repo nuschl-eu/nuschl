@@ -7,7 +7,7 @@
 //! and never parses them; the worker has no network.
 //!
 //! Requests and responses share a `request_id`; the worker answers every request
-//! once, in order. Binary fields are base64 strings. Every string and list has a
+//! once, in order. Binary fields travel as bytes. Every string and list has a
 //! bound the worker checks ([`CryptoRequest::check`]); frames are bounded by
 //! [`crate::MAX_FRAME_BYTES`] before they are parsed.
 use serde::{Deserialize, Serialize};
@@ -17,16 +17,23 @@ pub mod call;
 pub mod descriptor;
 pub mod epoch;
 
-/// Bytes as a base64 string.
+/// Bytes in IPC and a base64 string in human-readable formats.
 pub mod base64_bytes {
     use base64::Engine as _;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+        } else {
+            serializer.serialize_bytes(bytes)
+        }
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        if !deserializer.is_human_readable() {
+            return serde_bytes::deserialize(deserializer);
+        }
         let text = String::deserialize(deserializer)?;
         base64::engine::general_purpose::STANDARD
             .decode(text)
@@ -34,7 +41,7 @@ pub mod base64_bytes {
     }
 }
 
-/// Optional bytes as a base64 string or `null`.
+/// Optional bytes with a base64 representation in human-readable formats.
 pub mod base64_option {
     use base64::Engine as _;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -43,6 +50,9 @@ pub mod base64_option {
         bytes: &Option<Vec<u8>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
+        if !serializer.is_human_readable() {
+            return serde_bytes::serialize(bytes, serializer);
+        }
         match bytes {
             Some(bytes) => {
                 serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
@@ -54,6 +64,9 @@ pub mod base64_option {
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<Vec<u8>>, D::Error> {
+        if !deserializer.is_human_readable() {
+            return serde_bytes::deserialize(deserializer);
+        }
         Option::<String>::deserialize(deserializer)?
             .map(|text| {
                 base64::engine::general_purpose::STANDARD
@@ -64,12 +77,15 @@ pub mod base64_option {
     }
 }
 
-/// Several byte strings as base64.
+/// Byte strings in IPC and a list of base64 strings in human-readable formats.
 pub mod base64_list {
     use base64::Engine as _;
     use serde::{Deserialize, Deserializer, Serializer, ser::SerializeSeq};
 
     pub fn serialize<S: Serializer>(list: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error> {
+        if !serializer.is_human_readable() {
+            return serializer.collect_seq(list.iter().map(|bytes| serde_bytes::Bytes::new(bytes)));
+        }
         let mut seq = serializer.serialize_seq(Some(list.len()))?;
         for bytes in list {
             seq.serialize_element(&base64::engine::general_purpose::STANDARD.encode(bytes))?;
@@ -80,6 +96,13 @@ pub mod base64_list {
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<Vec<u8>>, D::Error> {
+        if !deserializer.is_human_readable() {
+            return Vec::<serde_bytes::ByteBuf>::deserialize(deserializer).map(|list| {
+                list.into_iter()
+                    .map(serde_bytes::ByteBuf::into_vec)
+                    .collect()
+            });
+        }
         Vec::<String>::deserialize(deserializer)?
             .into_iter()
             .map(|text| {
@@ -89,6 +112,29 @@ pub mod base64_list {
             })
             .collect()
     }
+}
+
+/// Share the variants between the worker wire schema and the established JSON
+/// representation used for CLI events and saved contacts.
+macro_rules! ipc_enum_with_json {
+    ($(#[$attr:meta])* pub enum $name:ident, $tag:literal $(, $extra_derive:ident)? { $($variants:tt)* }) => {
+        $(#[$attr])*
+        #[derive(Serialize, Deserialize)]
+        $(#[derive($extra_derive)])?
+        #[serde(remote = "Self", rename_all = "snake_case", deny_unknown_fields)]
+        pub enum $name { $($variants)* }
+
+        const _: () = {
+            type Schema = $name;
+
+            #[derive(Serialize, Deserialize)]
+            $(#[derive($extra_derive)])?
+            #[serde(remote = "Schema", tag = $tag, rename_all = "snake_case", deny_unknown_fields)]
+            enum JsonSerde { $($variants)* }
+
+            nuschl_core::wire_serde!($name, JsonSerde, $name);
+        };
+    };
 }
 
 /// Bounds the worker enforces on what the session sends.
@@ -197,21 +243,22 @@ impl KeyTransparencySettings {
     }
 }
 
-/// Whether a server's view is witnessed (docs/e2ee.md §5.9).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "witness", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WitnessStatus {
-    /// No witness is required (nothing configured): as before.
-    #[default]
-    Off,
-    /// Cosigned by the required witnesses; fresh until `until_ms`.
-    Witnessed { until_ms: u64 },
-    /// The newest epoch waits for its cosignatures (minutes).
-    Pending,
-    /// "Automatic verification unavailable": cosignatures missing, stale or
-    /// unreachable. Messages keep using pinned keys; contacts' new devices are not
-    /// added to existing conversations (if configured).
-    Unavailable { reason: String },
+ipc_enum_with_json! {
+    /// Whether a server's view is witnessed (docs/e2ee.md §5.9).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum WitnessStatus, "witness", Default {
+        /// No witness is required (nothing configured): as before.
+        #[default]
+        Off,
+        /// Cosigned by the required witnesses; fresh until `until_ms`.
+        Witnessed { until_ms: u64 },
+        /// The newest epoch waits for its cosignatures (minutes).
+        Pending,
+        /// "Automatic verification unavailable": cosignatures missing, stale or
+        /// unreachable. Messages keep using pinned keys; contacts' new devices are not
+        /// added to existing conversations (if configured).
+        Unavailable { reason: String },
+    }
 }
 
 /// The certificates behind a binding (`KtRecord` on the wire).
@@ -229,7 +276,7 @@ pub struct KtRecordBytes {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CryptoRequest {
     Call(call::Request),
     /// The identity, if any: `Identity`.
@@ -974,26 +1021,27 @@ pub struct OwnKeyAlarm {
     pub reason: String,
 }
 
-/// How a head check ended.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum HeadOutcome {
-    /// The head is the latest accepted one now; `witness`: whether the server's
-    /// view is witnessed (docs/e2ee.md §5.9).
-    Accepted {
-        epoch: u64,
-        #[serde(default)]
-        witness: WitnessStatus,
-    },
-    /// Fetch `KtAudit { from, to }` (bisecting with `KtHead` if it is too large) and
-    /// send it with `Advance`.
-    NeedAudit { from: u64, to: u64 },
-    /// Verification did not succeed (stale head, bad signature, …): retried later;
-    /// not proof of misbehaviour.
-    Failed { reason: String },
-    /// The server contradicted itself (equivocation, a failed audit, a changed
-    /// log): an alarm, with the evidence kept.
-    Misbehaviour { reason: String },
+ipc_enum_with_json! {
+    /// How a head check ended.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum HeadOutcome, "status" {
+        /// The head is the latest accepted one now; `witness`: whether the server's
+        /// view is witnessed (docs/e2ee.md §5.9).
+        Accepted {
+            epoch: u64,
+            #[serde(default)]
+            witness: WitnessStatus,
+        },
+        /// Fetch `KtAudit { from, to }` (bisecting with `KtHead` if it is too large) and
+        /// send it with `Advance`.
+        NeedAudit { from: u64, to: u64 },
+        /// Verification did not succeed (stale head, bad signature, …): retried later;
+        /// not proof of misbehaviour.
+        Failed { reason: String },
+        /// The server contradicted itself (equivocation, a failed audit, a changed
+        /// log): an alarm, with the evidence kept.
+        Misbehaviour { reason: String },
+    }
 }
 
 /// What [`CryptoRequest::PublishBundle`] gives the session to send as `KtPublish`.
@@ -1007,51 +1055,53 @@ pub struct PublishBundle {
     pub created: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum MonitorOutcome {
-    /// Every version of our binding is one we made; `current` once the newest one
-    /// is published.
-    Consistent {
-        version: u64,
-        current: bool,
-    },
-    /// Someone else's key was bound to our account: the blocking "This wasn't me"
-    /// alarm (docs/e2ee.md §4).
-    OwnKeyAlarm {
-        reason: String,
-    },
-    Failed {
-        reason: String,
-    },
-    Misbehaviour {
-        reason: String,
-    },
+ipc_enum_with_json! {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum MonitorOutcome, "status" {
+        /// Every version of our binding is one we made; `current` once the newest one
+        /// is published.
+        Consistent {
+            version: u64,
+            current: bool,
+        },
+        /// Someone else's key was bound to our account: the blocking "This wasn't me"
+        /// alarm (docs/e2ee.md §4).
+        OwnKeyAlarm {
+            reason: String,
+        },
+        Failed {
+            reason: String,
+        },
+        Misbehaviour {
+            reason: String,
+        },
+    }
 }
 
-/// What the UI shows for a contact (docs/e2ee.md §4, §5.5).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ContactState {
-    /// Not checked yet.
-    Unknown,
-    /// The server has no identity for this account (unauthenticated: never shown
-    /// as "has no key", only as "not available").
-    NoIdentity,
-    /// Pinned on first use; KT consistent; not compared out of band.
-    Unverified,
-    /// Compared out of band, here or (`elsewhere`) on another server where the
-    /// key-transparency log binds the same identity.
-    Verified { elsewhere: Option<String> },
-    /// The account is now bound to another identity. `blocking`: it was verified,
-    /// and the old pin stays until the user accepts (direct conversations block
-    /// sending).
-    KeyChanged { blocking: bool },
-    /// "Automatic verification unavailable": checks failed repeatedly. A manual
-    /// verification still holds (`verified`).
-    Unavailable { reason: String, verified: bool },
-    /// The server contradicted itself about this contact or its log.
-    Misbehaviour { reason: String },
+ipc_enum_with_json! {
+    /// What the UI shows for a contact (docs/e2ee.md §4, §5.5).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ContactState, "state" {
+        /// Not checked yet.
+        Unknown,
+        /// The server has no identity for this account (unauthenticated: never shown
+        /// as "has no key", only as "not available").
+        NoIdentity,
+        /// Pinned on first use; KT consistent; not compared out of band.
+        Unverified,
+        /// Compared out of band, here or (`elsewhere`) on another server where the
+        /// key-transparency log binds the same identity.
+        Verified { elsewhere: Option<String> },
+        /// The account is now bound to another identity. `blocking`: it was verified,
+        /// and the old pin stays until the user accepts (direct conversations block
+        /// sending).
+        KeyChanged { blocking: bool },
+        /// "Automatic verification unavailable": checks failed repeatedly. A manual
+        /// verification still holds (`verified`).
+        Unavailable { reason: String, verified: bool },
+        /// The server contradicted itself about this contact or its log.
+        Misbehaviour { reason: String },
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1089,12 +1139,7 @@ pub struct Due {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(
-    tag = "status",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CryptoResponse {
     Call(call::Reply),
     Identity(IdentityView),
@@ -1166,24 +1211,25 @@ pub struct KeyPackageBatch {
     pub last_resort: Vec<u8>,
 }
 
-/// The lock in the conversation header (docs/e2ee.md §7.4).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Lock {
-    /// Grey: no group yet, negotiating, or key transparency pending for a new
-    /// device.
-    Pending { reason: String },
-    /// Red: no end-to-end encryption (no `mls/1`, or a conversation that never
-    /// had a group).
-    Open,
-    /// Green: the group is established, every member's credential verified
-    /// against key transparency.
-    Encrypted,
-    /// Green with a check mark: the same, and the contact verified out of band.
-    Verified,
-    /// Amber: encrypted, but something needs attention (an unverified device, a
-    /// key change, a gap or fork, a refused commit).
-    Attention { reason: String },
+ipc_enum_with_json! {
+    /// The lock in the conversation header (docs/e2ee.md §7.4).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Lock, "state" {
+        /// Grey: no group yet, negotiating, or key transparency pending for a new
+        /// device.
+        Pending { reason: String },
+        /// Red: no end-to-end encryption (no `mls/1`, or a conversation that never
+        /// had a group).
+        Open,
+        /// Green: the group is established, every member's credential verified
+        /// against key transparency.
+        Encrypted,
+        /// Green with a check mark: the same, and the contact verified out of band.
+        Verified,
+        /// Amber: encrypted, but something needs attention (an unverified device, a
+        /// key change, a gap or fork, a refused commit).
+        Attention { reason: String },
+    }
 }
 
 /// A member device, as the conversation shows it.
@@ -1276,60 +1322,62 @@ pub struct GroupInit {
     pub tree: Vec<u8>,
 }
 
-/// Where a message stands in its sender's chain (docs/e2ee.md §6.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "order", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Order {
-    InOrder,
-    /// Messages from that device are missing.
-    Gap {
-        missing: u64,
-    },
-    /// The server showed different histories: an alarm, both versions kept.
-    Fork,
+ipc_enum_with_json! {
+    /// Where a message stands in its sender's chain (docs/e2ee.md §6.4).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Order, "order" {
+        InOrder,
+        /// Messages from that device are missing.
+        Gap {
+            missing: u64,
+        },
+        /// The server showed different histories: an alarm, both versions kept.
+        Fork,
+    }
 }
 
-/// What one stream message was.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Received {
-    /// A chat message from another device.
-    Message {
-        seq: u64,
-        sender: MemberView,
-        text: String,
-        /// The sender's clock, Unix milliseconds.
-        sent_at: u64,
-        #[serde(with = "base64_bytes")]
-        idempotency_key: Vec<u8>,
-        order: Order,
-    },
-    /// Our own message (sent by this device) coming back.
-    Own {
-        seq: u64,
-        text: String,
-        #[serde(with = "base64_bytes")]
-        idempotency_key: Vec<u8>,
-    },
-    /// A commit was applied; the view shows the group now.
-    Commit { seq: u64, view: ConversationView },
-    /// History keys arrived (a grant, docs/e2ee.md §6.6): what came before this
-    /// device joined can be read from the archive now (`MlsArchive`).
-    History { seq: u64, keys: u32 },
-    /// Nothing to show (a typing indicator, a proposal, an envelope kind this
-    /// version does not show).
-    Nothing { seq: u64 },
-    /// Already processed (at or before the cursor).
-    Duplicate { seq: u64 },
-    /// Could not be decrypted: shown as an explicit gap, never silently.
-    Undecryptable { seq: u64, reason: String },
-    /// A commit the worker refused (a stranger, a credential that does not
-    /// verify, a changed binding): the conversation is blocked.
-    Refused {
-        seq: u64,
-        reason: String,
-        view: ConversationView,
-    },
+ipc_enum_with_json! {
+    /// What one stream message was.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Received, "kind" {
+        /// A chat message from another device.
+        Message {
+            seq: u64,
+            sender: MemberView,
+            text: String,
+            /// The sender's clock, Unix milliseconds.
+            sent_at: u64,
+            #[serde(with = "base64_bytes")]
+            idempotency_key: Vec<u8>,
+            order: Order,
+        },
+        /// Our own message (sent by this device) coming back.
+        Own {
+            seq: u64,
+            text: String,
+            #[serde(with = "base64_bytes")]
+            idempotency_key: Vec<u8>,
+        },
+        /// A commit was applied; the view shows the group now.
+        Commit { seq: u64, view: ConversationView },
+        /// History keys arrived (a grant, docs/e2ee.md §6.6): what came before this
+        /// device joined can be read from the archive now (`MlsArchive`).
+        History { seq: u64, keys: u32 },
+        /// Nothing to show (a typing indicator, a proposal, an envelope kind this
+        /// version does not show).
+        Nothing { seq: u64 },
+        /// Already processed (at or before the cursor).
+        Duplicate { seq: u64 },
+        /// Could not be decrypted: shown as an explicit gap, never silently.
+        Undecryptable { seq: u64, reason: String },
+        /// A commit the worker refused (a stranger, a credential that does not
+        /// verify, a changed binding): the conversation is blocked.
+        Refused {
+            seq: u64,
+            reason: String,
+            view: ConversationView,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1338,9 +1386,9 @@ mod tests {
     use crate::{Envelope, read_frame, write_frame};
 
     #[test]
-    fn requests_round_trip_with_base64_bytes() {
+    fn contact_proof_bytes_round_trip() {
         let request = CryptoRequest::Contact {
-            witnessed: None,
+            witnessed: Some(vec![0x98, 0x7c]),
             registration: Vec::new(),
             name_lookup: Vec::new(),
             name: None,
@@ -1358,13 +1406,60 @@ mod tests {
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &Envelope::new(3, &request)).unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains("\"AQID\""));
         let back: Envelope<CryptoRequest> = read_frame(&mut bytes.as_slice()).unwrap().unwrap();
-        assert!(matches!(
-            back.payload,
-            CryptoRequest::Contact { direct: true, .. }
-        ));
+        assert_eq!(back.request_id, 3);
         assert!(back.payload.check().is_ok());
+        let CryptoRequest::Contact {
+            lookup,
+            record,
+            direct,
+            witnessed,
+            ..
+        } = back.payload
+        else {
+            panic!("expected a contact request");
+        };
+        assert!(direct);
+        assert_eq!(lookup, [1, 2, 3]);
+        assert_eq!(witnessed.unwrap(), [0x98, 0x7c]);
+        assert_eq!(record.unwrap().devices, [vec![1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn saved_contacts_and_cli_events_keep_their_json_tags() {
+        let saved = serde_json::json!({"state": "verified", "elsewhere": "other server"});
+        let state: ContactState = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&state).unwrap(), saved);
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &Envelope::new(1, &state)).unwrap();
+        assert_eq!(
+            read_frame::<ContactState>(&mut frame.as_slice())
+                .unwrap()
+                .unwrap()
+                .payload,
+            state
+        );
+
+        let event = HeadOutcome::Accepted {
+            epoch: 9,
+            witness: WitnessStatus::Witnessed { until_ms: 10 },
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({
+                "status": "accepted", "epoch": 9,
+                "witness": {"witness": "witnessed", "until_ms": 10}
+            })
+        );
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &Envelope::new(2, &event)).unwrap();
+        assert_eq!(
+            read_frame::<HeadOutcome>(&mut frame.as_slice())
+                .unwrap()
+                .unwrap()
+                .payload,
+            event
+        );
     }
 
     #[test]
@@ -1392,10 +1487,5 @@ mod tests {
             head: vec![0; 148],
         };
         assert!(guest.check().is_ok());
-        // Unknown fields and malformed base64 are refused.
-        let bad = br#"{"kind":"contact_status","server":"s","account":"!!"}"#;
-        assert!(serde_json::from_slice::<CryptoRequest>(bad).is_err());
-        let extra = br#"{"kind":"due","server":"s","connected":true,"more":1}"#;
-        assert!(serde_json::from_slice::<CryptoRequest>(extra).is_err());
     }
 }

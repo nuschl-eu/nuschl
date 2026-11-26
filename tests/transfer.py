@@ -10,12 +10,10 @@ import argparse
 import base64
 import contextlib
 import hashlib
-import json
 import os
 from pathlib import Path
 import queue
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -24,11 +22,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from local_murmur import eventually, free_port  # noqa: E402
-
-
-def frame(payload):
-    body = json.dumps({"version": 1, "request_id": 1, "payload": payload}).encode()
-    return struct.pack(">I", len(body)) + body
+from worker_ipc import WorkerCodec  # noqa: E402
 
 
 def listening(port):
@@ -91,6 +85,7 @@ class Worker:
 
     def __init__(self, binaries, request, file=None):
         command = [str(binaries / "nuschl"), "transfer-sandbox"] + (["--file", str(file)] if file else [])
+        self.codec = WorkerCodec("transfer", command[0])
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL)
         self.events = queue.Queue()
@@ -101,16 +96,10 @@ class Worker:
         self.send(request)
 
     def send(self, payload):
-        self.process.stdin.write(frame(payload))
-        self.process.stdin.flush()
+        self.codec.write_frame(self.process.stdin, 1, payload)
 
     def _read(self):
-        while header := self.process.stdout.read(4):
-            size, = struct.unpack(">I", header)
-            assert size <= 12 * 1024 * 1024
-            envelope = json.loads(self.process.stdout.read(size))
-            assert envelope["version"] == 1 and envelope["request_id"] == 0, envelope
-            event = envelope["payload"]
+        while (event := self.codec.read_frame(self.process.stdout, 0)) is not None:
             if event["kind"] == "data":
                 self.data += base64.b64decode(event["bytes"])
                 time.sleep(self.slow)  # a slow disk: the pipe fills and the sender waits

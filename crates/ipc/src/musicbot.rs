@@ -76,7 +76,7 @@ impl Role {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Decode {
         mime: Option<String>,
@@ -109,7 +109,7 @@ pub enum Stage {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     Progress { stage: Stage, units: u64 },
     Pcm { samples: Vec<f32> },
@@ -130,8 +130,8 @@ fn read_error(error: crate::Error) -> String {
     match error {
         crate::Error::Io(_) => "codec IPC read failed or truncated",
         crate::Error::TooLarge => "codec IPC frame exceeds its budget",
-        crate::Error::Json(_) => "invalid codec IPC message",
         crate::Error::Version(_) => "unsupported codec IPC version",
+        _ => "invalid codec IPC message",
     }
     .into()
 }

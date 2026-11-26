@@ -3,13 +3,15 @@
 //! credentials or executable selection crosses this content-role protocol.
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::io;
+
+use crate::{Envelope, decode_frame_body, read_frame_within, write_frame_within};
 
 pub const SCHEMA: u16 = 1;
 pub const MAX_CHUNK_BYTES: usize = 16 * 1024;
-pub const MAX_REQUEST_BYTES: usize = 32 * 1024;
-/// A whole document in base64 with the response fields.
-pub const MAX_RESPONSE_BYTES: usize =
-    crate::preview::MAX_DOCUMENT_BYTES.div_ceil(3) * 4 + 64 * 1024;
+pub const MAX_REQUEST_BYTES: usize = MAX_CHUNK_BYTES + 32;
+/// A whole document with the response fields.
+pub const MAX_RESPONSE_BYTES: usize = crate::preview::MAX_DOCUMENT_BYTES + 64 * 1024;
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 /// Lets a 10 MiB document arrive in reads averaging 1.3 KiB.
 pub const MAX_CHUNKS: usize = 8192;
@@ -35,10 +37,17 @@ impl Purpose {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Start { schema: u16, purpose: Purpose },
-    Chunk { data: String, eof: bool },
+    Start {
+        schema: u16,
+        purpose: Purpose,
+    },
+    Chunk {
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        eof: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,12 +60,7 @@ pub enum Failure {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
     More,
     Complete(Response),
@@ -71,11 +75,11 @@ pub struct Response {
     pub location: Option<String>,
     pub media_type: Option<String>,
     pub charset: crate::preview::Charset,
-    /// Base64; check the encoded bound before decoding or allocating its body.
-    pub body: String,
+    #[serde(with = "serde_bytes")]
+    pub body: Vec<u8>,
 }
 impl Response {
-    pub fn decode_body(&self, purpose: Purpose) -> Result<Vec<u8>, Failure> {
+    pub fn validate(&self, purpose: Purpose) -> Result<(), Failure> {
         if self.schema != SCHEMA
             || !(200..=599).contains(&self.status)
             || self
@@ -86,98 +90,48 @@ impl Response {
                 .media_type
                 .as_ref()
                 .is_some_and(|s| s.len() > 128 || !s.is_ascii() || s.chars().any(char::is_control))
-            || self.body.len() > purpose.body_limit().div_ceil(3) * 4
         {
             return Err(Failure::Malformed);
         }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&self.body)
-            .map_err(|_| Failure::Malformed)?;
-        if bytes.len() > purpose.body_limit() {
+        if self.body.len() > purpose.body_limit() {
             return Err(Failure::TooLarge);
         }
-        Ok(bytes)
+        Ok(())
     }
 }
 
-/// Base64 for already-bounded document, image or stream bytes. Keeping this
-/// framing conversion here avoids a second codec dependency in the supervisor.
+/// Encode a fetched body for the offline content worker's preview request.
 pub fn encode_data(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-pub fn decode_chunk(data: &str) -> Result<Vec<u8>, Failure> {
-    if data.len() > MAX_CHUNK_BYTES.div_ceil(3) * 4 {
-        return Err(Failure::TooLarge);
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(|_| Failure::Malformed)?;
-    if bytes.len() > MAX_CHUNK_BYTES {
-        return Err(Failure::TooLarge);
-    }
+/// Streamed transport input uses a request limit sized for one chunk.
+pub fn read_request(reader: &mut impl io::Read) -> io::Result<Option<Envelope<Request>>> {
+    Ok(read_frame_within(reader, MAX_REQUEST_BYTES)?)
+}
+
+pub fn encode_request(id: u64, request: &Request) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_frame_within(&mut bytes, &Envelope::new(id, request), MAX_REQUEST_BYTES)?;
     Ok(bytes)
 }
-
-/// Strict small-frame reader for the dedicated HTTP parser role. The global
-/// content frame limit is intentionally not used for streamed transport input.
-pub fn read_request(
-    reader: &mut impl std::io::Read,
-) -> std::io::Result<Option<crate::Envelope<Request>>> {
-    use std::io::{Error, ErrorKind};
-    let mut size = [0; 4];
-    loop {
-        match reader.read(&mut size[..1]) {
-            Ok(0) => return Ok(None),
-            Ok(_) => break,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    reader.read_exact(&mut size[1..])?;
-    let size = u32::from_be_bytes(size) as usize;
-    if size == 0 || size > MAX_REQUEST_BYTES {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "preview parser request frame limit",
-        ));
-    }
-    let mut bytes = vec![0; size];
-    reader.read_exact(&mut bytes)?;
-    let envelope: crate::Envelope<Request> = serde_json::from_slice(&bytes)
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid preview parser request"))?;
-    if envelope.version != crate::PROTOCOL_VERSION {
-        return Err(Error::new(ErrorKind::InvalidData, "preview parser version"));
-    }
-    Ok(Some(envelope))
+pub fn write_reply(writer: &mut impl io::Write, id: u64, reply: &Reply) -> io::Result<()> {
+    Ok(write_frame_within(
+        writer,
+        &Envelope::new(id, reply),
+        MAX_RESPONSE_BYTES,
+    )?)
 }
-
-pub fn encode_request(id: u64, request: &Request) -> std::io::Result<Vec<u8>> {
-    let bytes =
-        serde_json::to_vec(&crate::Envelope::new(id, request)).map_err(std::io::Error::other)?;
-    framed(bytes, MAX_REQUEST_BYTES)
-}
-pub fn write_reply(
-    writer: &mut impl std::io::Write,
-    id: u64,
-    reply: &Reply,
-) -> std::io::Result<()> {
-    let bytes =
-        serde_json::to_vec(&crate::Envelope::new(id, reply)).map_err(std::io::Error::other)?;
-    writer.write_all(&framed(bytes, MAX_RESPONSE_BYTES)?)?;
-    writer.flush()
-}
-pub fn decode_reply(id: u64, bytes: &[u8]) -> std::io::Result<Reply> {
-    use std::io::{Error, ErrorKind};
+pub fn decode_reply(id: u64, bytes: &[u8]) -> io::Result<Reply> {
+    use io::{Error, ErrorKind};
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "preview parser reply frame limit",
         ));
     }
-    let reply: crate::Envelope<Reply> = serde_json::from_slice(bytes)
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid preview parser reply"))?;
-    if reply.version != crate::PROTOCOL_VERSION || reply.request_id != id {
+    let reply: Envelope<Reply> = decode_frame_body(bytes)?;
+    if reply.request_id != id {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "preview parser reply identity",
@@ -185,50 +139,60 @@ pub fn decode_reply(id: u64, bytes: &[u8]) -> std::io::Result<Reply> {
     }
     Ok(reply.payload)
 }
-fn framed(bytes: Vec<u8>, cap: usize) -> std::io::Result<Vec<u8>> {
-    if bytes.len() > cap {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "preview parser frame limit",
-        ));
-    }
-    let mut out = Vec::with_capacity(bytes.len() + 4);
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(&bytes);
-    Ok(out)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn encoded_and_decoded_limits_and_response_scalars_are_checked() {
-        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
-        assert!(decode_chunk(&encode(&vec![0; MAX_CHUNK_BYTES])).is_ok());
-        assert_eq!(
-            decode_chunk(&encode(&vec![0; MAX_CHUNK_BYTES + 1])),
-            Err(Failure::TooLarge)
-        );
-        assert!(decode_chunk("!").is_err());
+    fn body_limits_and_response_scalars_are_checked() {
         let mut reply = Response {
             schema: SCHEMA,
             status: 200,
             location: None,
             media_type: Some("text/html".into()),
             charset: crate::preview::Charset::Utf8,
-            body: encode(b"page"),
+            body: b"page".to_vec(),
         };
-        assert_eq!(reply.decode_body(Purpose::Document).unwrap(), b"page");
+        assert!(reply.validate(Purpose::Document).is_ok());
         reply.schema += 1;
-        assert!(reply.decode_body(Purpose::Document).is_err());
+        assert!(reply.validate(Purpose::Document).is_err());
         reply.schema = SCHEMA;
         reply.status = 101;
-        assert!(reply.decode_body(Purpose::Document).is_err());
+        assert!(reply.validate(Purpose::Document).is_err());
         reply.status = 200;
         reply.location = Some("https://example.org/\r\nx".into());
-        assert!(reply.decode_body(Purpose::Document).is_err());
+        assert!(reply.validate(Purpose::Document).is_err());
         reply.location = None;
-        reply.body = encode(&vec![0; Purpose::Document.body_limit() + 1]);
-        assert!(reply.decode_body(Purpose::Document).is_err());
+        reply.body = vec![0; Purpose::Image.body_limit() + 1];
+        assert_eq!(reply.validate(Purpose::Image), Err(Failure::TooLarge));
+    }
+
+    #[test]
+    fn full_chunks_and_replies_travel_as_raw_bytes() {
+        let bytes = vec![0xd3; MAX_CHUNK_BYTES];
+        let request = Request::Chunk {
+            data: bytes.clone(),
+            eof: false,
+        };
+        let frame = encode_request(u64::MAX, &request).unwrap();
+        assert!(frame.len() <= MAX_CHUNK_BYTES + 32);
+        let request = read_request(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(request.request_id, u64::MAX);
+        assert!(matches!(request.payload, Request::Chunk { data, eof: false } if data == bytes));
+
+        let reply = Reply::Complete(Response {
+            schema: SCHEMA,
+            status: 200,
+            location: None,
+            media_type: None,
+            charset: crate::preview::Charset::Utf8,
+            body: bytes.clone(),
+        });
+        let mut frame = Vec::new();
+        write_reply(&mut frame, 7, &reply).unwrap();
+        assert!(decode_reply(8, &frame[4..]).is_err());
+        assert!(
+            matches!(decode_reply(7, &frame[4..]).unwrap(), Reply::Complete(result) if result.body == bytes)
+        );
     }
 }

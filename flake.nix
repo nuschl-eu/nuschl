@@ -431,6 +431,9 @@
         # The desktop package from per-crate derivations (crate2nix): a change
         # rebuilds only the crates that depend on it.
         crates = import ./nix/crate2nix.nix { inherit pkgs toolchain; };
+        workerTestCodec = crates.project.workspaceMembers.nuschl-ipc.build.override {
+          features = [ "test-codec" ];
+        };
         # One `<crate>-unit` check per workspace member, generated from the
         # member list, so a member starts with its unit tests running in
         # `ci`. unitExtras gives a member's leaf the test inputs it needs;
@@ -1186,7 +1189,7 @@
             vm-home-manager = homeManagerChecks.vm;
             # nuschld under the module with stock clients (`nix build .#checks.x86_64-linux.vm-server`).
             vm-server = import ./nix/vm-server.nix {
-              inherit pkgs serverPackage;
+              inherit pkgs serverPackage workerTestCodec;
               nuschl = package;
               module = self.nixosModules.default;
               witnessModule = self.nixosModules.witness;
@@ -1232,7 +1235,7 @@
               module = self.nixosModules.musicbot;
             };
             vm-smoke = import ./nix/vm-smoke.nix {
-              inherit pkgs;
+              inherit pkgs workerTestCodec;
               nuschl = package;
               rtcProbe = rtcPackage;
               module = self.nixosModules.default;
@@ -1242,7 +1245,7 @@
               };
             };
             vm-link-previews = import ./tests/link_previews_vm.nix {
-              inherit pkgs;
+              inherit pkgs workerTestCodec;
               nuschl = package;
               sourceIdentity = self.rev or self.outPath;
               contentWorker = crates.project.workspaceMembers."nuschl-content-worker".build;

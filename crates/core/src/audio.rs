@@ -26,7 +26,7 @@ pub enum EchoMode {
 
 /// Who is cancelling echo on the active capture route.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "device", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum EchoSource {
     #[default]
     None,

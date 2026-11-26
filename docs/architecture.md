@@ -75,19 +75,18 @@ separate from live media callbacks and the media worker, with verified model fil
 downloaded on demand. Vulkan, optional Nix ROCm, Metal and CPU are backend targets;
 model support and confinement must be validated per backend before shipping.
 
-Control IPC is a versioned, length-prefixed JSON protocol with a 12 MiB limit checked
-before allocating a frame body (inline images make content and history replies the
-largest frames). Unknown versions, truncated frames, and oversized
-results fail explicitly. Helpers are selected by trusted executable paths and
-communicate over inherited pipes, not a publicly listening socket. Request IDs are
-checked by the supervisor. Worker stderr must never become protocol stdout.
+Native control IPC uses versioned Postcard envelopes with a fixed-length prefix.
+RTC, preview fetching and live audio carry encoded bytes without text expansion.
+Each frame limit is checked before
+allocation and the default cap is 12 MiB. Unknown versions, trailing bytes,
+truncation and oversized frames fail explicitly. Supervisors select helpers by
+trusted paths, check request IDs and use inherited pipes or socket pairs.
+Worker diagnostics use stderr.
 
-The media harness uses the same protocol for codec checks. Live control and small
-compressed Opus frames use bounded JSON IPC with capture generation tags; PCM stays
-inside the worker. Measured cost is 7.4 µs per packet each way (0.15% of a core with
-four talkers), so a binary transport is not warranted (see
-[the DSP evaluation](dsp-evaluation.md)). Do not introduce shared writable memory
-merely for performance without reviewing the new trust boundary.
+Live audio includes capture generation tags and keeps PCM inside the worker.
+The media harness uses the production IPC codec. Browser workers use
+`postMessage` and forward pre-encoded Wasm results directly where the receiving
+side already consumes that encoding.
 
 The UI and network event loop must not wait synchronously for parsing, disk, or DSP.
 The native audio callbacks only convert samples and move them through lock-free SPSC

@@ -3,6 +3,7 @@
   nuschl,
   nativeFetchTest,
   contentWorker,
+  workerTestCodec,
   sourceIdentity,
   fixtureTests ? ./.,
 }:
@@ -50,6 +51,7 @@ pkgs.testers.runNixOSTest {
     services.resolved.enable = false;
     environment.systemPackages = [
       nuschl
+      workerTestCodec
       pkgs.python3
       pkgs.gnome-shell
       pkgs.at-spi2-core

@@ -19,16 +19,15 @@ libopus runs only in this test process, through ctypes, as a reference.
 """
 import argparse
 import ctypes
-import json
 import math
 from pathlib import Path
 import random
-import struct
 import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mumble_client import ReferenceOpus  # noqa: E402
+from worker_ipc import WorkerCodec  # noqa: E402
 
 RATE = 48000
 FRAME = 960  # 20 ms
@@ -56,20 +55,17 @@ class Worker:
     """The media worker's codec mode: one encoder and one decoder per process."""
 
     def __init__(self, binary):
+        self.codec = WorkerCodec("media", binary)
         self.process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self.request_id = 0
 
     def call(self, payload):
         self.request_id += 1
-        body = json.dumps({"version": 1, "request_id": self.request_id, "payload": payload}).encode()
-        self.process.stdin.write(struct.pack(">I", len(body)) + body)
-        self.process.stdin.flush()
-        header = self.process.stdout.read(4)
-        if len(header) < 4:
+        self.codec.write_frame(self.process.stdin, self.request_id, payload)
+        reply = self.codec.read_frame(self.process.stdout, self.request_id)
+        if reply is None:
             raise AssertionError(f"media worker exited ({self.process.wait()}) on {payload['kind']}")
-        envelope = json.loads(self.process.stdout.read(struct.unpack(">I", header)[0]))
-        assert envelope["request_id"] == self.request_id
-        return envelope["payload"]
+        return reply
 
     def encode(self, samples):
         packets = []

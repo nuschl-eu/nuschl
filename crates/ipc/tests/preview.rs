@@ -312,7 +312,7 @@ fn original_init_has_retired(stat: &mut File) -> bool {
 }
 
 async fn observed_namespace_retirement(fake: &Path) {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncWriteExt as _;
     for mode in ["descendant", "descendant-live", "progress"] {
         let mut child = host::preview_sandbox_command(fake, host::PreviewOperation::Prepare)
             .unwrap()
@@ -341,11 +341,10 @@ async fn observed_namespace_retirement(fake: &Path) {
         let mut output = child.stdout.take().unwrap();
         // An actual bounded reply proves the command consumed the input before
         // we cancel the outer monitor. The descendant has already been spawned.
-        let length = output.read_u32().await.unwrap() as usize;
-        assert!(length > 0 && length <= preview::MAX_RESPONSE_FRAME_BYTES);
-        let mut reply = vec![0; length];
-        output.read_exact(&mut reply).await.unwrap();
-        let reply: Envelope<ContentResponse> = serde_json::from_slice(&reply).unwrap();
+        let reply: Envelope<ContentResponse> =
+            nuschl_ipc::read_frame_async(&mut output, preview::MAX_RESPONSE_FRAME_BYTES)
+                .await
+                .unwrap();
         assert_eq!(reply.request_id, 1);
         assert!(matches!(
             reply.payload,
