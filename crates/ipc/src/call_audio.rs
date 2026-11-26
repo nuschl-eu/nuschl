@@ -23,7 +23,7 @@ const CONTROL_RESERVE: usize = 8;
 const EVENTS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     /// Share the desktop's audio, or stop sharing it.
     Share { active: bool },
@@ -41,7 +41,7 @@ pub enum Request {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     /// 20 ms of the shared desktop audio as stereo Opus. The timestamp counts
     /// 48 kHz samples since the share started.

@@ -5,7 +5,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::io;
 
-use crate::{Envelope, decode_postcard_body, read_postcard_frame, write_postcard_frame};
+use crate::{Envelope, decode_frame_body, read_frame_within, write_frame_within};
 
 pub const SCHEMA: u16 = 1;
 pub const MAX_CHUNK_BYTES: usize = 16 * 1024;
@@ -37,6 +37,7 @@ impl Purpose {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Start {
         schema: u16,
@@ -59,6 +60,7 @@ pub enum Failure {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
     More,
     Complete(Response),
@@ -105,16 +107,16 @@ pub fn encode_data(bytes: &[u8]) -> String {
 
 /// Streamed transport input uses a request limit sized for one chunk.
 pub fn read_request(reader: &mut impl io::Read) -> io::Result<Option<Envelope<Request>>> {
-    Ok(read_postcard_frame(reader, MAX_REQUEST_BYTES)?)
+    Ok(read_frame_within(reader, MAX_REQUEST_BYTES)?)
 }
 
 pub fn encode_request(id: u64, request: &Request) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    write_postcard_frame(&mut bytes, &Envelope::new(id, request), MAX_REQUEST_BYTES)?;
+    write_frame_within(&mut bytes, &Envelope::new(id, request), MAX_REQUEST_BYTES)?;
     Ok(bytes)
 }
 pub fn write_reply(writer: &mut impl io::Write, id: u64, reply: &Reply) -> io::Result<()> {
-    Ok(write_postcard_frame(
+    Ok(write_frame_within(
         writer,
         &Envelope::new(id, reply),
         MAX_RESPONSE_BYTES,
@@ -128,7 +130,7 @@ pub fn decode_reply(id: u64, bytes: &[u8]) -> io::Result<Reply> {
             "preview parser reply frame limit",
         ));
     }
-    let reply: Envelope<Reply> = decode_postcard_body(bytes)?;
+    let reply: Envelope<Reply> = decode_frame_body(bytes)?;
     if reply.request_id != id {
         return Err(Error::new(
             ErrorKind::InvalidData,

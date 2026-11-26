@@ -21,12 +21,7 @@ pub struct MathRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(
-    tag = "status",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MathResponse {
     Rendered(MathImage),
     /// Not rendered, and why, in words for a tooltip.

@@ -432,7 +432,7 @@ pub async fn page<S: SeqRows>(store: &mut S, query: &PageQuery) -> Result<Stored
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerStorageRequest {
     /// Channels, links and bans; registered users come in pages.
     Load,
@@ -622,12 +622,7 @@ pub const MAX_KT_KEY_BYTES: usize = 1024;
 pub const MAX_KT_VALUE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(
-    tag = "status",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerStorageResponse {
     Snapshot(ServerSnapshot),
     Users(Vec<StoredUser>),

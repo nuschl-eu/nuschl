@@ -76,7 +76,7 @@ impl Role {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Decode {
         mime: Option<String>,
@@ -109,7 +109,7 @@ pub enum Stage {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     Progress { stage: Stage, units: u64 },
     Pcm { samples: Vec<f32> },

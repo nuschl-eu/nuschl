@@ -5,9 +5,7 @@
 mod supervisor;
 pub use supervisor::{Error as WorkerError, Worker};
 
-use crate::{
-    Envelope, Error, read_postcard_frame, read_postcard_frame_async, write_postcard_frame,
-};
+use crate::{Envelope, Error, read_frame_async, read_frame_within, write_frame_within};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Read, Write},
@@ -99,6 +97,7 @@ impl Track {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Start {
         generation: u64,
@@ -217,6 +216,7 @@ impl Command {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
     Done,
     Rejected,
@@ -291,6 +291,7 @@ impl Reply {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     Connected,
     Disconnected,
@@ -353,7 +354,7 @@ fn metadata<T: Serialize>(
         return Err(invalid());
     }
     let mut bytes = Vec::new();
-    write_postcard_frame(
+    write_frame_within(
         &mut bytes,
         &Envelope::new(
             packet.id,
@@ -368,7 +369,7 @@ fn metadata<T: Serialize>(
 }
 
 pub fn read_request(reader: &mut impl Read) -> Result<Option<Packet<Command>>, Error> {
-    let Some(envelope) = read_postcard_frame(reader, MAX_METADATA)? else {
+    let Some(envelope) = read_frame_within(reader, MAX_METADATA)? else {
         return Ok(None);
     };
     let mut packet = frame(envelope, Command::permits)?;
@@ -387,8 +388,7 @@ async fn read_reply(
     reader: &mut (impl AsyncRead + Unpin),
     request: &Packet<Command>,
 ) -> Result<Packet<Reply>, Error> {
-    let envelope: Envelope<Metadata<Reply>> =
-        read_postcard_frame_async(reader, MAX_METADATA).await?;
+    let envelope: Envelope<Metadata<Reply>> = read_frame_async(reader, MAX_METADATA).await?;
     if envelope.request_id != request.id || !envelope.payload.kind.matches(&request.kind) {
         return Err(invalid());
     }
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(packet.id, 1);
         assert_eq!(packet.data, [0xab; MAX_DATAGRAM]);
         let mut bad = Vec::new();
-        write_postcard_frame(
+        write_frame_within(
             &mut bad,
             &Envelope::new(
                 1,
