@@ -1245,7 +1245,7 @@
               };
             };
             vm-link-previews = import ./tests/link_previews_vm.nix {
-              inherit pkgs;
+              inherit pkgs workerTestCodec;
               nuschl = package;
               sourceIdentity = self.rev or self.outPath;
               contentWorker = crates.project.workspaceMembers."nuschl-content-worker".build;
