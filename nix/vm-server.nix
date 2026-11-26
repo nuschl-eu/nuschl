@@ -10,6 +10,7 @@
   pkgs,
   nuschl,
   serverPackage ? nuschl,
+  workerTestCodec,
   module,
   witnessModule,
 }:
@@ -118,7 +119,8 @@ pkgs.testers.runNixOSTest {
       {
         environment.systemPackages = [
           nuschl
-          (pkgs.python3.withPackages (p: [ p.msgpack ]))
+          pkgs.python3
+          workerTestCodec
           pkgs.xvfb-run
           pkgs.pulseaudio
           pkgs.mumble

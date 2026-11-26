@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: EUPL-1.2
 
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Read, Write};
 
-use serde::{Deserialize as _, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::{Envelope, FRAME_VERSION, MAX_FRAME_BYTES};
-
-const MAX_DEPTH: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -20,10 +18,6 @@ pub enum Error {
     TrailingBytes,
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error(transparent)]
-    Encode(#[from] rmp_serde::encode::Error),
-    #[error(transparent)]
-    Decode(#[from] rmp_serde::decode::Error),
     #[error(transparent)]
     Postcard(#[from] postcard::Error),
 }
@@ -50,7 +44,7 @@ pub fn read_frame_within<T: DeserializeOwned>(
 ) -> Result<Option<Envelope<T>>, Error> {
     read_body(reader, maximum)?
         .as_deref()
-        .map(decode_messagepack)
+        .map(decode_frame_body)
         .transpose()
 }
 
@@ -58,7 +52,7 @@ pub async fn read_frame_async<T: DeserializeOwned>(
     reader: &mut (impl AsyncRead + Unpin),
     maximum: usize,
 ) -> Result<Envelope<T>, Error> {
-    decode_messagepack(&read_body_async(reader, maximum).await?)
+    decode_frame_body(&read_body_async(reader, maximum).await?)
 }
 
 pub fn write_frame<T: Serialize>(
@@ -73,69 +67,33 @@ pub fn write_frame_within<T: Serialize>(
     value: &Envelope<T>,
     maximum: usize,
 ) -> Result<(), Error> {
-    let mut body = CappedBuffer::new(maximum);
-    let result = value.serialize(
-        &mut rmp_serde::Serializer::new(&mut body)
-            .with_struct_map()
-            .with_human_readable(),
-    );
-    write_body(writer, &body.finish(result)?)
+    write_body(writer, &encode_frame_body(value, maximum)?)
 }
 
-pub fn read_postcard_frame<T: DeserializeOwned>(
-    reader: &mut impl Read,
-    maximum: usize,
-) -> Result<Option<Envelope<T>>, Error> {
-    read_body(reader, maximum)?
-        .as_deref()
-        .map(decode_postcard_body)
-        .transpose()
-}
-
-pub async fn read_postcard_frame_async<T: DeserializeOwned>(
-    reader: &mut (impl AsyncRead + Unpin),
-    maximum: usize,
-) -> Result<Envelope<T>, Error> {
-    decode_postcard_body(&read_body_async(reader, maximum).await?)
-}
-
-pub fn write_postcard_frame<T: Serialize>(
-    writer: &mut impl Write,
-    value: &Envelope<T>,
-    maximum: usize,
-) -> Result<(), Error> {
-    write_body(writer, &encode_postcard_body(value, maximum)?)
-}
-
-pub fn encode_postcard_body<T: Serialize>(
+fn encode_frame_body<T: Serialize>(
     value: &Envelope<T>,
     maximum: usize,
 ) -> Result<Vec<u8>, Error> {
     let mut body = CappedBuffer::new(maximum);
     let result = postcard::to_io(value, &mut body).map(|_| ());
-    body.finish(result)
-}
-
-pub fn decode_postcard_body<T: DeserializeOwned>(body: &[u8]) -> Result<Envelope<T>, Error> {
-    let (envelope, remaining) = postcard::take_from_bytes(body)?;
-    checked(envelope, remaining.is_empty())
-}
-
-fn decode_messagepack<T: DeserializeOwned>(body: &[u8]) -> Result<Envelope<T>, Error> {
-    let mut decoder = rmp_serde::Deserializer::new(Cursor::new(body)).with_human_readable();
-    decoder.set_max_depth(MAX_DEPTH);
-    let envelope = Envelope::deserialize(&mut decoder)?;
-    checked(envelope, decoder.get_ref().position() == body.len() as u64)
-}
-
-fn checked<T>(envelope: Envelope<T>, complete: bool) -> Result<Envelope<T>, Error> {
-    if envelope.version != FRAME_VERSION {
-        return Err(Error::Version(envelope.version));
+    if body.full {
+        return Err(Error::TooLarge);
     }
-    if !complete {
+    result?;
+    Ok(body.bytes)
+}
+
+pub(crate) fn decode_frame_body<T: DeserializeOwned>(body: &[u8]) -> Result<Envelope<T>, Error> {
+    // The envelope begins with its version, then the request ID and payload.
+    let (version, body) = postcard::take_from_bytes(body)?;
+    if version != FRAME_VERSION {
+        return Err(Error::Version(version));
+    }
+    let ((request_id, payload), remaining) = postcard::take_from_bytes(body)?;
+    if !remaining.is_empty() {
         return Err(Error::TrailingBytes);
     }
-    Ok(envelope)
+    Ok(Envelope { version, request_id, payload })
 }
 
 fn read_body(reader: &mut impl Read, maximum: usize) -> Result<Option<Vec<u8>>, Error> {
@@ -190,13 +148,7 @@ impl CappedBuffer {
         }
     }
 
-    fn finish(self, result: Result<(), impl Into<Error>>) -> Result<Vec<u8>, Error> {
-        if self.full {
-            return Err(Error::TooLarge);
-        }
-        result.map_err(Into::into)?;
-        Ok(self.bytes)
-    }
+
 }
 
 impl Write for CappedBuffer {
@@ -221,29 +173,18 @@ mod tests {
     #[test]
     fn postcard_frames_require_one_complete_supported_envelope() -> Result<(), Error> {
         let value = Envelope::new(7, 9_u8);
-        let mut body = encode_postcard_body(&value, 16)?;
-        assert_eq!(decode_postcard_body::<u8>(&body)?, value);
+        let mut body = encode_frame_body(&value, 16)?;
+        assert_eq!(decode_frame_body::<u8>(&body)?, value);
         body.push(0);
         assert!(matches!(
-            decode_postcard_body::<u8>(&body),
+            decode_frame_body::<u8>(&body),
             Err(Error::TrailingBytes)
         ));
         assert!(matches!(
-            encode_postcard_body(&value, 1),
+            encode_frame_body(&value, 1),
             Err(Error::TooLarge)
         ));
         Ok(())
     }
 
-    #[test]
-    fn messagepack_rejects_trailing_bytes() -> Result<(), Error> {
-        let mut frame = Vec::new();
-        write_frame(&mut frame, &Envelope::new(1, 3_u8))?;
-        frame.push(0);
-        assert!(matches!(
-            decode_messagepack::<u8>(&frame[4..]),
-            Err(Error::TrailingBytes)
-        ));
-        Ok(())
-    }
 }

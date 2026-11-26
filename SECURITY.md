@@ -64,11 +64,11 @@ allowance narrow, and name the safer alternative that is missing.
 
 Trusted supervisors start workers from fixed paths with fixed arguments. Workers
 exchange versioned, size-bounded messages over inherited pipes and socket pairs.
-The typed frames use MessagePack and Postcard through `nuschl-ipc`.
-`rmp-serde` forbids unsafe code and uses `rmp`'s standard I/O implementation.
-Postcard uses its standard I/O serializer and a bounded slice decoder, whose
-internal pointer reads are checked against that slice. These paths use existing
-locked versions with no C or system library dependencies.
+The typed frames use Postcard through `nuschl-ipc`. Its standard I/O serializer
+writes to a capped buffer. Its slice decoder checks the remaining input before
+using internal pointers. Byte strings use Serde's byte handling through
+`serde_bytes`. These paths use existing Rust crates and features without C
+or system library dependencies.
 Worker roles use the credentials listed below. Server TLS identity and passwords
 stay with the session authority. `nuschld`'s storage worker holds the database
 credential. A worker cannot name an executable, choose a database,

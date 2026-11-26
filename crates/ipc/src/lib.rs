@@ -20,11 +20,8 @@ pub mod thumbnail;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod video;
 
-pub use framing::{
-    Error, decode_postcard_body, encode_postcard_body, read_frame, read_frame_async,
-    read_frame_within, read_postcard_frame, read_postcard_frame_async, write_frame,
-    write_frame_within, write_postcard_frame,
-};
+pub use framing::{Error, read_frame, read_frame_async, read_frame_within, write_frame, write_frame_within};
+pub(crate) use framing::decode_frame_body;
 use nuschl_core::{ChatMessage, ContentBlock, HistoryPage, MessageDocument};
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +59,7 @@ pub const MAX_THUMBNAIL_PNG_BYTES: usize = 700 * 1024;
 
 /// One untrusted input for the content worker, and what to make of it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentRequest {
     /// Literal message text with fenced code; answered with `Rendered`.
     Render { text: String },
@@ -113,8 +110,6 @@ pub struct PreparedContent {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
-    tag = "status",
-    content = "value",
     rename_all = "snake_case",
     deny_unknown_fields
 )]
@@ -141,7 +136,7 @@ pub struct ThumbnailPng {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum StorageRequest {
     Append {
         message: ChatMessage,
@@ -209,8 +204,6 @@ pub enum StorageRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
-    tag = "status",
-    content = "value",
     rename_all = "snake_case",
     deny_unknown_fields
 )]
@@ -227,7 +220,7 @@ pub enum StorageResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MediaRequest {
     DecodeOpus {
         #[serde(with = "serde_bytes")]
@@ -240,8 +233,6 @@ pub enum MediaRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
-    tag = "status",
-    content = "value",
     rename_all = "snake_case",
     deny_unknown_fields
 )]
@@ -267,7 +258,7 @@ pub struct WormholeServers {
 /// To the transfer worker. The first request says what it does for its whole
 /// life; `Cancel` (or closing its input) may follow at any time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TransferRequest {
     /// Offer the one file the supervisor exposed to this worker, under
     /// `name`: a fresh code after every pickup, until cancelled.
@@ -288,7 +279,7 @@ pub enum TransferRequest {
 /// From the transfer worker, all with request_id 0. `peer` numbers the
 /// pickups of one offer; a receiver's single transfer is peer 0.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TransferEvent {
     /// A code waiting for someone to receive with it.
     Code {
@@ -375,7 +366,7 @@ mod tests {
 
 /// Live audio has independent events: request_id 0 denotes a stream event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LiveMediaRequest {
     /// The microphone opens and closes in place; a mute is confirmed with
     /// [`LiveMediaEvent::MicrophoneClosed`].
@@ -440,7 +431,7 @@ pub enum LiveMediaRequest {
     Shutdown,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LiveMediaEvent {
     Status {
         ready: bool,
@@ -566,7 +557,7 @@ mod voice_ipc_cost {
         }
         let per_pair = started.elapsed().as_secs_f64() / rounds as f64;
         println!(
-            "MessagePack playback frame: {} bytes; {:.2} µs to encode and decode one packet each way",
+            "Postcard playback frame: {} bytes; {:.2} µs to encode and decode one packet each way",
             bytes.len(),
             per_pair * 1e6,
         );
@@ -577,46 +568,6 @@ mod voice_ipc_cost {
 mod hostile_frames {
     use super::*;
 
-    #[test]
-    fn playback_without_a_stream_is_stream_zero() -> Result<(), Error> {
-        #[derive(Serialize)]
-        struct Playback {
-            kind: &'static str,
-            sender: u32,
-            sequence: u64,
-            #[serde(with = "serde_bytes")]
-            opus: &'static [u8],
-            end: bool,
-            volume: f32,
-        }
-        let mut frame = Vec::new();
-        write_frame(
-            &mut frame,
-            &Envelope::new(
-                0,
-                Playback {
-                    kind: "playback",
-                    sender: 3,
-                    sequence: 2,
-                    opus: &[1],
-                    end: false,
-                    volume: 1.0,
-                },
-            ),
-        )?;
-        let request = read_frame::<LiveMediaRequest>(&mut frame.as_slice())?
-            .unwrap()
-            .payload;
-        assert!(matches!(
-            request,
-            LiveMediaRequest::Playback {
-                stream: 0,
-                sender: 3,
-                ..
-            }
-        ));
-        Ok(())
-    }
     #[test]
     fn random_frames_are_rejected_without_panicking() {
         let mut state = 0x1234_5678_9abc_def0_u64;

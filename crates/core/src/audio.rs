@@ -26,7 +26,7 @@ pub enum EchoMode {
 
 /// Who is cancelling echo on the active capture route.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "device", rename_all = "snake_case")]
+#[serde(remote = "Self", tag = "kind", content = "device", rename_all = "snake_case")]
 pub enum EchoSource {
     #[default]
     None,
@@ -34,6 +34,16 @@ pub enum EchoSource {
     /// A recognised system canceller (e.g. PipeWire or PulseAudio echo-cancel).
     Upstream(String),
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "EchoSource")]
+enum BinaryEchoSource {
+    None,
+    Nuschl,
+    Upstream(String),
+}
+
+crate::wire_serde!(EchoSource, EchoSource, BinaryEchoSource);
 
 /// Requested mono VoIP target; the destination's network budget takes priority.
 pub const DEFAULT_VOICE_BITRATE: u32 = 128_000;

@@ -75,17 +75,18 @@ separate from live media callbacks and the media worker, with verified model fil
 downloaded on demand. Vulkan, optional Nix ROCm, Metal and CPU are backend targets;
 model support and confinement must be validated per backend before shipping.
 
-Native control IPC uses versioned, length-prefixed binary envelopes. MessagePack
-preserves the named Serde schemas shared with the app. RTC and preview-fetch use
-Postcard on their own typed messages. Each frame limit is checked before
+Native control IPC uses versioned Postcard envelopes with a fixed-length prefix.
+RTC, preview fetching and live audio carry encoded bytes without text expansion.
+Each frame limit is checked before
 allocation and the default cap is 12 MiB. Unknown versions, trailing bytes,
 truncation and oversized frames fail explicitly. Supervisors select helpers by
 trusted paths, check request IDs and use inherited pipes or socket pairs.
 Worker diagnostics use stderr.
 
-Live audio carries compressed Opus as byte strings with capture generation tags.
-The PCM stays inside the worker. The media harness uses the same IPC for codec
-checks. Browser workers exchange structured messages through `postMessage`.
+Live audio includes capture generation tags and keeps PCM inside the worker.
+The media harness uses the production IPC codec. Browser workers use
+`postMessage` and forward pre-encoded Wasm results directly where the receiving
+side already consumes that encoding.
 
 The UI and network event loop must not wait synchronously for parsing, disk, or DSP.
 The native audio callbacks only convert samples and move them through lock-free SPSC

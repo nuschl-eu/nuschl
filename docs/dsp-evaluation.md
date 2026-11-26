@@ -103,5 +103,5 @@ perceptual metric. No such corpus ships with the repository.
 The 2026-11-10 benchmark measured 7.4 µs to serialize and parse two 100-byte
 Opus packets in memory with the former JSON protocol. One playback frame was
 479 bytes. The current benchmark uses 320-byte Opus packets, representative
-of 20 ms at 128 kbit/s. It reports the size of the MessagePack playback
+of 20 ms at 128 kbit/s. It reports the size of the Postcard playback
 frame and the time to encode and decode a pair of messages in memory.
