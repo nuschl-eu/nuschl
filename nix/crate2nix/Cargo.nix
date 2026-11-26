@@ -10148,6 +10148,33 @@ rec {
         ];
 
       };
+      "embedded-io 0.4.0" = rec {
+        crateName = "embedded-io";
+        version = "0.4.0";
+        edition = "2021";
+        sha256 = "1v9wrc5nsgaaady7i3ya394sik5251j0iq5rls7mrx7fv696h6pg";
+        libName = "embedded_io";
+        features = {
+          "defmt" = [ "dep:defmt" ];
+          "futures" = [ "std" "async" "dep:futures" ];
+          "log" = [ "dep:log" ];
+          "std" = [ "alloc" "futures?/std" ];
+          "tokio" = [ "std" "async" "dep:tokio" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" ];
+      };
+      "embedded-io 0.6.1" = rec {
+        crateName = "embedded-io";
+        version = "0.6.1";
+        edition = "2021";
+        sha256 = "0v901xykajh3zffn6x4cnn4fhgfw3c8qpjwbsk6gai3gaccg3l7d";
+        libName = "embedded_io";
+        features = {
+          "defmt-03" = [ "dep:defmt-03" ];
+          "std" = [ "alloc" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" ];
+      };
       "encoding_rs" = rec {
         crateName = "encoding_rs";
         version = "0.8.44";
@@ -25579,6 +25606,16 @@ rec {
             packageId = "nuschl-sandbox";
           }
           {
+            name = "postcard";
+            packageId = "postcard";
+            usesDefaultFeatures = false;
+            features = [ "use-std" ];
+          }
+          {
+            name = "rmp-serde";
+            packageId = "rmp-serde";
+          }
+          {
             name = "rustix";
             packageId = "rustix 1.1.6";
             target = { target, features }: ("linux" == target."os" or null);
@@ -25588,6 +25625,10 @@ rec {
             name = "serde";
             packageId = "serde";
             features = [ "derive" ];
+          }
+          {
+            name = "serde_bytes";
+            packageId = "serde_bytes";
           }
           {
             name = "serde_json";
@@ -34803,6 +34844,18 @@ rec {
             usesDefaultFeatures = false;
           }
           {
+            name = "embedded-io";
+            packageId = "embedded-io 0.4.0";
+            rename = "embedded-io-04";
+            optional = true;
+          }
+          {
+            name = "embedded-io";
+            packageId = "embedded-io 0.6.1";
+            rename = "embedded-io-06";
+            optional = true;
+          }
+          {
             name = "serde";
             packageId = "serde";
             usesDefaultFeatures = false;
@@ -34827,6 +34880,7 @@ rec {
           "use-defmt" = [ "defmt" ];
           "use-std" = [ "serde/std" "alloc" ];
         };
+        resolvedDefaultFeatures = [ "alloc" "use-std" ];
       };
       "potential_utf" = rec {
         crateName = "potential_utf";

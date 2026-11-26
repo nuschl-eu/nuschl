@@ -65,7 +65,7 @@ mod windows {
     use nuschl_sandbox::{Containment, Role, command, contain, windows_policy::IN_JOB};
     use serde_json::{Value, json};
     use tokio::{
-        io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+        io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
         process::{Child, Command},
         time::timeout,
     };
