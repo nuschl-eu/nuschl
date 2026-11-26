@@ -154,11 +154,11 @@ async fn actual_stream_quota(worker: &Path, restart: bool) {
         let count = if restart { 2 } else { wire::MAX_CHUNKS + 2 };
         for id in 1..=count {
             let chunk = wire::Request::Chunk {
-                data: wire::encode_data(if id == 2 {
-                    b"HTTP/1.1 200 OK\r\nX-Padding: "
+                data: if id == 2 {
+                    b"HTTP/1.1 200 OK\r\nX-Padding: ".to_vec()
                 } else {
-                    b"x"
-                }),
+                    b"x".to_vec()
+                },
                 eof: false,
             };
             let frame =
