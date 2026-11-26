@@ -117,18 +117,20 @@ pub mod base64_list {
 /// Share the variants between the worker wire schema and the established JSON
 /// representation used for CLI events and saved contacts.
 macro_rules! ipc_enum_with_json {
-    ($(#[$attr:meta])* pub enum $name:ident, $tag:literal $variants:tt) => {
+    ($(#[$attr:meta])* pub enum $name:ident, $tag:literal $(, $extra_derive:ident)? { $($variants:tt)* }) => {
         $(#[$attr])*
         #[derive(Serialize, Deserialize)]
+        $(#[derive($extra_derive)])?
         #[serde(remote = "Self", rename_all = "snake_case", deny_unknown_fields)]
-        pub enum $name $variants
+        pub enum $name { $($variants)* }
 
         const _: () = {
             type Schema = $name;
 
             #[derive(Serialize, Deserialize)]
+            $(#[derive($extra_derive)])?
             #[serde(remote = "Schema", tag = $tag, rename_all = "snake_case", deny_unknown_fields)]
-            enum JsonSerde $variants
+            enum JsonSerde { $($variants)* }
 
             nuschl_core::wire_serde!($name, JsonSerde, $name);
         };
@@ -244,8 +246,9 @@ impl KeyTransparencySettings {
 ipc_enum_with_json! {
     /// Whether a server's view is witnessed (docs/e2ee.md §5.9).
     #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum WitnessStatus, "witness" {
+    pub enum WitnessStatus, "witness", Default {
         /// No witness is required (nothing configured): as before.
+        #[default]
         Off,
         /// Cosigned by the required witnesses; fresh until `until_ms`.
         Witnessed { until_ms: u64 },
@@ -255,12 +258,6 @@ ipc_enum_with_json! {
         /// unreachable. Messages keep using pinned keys; contacts' new devices are not
         /// added to existing conversations (if configured).
         Unavailable { reason: String },
-    }
-}
-
-impl Default for WitnessStatus {
-    fn default() -> Self {
-        Self::Off
     }
 }
 
