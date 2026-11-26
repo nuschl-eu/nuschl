@@ -4,6 +4,6 @@ import {renderFormula} from "./math-render-core.js";
 postMessage({kind:"ready"});
 onmessage = ({data}) => {
   if (!Number.isSafeInteger(data?.id) || data.id < 1) return;
-  try { postMessage({kind:"result", id:data.id, tree:JSON.stringify(renderFormula(data.tex, data.display))}); }
+  try { postMessage({kind:"result", id:data.id, tree:renderFormula(data.tex, data.display)}); }
   catch { postMessage({kind:"error", id:data.id, message:"This formula could not be rendered. Its source is available."}); }
 };

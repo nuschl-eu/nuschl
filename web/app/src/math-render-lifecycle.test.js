@@ -22,7 +22,7 @@ class Worker {
   terminate(){this.terminated++;}
   emit(data){this.onmessage?.({data});}
   ready(){this.emit({kind:"ready"});}
-  finish(text="x",id=this.sent.at(-1).id){this.emit({kind:"result",id,tree:JSON.stringify(tree(text))});}
+  finish(text="x",id=this.sent.at(-1).id){this.emit({kind:"result",id,tree:tree(text)});}
   error(id=this.sent.at(-1).id){this.emit({kind:"error",id,message:"This formula could not be rendered. Its source is available."});}
 }
 function fixture(options={}) {
@@ -113,7 +113,7 @@ test("global immutable LRU survives disposal, counts duplicate keys once, and ev
   // Near the maximum serialized reply, with bounded text and many inert rows.
   const large={tag:"math",attrs:{},children:Array.from({length:900},()=>({tag:"mrow",attrs:{},children:[]}))};
   assert.ok(JSON.stringify(large).length<65536);
-  for(let i=0;i<80;i++){const next=outcome(other.render(`large ${i}`));workers[0].emit({kind:"result",id:workers[0].sent.at(-1).id,tree:JSON.stringify(large)});await next;}
+  for(let i=0;i<80;i++){const next=outcome(other.render(`large ${i}`));workers[0].emit({kind:"result",id:workers[0].sent.at(-1).id,tree:large});await next;}
   assert.ok(other.cacheEntries<64);assert.ok(other.cacheBytes<=2*1024*1024);assert.ok(other.cacheBytes>1900000);
 });
 test("retirement notifies mounted subscribers once; removals and throwing views cannot break cleanup or cached formulas",async()=>{

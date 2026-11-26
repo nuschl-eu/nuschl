@@ -36,7 +36,7 @@ function attribute(name, value) {
   else fail();
 }
 function visit(node, budget, depth, project) {
-  if (++budget.nodes > MAX_NODES || depth > MAX_DEPTH || !node || typeof node !== "object") fail();
+  if (++budget.nodes > MAX_NODES || depth > MAX_DEPTH || !node || typeof node !== "object" || (!project && !record(node))) fail();
   if (Object.hasOwn(node, "text")) {
     if (Object.keys(node).some(key => key !== "text")) fail();
     const text = boundedText(node.text, 16384); budget.text += encoder.encode(text).length;
@@ -55,13 +55,13 @@ function visit(node, budget, depth, project) {
     if (tag === undefined && node.attributes === undefined && node.label === undefined) tag = "mrow";
     attrs = node.attributes ?? {}; children = node.children;
   } else {
-    if (!record(node) || Object.keys(node).some(key => !["tag", "attrs", "children"].includes(key))) fail();
+    if (Object.keys(node).some(key => !["tag", "attrs", "children"].includes(key))) fail();
     tag = node.tag; attrs = node.attrs; children = node.children;
   }
   if (!tags.has(tag) || !record(attrs) || Object.keys(attrs).length > 16 || !Array.isArray(children) || children.length > MAX_NODES) fail();
   const safeAttrs = {};
   for (const [name, value] of Object.entries(attrs)) { attribute(name, value); safeAttrs[name] = value; }
-  return {tag, attrs:safeAttrs, children:children.map(child => visit(child, budget, depth + 1, project))};
+  return {tag, attrs:safeAttrs, children:Array.from(children, child => visit(child, budget, depth + 1, project))};
 }
 export function validateMathTree(tree) {
   const result = visit(tree, {nodes:0,text:0}, 0, false);
@@ -71,8 +71,4 @@ export function validateMathTree(tree) {
 }
 export function projectMathTree(tree) {
   return validateMathTree(visit(tree, {nodes:0,text:0}, 0, true));
-}
-export function parseMathReply(json) {
-  boundedText(json, MAX_TREE_BYTES);
-  return validateMathTree(JSON.parse(json));
 }

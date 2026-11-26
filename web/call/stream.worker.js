@@ -35,11 +35,11 @@ function run(worker, call) {
 addEventListener("message", async ({ data: { id, request } }) => {
   const worker = await ready.catch(fatal);
   if (!worker) return;
-  const { value: reply, error, trapped } = run(worker, (w) => w.handle(request, Date.now()));
+  const { value: reply, error, trapped } = run(worker, (w) => JSON.parse(w.handle(JSON.stringify(request), Date.now())));
   if (trapped) return;
   if (error !== undefined) return postMessage({ id, error });
   postMessage({ id, reply });
-  for (const event of JSON.parse(reply).events ?? []) {
+  for (const event of reply.events ?? []) {
     if (event.kind !== "keyed") continue;
     for (const transformer of receivers.get(event.peer) ?? []) {
       Promise.resolve().then(() => transformer.sendKeyFrameRequest()).catch(() => {});
