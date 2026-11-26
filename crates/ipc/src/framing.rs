@@ -125,7 +125,7 @@ fn decode_messagepack<T: DeserializeOwned>(body: &[u8]) -> Result<Envelope<T>, E
     let mut decoder = rmp_serde::Deserializer::new(Cursor::new(body)).with_human_readable();
     decoder.set_max_depth(MAX_DEPTH);
     let envelope = Envelope::deserialize(&mut decoder)?;
-    checked(envelope, decoder.position() == body.len() as u64)
+    checked(envelope, decoder.get_ref().position() == body.len() as u64)
 }
 
 fn checked<T>(envelope: Envelope<T>, complete: bool) -> Result<Envelope<T>, Error> {
