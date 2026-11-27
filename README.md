@@ -21,27 +21,30 @@ More about the app: [docs/desktop.md](docs/desktop.md).
 
 ## Install
 
-Downloads for **0.2.0** include the required helper programs and licenses:
+[Nuschl 0.3.0](https://github.com/nuschl-eu/nuschl/releases/tag/v0.3.0) adds
+experimental video calls and screen sharing. People using stock Mumble can join
+through a link in chat.
 
-| Platform | Download |
+| Platform | Install |
 | --- | --- |
-| Windows x86_64 | [Portable ZIP](https://github.com/nuschl-eu/nuschl/releases/download/v0.2.0/nuschl-0.2.0-windows-x86_64.zip) |
-| macOS Intel and Apple silicon | [Universal app ZIP](https://github.com/nuschl-eu/nuschl/releases/download/v0.2.0/nuschl-0.2.0-macos-universal.zip) |
-| Linux | [Nix installation](#nixos-and-nix) |
+| Windows x86_64 | [Installer](https://github.com/nuschl-eu/nuschl/releases/download/v0.3.0/nuschl-0.3.0-windows-x86_64-setup.exe) or [portable ZIP](https://github.com/nuschl-eu/nuschl/releases/download/v0.3.0/nuschl-0.3.0-windows-x86_64.zip) |
+| macOS Intel and Apple silicon | [Universal app ZIP](https://github.com/nuschl-eu/nuschl/releases/download/v0.3.0/nuschl-0.3.0-macos-universal.zip) |
+| Debian 13 and Ubuntu 24.04 (amd64) | [APT setup](docs/install.md#debian-and-ubuntu) or [download the .deb](https://github.com/nuschl-eu/nuschl/releases/download/v0.3.0/nuschl_0.3.0-1_amd64.deb) |
+| Arch Linux x86_64 | [`nuschl-bin` on the AUR](https://aur.archlinux.org/packages/nuschl-bin) |
+| Linux with Nix | [Nix installation](#nixos-and-nix) |
 
-Download the complete ZIP for your platform; the individual files on the release
-page support automatic updates. Platform requirements and first-start instructions
-are below.
+The installer, ZIPs and Linux packages include the required helper programs and
+licenses. Platform requirements and first-start instructions are below.
 
 ### NixOS and Nix
 
 Try it without installing anything:
 
 ```sh
-nix run github:nuschl-eu/nuschl/v0.2.0
+nix run github:nuschl-eu/nuschl/v0.3.0
 ```
 
-Without `/v0.2.0`, the flake builds the latest `main`.
+Use `nix run github:nuschl-eu/nuschl` to try the latest `main`.
 
 To keep it, add the flake as an input and install
 `inputs.nuschl.packages.${pkgs.stdenv.hostPlatform.system}.default`, or use the Home
@@ -63,18 +66,17 @@ inputs, not by itself. Details, and what to do about `No GPU adapters found`:
 
 ### Other Linux distributions
 
-Not yet: there is no Flatpak, AppImage or distribution package. You can build it
-from source (see [Development](#development)); it needs a Vulkan driver, and
-bubblewrap (`bwrap`) for its sandbox.
+Install with [APT on Debian or Ubuntu](docs/install.md#debian-and-ubuntu) or
+[makepkg on Arch Linux](docs/install.md#arch-linux). To build from source on
+another distribution, see [Development](#development). The desktop needs a
+Vulkan driver and uses bubblewrap (`bwrap`) to sandbox its helpers.
 
 ### Windows
 
-Windows releases use a portable zip, `nuschl-<version>-windows-x86_64.zip`, on the
-[Releases page](https://github.com/nuschl-eu/nuschl/releases). Unpack it into a folder of your own (not
-Program Files) and start `nuschl.exe`. Releases after 0.2.0 also have an installer,
-`nuschl-<version>-windows-x86_64-setup.exe`: it needs no administrator rights and adds
-a Start menu entry and an uninstall entry. Both update themselves in place
-([details](docs/install.md#windows)).
+The Windows installer runs with your user privileges and adds a Start menu entry
+and an uninstall entry. For the portable ZIP, unpack it into a folder you can write
+to and start `nuschl.exe`. Both update themselves in place
+([installation details](docs/install.md#windows)).
 
 Releases are not code-signed for now, so on the first start Windows shows "Windows
 protected your PC". Choose **More info**, then **Run anyway**. Windows with Smart App
@@ -99,10 +101,10 @@ screen readers, and F1 lists the keys.
 ### Android, iOS and the web
 
 Android and iOS remain planned ([docs/clients.md](docs/clients.md)). The web client
-supports text chat, voice and local history. Host it with `nixosModules.web`, which
-serves the app and its relay from your domain with ACME. TLS runs in the browser, so the
-relay sees ciphertext. Video and MLS in the browser remain unfinished
-([docs/web.md](docs/web.md), [browser voice](docs/browser-audio.md)).
+supports text chat, voice, local history, and experimental camera and screen
+sharing. Host it with `nixosModules.web`, which serves the app and its relay from
+your domain with ACME. TLS runs in the browser, so the relay sees ciphertext.
+See the [web setup guide](docs/web.md) and [browser voice guide](docs/browser-audio.md).
 
 ## Getting started
 
