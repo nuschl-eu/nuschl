@@ -181,9 +181,13 @@ forwarded to other users or returned in pages.
 ## 4. Sending and live delivery
 
 - `ChatSend { request_id, conversation, idempotency_key, format, content, reply_to?,
-  attachments? }` → `ChatAck { request_id, conversation, seq, server_time }` once the
-  message is durably stored, or an error (permission, size, rate limit with
-  `retry_after`). The client shows the message as pending until the ack.
+  attachments?, preview? }` → `ChatAck { request_id, conversation, seq, server_time }`
+  once the message is durably stored, or an error (permission, size, rate limit with
+  `retry_after`). The client shows the message as pending until the ack. `preview` is
+  the sender's carried card (docs/link-previews.md): validated against the model,
+  stored with the row, served in `Message.preview` on live delivery and in history
+  pages, and included in the idempotency hash, so a retry that changes it conflicts.
+  An edit replaces the text and clears the card.
 - `content` is what the user typed, with a `format` tag (Nuschl Markdown,
   [desktop.md](desktop.md#markdown)); every stored message keeps its format. `reply_to` is a `seq` in the
   same conversation (at most the head), never a copied excerpt. Attachments are
@@ -475,7 +479,9 @@ the wire definition):
   `too_many_requests`, `limit_reached`, `confirmation_required` (12; 11 is reserved
   for `mls/1`), each with one fixed detail string.
 - **Limits**: `ChatSend`/`ChatEdit` text ≤ 64 KiB (and the stock copy within the
-  server's text limit), stored stock HTML ≤ 1 MiB, ≤ 64 conversations per
+  server's text limit), a carried preview ≤ 40 KiB (`MAX_PREVIEW_BYTES`), a page's
+  rows count their previews against its byte cap, stored stock HTML ≤ 1 MiB, ≤ 64
+  conversations per
   `Subscribe`, ≤ 256 subscriptions per connection and 1,024 per account, ≤ 1,024
   direct conversations per account, pages ≤ 100 rows and 256 KiB of content, pages and
   bytes per minute per connection (`history.pages_per_minute`,

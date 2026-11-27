@@ -26,12 +26,15 @@ macro_rules! expirable {
 
 /// Message text the worker stores, whatever the server sends.
 const MAX_CONTENT: usize = 1024 * 1024;
+/// A stored preview: the model's 32 KiB image as base64 with its strings and
+/// field names, bounded again here because the row is the worker's input.
+const MAX_PREVIEW: usize = 64 * 1024;
 const MAX_ID: usize = 64;
 const MAX_READ_MARKERS: i64 = 100_000;
 
-const ROWS_DESC: &str = "SELECT conversation, seq, kind, target, author_account, author_user_id, author_name, format, content, reply_to, sent_ms, edited_ms, edits, deleted_ms, delete_reason FROM history_messages WHERE conversation = $1 AND seq >= $2 AND seq <= $3 ORDER BY seq DESC LIMIT $4";
-const ROWS_ASC: &str = "SELECT conversation, seq, kind, target, author_account, author_user_id, author_name, format, content, reply_to, sent_ms, edited_ms, edits, deleted_ms, delete_reason FROM history_messages WHERE conversation = $1 AND seq >= $2 AND seq <= $3 ORDER BY seq LIMIT $4";
-const INSERT: &str = "INSERT INTO history_messages (conversation, seq, kind, target, author_account, author_user_id, author_name, format, content, reply_to, sent_ms, edited_ms, edits, deleted_ms, delete_reason, idempotency_key, body_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)";
+const ROWS_DESC: &str = "SELECT conversation, seq, kind, target, author_account, author_user_id, author_name, format, content, reply_to, sent_ms, edited_ms, edits, deleted_ms, delete_reason, preview FROM history_messages WHERE conversation = $1 AND seq >= $2 AND seq <= $3 ORDER BY seq DESC LIMIT $4";
+const ROWS_ASC: &str = "SELECT conversation, seq, kind, target, author_account, author_user_id, author_name, format, content, reply_to, sent_ms, edited_ms, edits, deleted_ms, delete_reason, preview FROM history_messages WHERE conversation = $1 AND seq >= $2 AND seq <= $3 ORDER BY seq LIMIT $4";
+const INSERT: &str = "INSERT INTO history_messages (conversation, seq, kind, target, author_account, author_user_id, author_name, format, content, reply_to, sent_ms, edited_ms, edits, deleted_ms, delete_reason, idempotency_key, body_hash, preview) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)";
 
 type Row = (
     String,
@@ -49,6 +52,7 @@ type Row = (
     i64,
     Option<i64>,
     Option<i64>,
+    Option<String>,
 );
 
 fn kind_number(kind: MessageKind) -> i64 {
@@ -81,7 +85,7 @@ fn small(value: i64) -> u32 {
     u32::try_from(value).unwrap_or(0)
 }
 
-fn message(row: Row) -> StoredMessage {
+fn message(row: Row) -> Result<StoredMessage, Error> {
     let (
         conversation,
         seq,
@@ -98,8 +102,16 @@ fn message(row: Row) -> StoredMessage {
         edits,
         deleted_ms,
         delete_reason,
+        preview,
     ) = row;
-    StoredMessage {
+    let preview = match preview {
+        Some(preview) if preview.len() <= MAX_PREVIEW => {
+            Some(serde_json::from_str(&preview).map_err(|_| Error::InvalidMessage)?)
+        }
+        Some(_) => return Err(Error::InvalidMessage),
+        None => None,
+    };
+    Ok(StoredMessage {
         conversation,
         seq: unsigned(seq),
         kind: kind(kind_),
@@ -117,13 +129,19 @@ fn message(row: Row) -> StoredMessage {
         delete_reason: delete_reason.map(small),
         idempotency_key: None,
         body_hash: None,
-    }
+        preview,
+    })
 }
 
 fn check(message: &StoredMessage) -> Result<(), Error> {
     too_long(&message.conversation, MAX_ID)?;
     too_long(&message.author_name, MAX_NAME)?;
     too_long(&message.content, MAX_CONTENT)?;
+    if let Some(preview) = &message.preview {
+        preview.validate().map_err(|_| Error::InvalidMessage)?;
+        let stored = serde_json::to_string(preview).map_err(|_| Error::InvalidMessage)?;
+        too_long(&stored, MAX_PREVIEW)?;
+    }
     for value in [
         &message.author_account,
         &message.idempotency_key,
@@ -160,6 +178,14 @@ macro_rules! insert {
             .bind(message.delete_reason.map(i64::from))
             .bind(&message.idempotency_key)
             .bind(&message.body_hash)
+            .bind(
+                message
+                    .preview
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|_| Error::InvalidMessage)?,
+            )
             .execute(&mut *$transaction)
             .await?;
     }};
@@ -187,7 +213,7 @@ impl SeqRows for Rows<'_> {
                 .fetch_all(pool)
                 .await?
         });
-        Ok(rows.into_iter().map(message).collect())
+        rows.into_iter().map(message).collect()
     }
 }
 
@@ -275,7 +301,7 @@ impl ServerStore {
             }
             sqlx::query(
                 // Never revive a row that expired or was erased meanwhile.
-                "UPDATE history_messages SET content = $3, format = $4, edited_ms = $5, edits = edits + 1 WHERE conversation = $1 AND seq = $2 AND deleted_ms IS NULL",
+                "UPDATE history_messages SET content = $3, format = $4, edited_ms = $5, edits = edits + 1, preview = NULL WHERE conversation = $1 AND seq = $2 AND deleted_ms IS NULL",
             )
             .bind(&event.conversation)
             .bind(signed(target)?)
@@ -326,7 +352,7 @@ impl ServerStore {
                 return Ok(Response::Missing);
             }
             sqlx::query(
-                "UPDATE history_messages SET content = '', reply_to = NULL, deleted_ms = $3, delete_reason = $4 WHERE conversation = $1 AND seq = $2",
+                "UPDATE history_messages SET content = '', reply_to = NULL, preview = NULL, deleted_ms = $3, delete_reason = $4 WHERE conversation = $1 AND seq = $2",
             )
             .bind(&event.conversation)
             .bind(signed(target)?)
@@ -724,6 +750,86 @@ mod tests {
             ranges,
             max_bytes: 1024,
         }
+    }
+
+    fn card() -> nuschl_core::preview::Preview {
+        nuschl_core::preview::Preview {
+            version: nuschl_core::preview::VERSION,
+            provider: nuschl_core::preview::ProviderId::OpenGraphV1,
+            url: "https://example.org/page".into(),
+            title: "A title".into(),
+            description: "A description".into(),
+            image: Some(nuschl_core::preview::EmbeddedImage {
+                mime: nuschl_core::preview::ImageMime::Png,
+                data: vec![0x89; 256],
+                width: 16,
+                height: 9,
+                alt: "An alt".into(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stored_preview_comes_back_with_its_message_and_an_edit_or_delete_clears_it()
+    -> Result<(), Error> {
+        let directory = tempfile::tempdir().map_err(|_| Error::InvalidMessage)?;
+        let store = ServerStore::open(&directory.path().join("server.sqlite3")).await?;
+        let mut message = row(1, "look at this", None);
+        message.preview = Some(card());
+        store.history_append(&message).await?;
+        let page = store
+            .history_page(&query(Anchor::Latest, 10, vec![(1, u64::MAX)]))
+            .await?;
+        assert_eq!(page.rows[0].preview.as_ref(), Some(&card()));
+        // An edit replaces the text; the card belonged to the text that was
+        // sent.
+        let mut event = StoredMessage {
+            conversation: "c".repeat(32),
+            seq: 2,
+            kind: MessageKind::Edit,
+            target: Some(1),
+            author_account: Some("a".repeat(32)),
+            author_name: "Alice".into(),
+            format: 1,
+            sent_ms: 2000,
+            ..StoredMessage::default()
+        };
+        store
+            .history_edit(1, &"a".repeat(32), 1, "edited", 10, &event)
+            .await?;
+        let page = store
+            .history_page(&query(Anchor::Latest, 10, vec![(1, u64::MAX)]))
+            .await?;
+        assert_eq!(page.rows[0].content, "edited");
+        assert_eq!(page.rows[0].preview, None);
+        // A deletion drops it as well.
+        message.seq = 3;
+        message.preview = Some(card());
+        message.idempotency_key = None;
+        message.body_hash = None;
+        store.history_append(&message).await?;
+        event.seq = 4;
+        event.kind = MessageKind::Delete;
+        event.sent_ms = 3000;
+        store
+            .history_delete(3, Some(&"a".repeat(32)), 0, &event)
+            .await?;
+        let page = store
+            .history_page(&query(Anchor::Latest, 10, vec![(1, u64::MAX)]))
+            .await?;
+        let tombstone = page.rows.iter().find(|row| row.seq == 3).unwrap();
+        assert!(tombstone.deleted_ms.is_some());
+        assert_eq!(tombstone.preview, None);
+        // A card the model refuses is never stored.
+        let mut invalid = row(5, "bad", None);
+        let mut card = card();
+        card.version = 9;
+        invalid.preview = Some(card);
+        assert!(matches!(
+            store.history_append(&invalid).await,
+            Err(Error::InvalidMessage)
+        ));
+        Ok(())
     }
 
     #[tokio::test]

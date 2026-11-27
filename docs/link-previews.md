@@ -8,24 +8,37 @@ the whole worker has exited (SECURITY.md). The default is Direct. Windows and ma
 sender previews have passed cross-builds and unit tests; they still need a run on
 Windows 11 and on macOS.
 
-The negotiated typed-message contract and encrypted structured body below remain
-unfinished. Compatible Nuschl servers currently receive the same single legacy HTML
-message as stock servers; that is not `preview/1`. MLS and durable direct
-conversations currently send text alone. Browser sender generation remains disabled
-by design; receiving carried cards does not require it.
+A Nuschl server receives the card as typed data in the message itself, stored with
+its text: `ChatSend.preview` on the way in, `Message.preview` on live delivery and in
+history pages. There is no capability negotiation and no compatibility with earlier
+Nuschl clients; stock Mumble servers keep the single HTML message. The encrypted
+structured body below remains unfinished, so MLS conversations and durable direct
+conversations still send text alone. Browser sender generation remains disabled by
+design; receiving carried cards does not require it.
 
 ## Current delivery scope
 
-The initial release targets legacy Mumble servers: a visible composer card and a
-single ordinary HTML message carrying the original text, actual host, linked title,
-description and embedded image. Native and web recipients display that card through
-the existing inert legacy-content path; neither recipient fetches its resources.
-Stock Mumble clients receive the same compatible message. The quote-style card
-remains available on legacy servers without plugin-message support.
+Legacy Mumble servers get a visible composer card and a single ordinary HTML message
+carrying the original text, actual host, linked title, description and embedded
+image. Native and web recipients display that card through the existing inert
+legacy-content path; neither recipient fetches its resources. Stock Mumble clients
+receive the same compatible message. The quote-style card remains available on legacy
+servers without plugin-message support.
 
-Negotiated typed previews, new archive/persistence handling and MLS preview support
-are deferred. This does not disable ordinary existing local chat history. Issue
-[#11](https://github.com/nuschl-eu/nuschl/issues/11) remains open for the deferred work.
+A Nuschl server gets one typed message: the sender's text in `content` and the same
+card in `preview`, under one idempotency key and one sequence number. `nuschld`
+validates the card against the model, stores it with the row, serves it again in
+history pages and delivers it with edits and tombstones clearing it. A receiver
+projects the carried card locally into the same inert card and renders it through the
+content worker, so no receiver or server retrieves the message's URL or image. One
+row may carry about 40 KiB of card, counted against the page's byte cap.
+
+The wire bound is `MAX_PREVIEW_BYTES` (40 KiB) on `ChatSend`; the model's own bounds
+(`nuschl_core::preview`) apply to the values. `nuschl_protocol::nuschl::preview_wire`
+converts between the two and validates in both directions, so nothing invalid is
+written, stored or served. An edit has no preview field yet: an edited message keeps
+its text and loses its card. Issue
+[#11](https://github.com/nuschl-eu/nuschl/issues/11) tracks the remaining contracts.
 The sections below describe both this delivery and the remaining modern contracts;
 they are not a claim that those contracts have shipped.
 
@@ -42,10 +55,10 @@ for that URL until the URL changes or the sender explicitly requests a preview.
 Late worker replies cannot undo removal. A failed or unfinished preview never blocks
 the original text from being sent.
 
-The planned negotiated format gives text and preview one idempotency key, sequence
-number, storage transaction, edit and deletion. A preview is not a second image message. In that
-format, clients use typed, versioned metadata; the legacy projection is ordinary Mumble HTML
-in one compatible message, within its server limits, or text alone.
+Text and preview share one idempotency key, sequence number, storage transaction and
+deletion; a preview is not a second image message. On a Nuschl server clients use
+typed, versioned metadata; on a stock server the legacy projection is ordinary Mumble
+HTML in one compatible message, within its server limits, or text alone.
 
 ## Global fetch policy
 
@@ -133,13 +146,13 @@ budget or omit the preview rather than increasing that limit or truncating text.
    received-message code can initiate a fetch implicitly.
 2. **Portable model:** `crates/core/src/preview.rs` holds the versioned preview value
    with provider, actual URL, title, description and embedded image.
-3. **Future compatible-server contract:** negotiated `preview/1` must keep typed
-   text and card atomic through persistence, idempotency, live delivery, history,
-   edits and deletion. Authoritative committed revisions must order updates.
-   The current legacy path uses the established Mumble schema and existing local
-   history. The internal core preview value is rendered into one compatible HTML
-   message. `preview/1` remains unadvertised; its wire and storage integration is
-   follow-up work in [#11](https://github.com/nuschl-eu/nuschl/issues/11).
+3. **Nuschl-server contract:** typed text and card stay atomic through persistence,
+   idempotency, live delivery, history and deletion, under one sequence number.
+   `ChatSend.preview` and `Message.preview` carry the value; no capability is
+   advertised and no earlier Nuschl client is supported. An edit replaces the text
+   and clears the card. Local history stores the rendered card, as it does for the
+   legacy path; storing the typed value there remains follow-up work in
+   [#11](https://github.com/nuschl-eu/nuschl/issues/11).
 4. **MLS (remaining):** protect the entire structured body and archive record. A new authenticated
    application-body kind/version must not cause older clients to display raw JSON.
    Until group capability is authenticated, send text only. No cleartext preview

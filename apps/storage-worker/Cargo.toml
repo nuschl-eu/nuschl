@@ -18,6 +18,8 @@ tokio = { version = "1.54.1", features = ["macros", "rt", "io-std", "io-util"] }
 landlock = "0.4.4"
 
 [dev-dependencies]
+# The worker's schema test carries a preview through its framing.
+nuschl-core.workspace = true
 tempfile = "3.27.0"
 
 # The launch stage: on Windows the worker starts itself again inside its

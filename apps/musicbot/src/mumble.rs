@@ -573,6 +573,7 @@ fn answer(bot: &Arc<Bot>, index: usize, commands: &mpsc::Sender<Command>, text: 
     let _ = commands.try_send(Command::SendText {
         target: TextTarget::Direct(peer.session),
         body,
+        preview: None,
         expected_peer: Some(peer.instance),
     });
 }

@@ -1533,10 +1533,12 @@ fn request_command(request: Request) -> Command {
         Request::SendText {
             target,
             body,
+            preview,
             expected_peer,
         } => Command::SendText {
             target,
             body,
+            preview,
             expected_peer,
         },
         Request::SendHtml {
@@ -2267,7 +2269,7 @@ async fn connect_once(
                             if let (Some((seq, body, observed_at_ms, outgoing)), Some(peer)) = (visible, peer.as_ref()) {
                                 let target = conversation_keys.get(conversation).and_then(|key| key.parse().ok()).map(TextTarget::Channel).unwrap_or(TextTarget::DirectConversation(*conversation));
                                 let author = if outgoing { server.username.clone() } else if let Received::Message { sender, .. } = received { nuschl_session::mls::authenticated_sender_label(sender) } else { "Encrypted member".into() };
-                                let text = IncomingText { target, author, peer: None, body, html: false, outgoing, observed_at_ms, seq: Some(seq), pending: None };
+                                let text = IncomingText { target, author, peer: None, body, html: false, preview: None, outgoing, observed_at_ms, seq: Some(seq), pending: None };
                                 let job = ContentJob { server: id.clone(), generation, identity: server.history_identity(peer), nonce: nonce.clone(), text, archived: true };
                                 if content.send(ContentWork::Text(Box::new(job))).await.is_err() { break; }
                             }
@@ -2276,8 +2278,17 @@ async fn connect_once(
                     }
                     let _ = events.send(Event::Protocol { server: id.clone(), generation, event: SessionEvent::Mls(event) }).await;
                 },
-                SessionEvent::Text(text) => if let Some(peer) = &peer {
+                SessionEvent::Text(mut text) => if let Some(peer) = &peer {
                     if text.outgoing { let _ = events.send(Event::Sent { server: id.clone(), generation, target: text.target.clone(), body: text.body.clone() }).await; }
+                    // A Nuschl message carries its card as typed data: the
+                    // receiver projects it locally into the same inert card
+                    // and renders it through the content worker
+                    // (docs/link-previews.md). A card that cannot be shown
+                    // leaves the text alone.
+                    if let Some(html) = text.preview.as_ref().and_then(|preview| crate::preview::carried_card_html(&text.body, preview)) {
+                        text.body = html;
+                        text.html = true;
+                    }
                     let archived = server_history && matches!(text.target, TextTarget::Channel(_) | TextTarget::DirectConversation(_));
                     let job = ContentJob { server: id.clone(), generation, identity: server.history_identity(peer), nonce: nonce.clone(), text, archived };
                     if content.try_send(ContentWork::Text(Box::new(job))).is_err() {
@@ -5470,6 +5481,7 @@ mod storage_loop_tests {
                     peer: None,
                     body: "body".into(),
                     html: false,
+                    preview: None,
                     outgoing: false,
                     observed_at_ms: 1,
                     seq: None,

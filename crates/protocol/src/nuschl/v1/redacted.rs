@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! `Debug` for extension messages that carry message text or idempotency
 //! keys: only their lengths are shown.
-use super::{ChatEdit, ChatSend, Message, Rule, ShareLink, ShareLinkCreate};
+use super::{ChatEdit, ChatSend, Message, Preview, Rule, ShareLink, ShareLinkCreate};
 use std::fmt;
 
 struct Length(usize);
@@ -9,6 +9,20 @@ struct Length(usize);
 impl fmt::Debug for Length {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<{} bytes redacted>", self.0)
+    }
+}
+
+impl fmt::Debug for Preview {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let image = self.image.as_ref().map_or(0, |image| image.data.len());
+        f.debug_struct("Preview")
+            .field("version", &self.version)
+            .field("provider", &self.provider)
+            .field("url", &Length(self.url.len()))
+            .field("title", &Length(self.title.len()))
+            .field("description", &Length(self.description.len()))
+            .field("image", &image)
+            .finish()
     }
 }
 
@@ -21,6 +35,7 @@ impl fmt::Debug for ChatSend {
             .field("format", &self.format)
             .field("content", &Length(self.content.len()))
             .field("reply_to", &self.reply_to)
+            .field("preview", &self.preview)
             .finish()
     }
 }
@@ -53,6 +68,7 @@ impl fmt::Debug for Message {
             .field("delete_reason", &self.delete_reason)
             .field("edits", &self.edits)
             .field("mls", &Length(self.mls.len()))
+            .field("preview", &self.preview)
             .finish()
     }
 }

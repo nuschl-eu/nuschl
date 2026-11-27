@@ -39,13 +39,39 @@ fn conversation(bytes: &[u8]) -> Result<Id, Failure> {
 }
 
 /// What an idempotency key was used for, to tell a retry from a conflict.
-fn body_hash(conversation: &Id, format: i32, reply_to: u64, content: &str) -> String {
+fn body_hash(
+    conversation: &Id,
+    format: i32,
+    reply_to: u64,
+    content: &str,
+    preview: Option<&nuschl_core::preview::Preview>,
+) -> String {
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     context.update(conversation);
     context.update(&format.to_be_bytes());
     context.update(&reply_to.to_be_bytes());
     context.update(content.as_bytes());
+    if let Some(preview) = preview {
+        // The card travels with the text, so a retry that changes it is a
+        // different message.
+        let card = serde_json::to_vec(preview).unwrap_or_default();
+        context.update(&(card.len() as u64).to_be_bytes());
+        context.update(&card);
+    }
     hex::encode(context.finish().as_ref())
+}
+
+/// The carried preview of a request, validated through the model. A card that
+/// does not hold up is refused: nothing invalid is stored or served.
+fn carried_preview(
+    preview: Option<&v1::Preview>,
+) -> Result<Option<nuschl_core::preview::Preview>, Failure> {
+    let Some(preview) = preview else {
+        return Ok(None);
+    };
+    nuschl_protocol::nuschl::preview_wire::decode(preview)
+        .map(Some)
+        .map_err(|_| fail(Code::Malformed))
 }
 
 fn wire_kind(kind: MessageKind) -> v1::message::Kind {
@@ -93,6 +119,11 @@ impl State {
             deleted_ms: row.deleted_ms.unwrap_or(0),
             delete_reason: row.delete_reason.unwrap_or(0),
             edits: row.edits,
+            // A card that no longer encodes is left out: the text stays.
+            preview: row
+                .preview
+                .as_ref()
+                .and_then(|preview| nuschl_protocol::nuschl::preview_wire::encode(preview).ok()),
         }
     }
 
@@ -358,6 +389,7 @@ impl State {
             Ok(Some(changed)) => changed,
             Ok(None) => html,
         };
+        let preview = carried_preview(message.preview.as_ref())?;
         let (account, user_id, name) = self.author(session);
         let seq = self.conversations.next_seq(id);
         // Unregistered senders have no durable identity to scope a key to, and
@@ -374,9 +406,17 @@ impl State {
             reply_to: (message.reply_to > 0).then_some(message.reply_to),
             sent_ms: now_ms(),
             idempotency_key: keyed.map(|_| hex::encode(key)),
-            body_hash: keyed
-                .map(|_| body_hash(&id, message.format, message.reply_to, &message.content)),
+            body_hash: keyed.map(|_| {
+                body_hash(
+                    &id,
+                    message.format,
+                    message.reply_to,
+                    &message.content,
+                    preview.as_ref(),
+                )
+            }),
             content: message.content,
+            preview,
             ..StoredMessage::default()
         };
         let wire = self.wire_message(row.clone());

@@ -6,8 +6,10 @@ No host networking/device/profile is authorized by this script. The VM driver
 sets public-numbered loopback aliases and denies every non-loopback output.
 `peers` reuses the frozen native-fetch fixture's HTTP implementation;
 `native-peers` runs those same peers with only the guest's low-port capability;
-`desktop` reuses the private GNOME/AT-SPI/null-Pulse welcome fixture. This tests
-legacy one-message HTML fallback, not typed preview/1 or MLS completion.
+`desktop` reuses the private GNOME/AT-SPI/null-Pulse welcome fixture. A stock
+server gets the legacy one-message HTML fallback; `nuschld` carries the card as
+typed data beside the text (docs/link-previews.md). MLS completion is out of
+scope here.
 """
 import argparse
 import hashlib
@@ -442,6 +444,9 @@ def desktop(args):
         def sent_by_reader():
             return [event for event in list(receiver.events) if event.get("kind") == "text"
                 and event.get("author") == "Welcome reader"]
+        # A Nuschl server carries the card as typed data with the text, so its
+        # stock copy is the text alone (docs/link-previews.md).
+        typed = args.server == "nuschld"
         def archive_content(message):
             content = message["content"]
             assert isinstance(content, str), "CLI archive content must be a JSON string"
@@ -514,14 +519,17 @@ def desktop(args):
             wire = event["body"]
             literal = html.unescape(re.sub(r"<[^>]+>", "", wire.split("<br/><blockquote>", 1)[0]))
             assert literal == body, (literal, body)
-            assert ("Synthetic preview" in wire) == preview, wire
-            assert ("data:image/" in wire) == preview, wire
+            if typed:
+                assert "<blockquote>" not in wire and "data:image/" not in wire, wire
+            else:
+                assert ("Synthetic preview" in wire) == preview, wire
+                assert ("data:image/" in wire) == preview, wire
             assert body.split()[1] in wire, "original target disappeared from the one message"
             eventually(lambda: any(marker in label for _, _, label, _ in items(recipient_ui)), "real recipient did not render original text")
             if preview:
                 # Reuse the actual desktop projection in the browser receiver
                 # fixture instead of maintaining a second hand-written card.
-                if "legacy_preview_wire" not in observation:
+                if not typed and "legacy_preview_wire" not in observation:
                     wire_path = args.output / "legacy-preview-message.html"
                     wire_path.write_text(wire)
                     observation["legacy_preview_wire"] = {
@@ -574,10 +582,27 @@ def desktop(args):
                     receiver.send(kind="history", request_id=request, conversation=chat["conversation"], limit=32)
                     page = receiver.wait(lambda event: event.get("kind") == "history_page" and event.get("request_id") == request)
                     archived = [message for message in page["messages"] if marker in archive_content(message)]
-                    # The protocol's Format::LegacyHtml value is 2.
-                    assert len(archived) == 1 and archived[0]["format"] == 2, archived
-                    assert archive_content(archived[0]) == wire
-                    mark("compatible_history_keeps_one_legacy_html_message", seq=archived[0]["seq"])
+                    if typed:
+                        # The protocol's Format::Text value is 1: the card is a
+                        # field of the message, not part of its text.
+                        assert len(archived) == 1 and archived[0]["format"] == 1, archived
+                        assert archive_content(archived[0]) == literal
+                        card = archived[0].get("preview")
+                        if preview:
+                            assert isinstance(card, dict), archived[0]
+                            assert card["title"] == "Synthetic preview", card
+                            assert card["url"].startswith("http://93.184.215.14/"), card
+                            image = card.get("image")
+                            assert isinstance(image, dict) and image["bytes"] > 0, card
+                        else:
+                            assert card is None, archived[0]
+                        mark("typed_history_keeps_the_card_with_its_message",
+                            seq=archived[0]["seq"], preview=preview)
+                    else:
+                        # The protocol's Format::LegacyHtml value is 2.
+                        assert len(archived) == 1 and archived[0]["format"] == 2, archived
+                        assert archive_content(archived[0]) == wire
+                        mark("compatible_history_keeps_one_legacy_html_message", seq=archived[0]["seq"])
             mark("single_message_received_by_independent_native_ui", preview=preview,
                 wire_sha256=hashlib.sha256(wire.encode()).hexdigest())
             return wire
@@ -952,7 +977,7 @@ def desktop(args):
             assert saved == {"mode": "off"}
             events()  # Keep the final synthetic-peer assertion oracle.
             mark("policy_persisted")
-            return {"server": args.server, "cases": cases, "modern_typed_preview": False,
+            return {"server": args.server, "cases": cases, "modern_typed_preview": typed,
                 "production_tls_bypass": False, "host_devices": False}
         except BaseException as failure:
             try:

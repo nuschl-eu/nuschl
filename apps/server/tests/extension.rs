@@ -458,6 +458,7 @@ impl Session {
             format: v1::Format::Text as i32,
             content: content.into(),
             reply_to: 0,
+            preview: None,
         }))
         .await
     }
@@ -2724,6 +2725,7 @@ async fn the_session_sends_channel_text_durably_and_resends_after_a_reconnect() 
         .command(Command::SendText {
             target: connection::TextTarget::Channel(0),
             body: "hello there".into(),
+            preview: None,
             expected_peer: None,
         })
         .await;
@@ -2793,6 +2795,92 @@ async fn the_session_sends_channel_text_durably_and_resends_after_a_reconnect() 
         .await;
     let marker = alice.subscribe(&[root]).await.conversations[0].read;
     assert_eq!(marker, 2);
+}
+
+fn carried() -> v1::Preview {
+    nuschl_protocol::nuschl::preview_wire::encode(&nuschl_core::preview::Preview {
+        version: nuschl_core::preview::VERSION,
+        provider: nuschl_core::preview::ProviderId::OpenGraphV1,
+        url: "https://example.org/page".into(),
+        title: "A title".into(),
+        description: "A description".into(),
+        image: Some(nuschl_core::preview::EmbeddedImage {
+            mime: nuschl_core::preview::ImageMime::Png,
+            data: vec![0x89; 128],
+            width: 16,
+            height: 9,
+            alt: "An alt".into(),
+        }),
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_carried_preview_is_stored_served_and_echoed_with_its_message() {
+    let fixture = Fixture::start("").await;
+    let mut alice = nuschl(&fixture, "Alice", 0).await;
+    alice.register().await;
+    let mut bob = nuschl(&fixture, "Bob", 1).await;
+    bob.register().await;
+    let root = alice.conversations[&0];
+    let card = carried();
+    alice
+        .command(Command::SendText {
+            target: connection::TextTarget::Channel(0),
+            body: "look at this".into(),
+            preview: Some(nuschl_protocol::nuschl::preview_wire::decode(&card).unwrap()),
+            expected_peer: None,
+        })
+        .await;
+    let (_, seq) = alice
+        .wait(|event| match event {
+            SessionEvent::ChatAcked { key, seq } => Some((*key, *seq)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(seq, 1);
+    // The text and its card are stored as one row.
+    let stored = fixture.store.lock().unwrap().history.messages.clone();
+    let row = stored.get(&(hex::encode(root), 1)).expect("the row");
+    assert_eq!(row.content, "look at this");
+    assert!(row.preview.is_some(), "the card is stored with the text");
+    // Another member receives the text with the card.
+    let text = bob
+        .wait(|event| match event {
+            SessionEvent::Text(text) if !text.outgoing => Some(text.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(text.body, "look at this");
+    assert_eq!(text.preview, row.preview);
+    // A history page serves it again: a client that was not connected shows
+    // the same card.
+    let page = bob.page(root, latest(), 10).await;
+    let message = page.messages.first().expect("one message");
+    assert_eq!(message.content, "look at this");
+    assert_eq!(message.preview.as_ref(), Some(&card));
+    // The sender's own echo carries the card too.
+    // A card that does not validate is refused, and nothing is stored.
+    let mut broken = carried();
+    broken.version = 9;
+    let id = request_id();
+    let refused = alice
+        .request(NuschlRequest::Send(v1::ChatSend {
+            request_id: id,
+            conversation: root.to_vec(),
+            idempotency_key: vec![3; 16],
+            format: v1::Format::Text as i32,
+            content: "bad card".into(),
+            reply_to: 0,
+            preview: Some(broken),
+        }))
+        .await;
+    assert_eq!(error_code(&refused), Some(v1::error::Code::Malformed));
+    assert_eq!(
+        fixture.store.lock().unwrap().history.messages.len(),
+        1,
+        "a refused card stores nothing"
+    );
 }
 
 // ---- share/1: share links (docs/web.md) ----

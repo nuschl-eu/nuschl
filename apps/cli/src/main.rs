@@ -335,9 +335,19 @@ impl TryFrom<String> for Hex {
 }
 fn message_json(message: &v1::Message) -> serde_json::Value {
     let author = message.author.clone().unwrap_or_default();
+    // A carried preview is described, not dumped: the encoded image stays out
+    // of the diagnostic stream (docs/link-previews.md).
+    let preview = message.preview.as_ref().map(|preview| {
+        json!({"version":preview.version, "provider":preview.provider, "url":preview.url,
+            "title":preview.title, "description":preview.description,
+            "image":preview.image.as_ref().map(|image| json!({"mime":image.mime,
+                "width":image.width, "height":image.height, "alt":image.alt,
+                "bytes":image.data.len()}))})
+    });
     json!({"seq":message.seq, "kind":message.kind, "target":message.target, "author":author.name,
         "user_id":author.user_id, "format":message.format, "content":message.content,
-        "deleted":message.deleted_ms != 0, "edits":message.edits, "delete_reason":message.delete_reason})
+        "deleted":message.deleted_ms != 0, "edits":message.edits, "delete_reason":message.delete_reason,
+        "preview":preview})
 }
 fn direct_json(direct: &v1::Direct) -> serde_json::Value {
     json!({"conversation":hex::encode(&direct.conversation), "user_id":direct.user_id, "name":direct.name,
@@ -823,11 +833,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(Input::Text { channel, body }) => Command::SendText {
                     target: TextTarget::Channel(channel),
                     body,
+                    preview: None,
                     expected_peer: None,
                 },
                 Ok(Input::Direct { session, body }) => Command::SendText {
                     target: TextTarget::Direct(session),
                     body,
+                    preview: None,
                     expected_peer: None,
                 },
                 Ok(Input::Mute { muted, deafened }) => Command::SetSelf { muted, deafened },
@@ -859,6 +871,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     format: v1::Format::Text as i32,
                     content,
                     reply_to: 0,
+                    preview: None,
                 })),
                 Ok(Input::History {
                     request_id,
@@ -936,6 +949,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Some(id) => Command::SendText {
                         target: TextTarget::DirectConversation(id),
                         body,
+                        preview: None,
                         expected_peer: None,
                     },
                     None => {

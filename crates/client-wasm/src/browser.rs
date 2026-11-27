@@ -483,10 +483,13 @@ impl Platform for BrowserPlatform {
             Request::SetSelf { muted, deafened } => {
                 connection.session.borrow_mut().set_self(muted, deafened)
             }
+            // The browser sends text alone: sender-side preview generation is
+            // disabled there (docs/link-previews.md).
             Request::SendText {
                 target,
                 body,
                 expected_peer,
+                ..
             } => connection
                 .session
                 .borrow_mut()

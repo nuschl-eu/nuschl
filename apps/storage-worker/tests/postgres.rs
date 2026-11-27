@@ -135,6 +135,23 @@ fn message(
     }
 }
 
+fn card() -> nuschl_core::preview::Preview {
+    nuschl_core::preview::Preview {
+        version: nuschl_core::preview::VERSION,
+        provider: nuschl_core::preview::ProviderId::OpenGraphV1,
+        url: "https://example.org/page".into(),
+        title: "A title".into(),
+        description: "A description".into(),
+        image: Some(nuschl_core::preview::EmbeddedImage {
+            mime: nuschl_core::preview::ImageMime::Png,
+            data: vec![0x89; 128],
+            width: 16,
+            height: 9,
+            alt: "An alt".into(),
+        }),
+    }
+}
+
 fn event(seq: u64, kind: MessageKind, target: u64, author: &str) -> StoredMessage {
     StoredMessage {
         kind,
@@ -190,7 +207,9 @@ fn exercise(worker: &mut Worker) {
             1_000 + seq as i64
         };
         let key = format!("{seq:032}");
-        let row = message(seq, ALICE, &format!("m{seq}"), Some(&key), sent);
+        let mut row = message(seq, ALICE, &format!("m{seq}"), Some(&key), sent);
+        // One row carries a card through the worker and back.
+        row.preview = (seq == 4).then(card);
         assert!(matches!(
             worker.request(Request::HistoryAppend { message: row }),
             Response::Appended {
@@ -222,6 +241,12 @@ fn exercise(worker: &mut Worker) {
         (MessageKind::Void, MessageKind::Void)
     );
     assert!(rows.iter().all(|row| row.idempotency_key.is_none()));
+    assert_eq!(
+        rows[3].preview,
+        Some(card()),
+        "the card survives the worker"
+    );
+    assert_eq!(rows[2].preview, None);
 
     // Edits by the author only, replacing the content.
     let edit = |seq, target, author: &str, content: &str| Request::HistoryEdit {
@@ -253,6 +278,7 @@ fn exercise(worker: &mut Worker) {
     let rows = worker.page(CHANNEL, Anchor::After(0));
     assert_eq!(rows[3].content, "m4 edited");
     assert_eq!(rows[3].edits, 1);
+    assert_eq!(rows[3].preview, None, "an edit drops the card");
     assert_eq!(
         (rows[2].content.as_str(), rows[2].delete_reason),
         ("", Some(0))

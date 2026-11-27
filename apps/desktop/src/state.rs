@@ -2410,6 +2410,7 @@ impl Desktop {
                 text.map(|body| Command::SendText {
                     target,
                     body,
+                    preview: None,
                     expected_peer,
                 })
             } else {

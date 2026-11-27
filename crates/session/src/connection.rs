@@ -116,6 +116,8 @@ pub struct IncomingText {
     pub peer: Option<User>,
     pub body: String,
     pub html: bool,
+    /// A Nuschl message's carried preview, already validated.
+    pub preview: Option<nuschl_core::preview::Preview>,
     pub outgoing: bool,
     pub observed_at_ms: i64,
     /// The server's sequence number (Nuschl servers: from history).
@@ -134,6 +136,9 @@ pub struct PendingChat {
     pub conversation: [u8; 16],
     pub key: [u8; 16],
     pub content: String,
+    /// The carried preview. A retry sends the same value: the server stores
+    /// the message once, card included.
+    pub preview: Option<nuschl_core::preview::Preview>,
 }
 
 /// Plugin data another client sent us (`PluginDataTransmission`): opaque
@@ -373,6 +378,10 @@ pub enum Command {
     SendText {
         target: TextTarget,
         body: String,
+        /// The sender's fetched preview, carried as typed data on a Nuschl
+        /// conversation (docs/link-previews.md). Stock servers get the
+        /// projected HTML message through [`Self::SendPreview`] instead.
+        preview: Option<nuschl_core::preview::Preview>,
         expected_peer: Option<u64>,
     },
     /// Send Mumble rich text as-is (e.g. inline images), one message per
@@ -922,7 +931,10 @@ pub fn random_key() -> [u8; 16] {
 }
 
 /// What a Nuschl server sends, checked against the extension's bounds.
+/// A decoded frame keeps its message inline; each event lives for one step of
+/// the session actor, so the largest variant's size costs nothing.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum NuschlEvent {
     Error(v1::Error),
     Ack(v1::ChatAck),
@@ -3534,6 +3546,7 @@ impl State {
             Command::SendText {
                 target,
                 body,
+                preview,
                 expected_peer,
             } => {
                 if body.trim().is_empty() || body.len() > MAX_CONTENT_BYTES {
@@ -3565,6 +3578,7 @@ impl State {
                                 conversation,
                                 key: random_key(),
                                 content: body.clone(),
+                                preview: preview.clone(),
                             },
                             false,
                         )
@@ -3623,6 +3637,22 @@ impl State {
             )
             .await;
         }
+        let preview = match pending.preview.as_ref() {
+            Some(preview) => match nuschl_protocol::nuschl::preview_wire::encode(preview) {
+                Ok(preview) => Some(preview),
+                Err(error) => {
+                    return emit(
+                        events,
+                        SessionEvent::ChatFailed {
+                            key: pending.key,
+                            reason: format!("This preview cannot be sent: {error}."),
+                        },
+                    )
+                    .await;
+                }
+            },
+            None => None,
+        };
         self.next_request += 1;
         let request_id = INTERNAL | self.next_request;
         self.queue(
@@ -3634,6 +3664,7 @@ impl State {
                 format: v1::Format::Text as i32,
                 content: pending.content.clone(),
                 reply_to: 0,
+                preview,
             },
         );
         let attempts = self
@@ -3665,6 +3696,7 @@ impl State {
                 peer,
                 body: pending.content,
                 html: false,
+                preview: pending.preview,
                 outgoing: true,
                 observed_at_ms: nuschl_core::now_ms(),
                 seq: None,
@@ -3831,6 +3863,10 @@ impl State {
                         .find(|user| author.user_id != 0 && user.user_id == Some(author.user_id))
                         .cloned(),
                 };
+                // A card that does not decode is dropped; the text stays.
+                let preview = message.preview.as_ref().and_then(|preview| {
+                    nuschl_protocol::nuschl::preview_wire::decode(preview).ok()
+                });
                 emit(
                     events,
                     SessionEvent::Text(IncomingText {
@@ -3843,6 +3879,7 @@ impl State {
                         peer,
                         body: message.content,
                         html: message.format == v1::Format::LegacyHtml as i32,
+                        preview,
                         outgoing,
                         observed_at_ms: message.sent_ms,
                         seq: Some(message.seq),
@@ -4049,6 +4086,7 @@ impl State {
                 peer,
                 body,
                 html,
+                preview: None,
                 outgoing: true,
                 observed_at_ms: nuschl_core::now_ms(),
                 seq: None,
@@ -4439,6 +4477,7 @@ impl State {
                             peer: actor.clone(),
                             body: message.message.clone(),
                             html: self.limits.allow_html,
+                            preview: None,
                             outgoing: false,
                             observed_at_ms: nuschl_core::now_ms(),
                             seq: None,
@@ -5355,6 +5394,7 @@ mod tests {
                     Command::SendText {
                         target: TextTarget::Channel(0),
                         body: body.clone(),
+                        preview: None,
                         expected_peer: None,
                     },
                     &tx,
@@ -6487,6 +6527,7 @@ mod tests {
             Command::SendText {
                 target: TextTarget::Channel(0),
                 body: "private caption".into(),
+                preview: None,
                 expected_peer: None,
             },
             Command::SendHtml {
@@ -6516,6 +6557,7 @@ mod tests {
             conversation: [2; 16],
             target: TextTarget::Channel(0),
             content: "restored secret".into(),
+            preview: None,
         };
         state.outbox.push(Outgoing {
             preview: None,
@@ -7193,6 +7235,140 @@ mod tests {
         assert_eq!(listen.listening_channel_add, [0]);
     }
 
+    fn carried_preview() -> nuschl_core::preview::Preview {
+        nuschl_core::preview::Preview {
+            version: nuschl_core::preview::VERSION,
+            provider: nuschl_core::preview::ProviderId::OpenGraphV1,
+            url: "https://example.org/page".into(),
+            title: "A title".into(),
+            description: "A description".into(),
+            image: Some(nuschl_core::preview::EmbeddedImage {
+                mime: nuschl_core::preview::ImageMime::Png,
+                data: vec![0x89; 64],
+                width: 16,
+                height: 9,
+                alt: "An alt".into(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_carried_preview_travels_with_its_message_both_ways() {
+        let mut state = State {
+            own_session: Some(7),
+            extension: Some(vec![nuschl::capability::HISTORY.into()]),
+            ..State::default()
+        };
+        state.channels.insert(
+            5,
+            Channel {
+                id: 5,
+                instance: 45,
+                ..Channel::default()
+            },
+        );
+        state.conversations.insert(5, [5; 16]);
+        let (tx, mut rx) = mpsc::channel(64);
+        let preview = carried_preview();
+        state
+            .command(
+                Command::SendText {
+                    target: TextTarget::Channel(5),
+                    body: "look at this".into(),
+                    preview: Some(preview.clone()),
+                    expected_peer: None,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        let [(nuschl::kind::CHAT_SEND, wire)] = state.outbound.as_slice() else {
+            panic!("one ChatSend: {:?}", state.outbound)
+        };
+        let wire = v1::ChatSend::decode(wire.as_slice()).unwrap();
+        assert_eq!(wire.content, "look at this");
+        let carried = wire.preview.as_ref().expect("the card rides along");
+        assert_eq!(
+            nuschl_protocol::nuschl::preview_wire::decode(carried).unwrap(),
+            preview
+        );
+        // The retry carries the same value under the same key.
+        let Ok(SessionEvent::ChatPending(pending)) = rx.try_recv() else {
+            panic!("not pending")
+        };
+        assert_eq!(pending.preview.as_ref(), Some(&preview));
+        // Our own echo shows the card we sent.
+        let Ok(SessionEvent::Text(echo)) = rx.try_recv() else {
+            panic!("no outgoing echo")
+        };
+        assert_eq!(echo.preview.as_ref(), Some(&preview));
+        // A received message carries its sender's card.
+        state.outbound.clear();
+        let chat = v1::ChatEvent {
+            conversation: vec![5; 16],
+            message: Some(v1::Message {
+                seq: 3,
+                author: Some(v1::Author {
+                    name: "Bob".into(),
+                    ..Default::default()
+                }),
+                content: "look at this".into(),
+                format: v1::Format::Text as i32,
+                preview: nuschl_protocol::nuschl::preview_wire::encode(&preview).ok(),
+                ..Default::default()
+            }),
+        };
+        state.nuschl(NuschlEvent::Chat(chat), &tx).await.unwrap();
+        while let Ok(event) = rx.try_recv() {
+            if let SessionEvent::Text(text) = event {
+                assert_eq!(text.preview.as_ref(), Some(&preview));
+                assert_eq!(text.body, "look at this");
+                return;
+            }
+        }
+        panic!("no received text");
+    }
+
+    #[tokio::test]
+    async fn a_received_preview_that_does_not_decode_leaves_the_text() {
+        let mut state = State {
+            own_session: Some(7),
+            extension: Some(vec![nuschl::capability::HISTORY.into()]),
+            ..State::default()
+        };
+        state.channels.insert(
+            5,
+            Channel {
+                id: 5,
+                instance: 45,
+                ..Channel::default()
+            },
+        );
+        state.conversations.insert(5, [5; 16]);
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut broken = nuschl_protocol::nuschl::preview_wire::encode(&carried_preview()).unwrap();
+        broken.version = 9;
+        let chat = v1::ChatEvent {
+            conversation: vec![5; 16],
+            message: Some(v1::Message {
+                seq: 4,
+                content: "text stays".into(),
+                format: v1::Format::Text as i32,
+                preview: Some(broken),
+                ..Default::default()
+            }),
+        };
+        state.nuschl(NuschlEvent::Chat(chat), &tx).await.unwrap();
+        while let Ok(event) = rx.try_recv() {
+            if let SessionEvent::Text(text) = event {
+                assert_eq!(text.preview, None);
+                assert_eq!(text.body, "text stays");
+                return;
+            }
+        }
+        panic!("no received text");
+    }
+
     #[tokio::test]
     async fn direct_conversations_carry_sends_and_messages_from_others() {
         let mut state = State {
@@ -7217,6 +7393,7 @@ mod tests {
         let send = |body: &str| Command::SendText {
             target: TextTarget::DirectConversation([5; 16]),
             body: body.into(),
+            preview: None,
             expected_peer: None,
         };
         let list = v1::DirectList {
@@ -7417,6 +7594,7 @@ mod tests {
         let text = Command::SendText {
             target: TextTarget::Channel(0),
             body: "and one more thing".into(),
+            preview: None,
             expected_peer: None,
         };
         state.command(text, &tx).await.unwrap();
@@ -7452,6 +7630,7 @@ mod tests {
         let text = Command::SendText {
             target: TextTarget::Channel(0),
             body: "later".into(),
+            preview: None,
             expected_peer: None,
         };
         state.command(text, &tx).await.unwrap();
