@@ -40,7 +40,7 @@ use nuschl_protocol::{
     nuschl::capability,
     plugin::{self, Payload, Refusal},
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 /// Receivers one send may name (the session's `MAX_ACTION_TARGETS`).
 pub const MAX_PLUGIN_RECEIVERS: usize = 128;
@@ -102,15 +102,35 @@ impl PluginDataEvent {
     }
 }
 
+/// Kit presses whose admission has not arrived; a press is one small frame.
+const MAX_KIT_REQUESTS: usize = 64;
+
 #[derive(Default)]
 pub(super) struct PluginQueue {
     accept: bool,
     items: VecDeque<PluginDataEvent>,
     bytes: usize,
     dropped: u64,
+    /// Requests of our own kit presses, whose admissions belong to no caller of
+    /// the generic interface.
+    kit_requests: BTreeSet<u64>,
 }
 
 impl PluginQueue {
+    /// Remembers a kit press until its admission arrives, so the admission is
+    /// dropped rather than queued for the generic interface.
+    pub(super) fn kit_request(&mut self, request: u64) {
+        self.kit_requests.insert(request);
+        while self.kit_requests.len() > MAX_KIT_REQUESTS {
+            self.kit_requests.pop_first();
+        }
+    }
+
+    /// Takes a kit press's admission, if this request is one.
+    fn kit_admission(&mut self, request: u64) -> bool {
+        self.kit_requests.remove(&request)
+    }
+
     fn push(&mut self, item: PluginDataEvent) {
         let cost = item.cost();
         if self.items.len() >= MAX_PLUGIN_QUEUE || self.bytes + cost > MAX_PLUGIN_QUEUE_BYTES {
@@ -253,9 +273,20 @@ impl Client {
                 .is_some_and(|own| own.instance != 0);
         match event {
             ServerEvent::PluginData(data)
+                if connected && data.payload.data_id() == nuschl_core::integration::KIT_DATA_ID =>
+            {
+                self.kit_surface(index, &data);
+            }
+            ServerEvent::PluginData(data)
                 if connected && data.payload.data_id() == nuschl_core::call::CARD_DATA_ID =>
             {
                 self.call_card(index, &data);
+            }
+            ServerEvent::PluginData(data)
+                if connected
+                    && data.payload.data_id() == nuschl_core::integration::KIT_LINK_DATA_ID =>
+            {
+                self.kit_link(index, &data);
             }
             ServerEvent::PluginDataAdmission { request, result } if self.call_request(request) => {
                 if result.is_err() {
@@ -271,6 +302,8 @@ impl Client {
                     data,
                 });
             }
+            ServerEvent::PluginDataAdmission { request, .. }
+                if self.plugin_data.kit_admission(request) => {}
             ServerEvent::PluginDataAdmission { request, result } => {
                 self.plugin_data.push(PluginDataEvent::Admission {
                     server: id,
@@ -907,6 +940,321 @@ mod tests {
         client.handle(input(&client, 0, ServerEvent::User(user(3, 34))));
         client.settle();
         assert!(client.own_call().is_none());
+    }
+
+    fn surface(
+        sender: u32,
+        instance: u64,
+        surface: &nuschl_core::integration::Surface,
+    ) -> ServerEvent {
+        ServerEvent::PluginData(ReceivedPluginData {
+            payload: Payload::new(
+                nuschl_core::integration::KIT_DATA_ID.into(),
+                surface.encode().unwrap(),
+            )
+            .unwrap(),
+            ..match data(sender, instance, b"") {
+                ServerEvent::PluginData(data) => data,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    fn shown(id: u32, revision: u64, text: &str) -> nuschl_core::integration::Surface {
+        nuschl_core::integration::Surface {
+            id,
+            revision,
+            nodes: vec![nuschl_core::integration::Node::Text {
+                style: nuschl_core::integration::Style::Title,
+                text: text.into(),
+            }],
+        }
+    }
+
+    fn kit_buttons(
+        sender: u32,
+        instance: u64,
+        buttons: Vec<nuschl_core::integration::Button>,
+    ) -> ServerEvent {
+        surface(
+            sender,
+            instance,
+            &nuschl_core::integration::Surface {
+                id: 1,
+                revision: 1,
+                nodes: vec![nuschl_core::integration::Node::Buttons(buttons)],
+            },
+        )
+    }
+
+    fn kit_link(sender: u32, instance: u64, url: &str) -> ServerEvent {
+        ServerEvent::PluginData(ReceivedPluginData {
+            payload: Payload::new(
+                nuschl_core::integration::KIT_LINK_DATA_ID.into(),
+                url.as_bytes().to_vec(),
+            )
+            .unwrap(),
+            ..match data(sender, instance, b"") {
+                ServerEvent::PluginData(data) => data,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    fn web_button() -> nuschl_core::integration::Button {
+        nuschl_core::integration::Button {
+            id: 3,
+            icon: nuschl_core::integration::Icon::Web,
+            label: "Web".into(),
+            enabled: true,
+        }
+    }
+
+    fn opened(client: &mut Client) -> Vec<String> {
+        client
+            .take_updates()
+            .into_iter()
+            .filter_map(|update| match update {
+                crate::Update::Link(url) => Some(url),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_web_press_opens_the_page_the_bot_sends() {
+        let (mut client, _) = connected();
+        client.handle(input(&client, 0, kit_buttons(2, 22, vec![web_button()])));
+        client.press_surface(0, 2, 22, 1, 1, 3).unwrap();
+        client.handle(input(
+            &client,
+            0,
+            kit_link(2, 22, "https://music.example.org/u/7a/"),
+        ));
+        assert_eq!(opened(&mut client), ["https://music.example.org/u/7a/"]);
+        // One press opens one page: the answer is not reusable.
+        client.handle(input(
+            &client,
+            0,
+            kit_link(2, 22, "https://music.example.org/u/7a/"),
+        ));
+        assert!(opened(&mut client).is_empty());
+    }
+
+    #[test]
+    fn a_page_needs_the_press_that_asked_for_it() {
+        let (mut client, _) = connected();
+        client.handle(input(&client, 0, kit_buttons(2, 22, vec![web_button()])));
+        // No press at all.
+        client.handle(input(
+            &client,
+            0,
+            kit_link(2, 22, "https://music.example.org/u/7a/"),
+        ));
+        assert!(opened(&mut client).is_empty());
+        // Another presence of the same server.
+        client.handle(input(&client, 0, kit_buttons(3, 33, vec![web_button()])));
+        client.press_surface(0, 2, 22, 1, 1, 3).unwrap();
+        client.handle(input(
+            &client,
+            0,
+            kit_link(3, 33, "https://music.example.org/u/7a/"),
+        ));
+        assert!(opened(&mut client).is_empty());
+    }
+
+    #[test]
+    fn only_a_web_control_asks_for_a_page() {
+        let (mut client, _) = connected();
+        let mut play = web_button();
+        play.id = 1;
+        play.icon = nuschl_core::integration::Icon::Play;
+        client.handle(input(&client, 0, kit_buttons(2, 22, vec![play])));
+        client.press_surface(0, 2, 22, 1, 1, 1).unwrap();
+        client.handle(input(
+            &client,
+            0,
+            kit_link(2, 22, "https://music.example.org/u/7a/"),
+        ));
+        assert!(opened(&mut client).is_empty());
+    }
+
+    #[test]
+    fn a_link_that_is_not_a_web_page_opens_nothing() {
+        let (mut client, _) = connected();
+        client.handle(input(&client, 0, kit_buttons(2, 22, vec![web_button()])));
+        for url in [
+            "javascript:alert(1)",
+            "mumble://example.org/Lobby",
+            "file:///etc/passwd",
+            "https://example.org/a b",
+        ] {
+            client.press_surface(0, 2, 22, 1, 1, 3).unwrap();
+            client.handle(input(&client, 0, kit_link(2, 22, url)));
+            assert!(opened(&mut client).is_empty(), "{url}");
+        }
+    }
+
+    #[test]
+    fn integration_surfaces_keep_the_newest_revision_and_follow_presence() {
+        let (mut client, recorder) = connected();
+        client.handle(input(&client, 0, surface(2, 22, &shown(1, 1, "One"))));
+        assert_eq!(client.surfaces(0).len(), 1);
+        assert_eq!(client.surfaces(0)[0].surface.revision, 1);
+        // The same and an older revision change nothing.
+        client.handle(input(&client, 0, surface(2, 22, &shown(1, 1, "Old"))));
+        client.handle(input(&client, 0, surface(2, 22, &shown(1, 0, "Older"))));
+        assert_eq!(client.surfaces(0)[0].surface.revision, 1);
+        client.handle(input(&client, 0, surface(2, 22, &shown(1, 2, "Two"))));
+        assert_eq!(client.surfaces(0)[0].surface.revision, 2);
+        // A press names the revision on screen; a stale one is refused.
+        client.press_surface(0, 2, 22, 1, 2, 7).unwrap();
+        client.settle();
+        let actions: Vec<_> = recorder
+            .sent
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter_map(|(_, _, request)| match request {
+                Request::PluginData {
+                    receivers, payload, ..
+                } if payload.data_id() == nuschl_core::integration::KIT_ACTION_DATA_ID => Some((
+                    receivers,
+                    nuschl_core::integration::Action::decode(payload.data()).unwrap(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].0, [(2, 22)]);
+        assert_eq!(
+            (
+                actions[0].1.surface,
+                actions[0].1.revision,
+                actions[0].1.control
+            ),
+            (1, 2, 7)
+        );
+        assert!(client.press_surface(0, 2, 22, 1, 1, 7).is_err());
+        // A new presence owns no revision of its predecessor's card.
+        client.handle(input(&client, 0, ServerEvent::User(user(2, 23))));
+        assert!(client.surfaces(0).is_empty());
+        // An empty surface withdraws.
+        client.handle(input(&client, 0, surface(3, 33, &shown(1, 1, "Theirs"))));
+        assert_eq!(client.surfaces(0).len(), 1);
+        client.handle(input(
+            &client,
+            0,
+            surface(
+                3,
+                33,
+                &nuschl_core::integration::Surface {
+                    id: 1,
+                    revision: 2,
+                    nodes: Vec::new(),
+                },
+            ),
+        ));
+        assert!(client.surfaces(0).is_empty());
+        // Leaving the connection forgets every card.
+        client.handle(input(&client, 0, surface(3, 33, &shown(1, 3, "Again"))));
+        assert_eq!(client.surfaces(0).len(), 1);
+        client.disconnect(0);
+        assert!(client.surfaces(0).is_empty());
+    }
+
+    #[test]
+    fn a_press_names_the_sender_that_drew_the_card() {
+        let (mut client, recorder) = connected();
+        // Two bots, the same surface id and revision.
+        client.handle(input(&client, 0, surface(2, 22, &shown(1, 1, "Theirs"))));
+        client.handle(input(&client, 0, surface(3, 33, &shown(1, 1, "Mine"))));
+        assert_eq!(client.surfaces(0).len(), 2);
+        for (sender, instance) in [(2, 22), (3, 33)] {
+            client.press_surface(0, sender, instance, 1, 1, 4).unwrap();
+        }
+        client.settle();
+        let mut receivers: Vec<_> = recorder
+            .sent
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter_map(|(_, _, request)| match request {
+                Request::PluginData { receivers, .. } => Some(receivers),
+                _ => None,
+            })
+            .collect();
+        receivers.sort();
+        assert_eq!(receivers, [vec![(2, 22)], vec![(3, 33)]]);
+        // A press for a presence the sender no longer has is refused.
+        assert!(client.press_surface(0, 2, 21, 1, 1, 4).is_err());
+    }
+
+    #[test]
+    fn a_withdrawal_older_than_the_card_leaves_it() {
+        let (mut client, _) = connected();
+        client.handle(input(&client, 0, surface(2, 22, &shown(1, 2, "Two"))));
+        let empty = nuschl_core::integration::Surface {
+            id: 1,
+            revision: 1,
+            nodes: Vec::new(),
+        };
+        client.handle(input(&client, 0, surface(2, 22, &empty)));
+        assert_eq!(client.surfaces(0).len(), 1, "a late withdrawal");
+        client.handle(input(
+            &client,
+            0,
+            surface(
+                2,
+                22,
+                &nuschl_core::integration::Surface {
+                    id: 1,
+                    revision: 3,
+                    nodes: Vec::new(),
+                },
+            ),
+        ));
+        assert!(client.surfaces(0).is_empty(), "a withdrawal after it");
+    }
+
+    #[test]
+    fn a_kit_press_admission_stays_out_of_the_generic_queue() {
+        let (mut client, recorder) = connected();
+        client.accept_plugin_data(true);
+        client.handle(input(&client, 0, surface(2, 22, &shown(1, 1, "One"))));
+        client.press_surface(0, 2, 22, 1, 1, 4).unwrap();
+        let request = recorder
+            .sent
+            .lock()
+            .unwrap()
+            .drain(..)
+            .find_map(|(_, _, request)| match request {
+                Request::PluginData { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("the press");
+        client.handle(input(
+            &client,
+            0,
+            ServerEvent::PluginDataAdmission {
+                request,
+                result: Ok(()),
+            },
+        ));
+        assert!(
+            client.take_plugin_data().is_empty(),
+            "a kit press's admission is nobody's"
+        );
+        // Any other admission still arrives.
+        client.handle(input(
+            &client,
+            0,
+            ServerEvent::PluginDataAdmission {
+                request: request.wrapping_add(9_000),
+                result: Ok(()),
+            },
+        ));
+        assert_eq!(client.take_plugin_data().len(), 1);
     }
 
     #[test]

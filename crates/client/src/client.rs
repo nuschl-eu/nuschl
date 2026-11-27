@@ -202,6 +202,8 @@ pub enum Update {
     OwnMessage,
     /// Something arrived out of sight that deserves a notification.
     Notify(Notification),
+    /// Open this page: a link a bot sent in answer to a card's web control.
+    Link(String),
     /// The Nuschl extension was negotiated (the server's policy, e.g. its
     /// minimum version, is in the server's state).
     Negotiated { server: String },
@@ -278,10 +280,12 @@ pub enum SendError {
 }
 
 mod call;
+mod integration;
 mod plugin;
 mod share;
 pub(crate) use call::EndedCall;
 pub use call::{Call, MAX_CALLS, OwnCall};
+pub use integration::{MAX_SURFACES, ReceivedSurface};
 pub use plugin::{
     MAX_PLUGIN_QUEUE, MAX_PLUGIN_QUEUE_BYTES, MAX_PLUGIN_RECEIVERS, PluginDataEvent,
     ReceivedPluginData,
@@ -651,6 +655,7 @@ impl Client {
                 server.certificate = None;
                 server.dismiss_notice();
                 server.calls.clear();
+                server.surfaces.clear();
                 // It joins the channel you were last in there.
                 let id = server.id.clone();
                 self.forget_plugin_data(&id);
@@ -752,6 +757,7 @@ impl Client {
         }
         server.users.clear();
         server.calls.clear();
+        server.surfaces.clear();
         server.talking.clear();
         server.transport = None;
         server.audio_status = "Audio disconnected".into();
@@ -2313,6 +2319,7 @@ impl Client {
                     }
                     server.users.clear();
                     server.calls.clear();
+                    server.surfaces.clear();
                     server.talking.clear();
                     server.transport = None;
                     server.permissions.clear();

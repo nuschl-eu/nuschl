@@ -79,6 +79,19 @@ const MAX_BLOB_REQUEST: usize = 64;
 /// Delayed UI actions are small; bulk targets need explicit fresh actions.
 pub const MAX_ACTION_TARGETS: usize = 128;
 
+/// The reserved plugin-data IDs of the client's own UI protocols: the call card
+/// and the integration kit, in each direction. Every other reserved ID stays
+/// outside the generic plugin-data API.
+fn ui_data(id: &str) -> bool {
+    [
+        nuschl_core::call::CARD_DATA_ID,
+        nuschl_core::integration::KIT_DATA_ID,
+        nuschl_core::integration::KIT_ACTION_DATA_ID,
+        nuschl_core::integration::KIT_LINK_DATA_ID,
+    ]
+    .contains(&id)
+}
+
 // Known protocol types are not necessarily implemented by this client. In
 // particular knock/1 needs a native consumer before we negotiate typed notices;
 // stock-compatible admission notices remain available without that capability.
@@ -2254,7 +2267,7 @@ impl State {
         if self.encrypted_server() {
             return Err(Refusal::EndToEnd);
         }
-        if payload.is_reserved() && payload.data_id() != nuschl_core::call::CARD_DATA_ID {
+        if payload.is_reserved() && !ui_data(payload.data_id()) {
             return Err(Refusal::Reserved);
         }
         // Servers before Mumble 1.4 do not relay it (API_v_1_x_x.cpp).
@@ -2304,9 +2317,9 @@ impl State {
     /// for it, we are logged in and the server is not end to end; then
     /// budgeted, bounded before it is decoded, and surfaced with its sender's
     /// identity as known right now, without waiting for the event channel.
-    /// Nothing here interprets the bytes. Of the reserved namespace only call
-    /// cards are surfaced, for the client's own call feature. Nothing in it can
-    /// end the connection.
+    /// Nothing here interprets the bytes. Of the reserved namespace, call
+    /// cards and integration surfaces reach the client; the client's own
+    /// features read them. Nothing in it can end the connection.
     fn plugin_data(&mut self, frame: &ControlFrame, events: &mpsc::Sender<SessionEvent>) {
         if !self.accept_plugin_data || self.own_session.is_none() || self.encrypted_server() {
             return;
@@ -2324,9 +2337,8 @@ impl State {
         let Ok(message) = plugin::PluginData::decode(&frame.payload, MAX_RECEIVED_RECEIVERS) else {
             return dropped();
         };
-        if message.payload.is_reserved()
-            && message.payload.data_id() != nuschl_core::call::CARD_DATA_ID
-        {
+        // The client reads the reserved IDs of the UI protocols it ships.
+        if message.payload.is_reserved() && !ui_data(message.payload.data_id()) {
             return;
         }
         // Stock clients ignore data without a sender they know; one sent to
@@ -8730,23 +8742,27 @@ mod plugin_data_tests {
     }
 
     #[tokio::test]
-    async fn call_cards_are_the_reserved_data_sent_and_surfaced() {
+    async fn ui_protocols_are_the_reserved_data_sent_and_surfaced() {
         let (tx, mut rx) = mpsc::channel(64);
         let mut state = connected();
-        let card = nuschl_core::call::CARD_DATA_ID;
-        state
-            .command(send(1, vec![(2, 22)], card), &tx)
-            .await
-            .unwrap();
-        assert_eq!(admissions(&drain(&mut rx)), [(1, Ok(()))]);
-        assert_eq!(state.outbound.len(), 1);
-        state
-            .handle(incoming(Some(2), Some(card), Some(b"x".as_slice())), &tx)
-            .await
-            .unwrap();
-        let received = received(drain(&mut rx));
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].payload, payload(card, b"x"));
+        for (request, data_id) in [
+            (1, nuschl_core::call::CARD_DATA_ID),
+            (2, nuschl_core::integration::KIT_DATA_ID),
+            (3, nuschl_core::integration::KIT_ACTION_DATA_ID),
+        ] {
+            state
+                .command(send(request, vec![(2, 22)], data_id), &tx)
+                .await
+                .unwrap();
+            assert_eq!(admissions(&drain(&mut rx)), [(request, Ok(()))]);
+            state
+                .handle(incoming(Some(2), Some(data_id), Some(b"x".as_slice())), &tx)
+                .await
+                .unwrap();
+            let received = received(drain(&mut rx));
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].payload, payload(data_id, b"x"));
+        }
     }
 
     #[tokio::test]

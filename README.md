@@ -179,7 +179,10 @@ player has live updates, scrubbing and drag-and-drop ordering. Queues, playback
 positions and the latest 1,000 history entries per queue survive deployment
 restarts. Its Mumble comment gives the instance address and link instructions.
 Each channel has its own queue or shares another channel's. VAD-based ducking and
-playback settings are adjustable on the page. With an import service configured,
+playback settings are adjustable on the page. The app draws the bot's card above the
+voice status — title, progress, play/pause, skip, a listen control, the globe that
+opens your own page and its own volume — and any bot may publish one
+([docs/integrations-kit.md](docs/integrations-kit.md)). With an import service configured,
 people can search for albums missing from the library and add them from the page.
 On NixOS: `imports = [ inputs.nuschl.nixosModules.musicbot ];` and
 `services.nuschl-musicbot`; details in [docs/musicbot.md](docs/musicbot.md).

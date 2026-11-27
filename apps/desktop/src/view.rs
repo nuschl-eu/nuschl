@@ -1052,6 +1052,7 @@ fn sidebar(
                     cx,
                 )),
         )
+        .children(crate::integrations::cards(this, server_index, cx))
         .when_some(
             crate::voice::card(this, voice_places, window, cx),
             |sidebar, card| sidebar.child(card),

@@ -178,6 +178,14 @@ pub struct ServerState {
     pub users: BTreeMap<u32, User>,
     /// Calls others announced with a card (`Client::calls_in`).
     pub calls: Vec<crate::client::Call>,
+    /// Integration surfaces their senders announced (`Client::surfaces`).
+    pub surfaces: Vec<crate::client::ReceivedSurface>,
+    /// A page link this client asked for: the sender's presence and when the
+    /// request expires. A bot sends a link only right after the press, so its
+    /// reply is bound to the press that started it.
+    pub(crate) web_request: Option<(u32, u64, u64)>,
+    /// The next action key for a press (wraps).
+    pub(crate) kit_key: u32,
     pub(crate) ended_calls: VecDeque<crate::client::EndedCall>,
     /// Channels this connection has seen (cached ones not among them go).
     pub seen_channels: BTreeSet<u32>,
@@ -318,6 +326,9 @@ impl ServerState {
             own_session: None,
             users: BTreeMap::new(),
             calls: Vec::new(),
+            surfaces: Vec::new(),
+            web_request: None,
+            kit_key: 0,
             ended_calls: VecDeque::new(),
             seen_channels: BTreeSet::new(),
             muted: true,

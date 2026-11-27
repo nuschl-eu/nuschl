@@ -45,6 +45,10 @@ pub enum MenuTarget {
     VideoStats(u64),
     VideoQuality(u64, crate::native_call::Feed),
     VideoFeeds(u64),
+    /// The cards this server has, drawn by `crate::integrations::cards`. Open
+    /// across toggles, so several are shown or hidden in one visit.
+    /// Stays open: the user toggles several cards in a row.
+    Integrations,
 }
 
 /// Original saved endpoint plus observed connection/target lifetimes. Local
@@ -443,7 +447,8 @@ impl Desktop {
                 | MenuTarget::AclSource => None,
                 MenuTarget::VideoStats(_)
                 | MenuTarget::VideoQuality(..)
-                | MenuTarget::VideoFeeds(_) => None,
+                | MenuTarget::VideoFeeds(_)
+                | MenuTarget::Integrations => None,
             };
             let wanted = channel
                 .into_iter()
@@ -857,6 +862,44 @@ impl Desktop {
 
     fn menu_entries(&self, menu: &Menu) -> Vec<Entry> {
         let mut entries = Vec::new();
+        if matches!(menu.target, MenuTarget::Integrations) {
+            let Some(index) = menu.origin.local_index(self) else {
+                return entries;
+            };
+            let server = self.client.servers[index].id.clone();
+            let rows: Vec<_> = self
+                .client
+                .surfaces(index)
+                .iter()
+                .map(|entry| {
+                    let key = crate::integrations::surface_key(&server, entry);
+                    let shown = !self.dismissed_surfaces.contains(&key);
+                    (
+                        key,
+                        shown,
+                        crate::integrations::describe(self, index, entry),
+                    )
+                })
+                .collect();
+            for (key, shown, label) in rows {
+                let id = format!(
+                    "integration:{}-{}-{}-{}",
+                    key.0,
+                    key.1.unwrap_or(0),
+                    key.2,
+                    key.3
+                );
+                let mut item = local_item(label, "check", move |this, _, _, cx| {
+                    this.toggle_integration(key.clone(), cx);
+                })
+                .key(id);
+                if let Entry::Item { choice, .. } = &mut item {
+                    *choice = Some(shown);
+                }
+                entries.push(item);
+            }
+            return entries;
+        }
         if let MenuTarget::VideoStats(generation) = menu.target {
             if let Some(label) = self.video_stats_command(generation) {
                 entries.push(local_item(label, "info", move |this, _, _, cx| {
@@ -1024,6 +1067,8 @@ impl Desktop {
         let own = server.own_session;
         let my_channel = server.voice_channel();
         match menu.target {
+            // Handled above, before the entries that need a live connection.
+            MenuTarget::Integrations => {}
             MenuTarget::User(session) => {
                 let Some(user) = menu
                     .user
@@ -1716,9 +1761,14 @@ impl Desktop {
                 None => return,
             },
         };
+        // The integrations picker stays open: hiding one card is a step, not
+        // the end of the visit.
+        let keep_open = matches!(menu.target, MenuTarget::Integrations);
         let mut activate = |this: &mut Self| {
-            this.menu = None;
-            window.focus(&this.window_focus, cx);
+            if !keep_open {
+                this.menu = None;
+                window.focus(&this.window_focus, cx);
+            }
             action(this, index, window, cx);
         };
         if matches!(access, Access::Live) {
@@ -1726,6 +1776,19 @@ impl Desktop {
         } else {
             activate(self);
         }
+    }
+
+    /// Shows or hides one integration card, keyed by
+    /// [`crate::integrations::surface_key`].
+    pub fn toggle_integration(
+        &mut self,
+        key: crate::integrations::SurfaceKey,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.dismissed_surfaces.remove(&key) {
+            self.dismissed_surfaces.insert(key);
+        }
+        cx.notify();
     }
 
     pub fn channel_url(&self, server: usize, channel: u32) -> Option<String> {
@@ -2016,7 +2079,10 @@ struct MenuSurface {
     identity: SharedString,
     anchor: MenuAnchor,
     quality: bool,
+    /// The menu's name, for assistive technology and, when `heading` is set,
+    /// the line drawn above its rows.
     label: &'static str,
+    heading: bool,
     max_width: Pixels,
     rows: Vec<AnyElement>,
 }
@@ -2074,6 +2140,29 @@ impl RenderOnce for MenuSurface {
             .border_1()
             .border_color(color(BORDER_STRONG))
             .shadow_lg()
+            // A named menu says what it is: the picker's rows alone read as an
+            // unlabelled list.
+            .when(self.heading, |menu| {
+                menu.child(
+                    div()
+                        .flex_shrink_0()
+                        .px_2()
+                        .pt_1()
+                        .pb(px(5.))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(color(TEXT_FAINT))
+                        .child(text!(self.label).with_id("menu-heading")),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .mx_1()
+                        .mb_1()
+                        .h(px(1.))
+                        .bg(color(BORDER_STRONG)),
+                )
+            })
             .child(
                 crate::layout::scrollable(
                     "context-menu-actions",
@@ -2139,6 +2228,7 @@ pub fn menu(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
     }
     let quality = matches!(menu.target, MenuTarget::VideoQuality(..));
     let (label, width) = match menu.target {
+        MenuTarget::Integrations => ("Integrations", px(224.)),
         MenuTarget::VideoFeeds(_) => ("Video sources", px(224.)),
         _ if quality => ("Video quality", px(224.)),
         _ => ("Context menu", px(320.)),
@@ -2356,6 +2446,7 @@ pub fn menu(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                 anchor: menu.anchor,
                 quality,
                 label,
+                heading: matches!(menu.target, MenuTarget::Integrations),
                 max_width: width,
                 rows,
             })

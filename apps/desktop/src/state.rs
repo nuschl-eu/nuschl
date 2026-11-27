@@ -339,6 +339,10 @@ pub struct Desktop {
     pub timeline_current: std::cell::Cell<Option<crate::scrolling::Key>>,
     /// A timer to clear others' typing indicators is running.
     pub typing_timer: bool,
+    /// A timer to advance playing integration cards is running.
+    pub surface_timer: bool,
+    /// Integration cards the user hid ([`crate::integrations::SurfaceKey`]).
+    pub dismissed_surfaces: std::collections::BTreeSet<crate::integrations::SurfaceKey>,
     /// The clipboard image pasted last, and when it was last pasted.
     pasted_image: Option<(u64, std::time::Instant)>,
     drafts: BTreeMap<(String, u32), String>,
@@ -627,6 +631,8 @@ impl Desktop {
             link_focus: None,
             timeline_current: Default::default(),
             typing_timer: false,
+            surface_timer: false,
+            dismissed_surfaces: Default::default(),
             acknowledged: Vec::new(),
             pasted_image: None,
             drafts: BTreeMap::new(),
@@ -2612,6 +2618,7 @@ impl Desktop {
         self.apply_updates(cx);
         self.sync_link_preview(cx);
         self.expire_typing(cx);
+        self.animate_surfaces(cx);
         self.flush_outgoing(cx);
         self.sync_call();
         self.sync_native_call();
@@ -2620,6 +2627,7 @@ impl Desktop {
     pub fn apply_updates(&mut self, cx: &mut Context<Self>) {
         for update in self.client.take_updates() {
             match update {
+                Update::Link(url) => cx.open_url(&url),
                 Update::BookmarksChanged => self.cache_dirty = true,
                 Update::BookmarksChangedNow => {
                     let bookmarks = self
