@@ -21,7 +21,7 @@
 <section aria-labelledby="requests-title" aria-busy={result.loading}>
   <div class="section-heading">
     <h1 id="requests-title">Requests</h1>
-    {#if revision !== null}<a class="add-link" href={buildRoute({ view: "add", q: "" })}><Icon name="add" size={18} /> Add music</a>{/if}
+    {#if revision !== null}<a class="heading-link" href={buildRoute({ view: "add", q: "" })}><Icon name="add" size={18} /> Add music</a>{/if}
   </div>
   {#if revision === null}
     <p class="notice muted">Adding music is not available on this bot.</p>
@@ -29,18 +29,18 @@
     <p class="notice muted" role="status">Requests will update after the connection is restored.</p>
   {:else}
     {#if budget}<p class="budget">{budget}</p>{/if}
-    {#if result.error}<div class="notice error" role="alert"><p>{result.error}</p><button onclick={() => result.reload()}>Try again</button></div>{/if}
+    {#if result.error}<div class="notice error" role="alert"><p>{result.error}</p><button class="btn" onclick={() => result.reload()}>Try again</button></div>{/if}
     {#if result.loading && !data}<p class="notice" role="status">Loading requests…</p>{/if}
     {#if data && !requests.length}<p class="notice muted">No requests yet.</p>{/if}
-    <ol class="request-list" aria-label="Requests">
+    <ol class="rows card request-list" aria-label="Requests">
       {#each requests as request (request.id)}
         {@const progress = requestProgress(request)}
         <li>
           <Cover importId={request.has_cover ? request.album_id : null} size={128} px={56} />
-          <div class="description">
+          <div class="row-text">
             <div class="request-heading">
-              <div class="title"><a href={buildRoute({ view: "addAlbum", id: request.album_id })}>{request.title}</a></div>
-              {#if request.mine}<span class="mine">Yours</span>{/if}
+              <div class="row-title"><a href={buildRoute({ view: "addAlbum", id: request.album_id })}>{request.title}</a></div>
+              {#if request.mine}<span class="badge accent">Yours</span>{/if}
             </div>
             <div class="muted">{request.artist}</div>
             <p class="metadata muted">
@@ -58,19 +58,16 @@
 </section>
 
 <style>
-  .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
-  h1 { margin: 0; overflow-wrap: anywhere; }
-  .add-link { display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap; }
-  .budget { font-weight: 600; }
-  .request-list { list-style: none; padding: 0; margin: 1rem 0; }
-  li { display: flex; gap: 0.85rem; padding: 1rem 0; border-bottom: 1px solid var(--border); }
-  .description { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+  .budget { display: inline-flex; margin: 0 0 0.5rem; padding: 0.25rem 0.8rem; border-radius: 999px; background: var(--surface-2); font-size: 0.85rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .request-list { margin: 1rem 0; }
+  .request-list > li { align-items: flex-start; padding-block: 0.75rem; }
+  .row-text { overflow-wrap: anywhere; }
   .request-heading { display: flex; align-items: start; justify-content: space-between; gap: 0.5rem; }
-  .title { min-width: 0; font-weight: 650; }
-  .mine { flex: none; padding: 0.1rem 0.5rem; border: 1px solid var(--accent); border-radius: 999px; color: var(--accent); font-size: 0.75rem; font-weight: 600; }
-  .metadata { display: flex; flex-wrap: wrap; gap: 0.7rem; font-size: 0.85rem; margin: 0.4rem 0; }
-  .status { margin: 0.4rem 0 0; }
-  .status.done { color: var(--accent); }
-  .status.failed { color: var(--danger); }
-  progress { width: 100%; max-width: 20rem; margin-top: 0.5rem; accent-color: var(--accent); }
+  .request-heading .row-title { min-width: 0; white-space: normal; }
+  .row-text > .muted:not(.metadata) { font-size: 0.9rem; }
+  .metadata { display: flex; flex-wrap: wrap; gap: 0 0.75rem; font-size: 0.85rem; margin: 0.35rem 0; }
+  .status { margin: 0.35rem 0 0; font-weight: 500; }
+  .status.done { color: var(--success); }
+  .status.failed { color: var(--error); }
+  progress { width: 100%; max-width: 20rem; margin-top: 0.5rem; }
 </style>

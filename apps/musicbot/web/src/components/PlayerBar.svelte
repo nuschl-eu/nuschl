@@ -5,6 +5,7 @@
     const current = player?.current ?? null;
     if (!player) return null;
     if (player.error) return `Playback error: ${player.error}`;
+    if (player.dj) return player.paused ? "DJ mode, paused" : "DJ mode";
     if (!current) return null;
     if (player.paused) return "Paused";
     if (player.listeners === 0) return "Waiting for listeners";
@@ -16,7 +17,7 @@
 
 <script>
   import { store } from "../store.svelte.js";
-  import { buildRoute } from "../logic.js";
+  import { buildRoute, leadDeck } from "../logic.js";
   import { carriesItem, droppedItem } from "../dnd.js";
   import { listening } from "../listening.svelte.js";
   import Cover from "./Cover.svelte";
@@ -25,13 +26,17 @@
   import DuckingPanel from "./DuckingPanel.svelte";
   import SongRating from "./SongRating.svelte";
   import BrowserListen from "./BrowserListen.svelte";
+  import FavoriteHeart from "./FavoriteHeart.svelte";
+  import AddToPlaylist from "./AddToPlaylist.svelte";
 
   let { onexpand } = $props();
   const index = $derived(store.selected);
   const player = $derived(store.player);
   const players = $derived(store.snapshot?.players ?? []);
   const current = $derived(player?.current ?? null);
-  const track = $derived(current?.entry.track ?? null);
+  const djState = $derived(player?.dj ?? null);
+  const lead = $derived(leadDeck(djState));
+  const track = $derived(current?.entry.track ?? (lead === null ? null : djState.decks[lead].entry.track));
   const volume = $derived(store.volume(index));
   const queueStatus = $derived(playerStatus(player));
   // Browser listening only gets the line when the queue has nothing to report.
@@ -56,7 +61,7 @@
 </script>
 
 <footer
-  class="player"
+  class="player card"
   class:dropping
   aria-label="Player"
   ondragover={dragover}
@@ -67,7 +72,7 @@
 >
   <div class="song">
     {#if track}
-      <Cover library={track.library} art={track.cover_art} size={128} px={64} />
+      <Cover library={track.library} art={track.cover_art} size={128} px={56} />
       <div class="text">
         <div class="title" title={track.title}><a href={buildRoute({ view: "song", library: track.library, id: track.id, namespace: store.browseKey })}>{track.title}</a></div>
         {#if track.artist}
@@ -85,8 +90,12 @@
           </div>
         {/if}
       </div>
+      <div class="song-actions">
+        <FavoriteHeart library={track.library} songId={track.id} title={track.title} namespace={store.browseKey} />
+        <AddToPlaylist library={track.library} songs={[track.id]} title={track.title} namespace={store.browseKey} up />
+      </div>
     {:else}
-      <Cover library={0} art={null} px={64} />
+      <Cover library={0} art={null} px={56} />
       <div class="text"><div class="sub">{dropping ? "Drop to add to the queue" : "Nothing is playing"}</div></div>
     {/if}
   </div>
@@ -101,18 +110,25 @@
         title={player?.paused ? "Play (Space)" : "Pause (Space)"}
         onclick={() => store.togglePause(index)}
       >
-        <Icon name={player?.paused ? "play" : "pause"} size={24} />
+        <Icon name={player?.paused ? "play" : "pause"} size={22} />
       </button>
       <div class="controls-end">
-        <button class="icon-button" disabled={!current} aria-label="Skip" title="Skip" onclick={() => store.skip(index)}>
-          <Icon name="skip" />
-        </button>
-        <button class="icon-button" aria-label="Open big screen" aria-haspopup="dialog" title="Big screen" onclick={onexpand}>
+        {#if djState}
+          <a class="icon-btn" href={buildRoute({ view: "dj" })} aria-label="Open the decks" title="DJ decks"><Icon name="decks" /></a>
+        {:else}
+          <button class="icon-btn" disabled={!current} aria-label="Skip" title="Skip" onclick={() => store.skip(index)}>
+            <Icon name="skip" />
+          </button>
+        {/if}
+        <button class="icon-btn" aria-label="Open big screen" aria-haspopup="dialog" title="Big screen" onclick={(event) => { store.bigScreenLyrics = false; onexpand(event); }}>
           <Icon name="expand" />
+        </button>
+        <button class="icon-btn" disabled={!track} aria-label="Lyrics" aria-haspopup="dialog" title="Lyrics on the big screen" onclick={(event) => { store.bigScreenLyrics = true; onexpand(event); }}>
+          <Icon name="lyrics" />
         </button>
       </div>
     </div>
-    <Progress player={index} {current} />
+    {#if !djState}<Progress player={index} {current} />{/if}
     <span class="status" class:error={statusError} role="status" title={status ?? ""}>{status ?? ""}</span>
   </div>
 
@@ -141,52 +157,55 @@
 
 <style>
   .player {
+    flex: none;
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
     align-items: center;
-    gap: 1rem;
-    padding: 0.6rem 1rem;
-    border-top: 1px solid var(--border);
-    background: var(--surface);
+    gap: 0.9rem;
+    width: min(1568px, calc(100% - 2rem));
+    margin: 0 auto 0.75rem;
+    padding: 0.5rem 0.75rem;
   }
-  .player.dropping { outline: 2px dashed var(--accent); outline-offset: -4px; }
+  .player.dropping { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow); }
   .song { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
   .text { min-width: 0; line-height: 1.3; }
+  .song-actions { display: flex; flex: none; align-items: center; margin-left: auto; }
   .title { font-weight: 600; }
   .title, .sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sub { font-size: 0.85rem; color: var(--muted); }
-  .title a, .sub a { color: inherit; }
-  .center { display: grid; justify-items: center; gap: 0.2rem; min-width: 0; }
+  .sub a:not(:hover) { color: inherit; }
+  .center { display: grid; justify-items: center; gap: 0.1rem; min-width: 0; }
   /* Play stays centred; the side groups use the otherwise empty width of the row. */
   .controls { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 0.5rem; width: 100%; max-width: 32rem; }
   .controls-start { display: flex; justify-content: flex-end; min-width: 0; }
   .controls-end { display: flex; align-items: center; gap: 0.25rem; min-width: 0; }
   .play {
-    width: 40px;
-    height: 40px;
-    border-radius: 50%;
-    border: none;
+    width: 2.6rem;
+    height: 2.6rem;
+    flex: none;
     display: grid;
     place-items: center;
-    background: var(--text);
-    color: var(--background);
-    cursor: pointer;
-    flex: none;
+    border: none;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--accent-fg);
   }
-  .play:disabled { opacity: 0.4; cursor: default; }
-  .status { width: 100%; height: 1.25rem; line-height: 1.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; font-size: 0.8rem; color: var(--muted); }
-  .status.error { color: var(--danger); }
-  .side { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 0.5rem; min-width: 0; }
-  .queue-select select { max-width: 10rem; }
-  .volume { display: flex; align-items: center; gap: 0.35rem; color: var(--muted); }
-  .volume input { width: 7rem; }
+  .play:hover:not(:disabled) { filter: brightness(1.08); }
+  .play:disabled { opacity: 0.4; }
+  .status { width: 100%; height: 1.2rem; line-height: 1.2rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; font-size: 0.8rem; color: var(--muted); }
+  .status.error { color: var(--error); }
+  .side { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 0.25rem 0.5rem; min-width: 0; }
+  .queue-select select { max-width: 10rem; padding: 0.3rem 0.7rem; border-radius: 999px; font-size: 0.85rem; }
+  .volume { display: flex; align-items: center; gap: 0.35rem; color: var(--muted); font-size: 0.85rem; }
+  .volume input { width: 6rem; }
 
   @media (max-width: 760px) {
     .player {
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       grid-template-areas: "song side" "center center";
-      gap: 0.4rem 0.75rem;
-      padding: 0.5rem 0.75rem;
+      gap: 0.3rem 0.75rem;
+      width: calc(100% - 1rem);
+      margin-bottom: 0.5rem;
     }
     .song { grid-area: song; }
     .center { grid-area: center; }

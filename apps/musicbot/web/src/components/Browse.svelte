@@ -3,38 +3,55 @@
   import { store } from "../store.svelte.js";
   import { resource } from "../resource.svelte.js";
   import { query } from "../api.js";
-  import { ALBUM_LISTS, buildRoute, formatDuration, shareRoute, shareUrl, totalDuration } from "../logic.js";
+  import { ALBUM_LISTS, artistJumps, buildRoute, formatDuration, shareRoute, shareUrl, totalDuration } from "../logic.js";
   import { startItemDrag } from "../dnd.js";
   import Cover from "./Cover.svelte";
   import MediaCard from "./MediaCard.svelte";
   import SongList from "./SongList.svelte";
   import SongPage from "./SongPage.svelte";
   import Icon from "./Icon.svelte";
+  import Playlists from "./Playlists.svelte";
+  import PlaylistTools from "./PlaylistTools.svelte";
+  import AddToPlaylist from "./AddToPlaylist.svelte";
+  import DeckQueueAdd from "./DeckQueueAdd.svelte";
+  import Genres from "./Genres.svelte";
+  import GenreSongs from "./GenreSongs.svelte";
 
   let { route } = $props();
   let page = $state(0);
   const namespace = store.browseKey;
   const current = $derived(namespace !== null && namespace === store.browseKey && store.connection === "open" && !store.invalid);
   const sonicView = $derived(route.view === "similar" || route.view === "path");
+  const genreView = $derived(route.view === "genres" || route.view === "genre");
+  const playlistView = $derived(route.view === "playlists" || route.view === "playlist");
   const result = resource(() => {
     if (!current || (route.library != null && !store.browseItemCurrent({ library: route.library, namespace }))
       || ((route.id != null || route.to != null) && route.namespace !== namespace)) return null;
+    // Every viewer reloads playlists when anybody changes one.
+    if (playlistView) store.playlistRevision;
     if (route.view === "search") return route.q.trim() ? query("api/search", { q: route.q }) : null;
     if (route.view === "albums") return query("api/albums", { library: route.library, list: route.list, page });
+    if (route.view === "genre") return query("api/genre/albums", { library: route.library, name: route.name, page });
     if (route.view === "path") return query("api/path", { library: route.library, from: route.from, to: route.to });
     return query(`api/${route.view}`, { library: route.library, ...(route.id == null ? {} : { id: route.id }) });
-  }, () => store.browseSignal);
+  }, () => store.browseSignal, undefined, { keep: true });
   const data = $derived(current ? result.data : null);
-  const detail = $derived(sonicView ? null : data?.[route.view] ?? null);
+  const detail = $derived(sonicView || genreView ? null : data?.[route.view] ?? null);
+  // The genre page's counts come from the genre list.
+  const genreList = resource(() => (route.view === "genre" && current && store.browseItemCurrent({ library: route.library, namespace })
+    ? query("api/genres", { library: route.library }) : null), () => store.browseSignal);
+  const genre = $derived(current ? genreList.data?.genres?.find((entry) => entry.name === route.name) ?? null : null);
+  const amount = (value, one, many) => (Number.isInteger(value) ? `${value.toLocaleString()} ${value === 1 ? one : many}` : null);
   const songs = $derived(data?.songs ?? []);
   const matches = $derived(sonicView ? data?.matches ?? [] : []);
   const matchSongs = $derived(matches.map((match) => match.track));
   const sonicItem = $derived(route.view === "path"
     ? { kind: "path", library: route.library, id: route.from, to: route.to, namespace }
     : { kind: "similar", library: route.library, id: route.id, namespace });
-  const titles = { albums: "Albums", artists: "Artists", playlists: "Playlists", search: "Search" };
+  const titles = { albums: "Albums", artists: "Artists", genres: "Genres", playlists: "Playlists", search: "Search" };
   const heading = $derived(titles[route.view]
-    ?? (route.view === "similar" ? (data?.song ? `Similar to ${data.song.title}` : "Similar songs")
+    ?? (route.view === "genre" ? route.name
+      : route.view === "similar" ? (data?.song ? `Similar to ${data.song.title}` : "Similar songs")
       : route.view === "path" ? (matches.length ? `Blend: ${matches[0].track.title} → ${matches.at(-1).track.title}` : "Blend")
       : route.view === "song" ? data?.song?.title ?? (data ? "Song" : "Loading…")
       : detail?.name ?? "Loading…"));
@@ -70,6 +87,21 @@
     page = next;
     document.getElementById("main-content")?.scrollTo({ top: 0 });
   }
+
+  function removeSong(index, song) {
+    store.playlistChange("api/playlists/remove", { library: detail.library, id: detail.id, index, song: song.id }, namespace);
+  }
+
+  const jumps = $derived(route.view === "artists" ? artistJumps(data?.groups) : []);
+  let jumpHeight = $state(0);
+  const groupId = (index) => `artist-group-${index}`;
+
+  // Element ids and scrollIntoView keep the page's route in the address bar.
+  function jump(index) {
+    const heading = document.getElementById(groupId(index));
+    heading?.scrollIntoView({ block: "start" });
+    heading?.focus({ preventScroll: true });
+  }
 </script>
 
 <section class="browse" aria-labelledby="browse-title" aria-busy={result.loading}>
@@ -83,7 +115,7 @@
           </select>
         </label>
       {/if}
-      <button class="share" disabled={link === null} aria-label="Copy link to this page" aria-describedby={shareProblem === null ? undefined : "share-problem"} title={shareProblem === null ? "Copy a link for people who have their own link to this bot" : undefined} onclick={copyLink}><Icon name="link" size={18} /> Copy link</button>
+      <button class="btn" disabled={link === null} aria-label="Copy link to this page" aria-describedby={shareProblem === null ? undefined : "share-problem"} title={shareProblem === null ? "Copy a link for people who have their own link to this bot" : undefined} onclick={copyLink}><Icon name="link" size={18} /> Copy link</button>
     </div>
   </div>
   {#if shareProblem !== null}
@@ -97,18 +129,24 @@
   {/if}
   {#if route.view === "albums"}
     <div class="pagination">
-      <button disabled={!current || page === 0 || result.loading} onclick={() => changePage(page - 1)}>Previous</button>
+      <button class="btn" disabled={!current || page === 0 || result.loading} onclick={() => changePage(page - 1)}>Previous</button>
       <span class="muted">Page {page + 1}</span>
-      <button disabled={!current || !data?.more || result.loading} onclick={() => changePage(page + 1)}>Next</button>
+      <button class="btn" disabled={!current || !data?.more || result.loading} onclick={() => changePage(page + 1)}>Next</button>
     </div>
+  {/if}
+  {#if route.view === "genre" && genre}
+    <p class="muted metadata genre-counts">
+      {#if amount(genre.albums, "album", "albums")}<span>{amount(genre.albums, "album", "albums")}</span>{/if}
+      {#if amount(genre.songs, "song", "songs")}<span>{amount(genre.songs, "song", "songs")}</span>{/if}
+    </p>
   {/if}
 
   {#if !current}
     <p class="notice muted" role="status">Library browsing will resume after the connection is restored.</p>
-  {:else if result.loading}
+  {:else if result.loading && !data}
     <p class="notice" role="status">Loading library…</p>
   {:else if result.error}
-    <div class="notice error" role="alert"><p>{result.error}</p><button onclick={() => result.reload()}>Try again</button></div>
+    <div class="notice error" role="alert"><p>{result.error}</p><button class="btn" onclick={() => result.reload()}>Try again</button></div>
   {:else if route.view === "search" && !route.q.trim()}
     <p class="notice muted">Search for songs, albums or artists using the search box.</p>
   {:else if data}
@@ -117,22 +155,28 @@
       {#if !data.albums.length}<p class="notice muted">No albums in this list.</p>{/if}
       {#if data.albums.length}
         <div class="pagination bottom">
-          <button disabled={page === 0} onclick={() => changePage(page - 1)}>Previous</button>
+          <button class="btn" disabled={page === 0} onclick={() => changePage(page - 1)}>Previous</button>
           <span class="muted">Page {page + 1}</span>
-          <button disabled={!data.more} onclick={() => changePage(page + 1)}>Next</button>
+          <button class="btn" disabled={!data.more} onclick={() => changePage(page + 1)}>Next</button>
         </div>
       {/if}
     {:else if route.view === "artists"}
+      {#if jumps.length > 1}
+        <nav class="jump" aria-label="Jump to artists by initial" bind:offsetHeight={jumpHeight}>
+          {#each jumps as entry (entry.index)}
+            <button class="pill" onclick={() => jump(entry.index)} aria-label="Artists under {entry.name}">{entry.name}</button>
+          {/each}
+        </nav>
+      {/if}
       {#each data.groups as group, i (i)}
         <section class="group" aria-label={group.name}>
-          <h2>{group.name}</h2>
+          <h2 id={groupId(i)} class="group-heading" tabindex="-1" style:scroll-margin-top="{jumpHeight + 12}px">{group.name}</h2>
           <div class="media-grid">{#each group.artists as artist (artist.id)}<MediaCard item={artist} kind="artist" {namespace} />{/each}</div>
         </section>
       {/each}
       {#if !data.groups.some((group) => group.artists.length)}<p class="notice muted">No artists in this library.</p>{/if}
     {:else if route.view === "playlists"}
-      <div class="media-grid">{#each data.playlists as playlist (playlist.id)}<MediaCard item={playlist} kind="playlist" {namespace} />{/each}</div>
-      {#if !data.playlists.length}<p class="notice muted">No playlists in this library.</p>{/if}
+      <Playlists playlists={data.playlists} library={route.library} {namespace} {current} />
     {:else if route.view === "search"}
       <p class="muted">Results for “{route.q}”</p>
       {#each data.results as library (library.library)}
@@ -146,6 +190,22 @@
         </section>
       {/each}
       {#if !data.results.length}<p class="notice muted">No results.</p>{/if}
+    {:else if route.view === "genres"}
+      <Genres genres={data.genres} truncated={data.truncated} library={route.library} />
+    {:else if route.view === "genre"}
+      <section class="group" aria-labelledby="genre-albums">
+        <h2 id="genre-albums">Albums</h2>
+        <div class="media-grid">{#each data.albums as album (album.id)}<MediaCard item={album} {namespace} />{/each}</div>
+        {#if !data.albums.length}<p class="notice muted">{page === 0 ? "No albums in this genre." : "No more albums in this genre."}</p>{/if}
+        {#if page > 0 || data.more}
+          <div class="pagination bottom">
+            <button class="btn" disabled={page === 0 || result.loading} onclick={() => changePage(page - 1)}>Previous</button>
+            <span class="muted">Page {page + 1}</span>
+            <button class="btn" disabled={!data.more || result.loading} onclick={() => changePage(page + 1)}>Next</button>
+          </div>
+        {/if}
+      </section>
+      <GenreSongs library={route.library} name={route.name} {namespace} {current} />
     {:else if sonicView}
       <div class="sonic-header">
         {#if route.view === "path"}
@@ -156,8 +216,8 @@
         {/if}
         <p class="muted metadata"><span>{matchSongs.length} tracks</span><span>{formatDuration(totalDuration(matchSongs))}</span></p>
         <div class="detail-actions">
-          <button class="primary" disabled={!current || !store.player || !matches.length} title={route.view === "similar" ? "Adds every song listed except exact copies of this one" : undefined} onclick={() => store.add(store.selected, sonicItem)}><Icon name="add" /> Add all</button>
-          <button disabled={!current || !store.player || !matches.length} title={route.view === "similar" ? "Plays every song listed next except exact copies of this one" : undefined} onclick={() => store.add(store.selected, sonicItem, 0)}><Icon name="next" /> Play all next</button>
+          <button class="btn primary" disabled={!current || !store.player || !matches.length} onclick={() => store.add(store.selected, sonicItem)}><Icon name="add" /> Add all</button>
+          <button class="btn" disabled={!current || !store.player || !matches.length} onclick={() => store.add(store.selected, sonicItem, 0)}><Icon name="next" /> Play all next</button>
         </div>
       </div>
       <SongList songs={matchSongs} {namespace} covers similarities={matches.map((match) => match.similarity)} />
@@ -174,7 +234,15 @@
           {#if detail.artist}
             <p>{#if detail.artist_id}<a href={buildRoute({ view: "artist", library: detail.library, id: detail.artist_id, namespace })}>{detail.artist}</a>{:else}{detail.artist}{/if}</p>
           {/if}
-          {#if detail.owner}<p class="muted">By {detail.owner}</p>{/if}
+          {#if route.view === "playlist" && detail.personal}
+            <p class="muted">{detail.mine ? "Yours" : `By ${detail.owner_name}`}</p>
+            {#if detail.favorites || detail.shared}
+              <p class="badges">
+                {#if detail.favorites}<span class="badge accent">Favorites</span>{/if}
+                {#if detail.shared}<span class="badge success">Shared</span>{/if}
+              </p>
+            {/if}
+          {:else if detail.owner}<p class="muted">By {detail.owner}</p>{/if}
           <p class="muted metadata">
             {#if detail.year}<span>{detail.year}</span>{/if}
             {#if route.view === "artist"}<span>{data.albums.length} albums</span>
@@ -182,9 +250,20 @@
           </p>
           {#if route.view !== "artist"}
             <div class="detail-actions">
-              <button class="primary" disabled={!current || !store.player || !songs.length} onclick={() => store.add(store.selected, { kind: route.view, library: detail.library, id: detail.id, namespace })}><Icon name="add" /> Add to queue</button>
-              <button disabled={!current || !store.player || !songs.length} onclick={() => store.add(store.selected, { kind: route.view, library: detail.library, id: detail.id, namespace }, 0)}><Icon name="next" /> Play next</button>
+              <button class="btn primary" disabled={!current || !store.player || !songs.length} onclick={() => store.add(store.selected, { kind: route.view, library: detail.library, id: detail.id, namespace })}><Icon name="add" /> Add to queue</button>
+              <button class="btn" disabled={!current || !store.player || !songs.length} onclick={() => store.add(store.selected, { kind: route.view, library: detail.library, id: detail.id, namespace }, 0)}><Icon name="next" /> Play next</button>
+              <DeckQueueAdd button item={{ kind: route.view, library: detail.library, id: detail.id, namespace }} title={detail.name} disabled={!current || !songs.length} />
+              {#if route.view === "album"}<AddToPlaylist library={detail.library} album={detail.id} title={detail.name} {namespace} />{/if}
             </div>
+          {/if}
+          {#if route.view === "playlist"}
+            {#if detail.manageable}
+              <PlaylistTools playlist={detail} {namespace} {current} />
+            {:else if !detail.personal}
+              <p class="muted small">Made in the library; read-only here.</p>
+            {:else if !detail.editable && store.canOwnPlaylists}
+              <p class="muted small">{detail.owner_name} changes this playlist; they can share it to let others edit.</p>
+            {/if}
           {/if}
         </div>
       </div>
@@ -193,7 +272,7 @@
         <div class="media-grid">{#each data.albums as album (album.id)}<MediaCard item={album} {namespace} />{/each}</div>
         {#if !data.albums.length}<p class="notice muted">No albums by this artist.</p>{/if}
       {:else}
-        <SongList {songs} {namespace} covers={route.view === "playlist"} />
+        <SongList {songs} {namespace} covers={route.view === "playlist"} positions={route.view === "playlist"} onremove={route.view === "playlist" && detail.editable ? removeSong : null} />
         {#if !songs.length}<p class="notice muted">No tracks here.</p>{/if}
       {/if}
     {/if}
@@ -201,22 +280,24 @@
 </section>
 
 <style>
-  .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
   .heading-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
-  .share { display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap; }
-  .manual-link { display: grid; gap: 0.35rem; margin: -0.25rem 0 1rem; }
-  .share-problem { margin: -0.25rem 0 1rem; }
-  .manual-link input { width: 100%; min-width: 0; }
-  h1 { margin: 0; overflow-wrap: anywhere; }
+  .manual-link { display: grid; gap: 0.35rem; margin: -0.5rem 0 1.25rem; }
+  .share-problem { margin: -0.5rem 0 1.25rem; }
+  .manual-link input { width: 100%; }
   .sort select { max-width: 100%; }
-  .pagination { display: flex; align-items: center; justify-content: center; gap: 1rem; margin: 0 0 1.25rem; }
-  .pagination.bottom { margin: 1.5rem 0 0; }
   .group { margin-bottom: 2rem; }
-  .detail-header { display: flex; gap: 1.5rem; align-items: center; margin: 1rem 0 2rem; }
-  .detail-art { width: 11rem; flex: none; }
-  .detail-info { min-width: 0; }
-  .metadata { display: flex; flex-wrap: wrap; gap: 0.7rem; }
-  .detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .genre-counts { margin: -0.75rem 0 0.5rem; }
+  .jump { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0 0 0.5rem; padding: 0.5rem 0; background: var(--bg); }
+  .jump .pill { justify-content: center; min-width: 2.2rem; min-height: 2rem; font-weight: 600; color: var(--fg); }
+  .jump .pill:hover { border-color: var(--accent); color: var(--accent); }
+  .group-heading:focus { outline: none; }
+  .group-heading:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .metadata { display: flex; flex-wrap: wrap; gap: 0 0.75rem; font-variant-numeric: tabular-nums; }
+  .badges { display: flex; flex-wrap: wrap; gap: 0.3rem; }
   .sonic-header { margin: 0 0 1.25rem; }
-  @media (max-width: 600px) { .detail-header { gap: 1rem; align-items: flex-start; } .detail-art { width: 6.5rem; } .detail-actions { flex-direction: column; align-items: flex-start; } }
+  @media (max-width: 600px) {
+    .detail-actions { flex-direction: column; align-items: flex-start; }
+    .jump { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; }
+    .jump .pill { flex: none; }
+  }
 </style>

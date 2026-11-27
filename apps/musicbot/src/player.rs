@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! A queue and its playback. Each player encodes once for attached Mumble
 //! channels and shares unducked PCM with browser listeners; with nobody it waits.
+//! In DJ mode (`dj.rs`) two decks are mixed into the same outputs.
 use crate::{
     decode::{self, CHANNELS, Decoding, FRAME},
     subsonic::{Library, LibraryIdentity, Track},
 };
+
+mod dj;
+mod dsp;
+
 use axum::body::Bytes;
+pub use dj::{
+    DECKS, DeckSong, Dj, DjError, MAX_TRANSITION_SECONDS, MIN_TRANSITION_SECONDS, TEMPO_RANGES,
+};
+pub use dsp::{Curve, EQ_MAX_DB, EQ_MIN_DB};
 use nuschl_ipc::musicbot::{Client, Role};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -128,6 +137,19 @@ pub struct Playing {
 }
 
 impl Playing {
+    /// A song about to start, at its beginning, without a library identity yet.
+    fn new(entry: Entry) -> Self {
+        Self {
+            entry,
+            frames: 0,
+            source: None,
+            started_at_ms: None,
+            played_ms: 0,
+            buffering: true,
+            generation: 0,
+        }
+    }
+
     pub fn elapsed(&self) -> Duration {
         Duration::from_millis(self.frames.saturating_mul(20))
     }
@@ -152,27 +174,33 @@ pub struct State {
     pub next_id: u64,
     pub history: VecDeque<HistoryItem>,
     pub next_history_id: u64,
+    /// DJ mode, while it is on.
+    pub dj: Option<Dj>,
+    /// DJ mode's queue per deck, kept while DJ mode is off.
+    pub deck_queues: [VecDeque<Entry>; DECKS],
 }
 
 impl State {
     fn start_next(&mut self, source: impl FnOnce(&Track) -> Option<LibraryIdentity>) -> bool {
-        if self.current.is_some() || self.paused {
+        if self.current.is_some() || self.paused || self.dj.is_some() {
             return false;
         }
         let Some(entry) = self.queue.pop_front() else {
             return false;
         };
         self.error = None;
-        self.current = Some(Playing {
-            source: source(&entry.track),
-            entry,
-            frames: 0,
-            started_at_ms: None,
-            played_ms: 0,
-            buffering: true,
-            generation: 0,
-        });
+        let mut playing = Playing::new(entry);
+        playing.source = source(&playing.entry.track);
+        self.current = Some(playing);
         true
+    }
+
+    /// The song the room hears: the queue's current song or, in DJ mode, the
+    /// deck song whose heard play started last (else the lead deck's song).
+    pub fn now_playing(&self) -> Option<&Playing> {
+        self.current
+            .as_ref()
+            .or_else(|| self.dj.as_ref()?.now_playing())
     }
 
     fn fail(
@@ -220,9 +248,20 @@ impl State {
         error: Option<String>,
         now: impl FnOnce() -> i64,
     ) {
-        let Some(playing) = self.current.take() else {
-            return;
-        };
+        if let Some(playing) = self.current.take() {
+            self.finish_play(playing, outcome, error, now);
+        }
+    }
+
+    /// Records a finished play in the history: every failure, and other
+    /// endings once audio of the play reached an output.
+    fn finish_play(
+        &mut self,
+        playing: Playing,
+        outcome: HistoryOutcome,
+        error: Option<String>,
+        now: impl FnOnce() -> i64,
+    ) {
         if outcome != HistoryOutcome::Failed && playing.started_at_ms.is_none() {
             return;
         }
@@ -251,6 +290,7 @@ pub struct Restored {
     pub ducking: Ducking,
     pub current: Option<RestoredCurrent>,
     pub queue: Vec<Entry>,
+    pub deck_queues: [Vec<Entry>; DECKS],
     pub next_id: u64,
     pub history: VecDeque<HistoryItem>,
     pub next_history_id: u64,
@@ -289,8 +329,10 @@ pub struct Player {
     state: Mutex<State>,
     wake: Notify,
     packets: broadcast::Sender<Arc<Packet>>,
-    browser: broadcast::Sender<BrowserRecord>,
-    browser_generation: AtomicU64,
+    /// The room's PCM for browser listeners.
+    browser: Feed,
+    /// Each deck's PCM before its channel fader, for headphone cue in a browser.
+    cues: [Feed; DECKS],
     /// Bandwidth limits of the attached connections, by channel.
     limits: Mutex<BTreeMap<usize, u32>>,
     /// When somebody in an attached channel last spoke.
@@ -321,20 +363,84 @@ struct BrowserRecord {
     bytes: Bytes,
 }
 
+/// A bounded live PCM fanout for browsers. A reset (byte 0) starts a new
+/// generation; records of an older one are dropped.
+struct Feed {
+    sender: broadcast::Sender<BrowserRecord>,
+    generation: AtomicU64,
+}
+
+impl Feed {
+    fn new() -> Self {
+        Self {
+            sender: broadcast::channel(BROWSER_FRAMES).0,
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    fn listeners(&self) -> usize {
+        self.sender.receiver_count()
+    }
+
+    /// Called with the state lock held, so a reset cannot precede stale PCM.
+    fn reset(&self) {
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let _ = self.sender.send(BrowserRecord {
+            generation,
+            bytes: Bytes::from_static(&[0]),
+        });
+    }
+
+    /// Sends one frame to the listeners; false without any.
+    fn send(&self, frame: &[f32]) -> bool {
+        if self.listeners() == 0 {
+            return false;
+        }
+        let mut bytes = Vec::with_capacity(1 + FRAME * CHANNELS * 4);
+        bytes.push(1);
+        // The decode worker's PCM is only checked to be finite; browsers
+        // get full scale at most, as the Mumble path's gain stage ensures.
+        for sample in frame {
+            bytes.extend_from_slice(&sample.clamp(-1.0, 1.0).to_le_bytes());
+        }
+        self.sender
+            .send(BrowserRecord {
+                generation: self.generation.load(Ordering::Acquire),
+                bytes: Bytes::from(bytes),
+            })
+            .is_ok()
+    }
+}
+
+/// Which of a player's browser streams a subscription follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Listen {
+    /// What the room hears.
+    Room,
+    /// One deck before its channel fader.
+    Cue(usize),
+}
+
 /// A browser's live PCM subscription. Dropping it releases its listener.
 pub(crate) struct BrowserSubscription {
     records: Option<broadcast::Receiver<BrowserRecord>>,
     owner: Arc<Player>,
+    stream: Listen,
     generation: u64,
     reset: bool,
 }
 
 impl BrowserSubscription {
     pub(crate) async fn recv(&mut self) -> Option<Bytes> {
+        let owner = self.owner.clone();
+        let feed = owner.feed(self.stream);
         loop {
-            let generation = self.owner.browser_generation.load(Ordering::Acquire);
+            let generation = feed.generation.load(Ordering::Acquire);
             if self.generation != generation {
-                self.records = Some(self.owner.browser.subscribe());
+                self.records = Some(feed.sender.subscribe());
                 self.generation = generation;
                 self.reset = true;
             }
@@ -344,14 +450,13 @@ impl BrowserSubscription {
             match self.records.as_mut().unwrap().recv().await {
                 Ok(record) => {
                     if record.generation == self.generation
-                        && record.generation
-                            == self.owner.browser_generation.load(Ordering::Acquire)
+                        && record.generation == feed.generation.load(Ordering::Acquire)
                     {
                         return Some(record.bytes);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    self.records = Some(self.owner.browser.subscribe());
+                    self.records = Some(feed.sender.subscribe());
                     self.reset = true;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -395,12 +500,14 @@ impl Player {
                 next_id: 1,
                 history: VecDeque::new(),
                 next_history_id: 1,
+                dj: None,
+                deck_queues: [VecDeque::new(), VecDeque::new()],
             }),
             wake: Notify::new(),
             // About a second; a slower connection skips ahead.
             packets: broadcast::channel(50).0,
-            browser: broadcast::channel(BROWSER_FRAMES).0,
-            browser_generation: AtomicU64::new(0),
+            browser: Feed::new(),
+            cues: [Feed::new(), Feed::new()],
             limits: Mutex::new(BTreeMap::new()),
             speech: Mutex::new(None),
             changes,
@@ -458,13 +565,15 @@ impl Player {
         subscription
     }
 
-    pub(crate) fn subscribe_browser(self: &Arc<Self>) -> BrowserSubscription {
+    pub(crate) fn subscribe_browser(self: &Arc<Self>, stream: Listen) -> BrowserSubscription {
         // Register at a state boundary, not halfway through sending a frame.
         let _state = self.state();
+        let feed = self.feed(stream);
         let subscription = BrowserSubscription {
-            records: Some(self.browser.subscribe()),
+            records: Some(feed.sender.subscribe()),
             owner: self.clone(),
-            generation: self.browser_generation.load(Ordering::Acquire),
+            stream,
+            generation: feed.generation.load(Ordering::Acquire),
             reset: true,
         };
         self.wake.notify_one();
@@ -472,16 +581,16 @@ impl Player {
         subscription
     }
 
+    fn feed(&self, stream: Listen) -> &Feed {
+        match stream {
+            Listen::Room => &self.browser,
+            Listen::Cue(deck) => &self.cues[deck.min(DECKS - 1)],
+        }
+    }
+
     /// Called with the state lock held, so a reset cannot precede stale PCM.
     fn reset_browser(&self) {
-        let generation = self
-            .browser_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        let _ = self.browser.send(BrowserRecord {
-            generation,
-            bytes: Bytes::from_static(&[0]),
-        });
+        self.browser.reset();
     }
 
     pub(crate) fn update_bandwidth(&self, channel: usize, bandwidth: u32) {
@@ -504,8 +613,14 @@ impl Player {
         }
     }
 
+    /// Mumble channels and browsers that hear the room.
     pub fn listeners(&self) -> usize {
-        self.packets.receiver_count() + self.browser.receiver_count()
+        self.packets.receiver_count() + self.browser.listeners()
+    }
+
+    /// Browsers that hear a deck's cue.
+    pub fn cue_listeners(&self) -> [usize; DECKS] {
+        [0, 1].map(|deck| self.cues[deck].listeners())
     }
 
     /// Adds songs in order at `index` (clamped; `None`: at the end); returns
@@ -589,9 +704,13 @@ impl Player {
                 }
             });
             state.queue = restored.queue.into_iter().take(MAX_QUEUE).collect();
+            state.deck_queues = restored
+                .deck_queues
+                .map(|queue| queue.into_iter().take(MAX_QUEUE).collect());
             let largest = state
                 .queue
                 .iter()
+                .chain(state.deck_queues.iter().flatten())
                 .map(|entry| entry.id)
                 .chain(state.current.iter().map(|playing| playing.entry.id))
                 .max()
@@ -671,33 +790,24 @@ impl Player {
         opus: Option<Vec<u8>>,
         now: impl FnOnce() -> i64,
     ) -> bool {
-        let browser_sent = if self.browser.receiver_count() > 0 {
-            let mut bytes = Vec::with_capacity(1 + FRAME * CHANNELS * 4);
-            bytes.push(1);
-            // The decode worker's PCM is only checked to be finite; browsers
-            // get full scale at most, as the Mumble path's gain stage ensures.
-            for sample in frame.iter() {
-                bytes.extend_from_slice(&sample.clamp(-1.0, 1.0).to_le_bytes());
-            }
-            self.browser
-                .send(BrowserRecord {
-                    generation: self.browser_generation.load(Ordering::Acquire),
-                    bytes: Bytes::from(bytes),
-                })
-                .is_ok()
-        } else {
-            false
-        };
-        let native_sent = opus.is_some_and(|opus| {
-            self.packets
-                .send(Arc::new(Packet { opus, end: false }))
-                .is_ok()
-        });
+        let (browser_sent, native_sent) = self.send_room(frame, opus);
         if browser_sent || native_sent {
             playing.frames = playing.frames.saturating_add(1);
             playing.record_audio(now);
         }
         native_sent
+    }
+
+    /// Sends a frame to browser listeners and its Opus packet to Mumble;
+    /// returns whether each output took it.
+    fn send_room(&self, frame: &[f32], opus: Option<Vec<u8>>) -> (bool, bool) {
+        let browser_sent = self.browser.send(frame);
+        let native_sent = opus.is_some_and(|opus| {
+            self.packets
+                .send(Arc::new(Packet { opus, end: false }))
+                .is_ok()
+        });
+        (browser_sent, native_sent)
     }
 
     fn native_bitrate(&self, configured: u32) -> u32 {
@@ -709,54 +819,77 @@ impl Player {
     }
 
     fn has_output(&self, configured: u32) -> bool {
-        self.browser.receiver_count() > 0 || self.native_bitrate(configured) > 0
+        self.browser.listeners() > 0 || self.native_bitrate(configured) > 0
     }
 
     /// Plays the queue for as long as the program runs.
+    /// `preload` is the bot's preload pool and this player's index in it.
     pub async fn run(
         self: Arc<Self>,
         libraries: Arc<Vec<Library>>,
         configured_bitrate: u32,
         codec_worker: PathBuf,
+        preload: Option<(Arc<crate::preload::Pool>, usize)>,
     ) {
-        let mut encoder = Client::new(Role::Encode, codec_worker.clone());
+        let output = Output::new(
+            Client::new(Role::Encode, codec_worker.clone()),
+            configured_bitrate,
+        );
+        let start = {
+            let libraries = libraries.clone();
+            move |track, start| decode::start(libraries.clone(), codec_worker.clone(), track, start)
+        };
+        self.play(libraries, configured_bitrate, output, start, preload)
+            .await
+    }
+
+    /// The playback loop; `start` starts a decoder for a song.
+    async fn play(
+        self: Arc<Self>,
+        libraries: Arc<Vec<Library>>,
+        configured_bitrate: u32,
+        mut out: Output,
+        mut start: impl FnMut(Track, decode::Start) -> Decoding,
+        preload: Option<(Arc<crate::preload::Pool>, usize)>,
+    ) {
         // At most one raw frame survives an asynchronous encode. A pause or
         // temporarily absent listener cannot consume it without advancing time.
         let mut held: Option<Vec<f32>> = None;
         let mut decoding: Option<Decoding> = None;
-        let mut talking = false;
-        let mut last_bitrate = configured_bitrate;
-        let mut reset_encoder = false;
         let mut underrun = 0;
         let mut deadline: Option<Instant> = None;
-        // The gain of the last frame; changes are ramped so they do not click.
-        let mut gain = 0.0f32;
-        let mut was_ducked = false;
         loop {
+            if self.state().dj.is_some() {
+                // The queue's decoder continues as deck A's when it plays its song.
+                self.run_dj(
+                    &mut out,
+                    configured_bitrate,
+                    &libraries,
+                    &mut start,
+                    (decoding.take(), held.take()),
+                    preload.clone(),
+                )
+                .await;
+                underrun = 0;
+                deadline = None;
+                continue;
+            }
             if self.poll_decoder(&mut decoding, held.is_some()).await {
-                if talking {
-                    self.end(&mut encoder, last_bitrate).await;
-                    talking = false;
+                if out.talking {
+                    self.end(&mut out).await;
                 }
                 continue;
             }
-            if encoder.retirement_pending() {
+            if out.encoder.retirement_pending() {
                 if let Some(running) = decoding.as_mut() {
                     running.request_cancel();
                 }
-                if encoder.close().await.is_err() {
-                    self.wait_for_retirement().await;
+                if !self.retire_encoder(&mut out).await {
                     continue;
                 }
-                reset_encoder = false;
             }
-            if reset_encoder {
-                if let Err(error) = encoder.clear().await {
-                    tracing::warn!("{}: encoder reset failed: {error}", self.name);
-                    sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-                reset_encoder = false;
+            if out.reset_encoder && !self.clear_encoder(&mut out).await {
+                continue;
             }
             let replace = {
                 let mut state = self.state();
@@ -777,9 +910,8 @@ impl Player {
                 if let Some(previous) = decoding.as_mut() {
                     let finished = previous.frames.is_closed() && previous.frames.is_empty();
                     previous.request_cancel();
-                    if talking && !finished {
-                        self.end(&mut encoder, last_bitrate).await;
-                        talking = false;
+                    if out.talking && !finished {
+                        self.end(&mut out).await;
                     }
                     if !previous.retired() {
                         self.wait_for_retirement().await;
@@ -803,9 +935,7 @@ impl Player {
                         (playing.entry.track.clone(), start)
                     })
                 };
-                decoding = request.map(|(track, start)| {
-                    decode::start(libraries.clone(), codec_worker.clone(), track, start)
-                });
+                decoding = request.map(|(track, request)| start(track, request));
                 underrun = 0;
                 deadline = None;
             }
@@ -817,9 +947,8 @@ impl Player {
                 .as_mut()
                 .filter(|_| !paused && self.has_output(configured_bitrate))
             else {
-                if talking {
-                    self.end(&mut encoder, last_bitrate).await;
-                    talking = false;
+                if out.talking {
+                    self.end(&mut out).await;
                 }
                 deadline = None;
                 // Woken by changes; the timeout notices channels leaving.
@@ -838,8 +967,8 @@ impl Player {
                 *next = now;
             }
             let ducked = self.ducked(&ducking);
-            if ducked != was_ducked {
-                was_ducked = ducked;
+            if ducked != out.was_ducked {
+                out.was_ducked = ducked;
                 self.changes.notify();
             }
             let receive = {
@@ -857,17 +986,16 @@ impl Player {
             match receive {
                 Ok(Ok(frame)) => {
                     let bitrate = self.native_bitrate(configured_bitrate);
-                    if talking && bitrate == 0 {
-                        self.end(&mut encoder, last_bitrate).await;
-                        talking = false;
+                    if out.talking && bitrate == 0 {
+                        self.end(&mut out).await;
                     }
                     // Browser-only frames neither wait for nor reset the encoder.
                     let encoded = if bitrate > 0 {
                         let target = target_gain(volume, &ducking, ducked);
-                        let next = next_gain(gain, target);
+                        let next = next_gain(out.gain, target);
                         let mut samples = frame.clone();
-                        apply_gain(&mut samples, gain, next);
-                        Some((encoder.encode(samples, bitrate).await, next))
+                        apply_gain(&mut samples, out.gain, next);
+                        Some((out.encoder.encode(samples, bitrate).await, next))
                     } else {
                         None
                     };
@@ -876,7 +1004,7 @@ impl Player {
                     // while the unique encoder owns its one outstanding request.
                     let mut state = self.state();
                     if !state.matches(running.entry, running.generation) {
-                        reset_encoder |= encoded.is_some();
+                        out.reset_encoder |= encoded.is_some();
                         continue;
                     }
                     if state.paused
@@ -884,13 +1012,13 @@ impl Player {
                         || (encoded.is_some() && self.native_bitrate(configured_bitrate) < bitrate)
                     {
                         held = Some(frame);
-                        reset_encoder |= encoded.is_some();
+                        out.reset_encoder |= encoded.is_some();
                         continue;
                     }
                     let opus = match encoded {
                         Some((Ok(opus), next)) => {
-                            last_bitrate = bitrate;
-                            gain = next;
+                            out.last_bitrate = bitrate;
+                            out.gain = next;
                             Some(opus)
                         }
                         Some((Err(error), _)) => {
@@ -903,7 +1031,7 @@ impl Player {
                         None => None,
                     };
                     let playing = state.current.as_mut().unwrap();
-                    talking |= self.broadcast_frame(playing, &frame, opus, wall_clock_ms);
+                    out.talking |= self.broadcast_frame(playing, &frame, opus, wall_clock_ms);
                     if std::mem::take(&mut playing.buffering) {
                         self.changes.notify();
                     }
@@ -918,9 +1046,8 @@ impl Player {
                 }
                 Err(TryRecvError::Empty) => {
                     underrun += 1;
-                    if underrun == UNDERRUN_END && talking {
-                        self.end(&mut encoder, last_bitrate).await;
-                        talking = false;
+                    if underrun == UNDERRUN_END && out.talking {
+                        self.end(&mut out).await;
                     }
                     let mut state = self.state();
                     if state.matches(running.entry, running.generation)
@@ -986,9 +1113,61 @@ impl Player {
 
     /// A frame of silence that closes the transmission, so clients stop
     /// showing the bot as talking.
-    async fn end(&self, encoder: &mut Client, bitrate: u32) {
-        if let Ok(opus) = encoder.encode(vec![0.; FRAME * CHANNELS], bitrate).await {
+    async fn end(&self, out: &mut Output) {
+        out.talking = false;
+        if let Ok(opus) = out
+            .encoder
+            .encode(vec![0.; FRAME * CHANNELS], out.last_bitrate)
+            .await
+        {
             let _ = self.packets.send(Arc::new(Packet { opus, end: true }));
+        }
+    }
+
+    /// Closes a retiring encoder; false while it still holds its process.
+    async fn retire_encoder(&self, out: &mut Output) -> bool {
+        if out.encoder.close().await.is_err() {
+            self.wait_for_retirement().await;
+            return false;
+        }
+        out.reset_encoder = false;
+        true
+    }
+
+    /// Forgets the encoder's history after a frame it encoded was not sent.
+    async fn clear_encoder(&self, out: &mut Output) -> bool {
+        if let Err(error) = out.encoder.clear().await {
+            tracing::warn!("{}: encoder reset failed: {error}", self.name);
+            sleep(Duration::from_millis(500)).await;
+            return false;
+        }
+        out.reset_encoder = false;
+        true
+    }
+}
+
+/// The encoder and the transmission's state, shared by queue and DJ playback.
+struct Output {
+    encoder: Client,
+    /// Mumble shows the bot talking; a silent end frame closes it.
+    talking: bool,
+    last_bitrate: u32,
+    /// The encoder encoded a frame that was not sent.
+    reset_encoder: bool,
+    /// The gain of the last frame; changes are ramped so they do not click.
+    gain: f32,
+    was_ducked: bool,
+}
+
+impl Output {
+    fn new(encoder: Client, bitrate: u32) -> Self {
+        Self {
+            encoder,
+            talking: false,
+            last_bitrate: bitrate,
+            reset_encoder: false,
+            gain: 0.0,
+            was_ducked: false,
         }
     }
 }
@@ -1049,6 +1228,7 @@ mod tests {
             suffix: None,
             content_type: None,
             cover_art: None,
+            bpm: None,
         }
     }
 
@@ -1210,7 +1390,7 @@ mod tests {
         let player = Arc::new(player());
         let native = player.subscribe(0, 0, 0);
         assert!(!player.has_output(96_000));
-        let mut browser = player.subscribe_browser();
+        let mut browser = player.subscribe_browser(Listen::Room);
         assert_eq!(player.listeners(), 2);
         assert!(player.has_output(96_000));
         assert_eq!(browser.recv().await.unwrap().as_ref(), &[0]);
@@ -1243,8 +1423,8 @@ mod tests {
     async fn browsers_share_original_pcm_and_dual_outputs_count_once() {
         let player = Arc::new(player());
         let mut native = player.subscribe(0, 0, u32::MAX);
-        let mut first = player.subscribe_browser();
-        let mut second = player.subscribe_browser();
+        let mut first = player.subscribe_browser(Listen::Room);
+        let mut second = player.subscribe_browser(Listen::Room);
         assert_eq!(first.recv().await.unwrap().as_ref(), &[0]);
         assert_eq!(second.recv().await.unwrap().as_ref(), &[0]);
         player.enqueue(vec![track("a")], "ada", None);
@@ -1292,7 +1472,7 @@ mod tests {
     #[tokio::test]
     async fn browser_pcm_is_clamped_to_full_scale() {
         let player = Arc::new(player());
-        let mut browser = player.subscribe_browser();
+        let mut browser = player.subscribe_browser(Listen::Room);
         assert_eq!(browser.recv().await.unwrap().as_ref(), &[0]);
         player.enqueue(vec![track("a")], "ada", None);
         start_next(&player);
@@ -1316,7 +1496,7 @@ mod tests {
     #[tokio::test]
     async fn browser_seek_pause_and_skip_reset_without_stale_audio() {
         let player = Arc::new(player());
-        let mut browser = player.subscribe_browser();
+        let mut browser = player.subscribe_browser(Listen::Room);
         assert_eq!(browser.recv().await.unwrap().as_ref(), &[0]);
         player.enqueue(vec![track("a"), track("b")], "ada", None);
         let (entry, generation) = start_next(&player);
@@ -1352,7 +1532,7 @@ mod tests {
     #[tokio::test]
     async fn slow_browser_resets_and_discards_backlog_at_the_live_edge() {
         let player = Arc::new(player());
-        let mut browser = player.subscribe_browser();
+        let mut browser = player.subscribe_browser(Listen::Room);
         assert_eq!(browser.recv().await.unwrap().as_ref(), &[0]);
         player.enqueue(vec![track("a")], "ada", None);
         let (entry, generation) = start_next(&player);
@@ -1500,6 +1680,7 @@ mod tests {
                 played_ms: 80,
             }),
             queue: Vec::new(),
+            deck_queues: Default::default(),
             next_id: 42,
             history: VecDeque::new(),
             next_history_id: 1,
@@ -1713,6 +1894,7 @@ mod tests {
                 played_ms: 0,
             }),
             queue: Vec::new(),
+            deck_queues: Default::default(),
             next_id: 2,
             history: VecDeque::new(),
             next_history_id: 1,

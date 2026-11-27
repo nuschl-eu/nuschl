@@ -88,7 +88,7 @@ impl Cursor {
     }
 
     fn current(&mut self, state: &State, identities: &[LibraryIdentity]) -> Option<Report> {
-        let playing = state.current.as_ref()?;
+        let playing = state.now_playing()?;
         let time = playing.started_at_ms?;
         if playing.played_ms == 0 || self.now_playing == Some(playing.entry.id) {
             return None;
@@ -441,6 +441,7 @@ mod tests {
             suffix: None,
             content_type: None,
             cover_art: None,
+            bpm: None,
         }
     }
 
@@ -471,6 +472,7 @@ mod tests {
                 played_ms,
             }),
             queue: Vec::new(),
+            deck_queues: Default::default(),
             next_id: entry + 1,
             history,
             next_history_id,

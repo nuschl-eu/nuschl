@@ -44,8 +44,8 @@ const MAX_TEXT: usize = 1024;
 const MAX_COUNT: u32 = 100_000;
 /// The requester the bot itself watches the import list as.
 pub const BOT_REQUESTER: &str = "musicbot";
-/// The secret behind the requester pseudonyms, below the state directory.
-const SECRET_FILE: &str = "import_requester.key";
+/// The secret behind the per-person pseudonyms, below the state directory.
+pub const SECRET_FILE: &str = "import_requester.key";
 const SECRET_BYTES: usize = 32;
 
 /// Why a call failed, as viewers learn it.
@@ -428,8 +428,9 @@ fn json<T: DeserializeOwned>(
     }
 }
 
-/// Stable requester pseudonyms: HMAC-SHA256 under a secret kept in the state
-/// directory, over the Mumble server and the person's certificate hash.
+/// Stable per-person pseudonyms: HMAC-SHA256 under a secret kept in the state
+/// directory, over the Mumble server and the person's certificate hash. They
+/// name requesters to the import service and owners of personal playlists.
 pub struct Pseudonyms {
     secret: [u8; SECRET_BYTES],
 }
@@ -486,7 +487,6 @@ fn derive(secret: &[u8], server: &str, certificate: &str) -> String {
 /// What the bot holds for adding music.
 pub struct Adding {
     pub client: Arc<Client>,
-    pub pseudonyms: Pseudonyms,
     /// Index of the library added albums arrive in.
     pub library: usize,
     /// Advances when the import list changes; viewers see it in the state.
@@ -496,21 +496,14 @@ pub struct Adding {
 }
 
 impl Adding {
-    /// Reads the key and the pseudonym secret; fails startup when either is unusable.
-    pub fn open(
-        config: &config::Import,
-        libraries: &[config::Library],
-        state_directory: &Path,
-    ) -> Result<Self, String> {
+    /// Reads the key; fails startup when it is unusable.
+    pub fn open(config: &config::Import, libraries: &[config::Library]) -> Result<Self, String> {
         let library = config
             .library_index(libraries)
             .ok_or("import.library names no [[subsonic]] library")?;
         let key = config.key()?;
-        let pseudonyms =
-            Pseudonyms::load(state_directory).map_err(|error| format!("{SECRET_FILE}: {error}"))?;
         Ok(Self {
             client: Arc::new(Client::new(&config.url, &key)),
-            pseudonyms,
             library,
             revision: AtomicU64::new(0),
             wake: Notify::new(),
@@ -850,9 +843,6 @@ mod tests {
         });
         let adding = Adding {
             client: Arc::new(Client::new(&server.url, "key")),
-            pseudonyms: Pseudonyms {
-                secret: [1; SECRET_BYTES],
-            },
             library: 0,
             revision: AtomicU64::new(0),
             wake: Notify::new(),

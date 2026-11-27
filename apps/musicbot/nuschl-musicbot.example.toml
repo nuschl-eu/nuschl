@@ -25,6 +25,9 @@ ducking = true
 duck_level = 30       # percent of the normal volume while people speak
 duck_hold_ms = 800    # at most 10000
 duck_sensitivity = 50 # percent; higher counts quieter or less clear speech
+# Memory for DJ mode's songs decoded ahead (each deck's song and the next ones),
+# in MiB across all queues; about 11.5 MB per minute of music. 0: decks stream.
+preload_mib = 768
 
 # Music libraries: any Subsonic or OpenSubsonic server (Navidrome, Gonic,
 # Ampache, Airsonic, ...). A search asks all of them.

@@ -9,6 +9,8 @@
   import Progress from "./Progress.svelte";
   import SongRating from "./SongRating.svelte";
   import BrowserListen from "./BrowserListen.svelte";
+  import FavoriteHeart from "./FavoriteHeart.svelte";
+  import Lyrics from "./Lyrics.svelte";
   import { playerStatus } from "./PlayerBar.svelte";
 
   // `onclose(navigated)`: navigated is true when a link or history step moved to another page.
@@ -80,12 +82,15 @@
       </label>
     {/if}
     <div class="top-actions">
+      <button class="icon-btn" class:active={store.bigScreenLyrics} aria-label="Lyrics" aria-pressed={store.bigScreenLyrics} title={store.bigScreenLyrics ? "Show the next songs" : "Show the lyrics"} onclick={() => (store.bigScreenLyrics = !store.bigScreenLyrics)}>
+        <Icon name="lyrics" size={28} />
+      </button>
       {#if canFullscreen}
-        <button class="icon-button" aria-label="Full screen" aria-pressed={fullscreen} title={fullscreen ? "Leave full screen" : "Full screen"} onclick={toggleFullscreen}>
+        <button class="icon-btn" aria-label="Full screen" aria-pressed={fullscreen} title={fullscreen ? "Leave full screen" : "Full screen"} onclick={toggleFullscreen}>
           <Icon name={fullscreen ? "fullscreen-exit" : "fullscreen"} size={28} />
         </button>
       {/if}
-      <button class="icon-button" aria-label="Close big screen" title="Close (Esc)" onclick={() => onclose(false)}>
+      <button class="icon-btn" aria-label="Close big screen" title="Close (Esc)" onclick={() => onclose(false)}>
         <Icon name="close" size={28} />
       </button>
     </div>
@@ -118,7 +123,10 @@
               {:else}{track.album}{/if}
             </div>
           {/if}
-          <div class="rating"><SongRating library={track.library} songId={track.id} title={track.title} namespace={store.browseKey} large /></div>
+          <div class="rating">
+            <SongRating library={track.library} songId={track.id} title={track.title} namespace={store.browseKey} large />
+            <FavoriteHeart library={track.library} songId={track.id} title={track.title} namespace={store.browseKey} size={32} />
+          </div>
         {:else}
           <h2 class="title muted">Nothing is playing</h2>
         {/if}
@@ -138,7 +146,7 @@
           <Icon name={player?.paused ? "play" : "pause"} size={40} />
         </button>
         <div class="controls-end">
-          <button class="icon-button" disabled={!current} aria-label="Skip" title="Skip" onclick={() => store.skip(index)}>
+          <button class="icon-btn" disabled={!current} aria-label="Skip" title="Skip" onclick={() => store.skip(index)}>
             <Icon name="skip" size={32} />
           </button>
         </div>
@@ -154,9 +162,16 @@
 
       <p class="status" class:error={statusError} role="status" title={status ?? ""}>{status ?? ""}</p>
 
-      {#if upcoming.length}
-        <section class="up-next" aria-label="Up next">
-          <h3>Up next</h3>
+      {#if store.bigScreenLyrics && track}
+        <section class="lyrics-panel card" aria-label="Lyrics">
+          <h3 class="eyebrow">Lyrics</h3>
+          {#key `${track.library}:${track.id}`}
+            <Lyrics library={track.library} songId={track.id} title={track.title} namespace={store.browseKey} large />
+          {/key}
+        </section>
+      {:else if upcoming.length}
+        <section class="up-next card" aria-label="Up next">
+          <h3 class="eyebrow">Up next</h3>
           <ol>
             {#each upcoming as entry (entry.id)}
               <li>
@@ -185,7 +200,7 @@
     flex-direction: column;
     overflow-y: auto;
     padding: clamp(0.75rem, 2.5vw, 2rem);
-    background: var(--background);
+    background: var(--bg);
     outline: none;
   }
   .top { display: flex; flex: none; align-items: center; gap: 0.75rem; }
@@ -203,13 +218,14 @@
     padding: 1rem 0;
   }
   .art { width: min(68dvh, 42vw); }
-  .art :global(.cover) { border-radius: 12px; box-shadow: var(--shadow); }
+  .art :global(.cover) { border-radius: calc(var(--radius) + 4px); box-shadow: var(--shadow); }
   .info { display: grid; gap: 1.1rem; min-width: 0; }
   .song { display: grid; gap: 0.35rem; min-width: 0; }
   .title { margin: 0; font-size: clamp(1.6rem, 3.5vw, 3.25rem); line-height: 1.15; overflow-wrap: anywhere; }
+  .title a:not(:hover), .sub a:not(:hover) { color: inherit; }
   .sub { font-size: clamp(1rem, 1.8vw, 1.5rem); color: var(--muted); overflow-wrap: anywhere; }
-  .sub a { color: inherit; }
-  .rating { margin-top: 0.4rem; }
+  .rating { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.4rem; }
+  .rating :global(.heart) { width: 3rem; height: 3rem; }
 
   .controls { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 1rem; }
   .controls-start { display: flex; justify-content: flex-end; min-width: 0; }
@@ -221,29 +237,30 @@
     border: none;
     display: grid;
     place-items: center;
-    background: var(--text);
-    color: var(--background);
-    cursor: pointer;
+    background: var(--accent);
+    color: var(--accent-fg);
+    box-shadow: var(--shadow);
     flex: none;
   }
-  .play:hover:not(:disabled) { background: var(--text); filter: brightness(0.9); }
-  .play:disabled { opacity: 0.4; cursor: default; }
+  .play:hover:not(:disabled) { filter: brightness(1.08); }
+  .play:disabled { opacity: 0.4; }
+  .top .icon-btn, .controls-end .icon-btn { width: 3rem; height: 3rem; }
 
   .volume { display: flex; align-items: center; justify-content: center; gap: 0.6rem; color: var(--muted); }
   .volume input { flex: 1; max-width: 16rem; min-width: 0; }
   .status { min-height: 1.5rem; margin: 0; overflow-wrap: anywhere; text-align: center; color: var(--muted); }
-  .status.error { color: var(--danger); }
+  .status.error { color: var(--error); }
 
-  .up-next { border-top: 1px solid var(--border); padding-top: 0.75rem; min-width: 0; }
-  h3 { margin: 0 0 0.5rem; font-size: 1rem; color: var(--muted); }
-  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
-  li { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
+  .up-next, .lyrics-panel { min-width: 0; padding: 0.75rem; }
+  h3 { margin: 0 0 0.5rem 0.25rem; }
+  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.25rem; }
+  li { display: flex; align-items: center; gap: 0.75rem; min-width: 0; padding: 0.3rem 0.25rem; }
   .entry { flex: 1; min-width: 0; }
   .entry-title, .entry-artist { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .entry-title { font-weight: 500; }
   .entry-artist, .duration, .more { color: var(--muted); font-size: 0.85rem; }
   .duration { flex: none; font-variant-numeric: tabular-nums; }
-  .more { margin: 0.5rem 0 0; }
+  .more { margin: 0.5rem 0 0 0.25rem; }
 
   /* Portrait (phone, rotated screen) or narrow windows: stacked and centred. */
   @media (orientation: portrait), (max-width: 760px) {

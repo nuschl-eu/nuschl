@@ -103,7 +103,12 @@ pub struct Audio {
     pub duck_hold_ms: u32,
     /// How readily sound counts as speech, in percent.
     pub duck_sensitivity: u8,
+    /// Memory for DJ songs decoded ahead, in MiB, up to [`MAX_PRELOAD_MIB`];
+    /// 0 lets decks stream their songs.
+    pub preload_mib: u32,
 }
+
+pub const MAX_PRELOAD_MIB: u32 = 16_384;
 
 impl Default for Audio {
     fn default() -> Self {
@@ -115,6 +120,7 @@ impl Default for Audio {
             duck_level: ducking.level,
             duck_hold_ms: ducking.hold.as_millis() as u32,
             duck_sensitivity: ducking.sensitivity,
+            preload_mib: 768,
         }
     }
 }
@@ -256,6 +262,11 @@ impl Config {
         if self.web.cover_cache_mib > MAX_COVER_CACHE_MIB {
             return Err(format!(
                 "web.cover_cache_mib must be at most {MAX_COVER_CACHE_MIB}"
+            ));
+        }
+        if self.audio.preload_mib > MAX_PRELOAD_MIB {
+            return Err(format!(
+                "audio.preload_mib must be at most {MAX_PRELOAD_MIB}"
             ));
         }
         if !(6_000..=510_000).contains(&self.audio.bitrate) {

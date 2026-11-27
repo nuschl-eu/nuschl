@@ -18,10 +18,20 @@ const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// OpenSubsonic extension names (`getOpenSubsonicExtensions`).
 const TRANSCODING: &str = "transcoding";
 const SONIC_SIMILARITY: &str = "sonicSimilarity";
+const SONG_LYRICS: &str = "songLyrics";
+/// Lyric lines kept from one reply.
+pub const MAX_LYRIC_LINES: usize = 2000;
+/// Characters kept of one lyric line.
+pub const MAX_LYRIC_LINE_CHARS: usize = 500;
 /// Songs asked for and kept from `getSonicSimilarTracks`.
 pub const SONIC_SIMILAR_COUNT: usize = 25;
 /// The most songs asked for and kept from `findSonicPath`, both ends included.
 pub const SONIC_PATH_COUNT: usize = 25;
+/// The longest genre name, in characters, the bot asks a library for; genre
+/// lists hold the genres with names of 1 to this many characters.
+pub const MAX_GENRE_NAME: usize = 200;
+/// The most genres one genre list holds: the first ones by name.
+pub const MAX_GENRES: usize = 2000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -66,6 +76,9 @@ impl Error {
     }
 }
 
+/// The largest BPM taken from a library; larger values read as unknown.
+const MAX_BPM: u32 = 999;
+
 /// A song in one of the libraries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Track {
@@ -85,6 +98,9 @@ pub struct Track {
     pub content_type: Option<String>,
     /// For `getCoverArt`.
     pub cover_art: Option<String>,
+    /// Beats per minute, from OpenSubsonic's `bpm` (1 to 999).
+    #[serde(default)]
+    pub bpm: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -120,6 +136,22 @@ pub struct Playlist {
     pub duration: Option<u32>,
     pub owner: Option<String>,
     pub cover_art: Option<String>,
+}
+
+/// A genre of a library. The counts are `None` when the server gives no usable number.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Genre {
+    pub name: String,
+    pub albums: Option<u32>,
+    pub songs: Option<u32>,
+}
+
+/// A library's genres by name, at most [`MAX_GENRES`].
+#[derive(Debug, Serialize)]
+pub struct Genres {
+    pub genres: Vec<Genre>,
+    /// The library has more genres than the list holds.
+    pub truncated: bool,
 }
 
 /// The album lists of `getAlbumList2` the web page offers.
@@ -178,6 +210,11 @@ pub struct Image {
 
 /// Cover art larger than this is refused.
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How many matches of each kind a library contributes to search suggestions.
+const SUGGEST_SONGS: usize = 5;
+const SUGGEST_ALBUMS: usize = 3;
+const SUGGEST_ARTISTS: usize = 3;
 
 #[derive(Debug, Default)]
 pub struct SearchResult {
@@ -448,12 +485,32 @@ impl Library {
     }
 
     pub fn search(&self, query: &str) -> Result<SearchResult, Error> {
+        self.search3(query, 40, 12, 8)
+    }
+
+    /// A few matches for the suggestions under the search field: at most
+    /// `SUGGEST_SONGS` songs, `SUGGEST_ALBUMS` albums and `SUGGEST_ARTISTS` artists.
+    pub fn suggest(&self, query: &str) -> Result<SearchResult, Error> {
+        let mut found = self.search3(query, SUGGEST_SONGS, SUGGEST_ALBUMS, SUGGEST_ARTISTS)?;
+        found.songs.truncate(SUGGEST_SONGS);
+        found.albums.truncate(SUGGEST_ALBUMS);
+        found.artists.truncate(SUGGEST_ARTISTS);
+        Ok(found)
+    }
+
+    fn search3(
+        &self,
+        query: &str,
+        songs: usize,
+        albums: usize,
+        artists: usize,
+    ) -> Result<SearchResult, Error> {
         let reply = self.call(
             self.get("search3")
                 .query("query", query)
-                .query("songCount", "40")
-                .query("albumCount", "12")
-                .query("artistCount", "8"),
+                .query("songCount", songs.to_string())
+                .query("albumCount", albums.to_string())
+                .query("artistCount", artists.to_string()),
         )?;
         let found = reply.search_result3.unwrap_or_default();
         Ok(SearchResult {
@@ -491,6 +548,32 @@ impl Library {
             play_count: song.play_count,
         };
         Ok((song.track(self.index), details))
+    }
+
+    /// The song's lyrics, `None` when the library has none. Libraries with the
+    /// OpenSubsonic `songLyrics` extension are asked by song id and may answer
+    /// with timed lines; others by the song's artist and title, as plain text.
+    pub fn lyrics(&self, id: &str) -> Result<Option<Lyrics>, Error> {
+        let not_found = |result: Result<Reply, Error>| match result {
+            Err(Error::Api { code: 70, .. }) => Ok(None),
+            other => other.map(Some),
+        };
+        if self.has_extension(SONG_LYRICS) {
+            let reply = not_found(self.call(self.get("getLyricsBySongId").query("id", id)))?;
+            return Ok(reply
+                .and_then(|reply| reply.lyrics_list)
+                .and_then(|list| structured_lyrics(list.structured_lyrics)));
+        }
+        let song = self.song(id)?;
+        let mut request = self.get("getLyrics").query("title", &song.title);
+        if let Some(artist) = &song.artist {
+            request = request.query("artist", artist);
+        }
+        let reply = not_found(self.call(request))?;
+        Ok(reply
+            .and_then(|reply| reply.lyrics)
+            .and_then(|lyrics| lyrics.value)
+            .and_then(|text| plain_lyrics(&text)))
     }
 
     /// One track per album with a song of the same title and artist as
@@ -578,17 +661,84 @@ impl Library {
     }
 
     pub fn album_list(&self, list: AlbumList, size: u32, offset: u32) -> Result<Vec<Album>, Error> {
-        let reply = self.call(
+        self.album_page(
+            self.get("getAlbumList2").query("type", list.name()),
+            size,
+            offset,
+        )
+    }
+
+    /// One page of a genre's albums.
+    pub fn genre_albums(&self, genre: &str, size: u32, offset: u32) -> Result<Vec<Album>, Error> {
+        self.album_page(
             self.get("getAlbumList2")
-                .query("type", list.name())
+                .query("type", "byGenre")
+                .query("genre", genre),
+            size,
+            offset,
+        )
+    }
+
+    /// At most `size` albums of a `getAlbumList2` request, from `offset` on.
+    fn album_page(
+        &self,
+        request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+        size: u32,
+        offset: u32,
+    ) -> Result<Vec<Album>, Error> {
+        let reply = self.call(
+            request
                 .query("size", size.to_string())
                 .query("offset", offset.to_string()),
         )?;
         let albums = reply.album_list2.map(|list| list.album).unwrap_or_default();
         Ok(albums
             .into_iter()
+            .take(size as usize)
             .map(|album| album.album(self.index))
             .collect())
+    }
+
+    /// One page of a genre's songs: at most `count`, from `offset` on.
+    pub fn genre_songs(&self, genre: &str, count: u32, offset: u32) -> Result<Vec<Track>, Error> {
+        let reply = self.call(
+            self.get("getSongsByGenre")
+                .query("genre", genre)
+                .query("count", count.to_string())
+                .query("offset", offset.to_string()),
+        )?;
+        let songs = reply
+            .songs_by_genre
+            .map(|list| list.song)
+            .unwrap_or_default();
+        Ok(songs
+            .into_iter()
+            .take(count as usize)
+            .map(|song| song.track(self.index))
+            .collect())
+    }
+
+    /// The library's genres sorted by name, ignoring case, at most
+    /// [`MAX_GENRES`], each name once. The list holds the genres with names
+    /// of 1 to [`MAX_GENRE_NAME`] characters, the names the bot asks for.
+    pub fn genres(&self) -> Result<Genres, Error> {
+        let reply = self.call(self.get("getGenres"))?;
+        let mut genres: Vec<Genre> = reply
+            .genres
+            .map(|list| list.genre)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(GenreEntry::genre)
+            .collect();
+        genres.sort_unstable_by(|a, b| {
+            let a_folded = a.name.chars().flat_map(char::to_lowercase);
+            let b_folded = b.name.chars().flat_map(char::to_lowercase);
+            a_folded.cmp(b_folded).then_with(|| a.name.cmp(&b.name))
+        });
+        genres.dedup_by(|a, b| a.name == b.name);
+        let truncated = genres.len() > MAX_GENRES;
+        genres.truncate(MAX_GENRES);
+        Ok(Genres { genres, truncated })
     }
 
     pub fn playlists(&self) -> Result<Vec<Playlist>, Error> {
@@ -612,6 +762,75 @@ impl Library {
             .map(|song| song.track(self.index))
             .collect();
         Ok((playlist.info.playlist(self.index), songs))
+    }
+
+    /// Makes an empty playlist owned by the configured account and keeps it
+    /// private there. A playlist that cannot be made private is deleted again.
+    pub fn create_playlist(&self, name: &str) -> Result<Playlist, Error> {
+        let reply = self.call(self.get("createPlaylist").query("name", name))?;
+        let playlist = reply
+            .playlist
+            .ok_or_else(|| missing("playlist"))?
+            .info
+            .playlist(self.index);
+        if let Err(error) = self.update_playlist(&playlist.id, None, Some(false)) {
+            if let Err(cleanup) = self.delete_playlist(&playlist.id) {
+                tracing::warn!("{}: playlist {}: {cleanup}", self.name, playlist.id);
+            }
+            return Err(error);
+        }
+        Ok(playlist)
+    }
+
+    /// Renames a playlist or sets whether the library shows it to its other accounts.
+    pub fn update_playlist(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        public: Option<bool>,
+    ) -> Result<(), Error> {
+        let mut request = self.get("updatePlaylist").query("playlistId", id);
+        if let Some(name) = name {
+            request = request.query("name", name);
+        }
+        if let Some(public) = public {
+            request = request.query("public", if public { "true" } else { "false" });
+        }
+        self.call(request)?;
+        Ok(())
+    }
+
+    /// Appends songs, in requests of a bounded URL length.
+    pub fn add_to_playlist(&self, id: &str, songs: &[String]) -> Result<(), Error> {
+        for chunk in song_chunks(songs) {
+            let mut request = self.get("updatePlaylist").query("playlistId", id);
+            for song in chunk {
+                request = request.query("songIdToAdd", song);
+            }
+            self.call(request)?;
+        }
+        Ok(())
+    }
+
+    /// Removes the songs at `indices` (positions in the playlist). Higher
+    /// positions go first, so each request leaves the remaining ones in place.
+    pub fn remove_from_playlist(&self, id: &str, indices: &[usize]) -> Result<(), Error> {
+        let mut indices = indices.to_vec();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        indices.dedup();
+        for chunk in indices.chunks(PLAYLIST_CHUNK_SONGS) {
+            let mut request = self.get("updatePlaylist").query("playlistId", id);
+            for index in chunk {
+                request = request.query("songIndexToRemove", index.to_string());
+            }
+            self.call(request)?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_playlist(&self, id: &str) -> Result<(), Error> {
+        self.call(self.get("deletePlaylist").query("id", id))?;
+        Ok(())
     }
 
     /// Cover art at most `size` pixels wide, if the server scales it. Only
@@ -724,6 +943,33 @@ impl Library {
             extension,
         })
     }
+}
+
+/// Songs per playlist change request.
+const PLAYLIST_CHUNK_SONGS: usize = 100;
+/// Bytes the song parameters of one request may take, counting every id byte
+/// as percent-encoded, so request URLs stay within common server limits.
+const PLAYLIST_CHUNK_BYTES: usize = 4096;
+
+/// Splits songs into runs whose `songIdToAdd` parameters fit one request.
+fn song_chunks(songs: &[String]) -> Vec<&[String]> {
+    const PARAMETER: usize = "&songIdToAdd=".len();
+    let mut chunks = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (index, song) in songs.iter().enumerate() {
+        let cost = PARAMETER + 3 * song.len();
+        if index > start
+            && (index - start == PLAYLIST_CHUNK_SONGS || bytes + cost > PLAYLIST_CHUNK_BYTES)
+        {
+            chunks.push(&songs[start..index]);
+            (start, bytes) = (index, 0);
+        }
+        bytes += cost;
+    }
+    if start < songs.len() {
+        chunks.push(&songs[start..]);
+    }
+    chunks
 }
 
 pub(crate) fn transport_agent(
@@ -865,11 +1111,133 @@ struct Reply {
     album_list2: Option<AlbumList2>,
     playlists: Option<Playlists>,
     playlist: Option<PlaylistWithSongs>,
+    genres: Option<GenreList>,
+    songs_by_genre: Option<SongsByGenre>,
     #[serde(default)]
     open_subsonic_extensions: Vec<Extension>,
     transcode_decision: Option<TranscodeDecision>,
     #[serde(default)]
     sonic_match: Vec<SonicMatchEntry>,
+    lyrics: Option<PlainLyrics>,
+    lyrics_list: Option<LyricsList>,
+}
+
+/// A song's lyrics as the page shows them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Lyrics {
+    /// Every line has a start time.
+    pub synced: bool,
+    pub lang: Option<String>,
+    pub lines: Vec<LyricLine>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LyricLine {
+    /// When the line begins, in ms from the start of the song; only in synced lyrics.
+    pub start_ms: Option<u64>,
+    pub text: String,
+}
+
+#[derive(Deserialize)]
+struct PlainLyrics {
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LyricsList {
+    #[serde(default)]
+    structured_lyrics: Vec<StructuredLyrics>,
+}
+
+#[derive(Deserialize)]
+struct StructuredLyrics {
+    lang: Option<String>,
+    #[serde(default)]
+    synced: bool,
+    /// Milliseconds; positive shows every line sooner.
+    offset: Option<f64>,
+    #[serde(default)]
+    line: Vec<StructuredLine>,
+}
+
+#[derive(Deserialize)]
+struct StructuredLine {
+    start: Option<f64>,
+    #[serde(default)]
+    value: String,
+}
+
+/// One line of lyrics text: control characters go and long lines are cut.
+fn lyric_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || *character == '\t')
+        .take(MAX_LYRIC_LINE_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// The first synced lyrics with a line, otherwise the first unsynced ones.
+/// Synced lines are ordered by start; the offset applies to every line.
+fn structured_lyrics(all: Vec<StructuredLyrics>) -> Option<Lyrics> {
+    let usable =
+        |lyrics: &StructuredLyrics| lyrics.line.iter().any(|line| !line.value.trim().is_empty());
+    let pick = all
+        .iter()
+        .position(|lyrics| lyrics.synced && usable(lyrics))
+        .or_else(|| all.iter().position(usable))?;
+    let chosen = all.into_iter().nth(pick)?;
+    let offset = chosen
+        .offset
+        .filter(|offset| offset.is_finite())
+        .unwrap_or(0.0);
+    let start = |line: &StructuredLine| {
+        line.start
+            .filter(|start| start.is_finite())
+            .map(|start| (start - offset).clamp(0.0, u64::MAX as f64) as u64)
+    };
+    let synced = chosen.synced && chosen.line.iter().all(|line| start(line).is_some());
+    let mut lines: Vec<LyricLine> = chosen
+        .line
+        .iter()
+        .take(MAX_LYRIC_LINES)
+        .map(|line| LyricLine {
+            start_ms: if synced { start(line) } else { None },
+            text: lyric_text(&line.value),
+        })
+        .collect();
+    if synced {
+        lines.sort_by_key(|line| line.start_ms);
+    }
+    Some(Lyrics {
+        synced,
+        lang: chosen
+            .lang
+            .map(|lang| lyric_text(&lang).chars().take(16).collect())
+            .filter(|lang: &String| !lang.is_empty() && lang != "xxx"),
+        lines,
+    })
+}
+
+/// Plain lyrics split into lines; `None` when only blank lines remain.
+fn plain_lyrics(text: &str) -> Option<Lyrics> {
+    let lines: Vec<LyricLine> = text
+        .lines()
+        .take(MAX_LYRIC_LINES)
+        .map(|line| LyricLine {
+            start_ms: None,
+            text: lyric_text(line),
+        })
+        .collect();
+    lines
+        .iter()
+        .any(|line| !line.text.trim().is_empty())
+        .then_some(Lyrics {
+            synced: false,
+            lang: None,
+            lines,
+        })
 }
 
 #[derive(Deserialize)]
@@ -945,6 +1313,8 @@ struct Song {
     play_count: Option<u64>,
     #[serde(default, deserialize_with = "optional_identifier")]
     cover_art: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    bpm: Option<Scalar>,
 }
 
 /// What a song's page shows besides the queue fields.
@@ -1003,6 +1373,10 @@ impl Song {
             suffix: self.suffix,
             content_type: self.content_type,
             cover_art: self.cover_art,
+            bpm: self
+                .bpm
+                .and_then(Scalar::count)
+                .filter(|bpm| (1..=MAX_BPM).contains(bpm)),
         }
     }
 }
@@ -1105,6 +1479,78 @@ struct AlbumList2 {
 struct Playlists {
     #[serde(default)]
     playlist: Vec<PlaylistEntry>,
+}
+
+#[derive(Deserialize)]
+struct GenreList {
+    #[serde(default)]
+    genre: Vec<GenreEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenreEntry {
+    #[serde(default, deserialize_with = "lenient")]
+    value: Option<Scalar>,
+    #[serde(default, deserialize_with = "lenient")]
+    album_count: Option<Scalar>,
+    #[serde(default, deserialize_with = "lenient")]
+    song_count: Option<Scalar>,
+}
+
+impl GenreEntry {
+    /// The genre, when its name has 1 to [`MAX_GENRE_NAME`] characters.
+    fn genre(self) -> Option<Genre> {
+        let name = match self.value? {
+            Scalar::Text(text) => text,
+            Scalar::Number(number) => number.to_string(),
+        };
+        (!name.is_empty() && name.chars().count() <= MAX_GENRE_NAME).then(|| Genre {
+            name,
+            albums: self.album_count.and_then(Scalar::count),
+            songs: self.song_count.and_then(Scalar::count),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct SongsByGenre {
+    #[serde(default)]
+    song: Vec<Song>,
+}
+
+/// A text or whole-number value of a field servers fill in different ways.
+enum Scalar {
+    Text(String),
+    Number(u64),
+}
+
+impl Scalar {
+    /// A count from a number or a number in text; larger counts read as `u32::MAX`.
+    fn count(self) -> Option<u32> {
+        let number = match self {
+            Self::Number(number) => number,
+            Self::Text(text) => text.trim().parse().ok()?,
+        };
+        Some(u32::try_from(number).unwrap_or(u32::MAX))
+    }
+}
+
+/// Reads text or a whole number; every other value, such as a negative or
+/// fractional number, a list or `null`, reads as `None`.
+fn lenient<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Scalar>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Any {
+        Text(String),
+        Number(u64),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Any::deserialize(deserializer)? {
+        Any::Text(text) => Some(Scalar::Text(text)),
+        Any::Number(number) => Some(Scalar::Number(number)),
+        Any::Other(_) => None,
+    })
 }
 
 #[derive(Deserialize)]
@@ -1292,6 +1738,33 @@ pub(crate) mod tests {
         .song
         .unwrap()
         .track(0)
+    }
+
+    #[test]
+    fn bpm_comes_from_opensubsonic_songs_when_it_is_a_sane_whole_number() {
+        let bpm = |value: &str| {
+            let reply = format!(
+                r#"{{"subsonic-response":{{"status":"ok","song":{{"id":"s","bpm":{value}}}}}}}"#
+            );
+            parse_reply(reply.as_bytes())
+                .unwrap()
+                .song
+                .unwrap()
+                .track(0)
+                .bpm
+        };
+        assert_eq!(bpm("128"), Some(128));
+        assert_eq!(bpm(r#""174""#), Some(174));
+        // Navidrome sends 0 for songs without a BPM tag.
+        for unknown in ["0", "1000", "-5", "120.5", "null", r#""fast""#, "[]"] {
+            assert_eq!(bpm(unknown), None, "{unknown}");
+        }
+        assert_eq!(track().bpm, None);
+        // Queues saved before BPMs existed still load.
+        let saved: Track =
+            serde_json::from_str(r#"{"library":0,"id":"s","title":"t","artist":null,"album":null,"album_id":null,"artist_id":null,"duration":null,"track":null,"suffix":null,"content_type":null,"cover_art":null}"#)
+                .unwrap();
+        assert_eq!(saved.bpm, None);
     }
 
     #[test]
@@ -1794,5 +2267,212 @@ pub(crate) mod tests {
             assert_eq!(AlbumList::parse(list.name()), Some(list));
         }
         assert_eq!(AlbumList::parse("byGenre"), None);
+    }
+
+    #[test]
+    fn playlist_changes_keep_requests_short_and_remove_from_the_end() {
+        let songs: Vec<String> = (0..250).map(|index| format!("s{index}")).collect();
+        let chunks = song_chunks(&songs);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+            [100, 100, 50]
+        );
+        let long: Vec<String> = (0..30).map(|index| format!("{index:0>128}")).collect();
+        let chunks = song_chunks(&long);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), long);
+        for chunk in chunks {
+            let bytes: usize = chunk.iter().map(|song| 13 + 3 * song.len()).sum();
+            assert!(bytes <= PLAYLIST_CHUNK_BYTES, "{bytes}");
+        }
+        assert!(song_chunks(&[]).is_empty());
+
+        let server = Server::new(|request, socket| {
+            let body = if request.starts_with("GET /rest/createPlaylist") {
+                r#"{"subsonic-response":{"status":"ok","playlist":{"id":"p1","name":"Road trip","songCount":0}}}"#
+            } else {
+                r#"{"subsonic-response":{"status":"ok"}}"#
+            };
+            json(socket, body);
+        });
+        let library = library(&server);
+        let made = library.create_playlist("Road trip & more").unwrap();
+        assert_eq!((made.id.as_str(), made.library), ("p1", 0));
+        library.add_to_playlist("p1", &songs[..3]).unwrap();
+        library.remove_from_playlist("p1", &[2, 7, 2, 5]).unwrap();
+        library.update_playlist("p1", Some("New"), None).unwrap();
+        library.delete_playlist("p1").unwrap();
+        let lines: Vec<String> = server
+            .requests()
+            .iter()
+            .map(|request| request.lines().next().unwrap().to_owned())
+            .collect();
+        let expected = [
+            ("createPlaylist", "&name=Road%20trip%20%26%20more "),
+            ("updatePlaylist", "&playlistId=p1&public=false "),
+            (
+                "updatePlaylist",
+                "&playlistId=p1&songIdToAdd=s0&songIdToAdd=s1&songIdToAdd=s2 ",
+            ),
+            (
+                "updatePlaylist",
+                "&playlistId=p1&songIndexToRemove=7&songIndexToRemove=5&songIndexToRemove=2 ",
+            ),
+            ("updatePlaylist", "&playlistId=p1&name=New "),
+            ("deletePlaylist", "&id=p1 "),
+        ];
+        assert_eq!(lines.len(), expected.len(), "{lines:#?}");
+        for (line, (endpoint, ending)) in lines.iter().zip(expected) {
+            assert!(
+                line.starts_with(&format!("GET /rest/{endpoint}?apiKey=private-key&"))
+                    && line.ends_with(&format!("{ending}HTTP/1.1")),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_playlist_that_cannot_be_made_private_is_deleted_again() {
+        let server = Server::new(|request, socket| {
+            let body = if request.starts_with("GET /rest/createPlaylist") {
+                r#"{"subsonic-response":{"status":"ok","playlist":{"id":"p1","name":"x"}}}"#
+            } else if request.starts_with("GET /rest/updatePlaylist") {
+                r#"{"subsonic-response":{"status":"failed","error":{"code":50}}}"#
+            } else {
+                r#"{"subsonic-response":{"status":"ok"}}"#
+            };
+            json(socket, body);
+        });
+        let library = library(&server);
+        assert!(matches!(
+            library.create_playlist("x"),
+            Err(Error::Api { code: 50, .. })
+        ));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("GET /rest/deletePlaylist?"));
+        assert!(requests[2].contains("&id=p1 "));
+    }
+
+    #[test]
+    fn structured_lyrics_prefer_synced_lines_apply_the_offset_and_stay_bounded() {
+        let body = br#"{"subsonic-response":{"status":"ok","lyricsList":{"structuredLyrics":[
+            {"lang":"xxx","synced":false,"line":[{"value":"plain first"}]},
+            {"lang":"eng","synced":true,"offset":500,"line":[
+                {"start":12000,"value":"second\u0007 line  "},
+                {"start":200,"value":"first line"},
+                {"start":30000.5,"value":""}]}]}}}"#;
+        let list = parse_reply(body).unwrap().lyrics_list.unwrap();
+        let lyrics = structured_lyrics(list.structured_lyrics).unwrap();
+        assert!(lyrics.synced);
+        assert_eq!(lyrics.lang.as_deref(), Some("eng"));
+        let lines: Vec<_> = lyrics
+            .lines
+            .iter()
+            .map(|line| (line.start_ms, line.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (Some(0), "first line"),
+                (Some(11500), "second line"),
+                (Some(29500), "")
+            ]
+        );
+
+        // Unsynced lyrics, or synced ones with a line lacking its start, have no times.
+        let body = br#"{"subsonic-response":{"status":"ok","lyricsList":{"structuredLyrics":[
+            {"synced":true,"line":[{"start":1,"value":"a"},{"value":"b"}]}]}}}"#;
+        let list = parse_reply(body).unwrap().lyrics_list.unwrap();
+        let lyrics = structured_lyrics(list.structured_lyrics).unwrap();
+        assert!(!lyrics.synced && lyrics.lines.iter().all(|line| line.start_ms.is_none()));
+        assert_eq!(lyrics.lang, None);
+
+        let blank = br#"{"subsonic-response":{"status":"ok","lyricsList":{"structuredLyrics":[
+            {"synced":true,"line":[{"start":1,"value":"  "}]}]}}}"#;
+        let list = parse_reply(blank).unwrap().lyrics_list.unwrap();
+        assert_eq!(structured_lyrics(list.structured_lyrics), None);
+        assert_eq!(structured_lyrics(Vec::new()), None);
+
+        let long = "é".repeat(MAX_LYRIC_LINE_CHARS + 50);
+        let many = format!("{long}\n").repeat(MAX_LYRIC_LINES + 10);
+        let lyrics = plain_lyrics(&many).unwrap();
+        assert_eq!(lyrics.lines.len(), MAX_LYRIC_LINES);
+        assert_eq!(lyrics.lines[0].text.chars().count(), MAX_LYRIC_LINE_CHARS);
+        assert_eq!(plain_lyrics(" \n\r\n\t"), None);
+        let lyrics = plain_lyrics("One\r\nTwo\n").unwrap();
+        assert!(!lyrics.synced);
+        let texts: Vec<_> = lyrics
+            .lines
+            .iter()
+            .map(|line| (line.start_ms, line.text.as_str()))
+            .collect();
+        assert_eq!(texts, [(None, "One"), (None, "Two")]);
+    }
+
+    #[test]
+    fn lyrics_are_asked_by_song_id_with_the_extension_and_by_artist_and_title_without() {
+        for (extension, missing) in [(true, false), (true, true), (false, false), (false, true)] {
+            let server = Server::new(move |request, socket| {
+                let body = if request.starts_with("GET /rest/getOpenSubsonicExtensions") {
+                    if extension {
+                        r#"{"subsonic-response":{"status":"ok","openSubsonicExtensions":[{"name":"songLyrics","versions":[1]}]}}"#
+                    } else {
+                        r#"{"subsonic-response":{"status":"ok","openSubsonicExtensions":[]}}"#
+                    }
+                } else if request.starts_with("GET /rest/getSong") {
+                    r#"{"subsonic-response":{"status":"ok","song":{"id":"s1","title":"Tide & Time","artist":"Waves"}}}"#
+                } else if missing {
+                    r#"{"subsonic-response":{"status":"failed","error":{"code":70,"message":"not found"}}}"#
+                } else if request.starts_with("GET /rest/getLyricsBySongId") {
+                    r#"{"subsonic-response":{"status":"ok","lyricsList":{"structuredLyrics":[{"synced":true,"line":[{"start":0,"value":"Hi"}]}]}}}"#
+                } else {
+                    r#"{"subsonic-response":{"status":"ok","lyrics":{"artist":"Waves","title":"Tide","value":"Hi\nthere"}}}"#
+                };
+                json(socket, body);
+            });
+            let library = library(&server);
+            let lyrics = library.lyrics("s1").unwrap();
+            let lines: Vec<String> = server
+                .requests()
+                .iter()
+                .map(|request| request.lines().next().unwrap().to_owned())
+                .collect();
+            let last = lines.last().unwrap();
+            if missing {
+                assert_eq!(lyrics, None, "{extension}");
+            }
+            if extension {
+                assert_eq!(lines.len(), 2);
+                assert!(last.starts_with("GET /rest/getLyricsBySongId?"), "{last}");
+                assert!(last.ends_with("&id=s1 HTTP/1.1"), "{last}");
+                if !missing {
+                    let lyrics = lyrics.unwrap();
+                    assert!(lyrics.synced && lyrics.lines[0].start_ms == Some(0));
+                }
+            } else {
+                assert_eq!(lines.len(), 3);
+                assert!(lines[1].starts_with("GET /rest/getSong?"));
+                assert!(last.starts_with("GET /rest/getLyrics?"), "{last}");
+                assert!(
+                    last.ends_with("&title=Tide%20%26%20Time&artist=Waves HTTP/1.1"),
+                    "{last}"
+                );
+                if !missing {
+                    let lyrics = lyrics.unwrap();
+                    assert!(!lyrics.synced && lyrics.lines.len() == 2);
+                }
+            }
+        }
+        // Other failures stay errors with the redacted public message.
+        let server = Server::reply(
+            "application/json",
+            br#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"http://private.example/?apiKey=private-key"}}}"#,
+        );
+        let error = library(&server).lyrics("s1").err().unwrap();
+        assert_eq!(
+            error.public_message(),
+            "the music library rejected the request (error 40)"
+        );
     }
 }

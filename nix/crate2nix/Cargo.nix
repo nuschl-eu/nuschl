@@ -3934,6 +3934,24 @@ rec {
         };
         resolvedDefaultFeatures = [ "default" "experimental" "logging" "prettyplease" "runtime" ];
       };
+      "biquad" = rec {
+        crateName = "biquad";
+        version = "0.6.0";
+        edition = "2024";
+        sha256 = "1d0wkxf3h9ngwx93dgjlygsfzn0wdaz7ygf5plwl2l347x18zvld";
+        authors = [
+          "Emil Fresk <emil.fresk@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "num-traits";
+            packageId = "num-traits";
+            usesDefaultFeatures = false;
+            features = [ "libm" ];
+          }
+        ];
+
+      };
       "bit-set 0.10.0" = rec {
         crateName = "bit-set";
         version = "0.10.0";
@@ -25982,6 +26000,10 @@ rec {
             packageId = "axum";
             usesDefaultFeatures = false;
             features = [ "http1" "json" "query" "tokio" ];
+          }
+          {
+            name = "biquad";
+            packageId = "biquad";
           }
           {
             name = "clap";

@@ -35,8 +35,8 @@
 
 <div class="ducking" bind:this={root}>
   <button
-    class="icon-button"
-    class:on={ducking?.enabled}
+    class="icon-btn"
+    class:active={ducking?.enabled}
     bind:this={button}
     aria-expanded={open}
     aria-controls="{id}-panel"
@@ -47,7 +47,7 @@
     <span class="visually-hidden">Ducking settings</span>
   </button>
   {#if open && ducking}
-    <div class="panel" id="{id}-panel" role="group" aria-label="Ducking">
+    <div class="panel card" id="{id}-panel" role="group" aria-label="Ducking">
       <label class="check">
         <input type="checkbox" checked={ducking.enabled} onchange={(e) => set("enabled", e.currentTarget.checked)} />
         Quieter while someone talks
@@ -76,7 +76,6 @@
 
 <style>
   .ducking { position: relative; }
-  .on { color: var(--accent); }
   .panel {
     position: absolute;
     right: 0;
@@ -86,14 +85,11 @@
     max-height: calc(100dvh - 9rem);
     overflow-y: auto;
     display: grid;
-    gap: 0.35rem;
-    padding: 0.9rem;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    font-size: 0.875rem;
+    gap: 0.3rem;
+    padding: 1rem;
+    font-size: 0.9rem;
   }
-  .check { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.4rem; }
-  input[type="range"], input[type="number"] { width: 100%; margin: 0 0 0.4rem; }
+  label { font-weight: 500; }
+  .check { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; font-weight: 400; }
+  input[type="range"], input[type="number"] { width: 100%; margin: 0 0 0.5rem; }
 </style>

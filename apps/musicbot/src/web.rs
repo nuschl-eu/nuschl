@@ -6,12 +6,15 @@
 //! contract is described in docs/musicbot.md ("Web API").
 use crate::{
     Bot,
-    covers::{CoverKey, IMPORT_NAMESPACE},
+    covers::{CoverKey, IMPORT_NAMESPACE, ImageKey},
     import,
-    player::{BrowserSubscription, Ducking, MAX_DUCK_HOLD},
+    player::{
+        self as playback, BrowserSubscription, Curve, DECKS, DeckSong, DjError, Ducking, Listen,
+        MAX_DUCK_HOLD,
+    },
     subsonic::{
-        self, Album, AlbumList, Artist, Library, LibraryIdentity, Playlist, SongDetails,
-        SonicMatch, Track,
+        self, Album, AlbumList, Artist, Genres, Library, LibraryIdentity, Lyrics, MAX_GENRE_NAME,
+        SongDetails, SonicMatch, Track,
     },
     tokens::Owner,
 };
@@ -28,7 +31,9 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     path::PathBuf,
     pin::Pin,
@@ -36,8 +41,10 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
+use tokio::sync::{OwnedMutexGuard, Semaphore, SemaphorePermit, mpsc};
 use uuid::Uuid;
+
+mod playlists;
 
 /// Searches longer than this are cut.
 const MAX_QUERY: usize = 200;
@@ -49,12 +56,33 @@ static LIBRARY_CALLS: Semaphore = Semaphore::const_new(MAX_LIBRARY_CALLS);
 /// A body owns its slot until the SSE stream ends or is dropped. No waiters.
 const MAX_SSE_WATCHERS: usize = 32;
 static SSE_WATCHERS: Semaphore = Semaphore::const_new(MAX_SSE_WATCHERS);
-/// Includes fetching and the actual isolated worker exit, not HTTP lifetime.
+/// One worker run and its process exit, not HTTP lifetime.
 const MAX_COVER_JOBS: usize = 2;
 static COVER_JOBS: Semaphore = Semaphore::const_new(MAX_COVER_JOBS);
+/// Encoded covers fetched at once. Cover fetches have their own admission, so
+/// they leave [`LIBRARY_CALLS`] to browsing and run while worker jobs are busy.
+const MAX_COVER_FETCHES: usize = 4;
+static COVER_FETCHES: Semaphore = Semaphore::const_new(MAX_COVER_FETCHES);
+/// Uncached covers that may wait for a fetch or a job at once (a page of
+/// albums and some); more are refused at once.
+const MAX_COVER_WAITERS: usize = 64;
+static COVER_WAITERS: Semaphore = Semaphore::const_new(MAX_COVER_WAITERS);
+/// How long an uncached cover waits for a fetch, and then for a job, before
+/// it is refused.
+const COVER_WAIT: Duration = Duration::from_secs(10);
+/// How long a request waits for its worker job; the content worker's own
+/// exchange and exit deadlines are shorter.
+const COVER_JOB_TIMEOUT: Duration = Duration::from_secs(10);
+/// Images being made, each with the lock its maker holds, so byte-identical
+/// covers that arrive together wait for one worker job.
+static MAKING: std::sync::Mutex<BTreeMap<ImageKey, Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::Mutex::new(BTreeMap::new());
 /// Live bodies have their own admission, independent of library metadata calls.
 const MAX_LISTEN_STREAMS: usize = 16;
 static LISTEN_STREAMS: Semaphore = Semaphore::const_new(MAX_LISTEN_STREAMS);
+/// Headphone cue streams of DJ decks, admitted beside the room's listeners.
+const MAX_CUE_STREAMS: usize = 4;
+static CUE_STREAMS: Semaphore = Semaphore::const_new(MAX_CUE_STREAMS);
 /// A listening stream with nothing to send (a paused or waiting queue) sends
 /// this one-byte record at least this often, so proxies with read timeouts
 /// (nginx defaults to 60 s) keep it open.
@@ -62,8 +90,15 @@ const LISTEN_KEEPALIVE: Duration = Duration::from_secs(15);
 const KEEPALIVE_RECORD: &[u8] = &[2];
 /// Albums per page of an album list.
 const PAGE_SIZE: u32 = 48;
+/// Songs per page of a genre's songs.
+const GENRE_SONGS_PAGE: u32 = 50;
+/// The last page number a paged list asks for.
+const MAX_PAGE: u32 = 10_000;
 /// Changes that come in a burst are sent as one state.
 const COALESCE: Duration = Duration::from_millis(50);
+/// A viewer receives at most one state event in this time, so controls moved
+/// thirty times a second (DJ faders) cost at most ten snapshots a second.
+const MIN_EVENT_GAP: Duration = Duration::from_millis(100);
 const INVALID_LINK: &str =
     "This link is not valid (any more). Send !web to the music bot in Mumble for a new one.";
 /// Remembers the browser's own link, so token-free shared URLs can open it.
@@ -84,17 +119,36 @@ pub fn router(bot: Arc<Bot>) -> Router {
         .route("/u/{token}/api/history", get(history))
         .route("/u/{token}/api/events", get(events))
         .route("/u/{token}/api/listen", get(listen))
+        .route("/u/{token}/api/cue", get(cue))
+        .route("/u/{token}/api/dj", post(dj))
+        .route("/u/{token}/api/spectrum", get(spectrum))
+        .route("/u/{token}/api/spectrum/overview", get(spectrum_overview))
         .route("/u/{token}/api/command", post(command))
         .route("/u/{token}/api/rating", get(rating).post(set_rating))
         .route("/u/{token}/api/albums", get(albums))
         .route("/u/{token}/api/album", get(album))
         .route("/u/{token}/api/artists", get(artists))
         .route("/u/{token}/api/artist", get(artist))
-        .route("/u/{token}/api/playlists", get(playlists))
-        .route("/u/{token}/api/playlist", get(playlist))
+        .route("/u/{token}/api/genres", get(genres))
+        .route("/u/{token}/api/genre/albums", get(genre_albums))
+        .route("/u/{token}/api/genre/songs", get(genre_songs))
+        .route("/u/{token}/api/playlists", get(playlists::list))
+        .route("/u/{token}/api/playlist", get(playlists::detail))
+        .route("/u/{token}/api/playlists/create", post(playlists::create))
+        .route("/u/{token}/api/playlists/rename", post(playlists::rename))
+        .route("/u/{token}/api/playlists/share", post(playlists::share))
+        .route("/u/{token}/api/playlists/delete", post(playlists::delete))
+        .route("/u/{token}/api/playlists/add", post(playlists::add))
+        .route("/u/{token}/api/playlists/remove", post(playlists::remove))
+        .route(
+            "/u/{token}/api/favorites",
+            get(playlists::favorite).post(playlists::set_favorite),
+        )
         .route("/u/{token}/api/search", get(search))
+        .route("/u/{token}/api/suggest", get(suggest))
         .route("/u/{token}/api/song", get(song))
         .route("/u/{token}/api/similar", get(similar))
+        .route("/u/{token}/api/lyrics", get(lyrics))
         .route("/u/{token}/api/path", get(sonic_path))
         .route("/u/{token}/api/forget", post(forget))
         .route("/u/{token}/api/import/search", get(import_search))
@@ -291,14 +345,42 @@ async fn admitted_call<T: Send + 'static, E: Send + 'static>(
     call: impl FnOnce() -> Result<T, E> + Send + 'static,
 ) -> Result<T, CallFailure<E>> {
     let permit = admission.try_acquire().map_err(|_| CallFailure::Busy)?;
-    let task = tokio::task::spawn_blocking(move || {
+    blocking_call(timeout, move || {
         let _permit = permit;
         call()
-    });
-    match tokio::time::timeout(timeout, task).await {
+    })
+    .await
+}
+
+/// Runs a blocking call; whatever `call` owns, an admission permit included,
+/// stays held until the call returns, also after its caller stopped waiting.
+async fn blocking_call<T: Send + 'static, E: Send + 'static>(
+    timeout: Duration,
+    call: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, CallFailure<E>> {
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(call)).await {
         Ok(Ok(result)) => result.map_err(CallFailure::Failed),
         Ok(Err(_)) => Err(CallFailure::Crashed),
         Err(_) => Err(CallFailure::TimedOut),
+    }
+}
+
+/// The library's redacted error for an admitted call that ended without a result.
+fn library_failure(failure: CallFailure<subsonic::Error>) -> ApiError {
+    match failure {
+        CallFailure::Busy => ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the music library is busy".to_owned(),
+        ),
+        CallFailure::Failed(error) => ApiError(StatusCode::BAD_GATEWAY, error.public_message()),
+        CallFailure::Crashed => ApiError(
+            StatusCode::BAD_GATEWAY,
+            "the music library request failed".to_owned(),
+        ),
+        CallFailure::TimedOut => ApiError(
+            StatusCode::BAD_GATEWAY,
+            "the library did not answer in time".to_owned(),
+        ),
     }
 }
 
@@ -310,21 +392,18 @@ async fn blocking_library_call<T: Send + 'static>(
 ) -> Result<T, ApiError> {
     admitted_call(admission, timeout, call)
         .await
-        .map_err(|failure| match failure {
-            CallFailure::Busy => ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the music library is busy".to_owned(),
-            ),
-            CallFailure::Failed(error) => ApiError(StatusCode::BAD_GATEWAY, error.public_message()),
-            CallFailure::Crashed => ApiError(
-                StatusCode::BAD_GATEWAY,
-                "the music library request failed".to_owned(),
-            ),
-            CallFailure::TimedOut => ApiError(
-                StatusCode::BAD_GATEWAY,
-                "the library did not answer in time".to_owned(),
-            ),
-        })
+        .map_err(library_failure)
+}
+
+fn known_library(bot: &Bot, library: usize) -> Result<(), ApiError> {
+    if library < bot.libraries.len() {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "no such library".to_owned(),
+        ))
+    }
 }
 
 /// Runs a blocking library call with shared process-wide admission.
@@ -333,17 +412,46 @@ async fn ask<T: Send + 'static>(
     library: usize,
     call: impl FnOnce(&Library) -> Result<T, subsonic::Error> + Send + 'static,
 ) -> Result<T, ApiError> {
-    if library >= bot.libraries.len() {
-        return Err(ApiError(
-            StatusCode::BAD_GATEWAY,
-            "no such library".to_owned(),
-        ));
-    }
+    known_library(bot, library)?;
     let libraries = bot.libraries.clone();
     blocking_library_call(&LIBRARY_CALLS, LIBRARY_TIMEOUT, move || {
         call(&libraries[library])
     })
     .await
+}
+
+/// How a checked library call failed: the library's error, or a refusal the
+/// call found while it ran, for example after re-reading what it changes.
+enum Checked {
+    Library(subsonic::Error),
+    Refused(ApiError),
+}
+
+impl From<subsonic::Error> for Checked {
+    fn from(error: subsonic::Error) -> Self {
+        Self::Library(error)
+    }
+}
+
+/// [`ask`] for calls that may refuse with their own status.
+async fn ask_checked<T: Send + 'static>(
+    bot: &Bot,
+    library: usize,
+    call: impl FnOnce(&Library) -> Result<T, Checked> + Send + 'static,
+) -> Result<T, ApiError> {
+    known_library(bot, library)?;
+    let libraries = bot.libraries.clone();
+    admitted_call(&LIBRARY_CALLS, LIBRARY_TIMEOUT, move || {
+        call(&libraries[library])
+    })
+    .await
+    .map_err(|failure| match failure {
+        CallFailure::Failed(Checked::Refused(error)) => error,
+        CallFailure::Failed(Checked::Library(error)) => library_failure(CallFailure::Failed(error)),
+        CallFailure::Busy => library_failure(CallFailure::Busy),
+        CallFailure::Crashed => library_failure(CallFailure::Crashed),
+        CallFailure::TimedOut => library_failure(CallFailure::TimedOut),
+    })
 }
 
 /// The bot's public address: the page for a browser that opened its own link,
@@ -615,17 +723,9 @@ async fn art(
     let body = match cached {
         Some(body) => body,
         None => {
-            let (owned, id) = (bot.clone(), key.1.clone());
-            let image = async move {
-                ask(&owned, library, move |library| library.cover_art(&id, size))
-                    .await
-                    .map(|image| image.bytes)
-                    .map_err(|error| match error.0 {
-                        StatusCode::SERVICE_UNAVAILABLE => error,
-                        _ => ApiError(StatusCode::NOT_FOUND, error.1),
-                    })
-            };
-            fetch_cover(&bot, key, image).await?
+            let (libraries, id) = (bot.libraries.clone(), key.1.clone());
+            let image = move |fetch| library_image(libraries, library, id, size, fetch);
+            fetch_cover(&bot, key, image, worker_thumbnail).await?
         }
     };
     owner(&bot, &token)?;
@@ -644,56 +744,139 @@ async fn art(
         .into_response())
 }
 
-/// Fetches a cover that is not cached, has the content worker re-encode it,
-/// and caches it, even when the HTTP client has gone by then. `image` fetches
-/// the encoded cover; it runs only once a worker job is admitted.
-async fn fetch_cover(
+/// A library's encoded cover; the call holds `fetch` until its transport is
+/// done. A busy library gives 503; other failures give 404.
+async fn library_image(
+    libraries: Arc<Vec<Library>>,
+    library: usize,
+    id: String,
+    size: u32,
+    fetch: SemaphorePermit<'static>,
+) -> Result<Vec<u8>, ApiError> {
+    blocking_call(LIBRARY_TIMEOUT, move || {
+        let _fetch = fetch;
+        libraries[library].cover_art(&id, size)
+    })
+    .await
+    .map(|image| image.bytes)
+    .map_err(|failure| match library_failure(failure) {
+        error if error.0 == StatusCode::SERVICE_UNAVAILABLE => error,
+        error => ApiError(StatusCode::NOT_FOUND, error.1),
+    })
+}
+
+/// Makes an uncached cover and caches it, even when the HTTP client
+/// has gone by then. With at most [`MAX_COVER_WAITERS`] requests on the way, a
+/// request waits up to [`COVER_WAIT`] for one of [`MAX_COVER_FETCHES`] fetch
+/// permits; a cover another request finished meanwhile comes from the cache,
+/// and otherwise `image` fetches the encoded cover, holding the permit until
+/// its transport is done. A PNG the worker already made from the same bytes
+/// at this size comes from memory. Otherwise the request waits for the image's
+/// turn, so identical images arriving together take one job, and then up to
+/// [`COVER_WAIT`] for one of [`MAX_COVER_JOBS`] jobs, in which `convert` makes
+/// the PNG.
+async fn fetch_cover<I, F, C, R>(
     bot: &Arc<Bot>,
     key: CoverKey,
-    image: impl Future<Output = Result<Vec<u8>, ApiError>> + Send + 'static,
-) -> Result<Bytes, ApiError> {
-    let permit = COVER_JOBS.try_acquire().map_err(|_| {
+    image: I,
+    convert: C,
+) -> Result<Bytes, ApiError>
+where
+    I: FnOnce(SemaphorePermit<'static>) -> F,
+    F: Future<Output = Result<Vec<u8>, ApiError>>,
+    C: FnOnce(Vec<u8>, u32) -> R + Send + 'static,
+    R: Future<Output = Result<Bytes, ApiError>> + Send + 'static,
+{
+    let busy = || {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "the artwork worker is busy".to_owned(),
         )
-    })?;
-    let size = key.2;
-    let worker = content_worker_path(&std::env::current_exe().map_err(|_| {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the artwork worker is unavailable".to_owned(),
-        )
-    })?)?;
+    };
+    let waiting = COVER_WAITERS.try_acquire().map_err(|_| busy())?;
+    let fetch = tokio::time::timeout(COVER_WAIT, COVER_FETCHES.acquire())
+        .await
+        .map_err(|_| busy())?
+        .map_err(|_| busy())?;
+    if let Some(body) = bot.covers.get(&key).await {
+        return Ok(body);
+    }
+    let image = image(fetch).await?;
+    let made: ImageKey = (Sha256::digest(&image).into(), key.2);
+    if let Some(body) = bot.covers.made(&made) {
+        return Ok(keep(bot, key, body).await);
+    }
+    let turn = tokio::time::timeout(COVER_WAIT, image_turn(made))
+        .await
+        .map_err(|_| busy())?;
+    if let Some(body) = bot.covers.made(&made) {
+        return Ok(keep(bot, key, body).await);
+    }
+    let job = tokio::time::timeout(COVER_WAIT, COVER_JOBS.acquire())
+        .await
+        .map_err(|_| busy())?
+        .map_err(|_| busy())?;
+    drop(waiting);
     let owned = bot.clone();
     let task = tokio::spawn(async move {
-        let _permit = permit;
-        let image = image.await?;
-        if !worker.is_file() {
-            return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the artwork worker is unavailable".to_owned(),
-            ));
-        }
-        let thumbnail = nuschl_ipc::host::thumbnail(&worker, &image, size, size)
-            .await
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::NOT_FOUND,
-                    "the cover image is invalid or unavailable".to_owned(),
-                )
-            })?;
-        let body = Bytes::from(thumbnail.png);
+        let (_turn, _job) = (turn, job);
+        let body = convert(image, made.1).await?;
+        owned.covers.remember(made, body.clone());
         owned.covers.insert(&key, &body).await;
         Ok::<_, ApiError>(body)
     });
-    match tokio::time::timeout(LIBRARY_TIMEOUT + Duration::from_secs(10), task).await {
+    match tokio::time::timeout(COVER_JOB_TIMEOUT, task).await {
         Ok(Ok(result)) => result,
         _ => Err(ApiError(
             StatusCode::GATEWAY_TIMEOUT,
             "the artwork worker did not finish in time".to_owned(),
         )),
     }
+}
+
+/// The right to make the PNG for `image`; its holder is the only request
+/// making it. Entries nobody holds or waits for leave the map here.
+async fn image_turn(image: ImageKey) -> OwnedMutexGuard<()> {
+    let lock = {
+        let mut making = MAKING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        making.retain(|_, lock| Arc::strong_count(lock) > 1);
+        making.entry(image).or_default().clone()
+    };
+    lock.lock_owned().await
+}
+
+/// Caches a PNG made for another key under `key` as well, even when the HTTP
+/// client has gone by then.
+async fn keep(bot: &Arc<Bot>, key: CoverKey, body: Bytes) -> Bytes {
+    let (owned, kept) = (bot.clone(), body.clone());
+    let _ = tokio::spawn(async move { owned.covers.insert(&key, &kept).await }).await;
+    body
+}
+
+/// Has the confined content worker re-encode `image` as a PNG of at most
+/// `size` pixels per edge.
+async fn worker_thumbnail(image: Vec<u8>, size: u32) -> Result<Bytes, ApiError> {
+    let unavailable = || {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the artwork worker is unavailable".to_owned(),
+        )
+    };
+    let worker = content_worker_path(&std::env::current_exe().map_err(|_| unavailable())?)?;
+    if !worker.is_file() {
+        return Err(unavailable());
+    }
+    nuschl_ipc::host::thumbnail(&worker, &image, size, size)
+        .await
+        .map(|thumbnail| Bytes::from(thumbnail.png))
+        .map_err(|_| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "the cover image is invalid or unavailable".to_owned(),
+            )
+        })
 }
 
 #[derive(Serialize)]
@@ -708,9 +891,19 @@ struct StateView {
     players: Vec<PlayerView>,
     channels: Vec<ChannelView>,
     rating_revision: u64,
+    playlists: PlaylistStateView,
     /// Adding music, when configured: the library added albums arrive in and
     /// a revision that advances when the import list changes.
     import: Option<ImportStateView>,
+}
+
+/// Personal playlists: a revision that advances after every change, and
+/// whether this viewer may own and edit playlists (their Mumble client has a
+/// certificate).
+#[derive(Serialize)]
+struct PlaylistStateView {
+    revision: u64,
+    can_own: bool,
 }
 
 #[derive(Serialize)]
@@ -731,6 +924,81 @@ struct PlayerView {
     current: Option<CurrentView>,
     queue: Vec<EntryView>,
     history_revision: u64,
+    /// DJ mode, while it is on.
+    dj: Option<DjView>,
+    /// DJ mode's queue per deck, kept while DJ mode is off.
+    deck_queues: [Vec<EntryView>; DECKS],
+}
+
+#[derive(Serialize)]
+struct DjView {
+    decks: Vec<DeckView>,
+    /// −1 (deck A) to 1 (deck B).
+    crossfader: f32,
+    curve: Curve,
+    transition: Option<TransitionView>,
+    auto_load: bool,
+    notice: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DeckView {
+    entry: Option<EntryView>,
+    /// Song time; it advances `tempo` percent faster than real time.
+    position_ms: u64,
+    playing: bool,
+    buffering: bool,
+    advancing: bool,
+    cue_ms: u64,
+    volume: u8,
+    eq: EqView,
+    filter: f32,
+    /// Percent.
+    tempo: f64,
+    tempo_range: u8,
+    /// The song's BPM before the tempo: the library's, else the estimate.
+    bpm: Option<f64>,
+    /// "library" or "estimate".
+    bpm_source: Option<&'static str>,
+    /// The BPM estimate or beat grid is being computed.
+    analysing: bool,
+    /// How much of the song is decoded in memory; null while the deck streams.
+    loaded_ms: Option<u64>,
+    /// The whole song is in memory.
+    preloaded: bool,
+    #[serde(rename = "loop")]
+    looping: Option<LoopView>,
+    quantize: bool,
+    grid: Option<GridView>,
+    error: Option<String>,
+    cue_listeners: usize,
+}
+
+#[derive(Serialize)]
+struct LoopView {
+    start_ms: f64,
+    end_ms: Option<f64>,
+    active: bool,
+}
+
+#[derive(Serialize)]
+struct GridView {
+    bpm: f64,
+    first_beat_ms: f64,
+}
+
+#[derive(Serialize)]
+struct EqView {
+    low: f32,
+    mid: f32,
+    high: f32,
+}
+
+#[derive(Serialize)]
+struct TransitionView {
+    to: usize,
+    duration_ms: u64,
+    elapsed_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -768,7 +1036,7 @@ struct ChannelView {
 }
 
 /// Everything the app shows, as one snapshot.
-fn snapshot(bot: &Bot, you: &str) -> StateView {
+fn snapshot(bot: &Bot, you: &Owner) -> StateView {
     let players = bot
         .players
         .iter()
@@ -801,6 +1069,74 @@ fn snapshot(bot: &Bot, you: &str) -> StateView {
                 }),
                 queue: state.queue.iter().map(entry).collect(),
                 history_revision: state.next_history_id.saturating_sub(1),
+                deck_queues: state
+                    .deck_queues
+                    .each_ref()
+                    .map(|queue| queue.iter().map(entry).collect()),
+                dj: state.dj.as_ref().map(|dj| {
+                    let cue_listeners = player.cue_listeners();
+                    let running =
+                        !state.paused && (listeners > 0 || cue_listeners.iter().any(|n| *n > 0));
+                    DjView {
+                        decks: dj
+                            .decks
+                            .iter()
+                            .zip(cue_listeners)
+                            .map(|(deck, cue_listeners)| {
+                                let buffering =
+                                    deck.track.as_ref().is_some_and(|playing| playing.buffering);
+                                DeckView {
+                                    entry: deck.track.as_ref().map(|playing| entry(&playing.entry)),
+                                    position_ms: deck.position_ms(),
+                                    playing: deck.playing,
+                                    buffering,
+                                    advancing: running
+                                        && deck.playing
+                                        && deck.track.is_some()
+                                        && !buffering,
+                                    cue_ms: deck.cue_ms(),
+                                    volume: deck.volume,
+                                    eq: EqView {
+                                        low: deck.eq[0],
+                                        mid: deck.eq[1],
+                                        high: deck.eq[2],
+                                    },
+                                    filter: deck.filter,
+                                    tempo: (f64::from(deck.tempo) * 1e6).round() / 1e4,
+                                    tempo_range: deck.range,
+                                    bpm: deck.base_bpm().map(|bpm| (bpm * 10.0).round() / 10.0),
+                                    bpm_source: deck.bpm_from_library().map(|library| {
+                                        if library { "library" } else { "estimate" }
+                                    }),
+                                    analysing: deck.analysing,
+                                    loaded_ms: deck.loaded.map(|frames| frames / 48),
+                                    preloaded: deck.preloaded,
+                                    looping: deck.looping.map(|looping| LoopView {
+                                        start_ms: looping.start / 48.0,
+                                        end_ms: looping.end.map(|end| end / 48.0),
+                                        active: looping.active,
+                                    }),
+                                    quantize: deck.quantize,
+                                    grid: deck.grid.map(|grid| GridView {
+                                        bpm: grid.bpm,
+                                        first_beat_ms: grid.first / 48.0,
+                                    }),
+                                    error: deck.error.clone(),
+                                    cue_listeners,
+                                }
+                            })
+                            .collect(),
+                        crossfader: dj.crossfader,
+                        curve: dj.curve,
+                        transition: dj.transition.map(|transition| TransitionView {
+                            to: transition.to,
+                            duration_ms: transition.duration_ms(),
+                            elapsed_ms: transition.elapsed_ms(),
+                        }),
+                        auto_load: dj.auto_load,
+                        notice: dj.notice.clone(),
+                    }
+                }),
             }
         })
         .collect();
@@ -821,7 +1157,7 @@ fn snapshot(bot: &Bot, you: &str) -> StateView {
         })
         .collect();
     StateView {
-        you: you.to_owned(),
+        you: you.name.clone(),
         libraries: bot
             .libraries
             .iter()
@@ -840,6 +1176,10 @@ fn snapshot(bot: &Bot, you: &str) -> StateView {
         players,
         channels,
         rating_revision: bot.rating_revision.load(Ordering::SeqCst),
+        playlists: PlaylistStateView {
+            revision: bot.playlists.revision(),
+            can_own: crate::playlists::can_own(you),
+        },
         import: bot.adding.as_ref().map(|adding| ImportStateView {
             library: adding.library,
             revision: adding.revision.load(Ordering::SeqCst),
@@ -852,7 +1192,7 @@ async fn state(
     Path(token): Path<String>,
 ) -> Result<Json<StateView>, ApiError> {
     let owner = owner(&bot, &token)?;
-    Ok(Json(snapshot(&bot, &owner.name)))
+    Ok(Json(snapshot(&bot, &owner)))
 }
 
 #[derive(Deserialize)]
@@ -1024,13 +1364,35 @@ async fn listen(
     Path(token): Path<String>,
     Query(query): Query<ListenQuery>,
 ) -> Result<Response, ApiError> {
-    listen_response(bot, token, query.player, &LISTEN_STREAMS)
+    listen_response(bot, token, query.player, Listen::Room, &LISTEN_STREAMS)
+}
+
+#[derive(Deserialize)]
+struct CueQuery {
+    player: usize,
+    deck: usize,
+}
+
+/// A DJ deck's audio before its channel fader, for headphones in a browser.
+async fn cue(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    Query(query): Query<CueQuery>,
+) -> Result<Response, ApiError> {
+    listen_response(
+        bot,
+        token,
+        query.player,
+        Listen::Cue(query.deck),
+        &CUE_STREAMS,
+    )
 }
 
 fn listen_response(
     bot: Arc<Bot>,
     token: String,
     index: usize,
+    stream: Listen,
     admission: &'static Semaphore,
 ) -> Result<Response, ApiError> {
     let token = Uuid::parse_str(&token)
@@ -1038,6 +1400,11 @@ fn listen_response(
         .filter(|token| bot.tokens.is_valid(token))
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, INVALID_LINK.to_owned()))?;
     let player = bot.players.get(index).ok_or_else(|| bad("no such queue"))?;
+    if let Listen::Cue(deck) = stream
+        && deck >= DECKS
+    {
+        return Err(bad("no such deck"));
+    }
     let permit = admission.try_acquire().map_err(|_| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1045,7 +1412,7 @@ fn listen_response(
         )
     })?;
     let lease = ListenLease {
-        subscription: player.subscribe_browser(),
+        subscription: player.subscribe_browser(stream),
         _permit: permit,
     };
     // Only one record may leave the shared live fanout before the body polls.
@@ -1135,22 +1502,24 @@ fn state_stream(
     permit: tokio::sync::SemaphorePermit<'static>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     futures_util::stream::unfold(
-        (bot, token, changes, true, permit),
-        |(bot, token, mut changes, first, permit)| async move {
-            if !first {
+        (bot, token, changes, None::<tokio::time::Instant>, permit),
+        |(bot, token, mut changes, last, permit)| async move {
+            if let Some(last) = last {
                 tokio::select! {
                     result = changes.changed() => { result.ok()?; }
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 }
                 tokio::time::sleep(COALESCE).await;
+                tokio::time::sleep_until(last + MIN_EVENT_GAP).await;
             }
             changes.borrow_and_update();
             let owner = owner(&bot, &token).ok()?;
             let event = Event::default()
                 .event("state")
-                .json_data(snapshot(&bot, &owner.name))
+                .json_data(snapshot(&bot, &owner))
                 .ok()?;
-            Some((Ok(event), (bot, token, changes, false, permit)))
+            let sent = Some(tokio::time::Instant::now());
+            Some((Ok(event), (bot, token, changes, sent, permit)))
         },
     )
 }
@@ -1165,6 +1534,8 @@ enum Kind {
     Similar,
     /// The songs leading from `id` to `to` by sound.
     Path,
+    /// One page of a genre's songs: `id` is the genre's name, `page` the page.
+    Genre,
 }
 
 #[derive(Deserialize)]
@@ -1211,6 +1582,8 @@ enum Command {
         id: String,
         /// The song a `path` ends with.
         to: Option<String>,
+        /// The page of a `genre`'s songs, from 0.
+        page: Option<u32>,
         index: Option<usize>,
     },
     Attach {
@@ -1269,6 +1642,7 @@ async fn command(
             library,
             id,
             to,
+            page,
             index,
             ..
         } => {
@@ -1276,6 +1650,11 @@ async fn command(
                 Kind::Path => to.ok_or_else(|| bad("a sonic path needs the song it ends with"))?,
                 _ => String::new(),
             };
+            let id = match kind {
+                Kind::Genre => genre_name(id)?,
+                _ => id,
+            };
+            let offset = page.unwrap_or(0).min(MAX_PAGE) * GENRE_SONGS_PAGE;
             let sonic = |matches: Vec<SonicMatch>| -> Vec<Track> {
                 matches.into_iter().map(|found| found.track).collect()
             };
@@ -1283,10 +1662,12 @@ async fn command(
                 Kind::Album => library.album(&id).map(|(_, songs)| songs),
                 Kind::Playlist => library.playlist(&id).map(|(_, songs)| songs),
                 Kind::Song => library.song(&id).map(|song| vec![song]),
-                Kind::Similar => library
-                    .sonic_similar(&id)
-                    .map(|matches| sonic(without_identical(matches, &id))),
+                Kind::Similar => {
+                    let matches = library.sonic_similar(&id)?;
+                    Ok(sonic(distinct_similar(matches, &library.song(&id)?)))
+                }
                 Kind::Path => library.sonic_path(&id, &to).map(sonic),
+                Kind::Genre => library.genre_songs(&id, GENRE_SONGS_PAGE, offset),
             })
             .await?;
             let tracks = match kind {
@@ -1294,8 +1675,7 @@ async fn command(
                     let identity = bot.libraries[library].identity();
                     let state = player.state();
                     let playing = state
-                        .current
-                        .as_ref()
+                        .now_playing()
                         .map(|playing| (playing.source.as_ref(), playing.entry.track.id.as_str()));
                     continue_path(tracks, playing, &identity)
                 }
@@ -1316,16 +1696,594 @@ async fn command(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Similar songs without those that sound exactly like the seed (other copies
-/// of the same recording) and without the seed itself, so adding them all
-/// does not queue the same song again and again.
-fn without_identical(matches: Vec<SonicMatch>, seed: &str) -> Vec<SonicMatch> {
-    matches
-        .into_iter()
-        .filter(|found| {
-            found.track.id != seed && found.similarity.is_none_or(|score| score < 1.0 - 1e-6)
+/// Columns one spectrum request returns at most (20 s).
+const MAX_SPECTRUM_COLUMNS: usize = 2_000;
+/// Columns of a song's overview.
+const OVERVIEW_COLUMNS: usize = 1_000;
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum SpectrumView {
+    Coarse,
+    Fine,
+}
+
+#[derive(Deserialize)]
+struct SpectrumQuery {
+    player: usize,
+    deck: usize,
+    entry: u64,
+    view: Option<SpectrumView>,
+    from: Option<usize>,
+    count: Option<usize>,
+}
+
+/// The in-memory song of `deck` when it still is `entry`, and the song's
+/// expected column count (0 when its length is unknown).
+fn deck_buffer(
+    bot: &Bot,
+    token: &str,
+    query: &SpectrumQuery,
+) -> Result<(Arc<crate::preload::Buffer>, usize), ApiError> {
+    owner(bot, token)?;
+    let player = bot
+        .players
+        .get(query.player)
+        .ok_or_else(|| bad("no such queue"))?;
+    deck_index(query.deck)?;
+    let total = {
+        let state = player.state();
+        let track = state
+            .dj
+            .as_ref()
+            .and_then(|dj| dj.decks[query.deck].track.as_ref())
+            .filter(|playing| playing.entry.id == query.entry)
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "That deck plays another song now.".to_owned(),
+                )
+            })?;
+        track.entry.track.duration.map_or(0, |seconds| {
+            seconds as usize * crate::spectrum::COLUMNS_PER_SECOND
         })
-        .collect()
+    };
+    let buffer = bot
+        .preload
+        .as_ref()
+        .and_then(|pool| pool.buffer(query.player, query.entry))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "This song plays from the library; its waveform needs it in memory.".to_owned(),
+            )
+        })?;
+    Ok((buffer, total))
+}
+
+fn spectrum_response(
+    bytes: Vec<u8>,
+    from: usize,
+    columns: usize,
+    total: usize,
+    bands: usize,
+) -> Response {
+    let number = |value: usize| HeaderValue::from(value as u64);
+    let mut response = (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(HeaderName::from_static("x-spectrum-from"), number(from));
+    headers.insert(
+        HeaderName::from_static("x-spectrum-columns"),
+        number(columns),
+    );
+    headers.insert(HeaderName::from_static("x-spectrum-total"), number(total));
+    headers.insert(HeaderName::from_static("x-spectrum-bands"), number(bands));
+    response
+}
+
+/// Band energies of a deck's song, at most [`MAX_SPECTRUM_COLUMNS`] columns
+/// from `from`: one byte per band and column (see docs/musicbot.md).
+async fn spectrum(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    Query(query): Query<SpectrumQuery>,
+) -> Result<Response, ApiError> {
+    let count = query.count.unwrap_or(MAX_SPECTRUM_COLUMNS);
+    if count == 0 || count > MAX_SPECTRUM_COLUMNS {
+        return Err(bad(format!(
+            "count must be from 1 to {MAX_SPECTRUM_COLUMNS}"
+        )));
+    }
+    let (buffer, total) = deck_buffer(&bot, &token, &query)?;
+    let from = query.from.unwrap_or(0);
+    let spectrum = buffer.spectrum();
+    let to = from.saturating_add(count);
+    let (bytes, bands) = match query.view.unwrap_or(SpectrumView::Coarse) {
+        SpectrumView::Coarse => (
+            spectrum.coarse(from, to).to_vec(),
+            crate::spectrum::COARSE_BANDS,
+        ),
+        SpectrumView::Fine => (
+            spectrum.fine(from, to).to_vec(),
+            crate::spectrum::FINE_BANDS,
+        ),
+    };
+    Ok(spectrum_response(
+        bytes,
+        from,
+        spectrum.columns(),
+        total,
+        bands,
+    ))
+}
+
+/// The whole song of a deck in [`OVERVIEW_COLUMNS`] coarse columns.
+async fn spectrum_overview(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    Query(query): Query<SpectrumQuery>,
+) -> Result<Response, ApiError> {
+    let (buffer, total) = deck_buffer(&bot, &token, &query)?;
+    let spectrum = buffer.spectrum();
+    let columns = spectrum.columns();
+    let bytes = spectrum.overview(OVERVIEW_COLUMNS, total.max(columns));
+    Ok(spectrum_response(
+        bytes,
+        0,
+        columns,
+        total,
+        crate::spectrum::COARSE_BANDS,
+    ))
+}
+
+/// The longest seek a deck accepts, as the decoder's skip limit (three hours).
+const MAX_DECK_SEEK_MS: u64 = 3 * 60 * 60 * 1000;
+/// Song IDs a deck accepts from a library, in bytes.
+const MAX_DECK_SONG_ID: usize = 128;
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum LoopStep {
+    Loop,
+    Beat,
+}
+
+/// The beat loop lengths a deck offers.
+const BEAT_LOOPS: [f64; 8] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum Band {
+    Low,
+    Mid,
+    High,
+}
+
+/// A DJ control; continuous ones arrive up to thirty times a second.
+#[derive(Deserialize)]
+#[serde(tag = "control", rename_all = "snake_case")]
+enum DjControl {
+    Mode {
+        on: bool,
+    },
+    /// A library song, album or playlist (`library`, `id`, `kind`) or an
+    /// entry of the main queue or a deck queue (`entry`).
+    Load {
+        deck: usize,
+        library: Option<usize>,
+        id: Option<String>,
+        kind: Option<Kind>,
+        entry: Option<u64>,
+    },
+    /// Adds a library song, album or playlist to a deck's queue.
+    QueueAdd {
+        deck: usize,
+        library: usize,
+        id: String,
+        kind: Option<Kind>,
+        index: Option<usize>,
+    },
+    /// Moves an entry into a deck's queue (`deck`) or the main queue (null).
+    QueueMove {
+        entry: u64,
+        deck: Option<usize>,
+        index: usize,
+    },
+    QueueRemove {
+        entry: u64,
+    },
+    QueueClear {
+        deck: usize,
+    },
+    LoopIn {
+        deck: usize,
+    },
+    LoopOut {
+        deck: usize,
+    },
+    LoopToggle {
+        deck: usize,
+    },
+    BeatLoop {
+        deck: usize,
+        beats: f64,
+    },
+    LoopResize {
+        deck: usize,
+        factor: f64,
+    },
+    LoopMove {
+        deck: usize,
+        by: LoopStep,
+        direction: i8,
+    },
+    LoopSet {
+        deck: usize,
+        start_ms: f64,
+        end_ms: f64,
+    },
+    Quantize {
+        deck: usize,
+        on: bool,
+    },
+    Eject {
+        deck: usize,
+    },
+    Play {
+        deck: usize,
+        playing: bool,
+    },
+    Seek {
+        deck: usize,
+        position_ms: u64,
+    },
+    SetCue {
+        deck: usize,
+    },
+    JumpToCue {
+        deck: usize,
+    },
+    Volume {
+        deck: usize,
+        volume: u8,
+    },
+    Eq {
+        deck: usize,
+        band: Band,
+        db: f32,
+    },
+    Filter {
+        deck: usize,
+        value: f32,
+    },
+    /// Percent.
+    Tempo {
+        deck: usize,
+        tempo: f32,
+    },
+    TempoRange {
+        deck: usize,
+        range: u8,
+    },
+    Sync {
+        deck: usize,
+    },
+    Crossfader {
+        position: f32,
+    },
+    Curve {
+        curve: Curve,
+    },
+    Transition {
+        seconds: u32,
+    },
+    AutoLoad {
+        on: bool,
+    },
+}
+
+#[derive(Deserialize)]
+struct DjCommand {
+    player: usize,
+    #[serde(flatten)]
+    control: DjControl,
+}
+
+impl DjControl {
+    /// Range checks before the control reaches the player.
+    fn validate(&self) -> Result<(), ApiError> {
+        let within = |value: f32, low: f32, high: f32, what: &str| {
+            if value.is_finite() && (low..=high).contains(&value) {
+                Ok(())
+            } else {
+                Err(bad(format!("{what} must be from {low} to {high}")))
+            }
+        };
+        match self {
+            Self::Load {
+                deck,
+                library,
+                id,
+                kind,
+                entry,
+            } => {
+                deck_index(*deck)?;
+                match (library, id, entry) {
+                    (Some(_), Some(id), None) => deck_item(id, *kind)?,
+                    (None, None, Some(_)) if kind.is_none() => {}
+                    _ => return Err(bad("Name a library song or a queue entry.")),
+                }
+            }
+            Self::QueueAdd { deck, id, kind, .. } => {
+                deck_index(*deck)?;
+                deck_item(id, *kind)?;
+            }
+            Self::QueueMove { deck, .. } => {
+                if let Some(deck) = deck {
+                    deck_index(*deck)?;
+                }
+            }
+            Self::QueueClear { deck }
+            | Self::LoopIn { deck }
+            | Self::LoopOut { deck }
+            | Self::LoopToggle { deck }
+            | Self::Quantize { deck, .. } => deck_index(*deck)?,
+            Self::BeatLoop { deck, beats } => {
+                deck_index(*deck)?;
+                if !BEAT_LOOPS.contains(beats) {
+                    return Err(bad("a beat loop is 1/4, 1/2, 1, 2, 4, 8, 16 or 32 beats"));
+                }
+            }
+            Self::LoopResize { deck, factor } => {
+                deck_index(*deck)?;
+                if *factor != 0.5 && *factor != 2.0 {
+                    return Err(bad("a loop halves (0.5) or doubles (2)"));
+                }
+            }
+            Self::LoopMove {
+                deck, direction, ..
+            } => {
+                deck_index(*deck)?;
+                if direction.abs() != 1 {
+                    return Err(bad("a loop moves back (-1) or forward (1)"));
+                }
+            }
+            Self::LoopSet {
+                deck,
+                start_ms,
+                end_ms,
+            } => {
+                deck_index(*deck)?;
+                for value in [start_ms, end_ms] {
+                    if !value.is_finite() || !(0.0..=MAX_DECK_SEEK_MS as f64).contains(value) {
+                        return Err(bad("loop points lie within the first three hours"));
+                    }
+                }
+            }
+            Self::QueueRemove { .. } => {}
+            Self::Eject { deck }
+            | Self::Play { deck, .. }
+            | Self::SetCue { deck }
+            | Self::JumpToCue { deck }
+            | Self::Sync { deck } => deck_index(*deck)?,
+            Self::Seek { deck, position_ms } => {
+                deck_index(*deck)?;
+                if *position_ms > MAX_DECK_SEEK_MS {
+                    return Err(bad("a deck seeks at most three hours into a song"));
+                }
+            }
+            Self::Volume { deck, volume } => {
+                deck_index(*deck)?;
+                if *volume > 100 {
+                    return Err(bad("volume must be from 0 to 100"));
+                }
+            }
+            Self::Eq { deck, db, .. } => {
+                deck_index(*deck)?;
+                within(*db, playback::EQ_MIN_DB, playback::EQ_MAX_DB, "EQ")?;
+            }
+            Self::Filter { deck, value } => {
+                deck_index(*deck)?;
+                within(*value, -1.0, 1.0, "the filter")?;
+            }
+            Self::Tempo { deck, tempo } => {
+                deck_index(*deck)?;
+                let widest = f32::from(playback::TEMPO_RANGES[1]);
+                within(*tempo, -widest, widest, "tempo")?;
+            }
+            Self::TempoRange { deck, range } => {
+                deck_index(*deck)?;
+                if !playback::TEMPO_RANGES.contains(range) {
+                    return Err(bad("the tempo range is 8 or 16 percent"));
+                }
+            }
+            Self::Crossfader { position } => within(*position, -1.0, 1.0, "the crossfader")?,
+            Self::Transition { seconds } => {
+                if !(playback::MIN_TRANSITION_SECONDS..=playback::MAX_TRANSITION_SECONDS)
+                    .contains(seconds)
+                {
+                    return Err(bad(format!(
+                        "a transition takes {} to {} seconds",
+                        playback::MIN_TRANSITION_SECONDS,
+                        playback::MAX_TRANSITION_SECONDS
+                    )));
+                }
+            }
+            Self::Mode { .. } | Self::Curve { .. } | Self::AutoLoad { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+/// A library item a deck takes: a song, album or playlist ID of 1 to
+/// [`MAX_DECK_SONG_ID`] bytes.
+fn deck_item(id: &str, kind: Option<Kind>) -> Result<(), ApiError> {
+    if !matches!(kind, None | Some(Kind::Song | Kind::Album | Kind::Playlist)) {
+        return Err(bad("a deck takes songs, albums and playlists"));
+    }
+    if id.is_empty() || id.len() > MAX_DECK_SONG_ID {
+        return Err(bad("invalid song id"));
+    }
+    Ok(())
+}
+
+/// The songs of a library song, album or playlist, in order.
+async fn deck_songs(
+    bot: &Bot,
+    library: usize,
+    id: String,
+    kind: Option<Kind>,
+) -> Result<Vec<Track>, ApiError> {
+    ask(bot, library, move |library| match kind {
+        Some(Kind::Album) => library.album(&id).map(|(_, songs)| songs),
+        Some(Kind::Playlist) => library.playlist(&id).map(|(_, songs)| songs),
+        _ => library.song(&id).map(|song| vec![song]),
+    })
+    .await
+}
+
+fn deck_index(deck: usize) -> Result<(), ApiError> {
+    if deck < DECKS {
+        Ok(())
+    } else {
+        Err(bad("no such deck"))
+    }
+}
+
+impl From<DjError> for ApiError {
+    fn from(error: DjError) -> Self {
+        ApiError(StatusCode::CONFLICT, error.to_string())
+    }
+}
+
+/// A DJ mode control; the new state reaches every viewer through `events`.
+async fn dj(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    // JSON only, as for `command`.
+    Json(command): Json<DjCommand>,
+) -> Result<StatusCode, ApiError> {
+    let owner = owner(&bot, &token)?;
+    let player = bot
+        .players
+        .get(command.player)
+        .ok_or_else(|| bad("no such queue"))?;
+    command.control.validate()?;
+    match command.control {
+        DjControl::Mode { on } => player.set_dj(on),
+        DjControl::Load {
+            deck,
+            library: Some(library),
+            id: Some(id),
+            kind,
+            ..
+        } => {
+            let tracks = deck_songs(&bot, library, id, kind).await?;
+            player.dj_load(deck, DeckSong::Library(tracks, owner.name.clone()))?;
+        }
+        DjControl::Load {
+            deck,
+            entry: Some(entry),
+            ..
+        } => player.dj_load(deck, DeckSong::Queued(entry))?,
+        DjControl::Load { .. } => return Err(bad("Name a library song or a queue entry.")),
+        DjControl::QueueAdd {
+            deck,
+            library,
+            id,
+            kind,
+            index,
+        } => {
+            let tracks = deck_songs(&bot, library, id, kind).await?;
+            let added = player.dj_queue_add(deck, tracks, &owner.name, index)?;
+            tracing::info!(
+                "{} added {added} song(s) to a deck queue of {}",
+                owner.name,
+                player.name
+            );
+        }
+        DjControl::QueueMove { entry, deck, index } => player.dj_queue_move(entry, deck, index)?,
+        DjControl::QueueRemove { entry } => player.dj_queue_remove(entry)?,
+        DjControl::QueueClear { deck } => player.dj_queue_clear(deck)?,
+        DjControl::LoopIn { deck } => player.dj_loop_in(deck)?,
+        DjControl::LoopOut { deck } => player.dj_loop_out(deck)?,
+        DjControl::LoopToggle { deck } => player.dj_loop_toggle(deck)?,
+        DjControl::BeatLoop { deck, beats } => player.dj_beat_loop(deck, beats)?,
+        DjControl::LoopResize { deck, factor } => player.dj_loop_resize(deck, factor)?,
+        DjControl::LoopMove {
+            deck,
+            by,
+            direction,
+        } => player.dj_loop_move(deck, by == LoopStep::Beat, f64::from(direction))?,
+        DjControl::LoopSet {
+            deck,
+            start_ms,
+            end_ms,
+        } => player.dj_loop_set(
+            deck,
+            Duration::from_secs_f64(start_ms / 1000.0),
+            Duration::from_secs_f64(end_ms / 1000.0),
+        )?,
+        DjControl::Quantize { deck, on } => player.dj_quantize(deck, on)?,
+        DjControl::Eject { deck } => player.dj_eject(deck)?,
+        DjControl::Play { deck, playing } => player.dj_play(deck, playing)?,
+        DjControl::Seek { deck, position_ms } => {
+            player.dj_seek(deck, Duration::from_millis(position_ms))?
+        }
+        DjControl::SetCue { deck } => player.dj_set_cue(deck)?,
+        DjControl::JumpToCue { deck } => player.dj_jump_to_cue(deck)?,
+        DjControl::Volume { deck, volume } => player.dj_volume(deck, volume)?,
+        DjControl::Eq { deck, band, db } => player.dj_eq(deck, band as usize, db)?,
+        DjControl::Filter { deck, value } => player.dj_filter(deck, value)?,
+        DjControl::Tempo { deck, tempo } => player.dj_tempo(deck, tempo / 100.0)?,
+        DjControl::TempoRange { deck, range } => player.dj_tempo_range(deck, range)?,
+        DjControl::Sync { deck } => player.dj_sync(deck)?,
+        DjControl::Crossfader { position } => player.dj_crossfader(position)?,
+        DjControl::Curve { curve } => player.dj_curve(curve)?,
+        DjControl::Transition { seconds } => player.dj_transition(seconds)?,
+        DjControl::AutoLoad { on } => player.dj_auto_load(on)?,
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Similar songs, each recording once: the seed, matches with a similarity of
+/// 100% and matches with the seed's title and artist are left out, and of
+/// several copies of one recording (the same song on another album) the
+/// first, closest match stays.
+fn distinct_similar(matches: Vec<SonicMatch>, seed: &Track) -> Vec<SonicMatch> {
+    let mut kept: Vec<SonicMatch> = Vec::with_capacity(matches.len());
+    for found in matches {
+        let identical = found.track.id == seed.id
+            || found.similarity.is_some_and(|score| score >= 1.0 - 1e-6)
+            || same_recording(&found.track, seed)
+            || kept
+                .iter()
+                .any(|earlier| same_recording(&found.track, &earlier.track));
+        if !identical {
+            kept.push(found);
+        }
+    }
+    kept
+}
+
+/// Whether two tracks are copies of one recording: the same title and artist,
+/// compared without case or extra spaces, and lengths at most 3 seconds apart
+/// when both are known.
+fn same_recording(a: &Track, b: &Track) -> bool {
+    import::normalized(&a.title) == import::normalized(&b.title)
+        && import::normalized(a.artist.as_deref().unwrap_or_default())
+            == import::normalized(b.artist.as_deref().unwrap_or_default())
+        && match (a.duration, b.duration) {
+            (Some(a), Some(b)) => a.abs_diff(b) <= 3,
+            _ => true,
+        }
 }
 
 /// A path that starts with the song the queue is playing continues it: the
@@ -1430,7 +2388,7 @@ async fn albums(
 ) -> Result<Json<AlbumPage>, ApiError> {
     owner(&bot, &token)?;
     let list = AlbumList::parse(&query.list).unwrap_or(AlbumList::Newest);
-    let page = query.page.min(10_000);
+    let page = query.page.min(MAX_PAGE);
     let albums = ask(&bot, query.library, move |library| {
         library.album_list(list, PAGE_SIZE, page * PAGE_SIZE)
     })
@@ -1454,6 +2412,81 @@ async fn album(
     owner(&bot, &token)?;
     let (album, songs) = ask(&bot, query.library, move |library| library.album(&query.id)).await?;
     Ok(Json(AlbumView { album, songs }))
+}
+
+#[derive(Deserialize)]
+struct GenreQuery {
+    #[serde(default)]
+    library: usize,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    page: u32,
+}
+
+/// A genre name the bot asks a library for: 1 to [`MAX_GENRE_NAME`] characters.
+fn genre_name(name: String) -> Result<String, ApiError> {
+    if name.is_empty() {
+        Err(bad("a genre needs a name"))
+    } else if name.chars().count() > MAX_GENRE_NAME {
+        Err(bad(format!(
+            "genre names have at most {MAX_GENRE_NAME} characters"
+        )))
+    } else {
+        Ok(name)
+    }
+}
+
+/// The library's genres by name with their album and song counts.
+async fn genres(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    Query(query): Query<LibraryQuery>,
+) -> Result<Json<Genres>, ApiError> {
+    owner(&bot, &token)?;
+    Ok(Json(
+        ask(&bot, query.library, |library| library.genres()).await?,
+    ))
+}
+
+/// One page of a genre's albums, [`PAGE_SIZE`] at a time.
+async fn genre_albums(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    Query(query): Query<GenreQuery>,
+) -> Result<Json<AlbumPage>, ApiError> {
+    owner(&bot, &token)?;
+    let name = genre_name(query.name)?;
+    let page = query.page.min(MAX_PAGE);
+    let albums = ask(&bot, query.library, move |library| {
+        library.genre_albums(&name, PAGE_SIZE, page * PAGE_SIZE)
+    })
+    .await?;
+    let more = albums.len() as u32 == PAGE_SIZE;
+    Ok(Json(AlbumPage { albums, more }))
+}
+
+#[derive(Serialize)]
+struct SongPage {
+    songs: Vec<Track>,
+    more: bool,
+}
+
+/// One page of a genre's songs, [`GENRE_SONGS_PAGE`] at a time.
+async fn genre_songs(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    Query(query): Query<GenreQuery>,
+) -> Result<Json<SongPage>, ApiError> {
+    owner(&bot, &token)?;
+    let name = genre_name(query.name)?;
+    let page = query.page.min(MAX_PAGE);
+    let songs = ask(&bot, query.library, move |library| {
+        library.genre_songs(&name, GENRE_SONGS_PAGE, page * GENRE_SONGS_PAGE)
+    })
+    .await?;
+    let more = songs.len() as u32 == GENRE_SONGS_PAGE;
+    Ok(Json(SongPage { songs, more }))
 }
 
 #[derive(Serialize)]
@@ -1502,40 +2535,6 @@ async fn artist(
 }
 
 #[derive(Serialize)]
-struct PlaylistList {
-    playlists: Vec<Playlist>,
-}
-
-async fn playlists(
-    State(bot): State<Arc<Bot>>,
-    Path(token): Path<String>,
-    Query(query): Query<LibraryQuery>,
-) -> Result<Json<PlaylistList>, ApiError> {
-    owner(&bot, &token)?;
-    let playlists = ask(&bot, query.library, |library| library.playlists()).await?;
-    Ok(Json(PlaylistList { playlists }))
-}
-
-#[derive(Serialize)]
-struct PlaylistView {
-    playlist: Playlist,
-    songs: Vec<Track>,
-}
-
-async fn playlist(
-    State(bot): State<Arc<Bot>>,
-    Path(token): Path<String>,
-    Query(query): Query<ItemQuery>,
-) -> Result<Json<PlaylistView>, ApiError> {
-    owner(&bot, &token)?;
-    let (playlist, songs) = ask(&bot, query.library, move |library| {
-        library.playlist(&query.id)
-    })
-    .await?;
-    Ok(Json(PlaylistView { playlist, songs }))
-}
-
-#[derive(Serialize)]
 struct SongView {
     song: Track,
     details: SongDetails,
@@ -1569,6 +2568,25 @@ async fn song(
 }
 
 #[derive(Serialize)]
+struct LyricsView {
+    lyrics: Option<Lyrics>,
+}
+
+/// A song's lyrics, null when the library has none.
+async fn lyrics(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    Query(query): Query<ItemQuery>,
+) -> Result<Json<LyricsView>, ApiError> {
+    owner(&bot, &token)?;
+    let lyrics = ask(&bot, query.library, move |library| {
+        library.lyrics(&query.id)
+    })
+    .await?;
+    Ok(Json(LyricsView { lyrics }))
+}
+
+#[derive(Serialize)]
 struct SimilarView {
     song: Track,
     matches: Vec<SonicMatch>,
@@ -1587,6 +2605,7 @@ async fn similar(
         Ok((library.song(&query.id)?, matches))
     })
     .await?;
+    let matches = distinct_similar(matches, &song);
     Ok(Json(SimilarView { song, matches }))
 }
 
@@ -1637,6 +2656,31 @@ struct LibraryResults {
     error: Option<String>,
 }
 
+/// Runs `call` on every library with at most eight calls in flight and answers
+/// in library order. Overload fails the whole request at once; other failures
+/// stay with their library.
+async fn ask_every<T: Send + 'static>(
+    bot: &Bot,
+    call: impl Fn(&Library) -> Result<T, subsonic::Error> + Clone + Send + 'static,
+) -> Result<Vec<(usize, Result<T, ApiError>)>, ApiError> {
+    let calls = futures_util::stream::iter(0..bot.libraries.len())
+        .map(|library| {
+            let call = call.clone();
+            async move {
+                match ask(bot, library, call).await {
+                    // Reject overload promptly instead of waiting for the other
+                    // calls; their permits stay with their blocking workers.
+                    Err(error) if error.0 == StatusCode::SERVICE_UNAVAILABLE => Err(error),
+                    result => Ok((library, result)),
+                }
+            }
+        })
+        .buffer_unordered(MAX_LIBRARY_CALLS);
+    let mut found: Vec<_> = calls.try_collect().await?;
+    found.sort_unstable_by_key(|(library, _)| *library);
+    Ok(found)
+}
+
 /// Searches any number of libraries, with at most eight calls in flight.
 async fn search(
     State(bot): State<Arc<Bot>>,
@@ -1650,23 +2694,7 @@ async fn search(
             results: Vec::new(),
         }));
     }
-    let searches = futures_util::stream::iter(0..bot.libraries.len())
-        .map(|library| {
-            let text = text.clone();
-            let bot = &bot;
-            async move {
-                let result = ask(bot, library, move |library| library.search(&text)).await;
-                match result {
-                    // Reject overload promptly instead of waiting for the other
-                    // searches; their permits stay with their blocking workers.
-                    Err(error) if error.0 == StatusCode::SERVICE_UNAVAILABLE => Err(error),
-                    result => Ok((library, result)),
-                }
-            }
-        })
-        .buffer_unordered(MAX_LIBRARY_CALLS);
-    let mut found: Vec<_> = searches.try_collect().await?;
-    found.sort_unstable_by_key(|(library, _)| *library);
+    let found = ask_every(&bot, move |library| library.search(&text)).await?;
     let mut results = Vec::with_capacity(found.len());
     for (library, result) in found {
         let name = bot.libraries[library].name.clone();
@@ -1690,6 +2718,105 @@ async fn search(
         });
     }
     Ok(Json(SearchResults { results }))
+}
+
+/// Suggestion queries shorter than this, in characters, answer with no items.
+const MIN_SUGGEST_QUERY: usize = 2;
+/// Most items one suggestion answer holds.
+const MAX_SUGGESTIONS: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SuggestionKind {
+    Artist,
+    Album,
+    Song,
+}
+
+#[derive(Debug, Serialize)]
+struct Suggestion {
+    library: usize,
+    kind: SuggestionKind,
+    id: String,
+    title: String,
+    /// The artist of an album or song.
+    subtitle: Option<String>,
+    cover_art: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Suggestions {
+    items: Vec<Suggestion>,
+}
+
+/// A few artists, albums and songs for the text typed so far: artists of every
+/// library first, then albums, then songs, cut to `MAX_SUGGESTIONS`. An item
+/// with the kind, title and artist of an earlier one is left out, so the same
+/// artist in two libraries or the same song on two albums shows once. Libraries
+/// that fail add nothing.
+async fn suggest(
+    State(bot): State<Arc<Bot>>,
+    Path(token): Path<String>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Suggestions>, ApiError> {
+    owner(&bot, &token)?;
+    let text: String = query.q.trim().chars().take(MAX_QUERY).collect();
+    if text.chars().count() < MIN_SUGGEST_QUERY {
+        return Ok(Json(Suggestions { items: Vec::new() }));
+    }
+    let found: Vec<_> = ask_every(&bot, move |library| library.suggest(&text))
+        .await?
+        .into_iter()
+        .filter_map(|(_, result)| result.ok())
+        .collect();
+    let artists = found
+        .iter()
+        .flat_map(|found| &found.artists)
+        .map(|artist| Suggestion {
+            library: artist.library,
+            kind: SuggestionKind::Artist,
+            id: artist.id.clone(),
+            title: artist.name.clone(),
+            subtitle: None,
+            cover_art: artist.cover_art.clone(),
+        });
+    let albums = found
+        .iter()
+        .flat_map(|found| &found.albums)
+        .map(|album| Suggestion {
+            library: album.library,
+            kind: SuggestionKind::Album,
+            id: album.id.clone(),
+            title: album.name.clone(),
+            subtitle: album.artist.clone(),
+            cover_art: album.cover_art.clone(),
+        });
+    let songs = found
+        .iter()
+        .flat_map(|found| &found.songs)
+        .map(|song| Suggestion {
+            library: song.library,
+            kind: SuggestionKind::Song,
+            id: song.id.clone(),
+            title: song.title.clone(),
+            subtitle: song.artist.clone(),
+            cover_art: song.cover_art.clone(),
+        });
+    let mut seen = std::collections::HashSet::new();
+    Ok(Json(Suggestions {
+        items: artists
+            .chain(albums)
+            .chain(songs)
+            .filter(|item| {
+                seen.insert((
+                    item.kind,
+                    import::normalized(&item.title),
+                    import::normalized(item.subtitle.as_deref().unwrap_or_default()),
+                ))
+            })
+            .take(MAX_SUGGESTIONS)
+            .collect(),
+    }))
 }
 
 /// Adding music, or 404 where it is not configured.
@@ -1744,7 +2871,7 @@ async fn import_search(
     if text.is_empty() {
         return Ok(Json(ImportAlbums { albums: Vec::new() }));
     }
-    let requester = adding.pseudonyms.of(&owner);
+    let requester = bot.pseudonyms.of(&owner);
     let albums = import_call(&adding, move |client| client.search(&requester, &text)).await?;
     Ok(Json(ImportAlbums { albums }))
 }
@@ -1777,7 +2904,7 @@ async fn import_album(
     if !import::valid_id(&query.id) {
         return Err(import_error(import::Failure::NotAvailable));
     }
-    let requester = adding.pseudonyms.of(&owner);
+    let requester = bot.pseudonyms.of(&owner);
     let id = query.id;
     let album = import_call(&adding, move |client| client.album(&requester, &id)).await?;
     let in_library = in_library(&bot, adding.library, &album.album).await;
@@ -1831,7 +2958,7 @@ async fn import_requests(
 ) -> Result<Json<ImportRequests>, ApiError> {
     let owner = owner(&bot, &token)?;
     let adding = adding(&bot)?;
-    let requester = adding.pseudonyms.of(&owner);
+    let requester = bot.pseudonyms.of(&owner);
     let list = import_call(&adding, move |client| client.imports(&requester)).await?;
     Ok(Json(ImportRequests {
         requests: list.imports,
@@ -1865,7 +2992,7 @@ async fn import_request(
     if !import::valid_id(&body.album_id) {
         return Err(import_error(import::Failure::NotAvailable));
     }
-    let requester = adding.pseudonyms.of(&owner);
+    let requester = bot.pseudonyms.of(&owner);
     let album_id = body.album_id;
     let (request, existing) =
         import_call(&adding, move |client| client.request(&requester, &album_id)).await?;
@@ -1897,13 +3024,14 @@ async fn import_art(
         Some(body) => body,
         None => {
             // The cache is shared, so the bot asks: no viewer's lookups are spent.
-            let image = async move {
+            let image = move |fetch: SemaphorePermit<'static>| async move {
                 import_call(&adding, move |client| {
+                    let _fetch = fetch;
                     client.cover(import::BOT_REQUESTER, &id)
                 })
                 .await
             };
-            fetch_cover(&bot, key, image).await?
+            fetch_cover(&bot, key, image, worker_thumbnail).await?
         }
     };
     owner(&bot, &token)?;
@@ -2275,9 +3403,12 @@ mod tests {
 
     // These API tests share the production admission pool; the overload test
     // deliberately occupies every permit and must not race other API consumers.
-    static API_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static API_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn test_bot(url: &str, library_count: usize) -> (tempfile::TempDir, Arc<Bot>, String) {
+    pub(super) fn test_bot(
+        url: &str,
+        library_count: usize,
+    ) -> (tempfile::TempDir, Arc<Bot>, String) {
         let directory = tempfile::tempdir().unwrap();
         let config: crate::config::Config = serde_json::from_value(serde_json::json!({
             "web": { "listen": "127.0.0.1:0", "public_url": "http://localhost/" },
@@ -2296,7 +3427,7 @@ mod tests {
         let libraries = config
             .libraries
             .iter()
-            .zip(keys)
+            .zip(keys.iter().cloned())
             .enumerate()
             .map(|(index, (library, key))| {
                 Library::new(
@@ -2324,6 +3455,7 @@ mod tests {
             state_directory: directory.path().to_owned(),
             web_assets: None,
             codec_worker: std::path::PathBuf::from("/nonexistent/nuschl-musicbot-codec-worker"),
+            preload: None,
             libraries: Arc::new(libraries),
             players: Vec::new(),
             connections: Vec::new(),
@@ -2334,6 +3466,12 @@ mod tests {
                 .unwrap(),
             adding: None,
             rating_revision: std::sync::atomic::AtomicU64::new(0),
+            playlists: crate::playlists::Playlists::load(
+                directory.path().join(crate::playlists::FILE),
+                &keys,
+            )
+            .unwrap(),
+            pseudonyms: import::Pseudonyms::load(directory.path()).unwrap(),
         });
         (directory, bot, token)
     }
@@ -2366,14 +3504,14 @@ mod tests {
         static ADMISSION: Semaphore = Semaphore::const_new(MAX_LISTEN_STREAMS);
         let (_directory, bot, token) = listening_bot();
         assert_eq!(
-            listen_response(bot.clone(), "invalid".into(), 0, &ADMISSION)
+            listen_response(bot.clone(), "invalid".into(), 0, Listen::Room, &ADMISSION)
                 .err()
                 .unwrap()
                 .0,
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            listen_response(bot.clone(), token.clone(), 1, &ADMISSION)
+            listen_response(bot.clone(), token.clone(), 1, Listen::Room, &ADMISSION)
                 .err()
                 .unwrap()
                 .0,
@@ -2383,7 +3521,7 @@ mod tests {
         let mut responses = Vec::new();
         for _ in 0..MAX_LISTEN_STREAMS {
             responses.push(
-                listen_response(bot.clone(), token.clone(), 0, &ADMISSION)
+                listen_response(bot.clone(), token.clone(), 0, Listen::Room, &ADMISSION)
                     .ok()
                     .unwrap(),
             );
@@ -2391,14 +3529,14 @@ mod tests {
         assert_eq!(bot.players[0].listeners(), MAX_LISTEN_STREAMS);
         assert_eq!(ADMISSION.available_permits(), 0);
         assert_eq!(
-            listen_response(bot.clone(), token.clone(), 0, &ADMISSION)
+            listen_response(bot.clone(), token.clone(), 0, Listen::Room, &ADMISSION)
                 .err()
                 .unwrap()
                 .0,
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
-            listen_response(bot.clone(), "invalid".into(), 0, &ADMISSION)
+            listen_response(bot.clone(), "invalid".into(), 0, Listen::Room, &ADMISSION)
                 .err()
                 .unwrap()
                 .0,
@@ -2406,7 +3544,7 @@ mod tests {
             "auth precedes overload"
         );
         assert_eq!(
-            listen_response(bot.clone(), token.clone(), 1, &ADMISSION)
+            listen_response(bot.clone(), token.clone(), 1, Listen::Room, &ADMISSION)
                 .err()
                 .unwrap()
                 .0,
@@ -2417,7 +3555,7 @@ mod tests {
         released(&bot, MAX_LISTEN_STREAMS - 1).await;
         assert_eq!(ADMISSION.available_permits(), 1);
         responses.push(
-            listen_response(bot.clone(), token, 0, &ADMISSION)
+            listen_response(bot.clone(), token, 0, Listen::Room, &ADMISSION)
                 .ok()
                 .unwrap(),
         );
@@ -2430,7 +3568,7 @@ mod tests {
     async fn listening_emits_initial_reset_and_keeps_ownership_until_body_disconnects() {
         static ADMISSION: Semaphore = Semaphore::const_new(1);
         let (_directory, bot, token) = listening_bot();
-        let response = listen_response(bot.clone(), token, 0, &ADMISSION)
+        let response = listen_response(bot.clone(), token, 0, Listen::Room, &ADMISSION)
             .ok()
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2463,7 +3601,7 @@ mod tests {
         static ADMISSION: Semaphore = Semaphore::const_new(1);
         let (_directory, bot, token) = listening_bot();
         bot.players[0].set_paused(true);
-        let response = listen_response(bot.clone(), token.clone(), 0, &ADMISSION)
+        let response = listen_response(bot.clone(), token.clone(), 0, Listen::Room, &ADMISSION)
             .ok()
             .unwrap();
         tokio::task::yield_now().await;
@@ -2482,7 +3620,10 @@ mod tests {
             "revoked queued records are not delivered"
         );
         assert_eq!(
-            listen_response(bot, token, 0, &ADMISSION).err().unwrap().0,
+            listen_response(bot, token, 0, Listen::Room, &ADMISSION)
+                .err()
+                .unwrap()
+                .0,
             StatusCode::NOT_FOUND
         );
     }
@@ -2492,7 +3633,7 @@ mod tests {
         static ADMISSION: Semaphore = Semaphore::const_new(1);
         let (_directory, bot, token) = listening_bot();
         bot.players[0].set_paused(true);
-        let response = listen_response(bot.clone(), token, 0, &ADMISSION)
+        let response = listen_response(bot.clone(), token, 0, Listen::Room, &ADMISSION)
             .ok()
             .unwrap();
         let mut stream = response.into_body().into_data_stream();
@@ -2870,8 +4011,9 @@ mod tests {
             .acquire_many(MAX_LIBRARY_CALLS as u32)
             .await
             .unwrap();
+        // Covers have their own fetch admission and still reach the library.
         let response = tokio::time::timeout(
-            Duration::from_millis(200),
+            Duration::from_secs(5),
             art(
                 State(bot.clone()),
                 Path((token.clone(), 0, "cover".into())),
@@ -2883,10 +4025,10 @@ mod tests {
         .err()
         .unwrap()
         .into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             response_json(response).await["error"],
-            "the music library is busy"
+            "the music library sent a non-image response"
         );
         let response = tokio::time::timeout(
             Duration::from_millis(200),
@@ -2918,13 +4060,18 @@ mod tests {
         );
         let (_directory, bot, token) = test_bot(&server.url, 1);
         let art_key = bot.libraries[0].key().to_owned();
-        assert_eq!(snapshot(&bot, "x").library_keys, [art_key.as_str()]);
+        let viewer = owner(&bot, &token).ok().unwrap();
+        assert_eq!(snapshot(&bot, &viewer).library_keys, [art_key.as_str()]);
         // A 1×1 thumbnail PNG.
         let body = Bytes::from_static(b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0d\x49\x44\x41\x54\x78\x9c\x63\x38\x11\xa0\xf1\x1f\x00\x05\x64\x02\x40\x64\x52\x9c\x3a\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82");
         bot.covers
             .insert(&(art_key.clone(), "cover".into(), 300), &body)
             .await;
-        // A hit needs no artwork job.
+        // A hit needs no fetch and no artwork job.
+        let fetches = COVER_FETCHES
+            .acquire_many(MAX_COVER_FETCHES as u32)
+            .await
+            .unwrap();
         let jobs = COVER_JOBS
             .acquire_many(MAX_COVER_JOBS as u32)
             .await
@@ -2953,18 +4100,186 @@ mod tests {
         }
         let stale = request(Some("0000000000000000")).await.err().unwrap();
         assert_eq!(stale.0, StatusCode::NOT_FOUND);
-        // Not cached and no job free: the library is not asked either.
-        let missing = art(
+        let other = |bot: Arc<Bot>, token: String| {
+            art(
+                State(bot),
+                Path((token, 0, "other".into())),
+                Query(ArtQuery { size: 300, v: None }),
+            )
+        };
+        // Not cached and the waiting room is full: refused at once.
+        let full = COVER_WAITERS
+            .acquire_many(MAX_COVER_WAITERS as u32)
+            .await
+            .unwrap();
+        let refused = other(bot.clone(), token.clone()).await.err().unwrap();
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+        drop(full);
+        // A miss waits for a fetch; a cover finished meanwhile comes from the
+        // cache, and the library is not asked.
+        let waiting = tokio::spawn(other(bot.clone(), token.clone()));
+        while COVER_WAITERS.available_permits() == MAX_COVER_WAITERS {
+            tokio::task::yield_now().await;
+        }
+        bot.covers
+            .insert(&(art_key.clone(), "other".into(), 300), &body)
+            .await;
+        drop((fetches, jobs));
+        let response = waiting.await.unwrap().ok().unwrap();
+        let served = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(served, body);
+        assert_eq!(COVER_WAITERS.available_permits(), MAX_COVER_WAITERS);
+        // A miss that finds no fetch within the wait is refused.
+        let fetches = COVER_FETCHES
+            .acquire_many(MAX_COVER_FETCHES as u32)
+            .await
+            .unwrap();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let late = art(
             State(bot.clone()),
-            Path((token.clone(), 0, "other".into())),
+            Path((token.clone(), 0, "late".into())),
             Query(ArtQuery { size: 300, v: None }),
         )
         .await
         .err()
         .unwrap();
-        assert_eq!(missing.0, StatusCode::SERVICE_UNAVAILABLE);
-        drop(jobs);
+        assert_eq!(late.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() >= COVER_WAIT);
+        drop(fetches);
         assert!(server.requests().is_empty());
+    }
+
+    /// A 1×1 thumbnail PNG, standing in for what the content worker makes.
+    const PNG: &[u8] = b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x0d\x49\x44\x41\x54\x78\x9c\x63\x38\x11\xa0\xf1\x1f\x00\x05\x64\x02\x40\x64\x52\x9c\x3a\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+    type Runs = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    /// A content worker stand-in that records the images it gets and makes [`PNG`].
+    fn recorded(
+        runs: &Runs,
+    ) -> impl FnOnce(Vec<u8>, u32) -> std::future::Ready<Result<Bytes, ApiError>> + Send + 'static
+    {
+        let runs = runs.clone();
+        move |image, _| {
+            runs.lock().unwrap().push(image);
+            std::future::ready(Ok(Bytes::from_static(PNG)))
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_identical_cover_images_take_one_worker_job() {
+        let _exclusive = API_TESTS.lock().await;
+        let server = Server::new(|request, socket| {
+            use std::io::Write;
+            let body: &[u8] = if request.contains("id=mf-other") {
+                b"other image"
+            } else {
+                b"album image"
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(body).unwrap();
+        });
+        let (_directory, bot, _token) = test_bot(&server.url, 1);
+        let library = bot.libraries[0].key().to_owned();
+        let runs = Runs::default();
+        let cover = |id: String, size: u32| {
+            let (bot, convert) = (bot.clone(), recorded(&runs));
+            let key: CoverKey = (library.clone(), id.clone(), size);
+            async move {
+                let libraries = bot.libraries.clone();
+                let image = move |fetch| library_image(libraries, 0, id, size, fetch);
+                fetch_cover(&bot, key, image, convert).await.ok().unwrap()
+            }
+        };
+        // Twelve songs of one album arrive together, and the library answers
+        // each with the album's image.
+        let songs: Vec<_> = (0..12)
+            .map(|index| tokio::spawn(cover(format!("mf-{index}_0"), 300)))
+            .collect();
+        for song in songs {
+            assert_eq!(song.await.unwrap(), PNG);
+        }
+        assert_eq!(*runs.lock().unwrap(), [b"album image".to_vec()]);
+        assert_eq!(server.requests().len(), 12);
+        for index in 0..12 {
+            let key = (library.clone(), format!("mf-{index}_0"), 300);
+            assert_eq!(bot.covers.get(&key).await.as_deref(), Some(PNG));
+        }
+        // The album's own cover comes from memory.
+        assert_eq!(cover("al-1_0".into(), 300).await, PNG);
+        assert_eq!(runs.lock().unwrap().len(), 1);
+        // Other bytes, and the same bytes at another size, take their own run.
+        assert_eq!(cover("mf-other".into(), 300).await, PNG);
+        assert_eq!(cover("mf-0_0".into(), 64).await, PNG);
+        assert_eq!(
+            *runs.lock().unwrap(),
+            [
+                b"album image".to_vec(),
+                b"other image".to_vec(),
+                b"album image".to_vec()
+            ]
+        );
+        assert_eq!(server.requests().len(), 15);
+        assert_eq!(COVER_WAITERS.available_permits(), MAX_COVER_WAITERS);
+        assert_eq!(COVER_FETCHES.available_permits(), MAX_COVER_FETCHES);
+        assert_eq!(COVER_JOBS.available_permits(), MAX_COVER_JOBS);
+    }
+
+    #[tokio::test]
+    async fn a_cover_waiting_behind_its_image_takes_the_png_and_jobs_have_a_wait_limit() {
+        let _exclusive = API_TESTS.lock().await;
+        let (_directory, bot, _token) = test_bot("http://unused.invalid", 1);
+        let runs = Runs::default();
+        let cover = |id: &str, image: &'static [u8]| {
+            let (bot, convert) = (bot.clone(), recorded(&runs));
+            let key: CoverKey = ("k".into(), id.into(), 300);
+            async move {
+                let image = move |_fetch| std::future::ready(Ok(image.to_vec()));
+                fetch_cover(&bot, key, image, convert).await
+            }
+        };
+        // With both jobs taken, the first song waits for a job and holds its
+        // image's turn; the second, with the same image, waits behind it.
+        let jobs = COVER_JOBS
+            .acquire_many(MAX_COVER_JOBS as u32)
+            .await
+            .unwrap();
+        let shared: ImageKey = (Sha256::digest(b"shared image").into(), 300);
+        let first = tokio::spawn(cover("first", b"shared image"));
+        let second = tokio::spawn(cover("second", b"shared image"));
+        // The map's reference, the first's guard and the second's wait.
+        while MAKING
+            .lock()
+            .unwrap()
+            .get(&shared)
+            .map_or(0, Arc::strong_count)
+            < 3
+        {
+            tokio::task::yield_now().await;
+        }
+        drop(jobs);
+        assert_eq!(first.await.unwrap().ok().unwrap(), PNG);
+        assert_eq!(second.await.unwrap().ok().unwrap(), PNG);
+        assert_eq!(*runs.lock().unwrap(), [b"shared image".to_vec()]);
+        let key = ("k".into(), "second".into(), 300);
+        assert_eq!(bot.covers.get(&key).await.as_deref(), Some(PNG));
+
+        // A miss that finds no job within the wait is refused.
+        let jobs = COVER_JOBS
+            .acquire_many(MAX_COVER_JOBS as u32)
+            .await
+            .unwrap();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let late = cover("late", b"late image").await.err().unwrap();
+        assert_eq!(late.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(started.elapsed() >= COVER_WAIT);
+        drop(jobs);
+        assert_eq!(runs.lock().unwrap().len(), 1);
+        assert_eq!(COVER_WAITERS.available_permits(), MAX_COVER_WAITERS);
     }
 
     #[tokio::test]
@@ -3266,23 +4581,54 @@ mod tests {
     }
 
     #[test]
-    fn adding_similar_songs_skips_identical_copies_and_the_seed() {
-        let found = |id: &str, similarity: Option<f64>| SonicMatch {
-            track: fixture_track(id),
-            similarity,
+    fn similar_songs_list_each_recording_once() {
+        let track = |id: &str, title: &str, artist: Option<&str>, duration: Option<u32>| {
+            serde_json::from_value::<Track>(serde_json::json!({
+                "library": 0, "id": id, "title": title, "artist": artist, "duration": duration,
+            }))
+            .unwrap()
         };
+        let found = |track: Track, similarity: Option<f64>| SonicMatch { track, similarity };
+        let seed = track("seed", "Paper Boats", Some("Lumen"), Some(206));
         let matches = vec![
-            found("seed", Some(1.0)),
-            found("copy", Some(1.0)),
-            found("close", Some(0.999)),
-            found("unscored", None),
-            found("far", Some(0.4)),
+            found(seed.clone(), Some(1.0)),
+            found(track("exact", "Other", Some("Lumen"), Some(100)), Some(1.0)),
+            // The seed on a compilation, scored below 100%.
+            found(
+                track("best-of", " paper  BOATS", Some("lumen"), Some(208)),
+                Some(0.97),
+            ),
+            found(
+                track("hours", "Hours", Some("Nightjar"), Some(250)),
+                Some(0.9),
+            ),
+            found(
+                track("hours-live", "Hours (Live)", Some("Nightjar"), Some(280)),
+                Some(0.85),
+            ),
+            found(
+                track("hours-again", "Hours", Some("Nightjar"), Some(252)),
+                Some(0.8),
+            ),
+            found(
+                track("hours-edit", "Hours", Some("Nightjar"), Some(190)),
+                Some(0.75),
+            ),
+            found(track("unscored", "Salt Air", None, None), None),
+            found(track("unscored-copy", "Salt Air", None, Some(200)), None),
+            found(
+                track("cover", "Hours", Some("Someone Else"), Some(250)),
+                Some(0.4),
+            ),
         ];
-        let kept: Vec<_> = without_identical(matches, "seed")
+        let kept: Vec<_> = distinct_similar(matches, &seed)
             .into_iter()
             .map(|found| found.track.id)
             .collect();
-        assert_eq!(kept, ["close", "unscored", "far"]);
+        assert_eq!(
+            kept,
+            ["hours", "hours-live", "hours-edit", "unscored", "cover"]
+        );
     }
 
     /// `open` offers sonic similarity; `plain` does not; `failing` offers it
@@ -3328,7 +4674,7 @@ mod tests {
     fn snapshot_reports_only_already_known_sonic_support() {
         let server = sonic_fixture("open");
         let (_directory, bot, token) = test_bot(&server.url, 2);
-        let you = owner(&bot, &token).ok().unwrap().name;
+        let you = owner(&bot, &token).ok().unwrap();
         assert_eq!(snapshot(&bot, &you).sonic, [false, false]);
         assert!(server.requests().is_empty(), "snapshots never ask");
         bot.libraries[1].ping().unwrap();
@@ -3434,16 +4780,16 @@ mod tests {
         .0;
         assert_eq!((found.song.library, found.song.id.as_str()), (1, "s1"));
         let found = serde_json::to_value(&found).unwrap();
-        // The list shows everything the library found.
+        // The list leaves out the song itself and its 100% copy.
         let listed: Vec<_> = found["matches"]
             .as_array()
             .unwrap()
             .iter()
             .map(|found| found["track"]["id"].as_str().unwrap())
             .collect();
-        assert_eq!(listed, ["s1", "s1-copy", "s2"]);
-        assert_eq!(found["matches"][2]["track"]["library"], 1);
-        assert_eq!(found["matches"][2]["similarity"], 0.8);
+        assert_eq!(listed, ["s2"]);
+        assert_eq!(found["matches"][0]["track"]["library"], 1);
+        assert_eq!(found["matches"][0]["similarity"], 0.8);
 
         let path = sonic_path(
             State(bot.clone()),
@@ -3488,6 +4834,7 @@ mod tests {
             library: 1,
             id: "s1".into(),
             to: to.map(str::to_owned),
+            page: None,
             index: None,
         };
         let asked = server.requests().len();
@@ -3611,6 +4958,453 @@ mod tests {
         drop(occupied);
     }
 
+    #[tokio::test]
+    async fn lyrics_answer_the_lines_or_null() {
+        let _exclusive = API_TESTS.lock().await;
+        let server = Server::new(|request, socket| {
+            use std::io::Write;
+            let body = if request.starts_with("GET /rest/getOpenSubsonicExtensions") {
+                r#"{"subsonic-response":{"status":"ok","openSubsonicExtensions":[{"name":"songLyrics","versions":[1]}]}}"#
+            } else if request.contains("&id=s1 ") {
+                r#"{"subsonic-response":{"status":"ok","lyricsList":{"structuredLyrics":[{"lang":"eng","synced":true,"line":[{"start":1500,"value":"Hello"}]}]}}}"#
+            } else {
+                r#"{"subsonic-response":{"status":"ok","lyricsList":{"structuredLyrics":[]}}}"#
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let (_directory, bot, token) = test_bot(&server.url, 1);
+        let ask = |id: &str| {
+            lyrics(
+                State(bot.clone()),
+                Path(token.clone()),
+                Query(ItemQuery {
+                    library: 0,
+                    id: id.into(),
+                }),
+            )
+        };
+        let found = ask("s1").await.ok().unwrap();
+        assert_eq!(
+            serde_json::to_value(&found.0).unwrap(),
+            serde_json::json!({"lyrics": {"synced": true, "lang": "eng",
+                "lines": [{"start_ms": 1500, "text": "Hello"}]}})
+        );
+        let none = ask("s2").await.ok().unwrap();
+        assert_eq!(
+            serde_json::to_value(&none.0).unwrap(),
+            serde_json::json!({"lyrics": null})
+        );
+        let missing = lyrics(
+            State(bot.clone()),
+            Path(Uuid::nil().to_string()),
+            Query(ItemQuery {
+                library: 0,
+                id: "s1".into(),
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn suggestions_ask_for_few_matches_and_reject_overload() {
+        let _exclusive = API_TESTS.lock().await;
+        let server = Server::new(|request, socket| {
+            use std::io::Write;
+            let body = if request.contains("query=broken") {
+                serde_json::json!({"subsonic-response": {"status": "failed", "error": {"code": 0}}})
+            } else {
+                // More of each kind than asked for, as a server may send.
+                let entries = |prefix: &str, count: usize| {
+                    (0..count)
+                        .map(|n| {
+                            serde_json::json!({"id": format!("{prefix}{n}"),
+                            "name": format!("{prefix} {n}"), "title": format!("{prefix} {n}"),
+                            "artist": "Waves", "coverArt": format!("c-{prefix}{n}")})
+                        })
+                        .collect::<Vec<_>>()
+                };
+                // The second song is a copy of the first on another album,
+                // spelled with other case and spacing.
+                let mut songs = entries("s", 8);
+                songs.insert(
+                    1,
+                    serde_json::json!({"id": "s0-copy", "title": "S  0", "artist": "waves",
+                        "coverArt": "c-s0-copy"}),
+                );
+                serde_json::json!({"subsonic-response": {"status": "ok", "searchResult3": {
+                    "artist": entries("ar", 5), "album": entries("al", 5), "song": songs}}})
+            };
+            let body = serde_json::to_vec(&body).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(&body).unwrap();
+        });
+        let (_directory, bot, token) = test_bot(&server.url, 2);
+        let ask = |q: &str| {
+            suggest(
+                State(bot.clone()),
+                Path(token.clone()),
+                Query(SearchQuery { q: q.into() }),
+            )
+        };
+
+        for short in ["", "w", "  w  ", "ü"] {
+            assert!(ask(short).await.ok().unwrap().items.is_empty());
+        }
+        assert!(server.requests().is_empty());
+
+        let items = ask(" wa ").await.ok().unwrap().0.items;
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert!(request.starts_with("GET /rest/search3?"));
+            for parameter in [
+                "&query=wa&",
+                "&songCount=5&",
+                "&albumCount=3&",
+                "&artistCount=3",
+            ] {
+                assert!(request.contains(parameter), "{parameter} in {request}");
+            }
+        }
+        // Both libraries answer alike: each artist and album shows once, from the
+        // first library, then songs until the bound.
+        assert_eq!(items.len(), MAX_SUGGESTIONS);
+        let order: Vec<_> = items
+            .iter()
+            .map(|item| (item.library, item.id.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (0, "ar0"),
+                (0, "ar1"),
+                (0, "ar2"),
+                (0, "al0"),
+                (0, "al1"),
+                (0, "al2"),
+                (0, "s0"),
+                (0, "s1"),
+                (0, "s2"),
+                (0, "s3"),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&items[0]).unwrap(),
+            serde_json::json!({"library": 0, "kind": "artist", "id": "ar0", "title": "ar 0",
+                "subtitle": null, "cover_art": "c-ar0"})
+        );
+        assert_eq!(
+            serde_json::to_value(&items[3]).unwrap(),
+            serde_json::json!({"library": 0, "kind": "album", "id": "al0", "title": "al 0",
+                "subtitle": "Waves", "cover_art": "c-al0"})
+        );
+
+        // One library: the songs follow, cut at the bound.
+        let (_single, one, one_token) = test_bot(&server.url, 1);
+        let items = suggest(
+            State(one),
+            Path(one_token),
+            Query(SearchQuery { q: "wa".into() }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0
+        .items;
+        let kinds: Vec<_> = items.iter().map(|item| &item.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                [&SuggestionKind::Artist; 3].as_slice(),
+                &[&SuggestionKind::Album; 3],
+                &[&SuggestionKind::Song; 4],
+            ]
+            .concat()
+        );
+        assert_eq!(
+            serde_json::to_value(&items[6]).unwrap(),
+            serde_json::json!({"library": 0, "kind": "song", "id": "s0", "title": "s 0",
+                "subtitle": "Waves", "cover_art": "c-s0"})
+        );
+
+        // Failing libraries add nothing.
+        assert!(ask("broken").await.ok().unwrap().items.is_empty());
+
+        let occupied = LIBRARY_CALLS
+            .acquire_many(MAX_LIBRARY_CALLS as u32)
+            .await
+            .unwrap();
+        let asked = server.requests().len();
+        let refused = tokio::time::timeout(Duration::from_millis(200), ask("wa"))
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+        assert_eq!(
+            (refused.0, refused.1.as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, "the music library is busy")
+        );
+        assert_eq!(server.requests().len(), asked);
+        drop(occupied);
+    }
+
+    /// The decoded query parameters of a fixture request.
+    fn request_parameters(request: &str) -> std::collections::HashMap<String, String> {
+        let target: axum::http::Uri = request.split(' ').nth(1).unwrap().parse().unwrap();
+        Query::try_from_uri(&target).unwrap().0
+    }
+
+    fn fixture_json(socket: &mut std::net::TcpStream, body: &serde_json::Value) {
+        use std::io::Write;
+        let body = serde_json::to_vec(body).unwrap();
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        socket.write_all(&body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn genres_come_by_name_with_lenient_counts_and_bounded() {
+        let _exclusive = API_TESTS.lock().await;
+        let long = "x".repeat(MAX_GENRE_NAME + 1);
+        let server = Server::new(move |request, socket| {
+            assert!(request.starts_with("GET /rest/getGenres?"), "{request}");
+            fixture_json(
+                socket,
+                &serde_json::json!({"subsonic-response": {"status": "ok", "genres": {"genre": [
+                    {"value": "rock", "songCount": 12, "albumCount": 2},
+                    {"value": "Ambient", "songCount": "7", "albumCount": " 1 "},
+                    {"value": "Jazz; Fusion", "songCount": -3, "albumCount": 2.5},
+                    {"value": 1990, "songCount": null},
+                    {"value": "Ambient", "songCount": 7, "albumCount": 1},
+                    {"value": "", "songCount": 1},
+                    {"value": long, "songCount": 1},
+                    {"value": true, "songCount": 1},
+                    {"songCount": 1},
+                    {"value": "Électro", "songCount": 99_999_999_999u64, "albumCount": "many"},
+                ]}}}),
+            );
+        });
+        let (_directory, bot, token) = test_bot(&server.url, 1);
+        let list = genres(
+            State(bot.clone()),
+            Path(token.clone()),
+            Query(LibraryQuery { library: 0 }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        assert_eq!(
+            serde_json::to_value(&list).unwrap(),
+            serde_json::json!({"genres": [
+                {"name": "1990", "albums": null, "songs": null},
+                {"name": "Ambient", "albums": 1, "songs": 7},
+                {"name": "Jazz; Fusion", "albums": null, "songs": null},
+                {"name": "rock", "albums": 2, "songs": 12},
+                {"name": "Électro", "albums": null, "songs": u32::MAX},
+            ], "truncated": false})
+        );
+
+        let many = Server::new(|_, socket| {
+            let genre: Vec<_> = (0..subsonic::MAX_GENRES + 100)
+                .rev()
+                .map(|n| serde_json::json!({"value": format!("g{n:05}"), "songCount": n}))
+                .collect();
+            fixture_json(
+                socket,
+                &serde_json::json!({"subsonic-response": {"status": "ok", "genres": {"genre": genre}}}),
+            );
+        });
+        let (_many_directory, bot, token) = test_bot(&many.url, 1);
+        let list = genres(State(bot), Path(token), Query(LibraryQuery { library: 0 }))
+            .await
+            .ok()
+            .unwrap()
+            .0;
+        assert!(list.truncated);
+        assert_eq!(list.genres.len(), subsonic::MAX_GENRES);
+        assert_eq!(list.genres[0].name, "g00000");
+        assert_eq!(list.genres.last().unwrap().name, "g01999");
+    }
+
+    #[tokio::test]
+    async fn genre_pages_ask_by_name_and_page_and_keep_odd_names() {
+        let _exclusive = API_TESTS.lock().await;
+        // Full pages from offset 0, a short page after it, and more songs
+        // than asked for, as a server may send.
+        let server = Server::new(|request, socket| {
+            let parameters = request_parameters(request);
+            let genre = &parameters["genre"];
+            let offset: usize = parameters["offset"].parse().unwrap();
+            let body = if request.starts_with("GET /rest/getAlbumList2?") {
+                assert_eq!(parameters["type"], "byGenre");
+                let size: usize = parameters["size"].parse().unwrap();
+                let count = if offset == 0 { size } else { 3 };
+                let album: Vec<_> = (offset..offset + count)
+                    .map(|n| serde_json::json!({"id": format!("al{n}"), "name": format!("{genre} #{n}")}))
+                    .collect();
+                serde_json::json!({"subsonic-response": {"status": "ok", "albumList2": {"album": album}}})
+            } else {
+                assert!(
+                    request.starts_with("GET /rest/getSongsByGenre?"),
+                    "{request}"
+                );
+                let count: usize = parameters["count"].parse().unwrap();
+                let song: Vec<_> = (offset..offset + count + 10)
+                    .map(|n| serde_json::json!({"id": format!("s{n}"), "title": genre}))
+                    .collect();
+                serde_json::json!({"subsonic-response": {"status": "ok", "songsByGenre": {"song": song}}})
+            };
+            fixture_json(socket, &body);
+        });
+        let (_directory, mut bot, token) = test_bot(&server.url, 1);
+        let unique = Arc::get_mut(&mut bot).unwrap();
+        unique.players.push(Arc::new(crate::player::Player::new(
+            "Queue".into(),
+            50,
+            Ducking::default(),
+            unique.changes.clone(),
+        )));
+        let query = |name: &str, page| {
+            Query(GenreQuery {
+                library: 0,
+                name: name.to_owned(),
+                page,
+            })
+        };
+        let longest = "é".repeat(MAX_GENRE_NAME);
+        for name in [
+            "Rock; Pop",
+            "R&B",
+            "AC/DC Covers",
+            "Drum + Bass",
+            "a=b?c#d%20",
+            "Música Popular Brasileira 日本",
+            longest.as_str(),
+        ] {
+            let first = genre_albums(State(bot.clone()), Path(token.clone()), query(name, 0))
+                .await
+                .ok()
+                .unwrap()
+                .0;
+            assert_eq!(first.albums.len(), PAGE_SIZE as usize);
+            assert_eq!(first.albums[0].name, format!("{name} #0"));
+            assert!(first.more);
+            let second = genre_albums(State(bot.clone()), Path(token.clone()), query(name, 1))
+                .await
+                .ok()
+                .unwrap()
+                .0;
+            assert_eq!(second.albums[0].name, format!("{name} #48"));
+            assert!(!second.more);
+            let songs = genre_songs(State(bot.clone()), Path(token.clone()), query(name, 2))
+                .await
+                .ok()
+                .unwrap()
+                .0;
+            assert_eq!(songs.songs.len(), GENRE_SONGS_PAGE as usize);
+            assert_eq!(songs.songs[0].id, "s100");
+            assert_eq!(songs.songs[0].title, name);
+            assert!(songs.more);
+        }
+        let requests = server.requests();
+        assert_eq!(requests.len(), 21);
+        assert!(requests[0].contains("&size=48&offset=0"), "{}", requests[0]);
+        assert!(
+            requests[1].contains("&size=48&offset=48"),
+            "{}",
+            requests[1]
+        );
+        assert!(
+            requests[2].contains("&count=50&offset=100"),
+            "{}",
+            requests[2]
+        );
+        assert!(
+            requests[0].contains("&genre=Rock%3B%20Pop&"),
+            "{}",
+            requests[0]
+        );
+
+        // Adding a genre queues one page of its songs.
+        let add: Command = serde_json::from_str(
+            r#"{"command":"add","player":0,"kind":"genre","library":0,"id":"R&B","page":1}"#,
+        )
+        .unwrap();
+        command(State(bot.clone()), Path(token.clone()), Json(add))
+            .await
+            .ok()
+            .unwrap();
+        let queued = queue_ids(&bot);
+        assert_eq!(queued.len(), GENRE_SONGS_PAGE as usize);
+        assert_eq!((queued[0].as_str(), queued[49].as_str()), ("s50", "s99"));
+        assert!(server.requests()[21].contains("&genre=R%26B&count=50&offset=50"));
+
+        // Names the bot never asks for are refused before the library.
+        let too_long = "é".repeat(MAX_GENRE_NAME + 1);
+        let asked = server.requests().len();
+        for name in ["", too_long.as_str()] {
+            let refused = genre_albums(State(bot.clone()), Path(token.clone()), query(name, 0))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+            let refused = genre_songs(State(bot.clone()), Path(token.clone()), query(name, 0))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+            let add = Command::Add {
+                player: 0,
+                kind: Kind::Genre,
+                library: 0,
+                id: name.to_owned(),
+                to: None,
+                page: None,
+                index: None,
+            };
+            let refused = command(State(bot.clone()), Path(token.clone()), Json(add))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(server.requests().len(), asked);
+
+        let occupied = LIBRARY_CALLS
+            .acquire_many(MAX_LIBRARY_CALLS as u32)
+            .await
+            .unwrap();
+        let busy = [
+            genres(
+                State(bot.clone()),
+                Path(token.clone()),
+                Query(LibraryQuery { library: 0 }),
+            )
+            .await
+            .err()
+            .unwrap(),
+            genre_albums(State(bot.clone()), Path(token.clone()), query("R&B", 0))
+                .await
+                .err()
+                .unwrap(),
+            genre_songs(State(bot.clone()), Path(token.clone()), query("R&B", 0))
+                .await
+                .err()
+                .unwrap(),
+        ];
+        for refused in busy {
+            assert_eq!(
+                (refused.0, refused.1.as_str()),
+                (StatusCode::SERVICE_UNAVAILABLE, "the music library is busy")
+            );
+        }
+        assert_eq!(server.requests().len(), asked);
+        drop(occupied);
+    }
+
     #[test]
     fn import_covers_have_a_namespace_no_library_key_can_take() {
         assert!(!crate::library_keys::is_key(IMPORT_NAMESPACE));
@@ -3624,8 +5418,9 @@ mod tests {
 
     #[test]
     fn state_has_no_import_without_the_section() {
-        let (_directory, bot, _token) = test_bot("http://unused.invalid", 1);
-        let state = serde_json::to_value(snapshot(&bot, "Listener")).unwrap();
+        let (_directory, bot, token) = test_bot("http://unused.invalid", 1);
+        let viewer = owner(&bot, &token).ok().unwrap();
+        let state = serde_json::to_value(snapshot(&bot, &viewer)).unwrap();
         assert_eq!(state["import"], serde_json::Value::Null);
     }
 
@@ -3732,16 +5527,11 @@ mod tests {
             key_file: directory.path().join("import-key"),
             library: "Library 0".into(),
         };
-        let adding =
-            import::Adding::open(&config, &bot.config.libraries, directory.path()).unwrap();
+        let adding = import::Adding::open(&config, &bot.config.libraries).unwrap();
         Arc::get_mut(&mut bot).unwrap().adding = Some(Arc::new(adding));
-        let requester = bot
-            .adding
-            .as_ref()
-            .unwrap()
-            .pseudonyms
-            .of(&bot.tokens.owner(&token.parse().unwrap()).unwrap());
-        let state = serde_json::to_value(snapshot(&bot, "Listener")).unwrap();
+        let viewer = bot.tokens.owner(&token.parse().unwrap()).unwrap();
+        let requester = bot.pseudonyms.of(&viewer);
+        let state = serde_json::to_value(snapshot(&bot, &viewer)).unwrap();
         assert_eq!(
             state["import"],
             serde_json::json!({"library": 0, "revision": 0})
@@ -3908,5 +5698,343 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.0, StatusCode::NOT_FOUND);
+    }
+
+    fn dj_bot(url: &str, libraries: usize) -> (tempfile::TempDir, Arc<Bot>, String) {
+        let (directory, mut bot, token) = test_bot(url, libraries);
+        let unique = Arc::get_mut(&mut bot).unwrap();
+        unique.players.push(Arc::new(crate::player::Player::new(
+            "DJ queue".into(),
+            50,
+            Ducking::default(),
+            unique.changes.clone(),
+        )));
+        (directory, bot, token)
+    }
+
+    #[tokio::test]
+    async fn dj_controls_are_json_posts_with_checked_ranges() {
+        let _exclusive = API_TESTS.lock().await;
+        let server = Server::new(|_, socket| {
+            use std::io::Write;
+            let body = r#"{"subsonic-response":{"status":"ok","song":{"id":"s1","title":"Library song","duration":200,"bpm":126}}}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let (_directory, bot, token) = dj_bot(&server.url, 1);
+        let send = |value: serde_json::Value| {
+            let (bot, token) = (bot.clone(), token.clone());
+            async move {
+                let command: DjCommand = serde_json::from_value(value).unwrap();
+                dj(State(bot), Path(token), Json(command)).await
+            }
+        };
+        let status = |result: Result<StatusCode, ApiError>| match result {
+            Ok(status) => status,
+            Err(error) => error.0,
+        };
+        let view = || {
+            serde_json::to_value(snapshot(&bot, &owner(&bot, &token).ok().unwrap())).unwrap()
+                ["players"][0]["dj"]
+                .clone()
+        };
+        let volume = serde_json::json!({"player":0,"control":"volume","deck":0,"volume":50});
+        assert_eq!(status(send(volume.clone()).await), StatusCode::CONFLICT);
+        assert_eq!(
+            status(send(serde_json::json!({"player":3,"control":"mode","on":true})).await),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            serde_json::from_value::<DjCommand>(
+                serde_json::json!({"player":0,"control":"scratch","deck":0})
+            )
+            .is_err()
+        );
+        bot.players[0].enqueue(
+            vec![
+                fixture_track("q1"),
+                fixture_track("q2"),
+                fixture_track("q3"),
+            ],
+            "ada",
+            None,
+        );
+        let on = serde_json::json!({"player":0,"control":"mode","on":true});
+        assert_eq!(status(send(on).await), StatusCode::NO_CONTENT);
+        assert_eq!(view()["decks"][0]["entry"]["track"]["id"], "q1");
+        assert_eq!(view()["decks"][1]["entry"]["track"]["id"], "q2");
+        for refused in [
+            serde_json::json!({"player":0,"control":"volume","deck":0,"volume":101}),
+            serde_json::json!({"player":0,"control":"eq","deck":0,"band":"low","db":6.5}),
+            serde_json::json!({"player":0,"control":"eq","deck":0,"band":"high","db":-27}),
+            serde_json::json!({"player":0,"control":"filter","deck":1,"value":1.01}),
+            serde_json::json!({"player":0,"control":"tempo","deck":0,"tempo":16.5}),
+            serde_json::json!({"player":0,"control":"tempo_range","deck":0,"range":10}),
+            serde_json::json!({"player":0,"control":"crossfader","position":-1.5}),
+            serde_json::json!({"player":0,"control":"transition","seconds":0}),
+            serde_json::json!({"player":0,"control":"transition","seconds":61}),
+            serde_json::json!({"player":0,"control":"seek","deck":0,"position_ms":10_800_001}),
+            serde_json::json!({"player":0,"control":"play","deck":2,"playing":true}),
+            serde_json::json!({"player":0,"control":"load","deck":0,"library":0,"id":"s1","entry":3}),
+            serde_json::json!({"player":0,"control":"load","deck":0}),
+            serde_json::json!({"player":0,"control":"load","deck":0,"library":0,"id":""}),
+        ] {
+            assert_eq!(
+                status(send(refused.clone()).await),
+                StatusCode::BAD_REQUEST,
+                "{refused}"
+            );
+        }
+        // A library song replaces deck B's unheard queue song, which returns
+        // to the front of the queue.
+        let load = serde_json::json!({"player":0,"control":"load","deck":1,"library":0,"id":"s1"});
+        assert_eq!(status(send(load).await), StatusCode::NO_CONTENT);
+        let deck = view()["decks"][1].clone();
+        assert_eq!(deck["entry"]["track"]["title"], "Library song");
+        assert_eq!(deck["entry"]["added_by"], "Listener");
+        assert_eq!(deck["bpm"], 126.0);
+        assert_eq!(deck["bpm_source"], "library");
+        assert_eq!(queue_ids(&bot), ["q2", "q3"]);
+        let q3 = bot.players[0].state().queue[1].id;
+        let from_queue = serde_json::json!({"player":0,"control":"load","deck":0,"entry":q3});
+        assert_eq!(
+            status(send(from_queue.clone()).await),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(view()["decks"][0]["entry"]["track"]["id"], "q3");
+        assert_eq!(queue_ids(&bot), ["q1", "q2"]);
+        assert_eq!(status(send(from_queue).await), StatusCode::CONFLICT);
+        for accepted in [
+            volume,
+            serde_json::json!({"player":0,"control":"eq","deck":0,"band":"mid","db":-26}),
+            serde_json::json!({"player":0,"control":"filter","deck":0,"value":-0.25}),
+            serde_json::json!({"player":0,"control":"tempo","deck":0,"tempo":12}),
+            serde_json::json!({"player":0,"control":"crossfader","position":0.5}),
+            serde_json::json!({"player":0,"control":"curve","curve":"cut"}),
+            serde_json::json!({"player":0,"control":"auto_load","on":false}),
+            serde_json::json!({"player":0,"control":"seek","deck":0,"position_ms":61_000}),
+            serde_json::json!({"player":0,"control":"set_cue","deck":0}),
+            serde_json::json!({"player":0,"control":"transition","seconds":8}),
+        ] {
+            assert_eq!(
+                status(send(accepted.clone()).await),
+                StatusCode::NO_CONTENT,
+                "{accepted}"
+            );
+        }
+        let state = view();
+        let deck = &state["decks"][0];
+        assert_eq!(deck["volume"], 50);
+        assert_eq!(deck["eq"]["mid"], -26.0);
+        assert_eq!(deck["filter"], -0.25);
+        // Tempo is in percent and stays within the deck's 8 % range.
+        assert_eq!(deck["tempo"], 8.0);
+        assert_eq!(deck["tempo_range"], 8);
+        assert_eq!(deck["position_ms"], 61_000);
+        assert_eq!(deck["cue_ms"], 61_000);
+        assert_eq!(state["curve"], "cut");
+        assert_eq!(state["auto_load"], false);
+        // The crossfader stands towards B, so the transition fades to A.
+        assert_eq!(state["transition"]["to"], 0);
+        assert_eq!(state["transition"]["duration_ms"], 8_000);
+        assert_eq!(deck["playing"], true);
+        let eject = serde_json::json!({"player":0,"control":"eject","deck":1});
+        assert_eq!(status(send(eject).await), StatusCode::NO_CONTENT);
+        let play = serde_json::json!({"player":0,"control":"play","deck":1,"playing":true});
+        assert_eq!(status(send(play).await), StatusCode::CONFLICT);
+        let sync = serde_json::json!({"player":0,"control":"sync","deck":0});
+        assert_eq!(status(send(sync).await), StatusCode::CONFLICT);
+        let off = serde_json::json!({"player":0,"control":"mode","on":false});
+        assert_eq!(status(send(off).await), StatusCode::NO_CONTENT);
+        assert!(view().is_null());
+        let current = bot.players[0].state().current.clone().unwrap();
+        assert_eq!(current.entry.track.id, "q3");
+        assert_eq!(current.elapsed(), Duration::from_secs(61));
+    }
+
+    #[tokio::test]
+    async fn cue_streams_have_their_own_admission_and_check_the_deck_first() {
+        static CUES: Semaphore = Semaphore::const_new(MAX_CUE_STREAMS);
+        static ROOM: Semaphore = Semaphore::const_new(1);
+        let (_directory, bot, token) = listening_bot();
+        let open =
+            |token: String, stream: Listen| listen_response(bot.clone(), token, 0, stream, &CUES);
+        assert_eq!(
+            open(token.clone(), Listen::Cue(DECKS)).err().unwrap().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            open("invalid".into(), Listen::Cue(0)).err().unwrap().0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(CUES.available_permits(), MAX_CUE_STREAMS);
+        let responses: Vec<_> = (0..MAX_CUE_STREAMS)
+            .map(|index| {
+                open(token.clone(), Listen::Cue(index % DECKS))
+                    .ok()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(bot.players[0].cue_listeners(), [2, 2]);
+        assert_eq!(bot.players[0].listeners(), 0, "cue listeners hear no room");
+        let refused = open(token.clone(), Listen::Cue(1)).err().unwrap();
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+        let room = listen_response(bot.clone(), token, 0, Listen::Room, &ROOM)
+            .ok()
+            .unwrap();
+        assert_eq!(room.headers()["x-audio-frame-samples"], "960");
+        assert_eq!(bot.players[0].listeners(), 1);
+        drop(responses);
+        let mut changes = bot.changes.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while bot.players[0].cue_listeners() != [0, 0] {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(CUES.available_permits(), MAX_CUE_STREAMS);
+        drop(room);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn state_events_come_at_most_ten_times_a_second() {
+        static WATCHERS: Semaphore = Semaphore::const_new(1);
+        let (_directory, bot, token) = listening_bot();
+        let permit = WATCHERS.try_acquire().unwrap();
+        let mut stream = std::pin::pin!(state_stream(
+            bot.clone(),
+            token,
+            bot.changes.subscribe(),
+            permit
+        ));
+        let _first = stream.next().await.unwrap().unwrap();
+        // A fader moved thirty times a second.
+        let changes = bot.changes.clone();
+        let mover = tokio::spawn(async move {
+            loop {
+                changes.notify();
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        });
+        let mut last = tokio::time::Instant::now();
+        for _ in 0..10 {
+            let _event = stream.next().await.unwrap().unwrap();
+            let now = tokio::time::Instant::now();
+            assert!(now - last >= MIN_EVENT_GAP, "{:?}", now - last);
+            last = now;
+        }
+        mover.abort();
+    }
+
+    #[tokio::test]
+    async fn spectrum_ranges_are_bounded_and_bound_to_the_decks_song() {
+        let (_directory, mut bot, token) = dj_bot("http://unused.invalid", 0);
+        let starts = crate::preload::tests::Starts::default();
+        let pool =
+            crate::preload::Pool::new(1 << 30, starts.starter(), crate::beats::Beats::memory());
+        Arc::get_mut(&mut bot).unwrap().preload = Some(pool.clone());
+        let mut song = fixture_track("song");
+        song.duration = Some(60);
+        bot.players[0].enqueue(vec![song.clone()], "ada", None);
+        bot.players[0].set_dj(true);
+        let entry = bot.players[0].state().dj.as_ref().unwrap().decks[0]
+            .track
+            .as_ref()
+            .unwrap()
+            .entry
+            .id;
+        let query = |entry: u64, count: Option<usize>, view: SpectrumView| SpectrumQuery {
+            player: 0,
+            deck: 0,
+            entry,
+            view: Some(view),
+            from: Some(0),
+            count,
+        };
+        let status = |result: Result<Response, ApiError>| match result {
+            Ok(response) => response.status(),
+            Err(error) => error.0,
+        };
+        let ask =
+            |query: SpectrumQuery| spectrum(State(bot.clone()), Path(token.clone()), Query(query));
+        assert_eq!(
+            status(ask(query(entry, None, SpectrumView::Coarse)).await),
+            StatusCode::NOT_FOUND
+        );
+        pool.want(
+            0,
+            &[crate::preload::Want {
+                entry,
+                track: song,
+                need: crate::preload::Need::Loaded,
+            }],
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let decoder = starts.take(entry);
+        for frame in 0..100usize {
+            let samples = (0..crate::decode::FRAME)
+                .flat_map(|index| {
+                    let at = (frame * crate::decode::FRAME + index) as f32 / 48_000.0;
+                    [(std::f32::consts::TAU * 60.0 * at).sin() * 0.5; 2]
+                })
+                .collect();
+            decoder.sender.send(Ok(samples)).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.buffer(0, entry).unwrap().spectrum().columns() < 190 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let response = ask(query(entry, Some(150), SpectrumView::Coarse))
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(response.headers()["x-spectrum-total"], "6000");
+        assert_eq!(response.headers()["x-spectrum-bands"], "3");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 150 * 3);
+        // The 60 Hz tone lights the low band.
+        assert!(body[100 * 3] > body[100 * 3 + 2]);
+        let fine = ask(query(entry, Some(10), SpectrumView::Fine))
+            .await
+            .ok()
+            .unwrap();
+        let body = axum::body::to_bytes(fine.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 10 * crate::spectrum::FINE_BANDS);
+        assert_eq!(
+            status(
+                ask(query(
+                    entry,
+                    Some(MAX_SPECTRUM_COLUMNS + 1),
+                    SpectrumView::Coarse
+                ))
+                .await
+            ),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(ask(query(entry + 1, None, SpectrumView::Coarse)).await),
+            StatusCode::CONFLICT,
+            "an answer belongs to the song the deck plays"
+        );
+        let overview = spectrum_overview(
+            State(bot.clone()),
+            Path(token.clone()),
+            Query(query(entry, None, SpectrumView::Coarse)),
+        )
+        .await
+        .ok()
+        .unwrap();
+        let body = axum::body::to_bytes(overview.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), OVERVIEW_COLUMNS * 3);
+        drop(decoder);
     }
 }

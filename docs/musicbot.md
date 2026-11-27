@@ -17,12 +17,23 @@ browsers. People control what plays on a web page; they get their link by writin
 - **Browsing.** The web page browses each library much like Navidrome's own: album
   lists (recently added, recently played, most played, random, by name, starred)
   with covers, the artist index, an artist's albums, an album's songs, and
-  playlists. A search asks all libraries at once for artists, albums and songs.
-  Every song, album and playlist has *Add* and *Play next*. Song titles open the
-  song's page: its details (track, disc, length, year, genre, format, play count),
-  rating, the albums it appears on and, with sonic similarity, similar songs.
+  playlists. The artist index has a bar of initials that stays at the top while
+  scrolling; each initial scrolls to its artists. A search asks all libraries at
+  once for artists, albums and songs. While typing two or more characters in the
+  search field, a list under it suggests a few artists, albums and songs with
+  their covers; arrow keys pick one, Enter opens its page and Enter without a
+  pick runs the full search; Escape closes the list. Every song, album and
+  playlist has *Add* and *Play next*. Song titles open the song's page: its
+  details (track, disc, length, year, genre, format, play count), rating, the
+  albums it appears on and, with sonic similarity, similar songs. The genre
+  there links to the genre's page.
   Choose the destination queue in the player bar; the browser remembers the
   selection for the page (per public address and path).
+- **Genres.** The Genres page lists a library's genres with their album and
+  song counts, sorted by name or by size, and a field that narrows the list by
+  name. A genre's page shows its counts, its albums 48 per page and its songs
+  50 per page; *Add all* and *Play all next* queue the page of songs on screen.
+  Links to genre pages carry the genre's name, so they work when shared.
 - **Sonic similarity.** Libraries with the OpenSubsonic `sonicSimilarity` extension
   offer **Similar songs** for library tracks and the playing song, plus **Blend
   into this song**: songs that lead from the playing song to a chosen one by how
@@ -39,8 +50,9 @@ browsers. People control what plays on a web page; they get their link by writin
   and failed helpers show a placeholder.
   Finished covers are kept on disk in the state directory (`web.cover_cache_mib`,
   64 MiB by default, each for at most a day), so the library and the worker see
-  each cover and size once a day at most, also across restarts. The browser keeps
-  them for a day as well.
+  each cover and size once a day at most, also across restarts. Covers with
+  byte-identical images, such as an album's songs, share one worker job per
+  size. The browser keeps them for a day as well.
 - **Channels.** One Mumble connection per configured channel, each with its own
   client certificate. Every channel starts with its own queue. On the web page a
   channel can play another channel's queue instead: then both hear the same song,
@@ -57,6 +69,10 @@ browsers. People control what plays on a web page; they get their link by writin
   the whole window: large cover, scrubber, play/pause and skip, browser listening,
   Mumble volume, rating and the next songs. It can also switch to full screen;
   Esc closes it.
+- **DJ mode.** A queue switches into DJ mode on the DJ page: two decks with
+  their own decoders, mixed live into the queue's Mumble and browser output,
+  with crossfader, one-button fades, EQ, filter, tempo with BPM sync,
+  headphone cue in the browser and MIDI controllers. Details below.
 - **Queues.** Drag songs, albums or playlists from the library into the queue,
   then drag entries to reorder them. The move handles also accept Alt+Up/Down.
   Remove entries, clear upcoming tracks, skip, pause and set the volume. The player
@@ -71,12 +87,25 @@ browsers. People control what plays on a web page; they get their link by writin
   attempts per queue, newest first. It shows track details, who queued the track,
   local start/end times, transmitted duration, and whether it completed, was
   skipped, or failed. History survives restarts and loads in pages of 50.
+  In DJ mode, deck songs the room heard enter it the same way (see DJ mode).
 - **Library history.** Playback also appears in the configured Subsonic account's
   history and play counts. Shared channels count as one play; independent queues
   count separately. The submission rules are described below.
 - **Ratings.** Click one of the five stars on the playing song, a library track
   or a History entry to save its rating. Click the star for the current rating
   again to clear it. Listeners share the configured library account.
+- **Lyrics.** The song page shows a song's lyrics from the library, and the
+  lyrics button in the player bar opens them on the big screen (where the same
+  button switches between lyrics and the next songs). Timed lyrics follow the
+  music while that song plays in the selected queue; clicking a line plays from
+  there.
+- **Playlists.** Everyone with a Mumble certificate owns personal playlists:
+  **New playlist** on the Playlists page, an *Add to playlist* menu on songs,
+  albums, the song page and the playing song, and a heart in the player bar, the
+  big screen and the song page for their Favorites. Everyone sees every playlist
+  and queues one song or all of it; the owner renames, shares and deletes, and a
+  shared playlist takes songs from everyone with a certificate. Playlists made in
+  the library itself stay read-only. Details below.
 - **Ducking.** While somebody in a channel speaks, its Mumble music output gets
   quieter (by default to 30 % of its volume) and comes back 0.8 s after the last
   speech. It fades down in about 60 ms and up in about half a second, so nothing
@@ -113,7 +142,7 @@ the browser to the public address, so the key never stays in the address bar.
 The cookie is `SameSite=Lax` and scoped to the public address's path. Over HTTPS
 it is `Secure` and named `__Host-musicbot_link` (at `/`) or
 `__Secure-musicbot_link` (below a path); over plain HTTP it is `musicbot_link`.
-**Forget this browser** in the sidebar deletes it; the link itself stays valid.
+**Forget this browser** at the bottom of every page deletes it; the link itself stays valid.
 A person with a Mumble certificate keeps the same link; `!web new` replaces
 it, and the old one stops working. Without a certificate anybody could use the
 same name later, so every `!web` gives a new link. Links are kept in `tokens.json`
@@ -235,15 +264,21 @@ bot reconnects with growing pauses up to a minute.
 ## Security and codec roles
 
 The parent owns Mumble TLS, Subsonic credentials, bearer links and queue metadata.
-It transports opaque library bytes; it does not call a decoder, resampler, voice
-classifier or encoder, and does not link one: the codec crates belong to the separate
+It transports opaque library bytes; it does not call a decoder, voice classifier
+or encoder, and does not link one: the codec crates belong to the separate
 `nuschl-musicbot-codec-worker`, which `cargo-deny` alone allows to depend on them.
+The parent's own signal processing works on the validated 48 kHz PCM the decode
+children return: the volume and ducking gain, and in DJ mode the mix, the tempo
+resampler and a limiter in first-party safe Rust, and the EQ and filter as
+direct form I biquads with cookbook coefficients from the safe `biquad` crate
+(`apps/musicbot/src/player/dsp.rs`).
 The bot starts that worker only from its fixed place beside itself
 (`<prefix>/libexec/nuschl-musicbot/`; a missing worker fails the operation) as
 `--codec-worker <role>`, in one fixed role, through versioned, size-capped IPC
 (`nuschl_ipc::musicbot`):
 
-- Decode: one child for the current track of each active player. The parent streams
+- Decode: one child for the current track of each active player, and in DJ mode
+  one per loaded deck (two at most). The parent streams
   bounded opaque chunks; the child returns exactly 20 ms of finite stereo PCM per
   reply. The retained parent queue is 250 frames (5 seconds, 1,920,000 PCM bytes), plus at most
   five 32 KiB pump/read/write buffers, one 64 KiB response and bounded pipe storage.
@@ -401,6 +436,21 @@ service fault checks remain separate evidence.
 Rust tests cover queue ordering, seek boundaries, history lifecycle and retention,
 durable state, library identity across reordering/removal, gain ramps, VAD,
 and authenticated rating reads/writes, bounds, failures and live revisions.
+DJ mode's tests cover crossfader curves, EQ and filter responses, resampler
+length and continuity at five tempos, gain ramps, the limiter, the transition
+timeline, position accounting, auto load, failure back-off, entering and leaving,
+control ranges, cue admission, the SSE rate, and in the real playback loop with
+controlled decoders that two decks hold exactly two decoders that retire before
+the queue resumes. The deck queue, preload, BPM and loop tests cover deck-queue
+auto load and requeueing, saved deck queues, cue jumps that play in the next
+frame from memory and jumps past the decoded part that wait, preloading the next
+deck-queue song, the memory budget, the 30-minute cap, decode children counted
+and reaped, preload back-off, the beat grid within 10 ms on synthetic beats with
+intro silence and swing, tempo within 1 BPM at 85 to 174 BPM, loop lengths exact
+in samples at several tempos, the loop crossfade, quantised and free loop points,
+beat loops at several BPMs, the cache's bound and restart, band energies on
+tones and noise, column timing, and bounded spectrum ranges bound to the deck's
+song.
 Frontend tests cover progress interpolation, scrubbing, drag indices, route
 encoding, shortcuts, and history pagination during live refreshes.
 `tests/musicbot.py` drives the JSON API and two SSE viewers against stock Murmur
@@ -471,6 +521,222 @@ volume zero, independent local mute/volume, pause/seek/skip, queue switching,
 listener release and suspension cleanup. Reference-Opus Mumble output fell to
 the configured speech-ducking level while measured browser output stayed steady.
 
+## DJ mode
+
+**DJ mode** on the DJ page (or **DJ mode** in the queue's heading) turns the
+selected queue into two decks, A and B, mixed live into the same output: its
+Mumble channels and its browser listeners hear the mix, with the queue's Mumble
+volume and speech ducking applied as before. The playing song continues on deck A
+at its position with its decoder; with auto load on, the queue's next song waits
+on deck B, paused. **Leave DJ mode** continues the lead deck's song (the playing
+one, else the louder one) as the queue's current song from its position.
+
+Each deck has title, artist and cover; the song's BPM at the deck's tempo (see
+BPM and beat grid); the position with a seek slider,
+play/pause, **Cue** (go to the cue point), **Set cue**, load next and eject; a
+3-band EQ (low shelf 250 Hz, mid peak 1 kHz, high shelf 2.5 kHz, −26 to +6 dB),
+a filter knob (low-pass down to 60 Hz on the left, high-pass up to 8 kHz on the
+right, neutral in the middle) and the channel fader; a tempo fader with a ±8 %
+or ±16 % range that changes speed and pitch together, like a turntable, and
+**Sync**, which sets the deck's tempo so its BPM matches the other deck's
+tempo-adjusted BPM (widening the range to 16 % when needed; beat phase stays with
+the DJ); and a headphones button: this browser alone hears the deck after EQ,
+filter and tempo, before its channel fader and the crossfader, at its own volume.
+
+The mixer has the crossfader with a **Smooth** curve (constant power, each deck
+at −3 dB in the middle) or a **Cut** curve (both decks at full level, cut within
+the last 4 % of the travel), **Fade to A/B**, which moves the crossfader to the
+other deck over the chosen time and starts that deck, and **Auto load**: after a
+fade the deck that went silent pauses and takes its next song, and a deck whose
+song ends takes the next one too. Moving the crossfader stops a fade where it is.
+Everyone with a link controls the decks.
+
+**Deck queues.** In DJ mode each deck has its own queue under it (on phones: deck
+A, its queue, the mixer, deck B, its queue). Its rows reorder by drag or by
+Alt+Up/Down on their handle, and have **Load now**, moves to the other deck's
+queue or the main queue, and remove. The **A** and **B** buttons on library songs,
+albums, playlists and main-queue rows add to that deck's queue. A deck's next song
+(for **Load next**, auto load and the keyboard) is the first of its own queue,
+else the first of the main queue. A song that leaves a deck before the room heard
+it goes back to the front of the queue it came from. Deck queues have the main
+queue's cap (5,000 songs each), are saved with the queues in `queues.json`, and
+stay while DJ mode is off, hidden until it is on again.
+
+**Drag and drop.** Each deck takes the page's drags: library songs, albums and
+playlists, main-queue rows and deck-queue rows. A song loads onto the deck; an
+album or playlist puts its first song on the deck and the rest at the front of
+the deck's queue. The deck shows a highlight and "Drop to load onto deck A"
+while something is dragged over it. A deck queue takes drops at the gap the
+pointer points at, the main queue takes deck-queue rows back. Keyboard users use
+the **A**/**B** buttons and **Load now**.
+
+**Songs in memory.** Each deck's song, and the song each deck loads next, is
+decoded completely into memory as fast as its decode child delivers, as
+interleaved 16-bit stereo at 48 kHz (11.5 MB a minute). Playback, cue jumps,
+seeks and loops read from there: a jump inside the decoded part plays in the next
+frame, after the one-frame fade; a jump past it waits for decoding to reach it.
+The memory is one budget across the bot, `audio.preload_mib` (768 MiB by default,
+at most 16,384; 0 lets decks stream their songs as in the queue). Songs longer
+than 30 minutes or of unknown length and songs the budget cannot hold stream
+from a decoder like a queue song (a seek then restarts the decoder); a deck that
+streams a song (such as the queue's song carried onto deck A) keeps streaming it
+until its next seek or load, then plays it from memory once it is there. At most four preload decode
+children run at once across the bot, each keeping its process credit until it
+has exited; a playing deck's song comes before a paused deck's, and both before
+next songs, whose decoding stops for them and resumes later where it stopped.
+Next songs give way first when memory runs short, and a song's memory returns
+once it has left its deck and is no longer next. A preload failure fails that
+song; preloading waits 0.5 seconds after a failure, doubling up to 8 seconds,
+and stops with a notice after three failures in a row. The NixOS service sets no
+memory limit of its own; size `preload_mib` to the host.
+
+**BPM and beat grid.** A song's BPM comes from the library when it gives one
+(OpenSubsonic `bpm`, which Navidrome reads from the file's tags); otherwise the
+bot estimates it from the song in memory, and the deck shows "≈" and "BPM est."
+(and "Analysing…" while it runs). The estimate reads 60 seconds from 30 seconds
+into the song (from its start for songs under 90 seconds): a mono copy at 8 kHz,
+an onset envelope at 100 Hz from a 256-point spectrum in 15 bands, then tempo by
+a comb over the envelope's autocorrelation from 60 to 200 BPM, refined to 0.1
+BPM, with octave correction towards 80–170 BPM. Below a confidence of 0.15 the
+BPM stays unknown. The beat grid is the song's beats at a constant tempo: the
+library's BPM or the estimate, corrected by up to 0.5 % from the whole decoded
+song, and the first beat, found by matching the onset envelope against a pulse
+train at that tempo; below a confidence of 0.15 the grid stays unknown. One
+analysis runs at a time across the bot: a first one when the window is in
+memory, a final grid when the whole song is. Results are kept per library and
+song ID in `beats.json` in the state directory (private, replaced atomically,
+at most 20,000 songs, the oldest leaving first), so each song is analysed once.
+Sync uses the library's BPM or the estimate.
+
+**Loops.** Each deck loops from its song in memory. **In** and **Out** set a
+loop from the position, **Loop** turns it off or plays the last loop again from
+its start, the beat buttons make a loop of 1/4 to 32 beats from the current beat,
+½ and ×2 halve and double it, and ◀ ▶ move it by its length or by one beat (a
+deck playing inside a moving loop moves along). With **Quantise** on (the
+default) and a known beat grid, loop points snap to the nearest beat and beat
+loops start on the beat at or before the position; without a grid loops use the
+exact positions and the deck says the loop is free. A loop lasts a quarter beat to
+64 beats, or 10 ms to 60 seconds when free, and lies within the song. The loop is
+in song time, so tempo changes keep working inside it, and its end wraps to its
+start within the frame, sample-accurate, with a 5 ms equal-power crossfade. A
+seek or cue jump outside a playing loop turns it off; inside, it keeps looping.
+Songs a deck streams cannot loop. The deck's position bar and its waveform show
+the loop with handles to drag (snapping like the buttons) and, with a grid, beat
+ticks with bars emphasised.
+
+**Waveform.** Each deck draws its song around the playhead (±3, ±6 or ±12
+seconds) as a three-band waveform (low, mid, high in three theme colours) or,
+with **Spectrogram**, as a heat map of 24 bands, with the beat grid (bars every
+four beats drawn stronger), the cue point and the loop, whose ends drag here too.
+An overview strip above the position bar shows the whole song with the visible
+part and the loop. The bot computes the band energies from the song in memory as
+it decodes, one 20 ms frame of work at a time: a mono 12 kHz copy through biquad
+filter banks, 100 columns per second of song time, 3 coarse bands (20–250 Hz,
+250 Hz–2.5 kHz, 2.5–5.6 kHz) and 24 log-spaced bands from 40 Hz to 5.5 kHz, one
+byte per band in dB (27 bytes per column, about 1.6 MB for a 10-minute song). They
+live with the song's PCM and leave with it; `beats.json` keeps no waveforms. The
+page asks for the columns around the visible window (up to 2,000 per request),
+keeps them per song, and draws at the deck's tempo from the position it
+interpolates between state events; it redraws every animation frame while the
+deck plays and the page is visible, and only on changes otherwise. Songs a deck
+streams show a flat line with a note.
+
+**How it sounds.** Every control sets a target; the bot moves gains, EQ, filter
+and tempo towards it one step per 20 ms frame (settling in about 60 ms), ramps
+within the frame and recomputes filter coefficients every 32 samples. Play,
+pause, seeks and cue jumps fade over one frame. A peak limiter keeps the sum of
+both decks within full scale. The page sends a moving control about 30 times a
+second, one request at a time per control.
+
+**Latency.** A control reaches the mix after the network delay, typically 0.1 to
+0.3 seconds, plus up to 20 ms; Mumble and browsers add their own buffering.
+
+**Limits.** Two decks per queue. A deck that streams holds one decode child at
+most and starts a new one only after the old one has exited; songs in memory use
+the preload decode children (at most four across the bot). All of a player's
+decode children exit when DJ mode ends. A decode failure fails that deck's
+song; the deck's next decoder waits 0.5 seconds, doubling per failure in a row up
+to 8 seconds, and after three failures in a row auto load stops with a notice.
+Three encoder failures in a row pause DJ mode with a notice. Four headphone cue
+streams across the bot. DJ mode itself is not saved: after a restart the lead
+deck's song continues as the queue's current song.
+
+**History.** A deck's song counts as heard while the room's mix reaches a Mumble
+channel or a browser listener and the deck sounds in it at −20 dB or more
+(channel fader times crossfader); the first heard frame starts the play and
+announces it as now playing. When the song leaves the deck (end, eject, a new
+song, a fade with auto load, leaving DJ mode) the play enters the history like a
+queue play: completed at the end, skipped otherwise, failed on errors. Scrobbling
+uses the queue's threshold on heard time. Heard time counts the room's mix only;
+headphone cue audio stays out of it.
+
+**Keyboard shortcuts.** The DJ page is playable from the keyboard: the left hand
+plays deck A, the right hand deck B (the same keys six columns to the right), the
+mixer sits in the middle. Keys match by their place on the keyboard
+(`KeyboardEvent.code`), so they stay put on every layout; the panel shows each
+key's printed character where the browser tells it. Shortcuts act only on the DJ
+page and never while a text field, select or editable text has the focus; with
+Ctrl, Alt or Meta held the browser keeps the key. Space stays the page's play and
+pause for the queue (in DJ mode it holds and resumes the whole mix).
+
+| Action | Deck A | Deck B |
+| --- | --- | --- |
+| Play / pause | D | L |
+| Go to cue point / set it | F / Shift+F | ; / Shift+; |
+| Seek back / forward 4 s | A / Q | J / U |
+| Tempo down / up | S / W | K / I |
+| Volume down / up | C / E | . / O |
+| Filter towards low-pass / high-pass | Z / X | M / , |
+| Cut or restore low / mid / high EQ | 1 / 2 / 3 | 8 / 9 / 0 |
+| Sync | R | P |
+| Load the deck's next song | T | Y |
+| Headphone cue | V | / |
+| Loop in / out | Shift+Z / Shift+X | Shift+M / Shift+, |
+| Loop on/off (reloop) | Shift+D | Shift+L |
+| 4-beat / 8-beat loop | 4 / 5 | - / = |
+| Halve / double the loop | Shift+S / Shift+W | Shift+K / Shift+I |
+| Move the loop back / forward | Shift+A / Shift+Q | Shift+J / Shift+U |
+
+Mixer: G and H move the crossfader towards A and B (Shift+G and Shift+H to the
+ends), B fades to the other deck, N turns auto load on or off, and ? opens
+**Keyboard shortcuts**. A press moves a fader one step (volume 5 %, tempo 0.1 %,
+filter 0.05, crossfader 0.05); holding the key for a quarter second glides it
+(volume 50 % a second, tempo 1 %, filter 0.5, crossfader 1.0), and the browser's
+own key repeat is ignored. The panel lists every action with its key; **Change**
+binds the next key pressed (Escape cancels; a key bound elsewhere moves to the new
+action and the panel says so), **Unbind** frees one and **Reset to defaults**
+restores the layout. The bindings are kept in this browser's localStorage.
+
+**MIDI controllers.** In browsers with Web MIDI (Chromium-based, over HTTPS or on
+localhost), **Use a MIDI controller** lists the inputs. **Learn** beside a
+control, or **Learn on the decks** and a click on it, binds the next fader, knob or
+button moved; Escape cancels. Faders and knobs take control changes: absolute,
+14-bit when the controller also sends controller + 32 while learning, or relative
+encoders (1–63 up, 65–127 down); EQ, filter, tempo and crossfader knobs rest at
+their middle. Buttons take note-on or a control change of 64 or more. The mapping
+is kept in localStorage per device name and can be cleared. MIDI drives the queue
+selected on the page; headphone cue needs a click. Web MIDI's default allowlist
+(`self`) admits the page's own origin, and the bot sends no Permissions-Policy
+header that narrows it. Every controller is set up through Learn.
+
+## Lyrics
+
+The bot asks the library that holds the song. Libraries with the OpenSubsonic
+`songLyrics` extension (Navidrome among them) get `getLyricsBySongId` and may
+answer with timed lines from embedded or sidecar lyrics; the first timed lyrics
+in the answer win, otherwise the first untimed ones. Their `offset` moves every
+line (positive shows lines sooner), and lines are ordered by their start. Other
+libraries get the classic `getLyrics` with the song's artist and title and answer
+plain text. Each line keeps at most 500 characters without control characters,
+and at most 2,000 lines are kept. A library answer of "not found" (error 70)
+means the song has no lyrics.
+
+Timed lyrics highlight the line being sung while the selected queue plays that
+song, using the same position as the progress bar, and keep it in the middle of
+their box. Scrolling the box by hand pauses this for five seconds. Lines are
+buttons that seek there. The highlight follows the position the bot reports;
+Mumble and the browser add their own short delay.
+
 ## Song ratings
 
 Click a star to save one to five stars immediately. Click the star for the current
@@ -496,6 +762,60 @@ all five ratings and clearing, player/library/history controls, live updates,
 unchanged request counts during playback, failed writes and explicit recovery,
 and retained backend ratings after a bot restart. Narrow-screen controls were
 also exercised in Chromium.
+
+## Playlists
+
+Personal playlists are real playlists of each library's configured account,
+made with the Subsonic `createPlaylist`, `updatePlaylist` and `deletePlaylist`
+calls and kept private in the library (`public=false`). The bot records who owns
+each one in `playlists.json` in its state directory, a private file it replaces
+atomically:
+
+```json
+{"version":1,"playlists":[{"library":"<library key>","id":"<playlist id>",
+  "owner":"r<32 hex digits>","owner_name":"Ada","shared":false,"favorites":false}]}
+```
+
+`library` is the library's key from `library_keys.json`, `owner` the person's
+pseudonym (see "Requester pseudonyms" under Adding music; the secret in
+`import_requester.key` exists also without an import service) and `owner_name`
+their Mumble name, renewed whenever they change a playlist. Entries of a library
+whose key leaves `library_keys.json` go at the next start, and entries of
+playlists the library no longer lists go when somebody opens the Playlists page.
+
+A playlist lives in the library selected when it was made and takes songs of
+that library only. The page shows your playlists first (Favorites first), then
+other people's with their name and a **Shared** badge, then the library's own.
+
+| Who | View and queue | Add and remove songs | Rename, share, delete |
+| --- | --- | --- | --- |
+| The owner | yes | yes | yes, except Favorites |
+| Others with a certificate | yes | while it is shared | — |
+| People without a certificate | yes | — | — |
+| Anybody, for playlists made in the library | yes | — | — |
+
+People whose Mumble client lacks a certificate share one pseudonym per server, so
+owning playlists needs a certificate; the page explains why its controls are off.
+**Favorites** is a personal playlist per person and library, made by the first
+heart and named "Favorites of <name>". It stays private and keeps its name; its
+owner adds and removes songs. Turning a heart off takes every copy of the song out.
+
+Limits: names have 1 to 100 characters without control characters; a person owns
+at most 50 personal playlists and the bot keeps at most 10,000; a playlist holds
+at most 5,000 songs; one request adds 1 to 500 songs (an album with more is
+refused); song ids have at most 128 bytes. Songs go to the library 100 at a time
+and in at most 4 KiB of encoded ids per request, so request URLs stay short.
+
+Changes of one playlist wait for each other, as do one person's new playlists
+and Favorites; a change waits up to 30 seconds for its turn and then answers 503.
+The lock then moves into the admitted library call, which holds it until the
+library has answered, also when the browser has gone. Removing a song names its
+position and id; the bot reads the playlist again and answers 409 when another
+song is there now. After every change that reached the library, State/SSE
+`playlists.revision` advances and every open playlist view reloads.
+
+Tested against a loopback Subsonic fixture that keeps playlists the way
+Navidrome's API does; a run against a real Navidrome is still open.
 
 ## Backend playback history
 
@@ -593,8 +913,9 @@ library, without reading the key. On NixOS the key is one of the module's
 **Requester pseudonyms.** The import service learns one stable pseudonym per
 person: `"r"` and the first 32 hexadecimal digits of HMAC-SHA256
 over the Mumble server, a zero byte and the person's certificate hash, keyed with
-a 32-byte secret the bot makes on first use in `import_requester.key` in its
-state directory. People without a certificate share one pseudonym per server. The
+a 32-byte secret the bot makes at its first start in `import_requester.key` in its
+state directory. The same pseudonyms name the owners of personal playlists. People
+without a certificate share one pseudonym per server. The
 bot watches the import list and fetches covers, which every viewer shares, as
 `musicbot`.
 
@@ -639,7 +960,8 @@ the cookie. Cookie requests from another origin or site get 403 (see Links).
 POST bodies must be JSON, which cross-site forms cannot send. `POST forget` with
 `{}` answers 204 and deletes this browser's cookie. `GET state` returns a
 snapshot; `GET events` sends `event: state` SSE frames immediately, after changes,
-and roughly every two seconds for progress correction. Slow viewers receive the
+and roughly every two seconds for progress correction, at most ten a second (DJ
+faders change the state up to 30 times a second). Slow viewers receive the
 latest state when they can read again. Revoked links lose access to the stream.
 At most 32 streams may remain open across all tokens; excess viewers receive 503.
 The permit belongs to the response stream, not merely its request handler.
@@ -660,6 +982,13 @@ stream with nothing else to send (a paused or waiting queue) sends one at least 
 open. The stream remains open while the queue waits; disconnecting releases its
 subscription. Revoked links are
 checked during playback and at least once per second while idle or backpressured.
+
+`GET cue?player=N&deck=D` streams one DJ deck before its channel fader in the
+same format and records, for headphones in one browser. Invalid links return 404,
+unknown queues and decks 400, and with all four cue streams in use 503; cue
+streams have this admission of their own beside the 16 listening streams. A cue
+stream stays open while DJ mode is off and then sends only keep-alives.
+Seeking or loading the deck resets it.
 
 The authenticated `GET licenses` route serves the installed, bounded
 licence text. Nix packages are gated by the scoped Rust/npm notice inventory;
@@ -690,23 +1019,130 @@ write. Visible stars use it to reload the authoritative rating. The counter is
 local to a bot run; ratings are fetched from the library rather than queue or
 history snapshots. After a failed write, **Retry** reloads the current rating.
 
+State/SSE includes `playlists`: `{"revision":N,"can_own":bool}`. `revision`
+advances after every playlist change that reached the library and when owner
+entries change; `can_own` says whether this viewer's Mumble client has a
+certificate. `GET playlists?library=N` returns `{"playlists":[Playlist]}` and
+`GET playlist?library=N&id=ID` returns `{"playlist":Playlist,"songs":[Track]}`,
+where a Playlist has the library's fields (`library`, `id`, `name`, `song_count`,
+`duration`, `owner` (the library account), `cover_art`) and, for this viewer,
+`personal`, `owner_name` (null for library playlists), `mine`, `shared`,
+`favorites`, `editable` (may add and remove songs) and `manageable` (may rename,
+share and delete). The playlist changes are JSON POSTs:
+
+| Route | Body | Answer |
+| --- | --- | --- |
+| `playlists/create` | `{"library":N,"name":"…","shared":false}` (`shared` optional) | the new Playlist |
+| `playlists/rename` | `{"library":N,"id":"ID","name":"…"}` | 204 |
+| `playlists/share` | `{"library":N,"id":"ID","shared":bool}` | 204 |
+| `playlists/delete` | `{"library":N,"id":"ID"}` | 204 |
+| `playlists/add` | `{"library":N,"id":"ID"}` with exactly one of `"songs":["ID",…]`, `"album":"ID"` or `"player":N` (the song that queue plays, from the same library) | `{"added":N}` |
+| `playlists/remove` | `{"library":N,"id":"ID","index":N,"song":"ID"}` | 204, or 409 when another song is at `index` |
+| `favorites` | `{"library":N,"id":"song ID","favorite":bool}` | `{"favorite":bool}` |
+
+`GET favorites?library=N&id=ID` returns `{"favorite":bool}`: whether the song is
+in the viewer's Favorites of that library, without a library call while they have
+none. Refusals answer 403 with the reason (no certificate, a library playlist,
+private to its owner, Favorites stays private), invalid names, ids or song counts
+400, full playlists and reached caps 409, a playlist busy for 30 seconds 503,
+and library failures the redacted errors of browsing.
+
 `POST command` accepts JSON tagged by `command`: `pause`, `resume`, `skip`,
 `clear`, `seek` (`position_ms`), `volume`, `ducking`, `remove`, `move`, `add`, and
 `attach`. Commands include a player index; entries have stable IDs. `move.index`
 is the index after removing the moved entry. `add.index` is an insertion position,
 or null for the end. Successful commands return 204 and broadcast the new state.
 
-Browsing uses `albums`, `album`, `artists`, `artist`, `playlists`, `playlist`, and
-`search` JSON endpoints. Library identity in requests is its current config index.
+`POST dj` accepts one DJ mode control per request, JSON tagged by `control`, with
+`player` (the queue index) and, for deck controls, `deck` (0 for A, 1 for B):
+
+| Control | Fields | Range |
+| --- | --- | --- |
+| `mode` | `on` | turns DJ mode on or off |
+| `load` | `library`, `id` and `kind` (`song`, the default, `album` or `playlist`: the first song onto the deck, the rest to the front of its queue), or `entry` (an entry of the main queue or a deck queue, which leaves its queue) | ids of 1 to 128 bytes |
+| `queue_add` | `library`, `id`, `kind`, `index` (null: the end) | adds to the deck's queue |
+| `queue_move` | `entry`, `deck` (0, 1, or null for the main queue), `index` (in that queue without the entry) | |
+| `queue_remove` | `entry` | |
+| `queue_clear` | `deck` | |
+| `loop_in`, `loop_out`, `loop_toggle` | — | |
+| `beat_loop` | `beats` | 0.25, 0.5, 1, 2, 4, 8, 16 or 32 |
+| `loop_resize` | `factor` | 0.5 or 2 |
+| `loop_move` | `by` (`loop` or `beat`), `direction` | −1 or 1 |
+| `loop_set` | `start_ms`, `end_ms` (song time) | within the first three hours; snapped to beats when quantising |
+| `quantize` | `on` | |
+| `eject`, `set_cue`, `jump_to_cue`, `sync` | — | |
+| `play` | `playing` | |
+| `seek` | `position_ms` (song time) | 0 to three hours, clamped to the song |
+| `volume` | `volume` | 0 to 100 |
+| `eq` | `band` (`low`, `mid`, `high`), `db` | −26 to 6 |
+| `filter` | `value` | −1 (low-pass) to 1 (high-pass), 0 neutral |
+| `tempo` | `tempo` in percent | −16 to 16, clamped to the deck's range |
+| `tempo_range` | `range` | 8 or 16 |
+| `crossfader` | `position` | −1 (deck A) to 1 (deck B) |
+| `curve` | `curve` | `smooth` or `cut` |
+| `transition` | `seconds` | 1 to 60 |
+| `auto_load` | `on` | |
+
+Values outside a range and unknown decks answer 400; a control the state refuses
+answers 409 with the reason (DJ mode off, an empty deck, a queue entry gone, a
+full queue, sync without both BPMs or beyond 16 %, a fade to an empty deck, a
+loop without its start, a beat loop without beats, a loop on a song that streams).
+Successful controls return 204. State/SSE gives each player `dj`: null, or
+`{"decks":[Deck,Deck],"crossfader":N,"curve":"smooth"|"cut","transition":
+{"to":N,"duration_ms":N,"elapsed_ms":N}|null,"auto_load":bool,"notice":"…"|null}`,
+where a Deck has `entry` (the queue's entry format, or null), `position_ms` (song
+time), `playing`, `buffering`, `advancing`, `cue_ms`, `volume`, `eq`
+(`{"low":N,"mid":N,"high":N}`), `filter`, `tempo` (percent), `tempo_range`,
+`bpm` (the library's BPM or the estimate, one decimal, or null), `bpm_source`
+(`library`, `estimate` or null), `analysing`, `loaded_ms` (how much of the song
+is decoded in memory, null while the deck streams), `preloaded` (all of it),
+`loop` (`{"start_ms":N,"end_ms":N|null,"active":bool}` or null), `quantize`,
+`grid` (`{"bpm":N,"first_beat_ms":N}` or null: beats at `first_beat_ms + k ·
+60000 / bpm` in song time), `error` and `cue_listeners`. Song time advances
+`tempo` percent faster than real time while `advancing`. In DJ mode the player's
+`current` is null. Every player also has `deck_queues`: two lists of entries in
+the queue's format, kept while DJ mode is off.
+
+`GET spectrum?player=N&deck=D&entry=E&view=coarse|fine&from=C&count=K` returns
+the band energies of deck D's song for the deck's waveform: `count` (1 to 2,000,
+default 2,000) columns from column `from`, as `application/octet-stream` with one
+byte per band and column, column after column. Column n covers song time n/100 s
+to (n+1)/100 s. `coarse` has 3 bands (20–250 Hz, 250 Hz–2.5 kHz, 2.5–5.6 kHz),
+`fine` 24 log-spaced bands from 40 Hz to 5.5 kHz, lowest first, scaled so white
+noise reads flat. A byte b is `b · 72 / 255 − 72` dB (0 at −72 dB or below, 255
+at 0 dB, a full-scale sine). Headers: `X-Spectrum-From`, `X-Spectrum-Columns`
+(columns computed so far), `X-Spectrum-Total` (the song's columns, 0 when its
+length is unknown) and `X-Spectrum-Bands`. `GET spectrum/overview` with the same
+`player`, `deck` and `entry` returns the whole song in 1,000 coarse columns (the
+loudest of each group; columns not yet computed read 0). Both answer 409 when
+deck D plays another song than `entry`, 404 while the song streams instead of
+being in memory, and 400 for other values. The page draws the numbers itself.
+
+Browsing uses `albums`, `album`, `artists`, `artist`, `genres`, `genre/albums`,
+`genre/songs`, `playlists`, `playlist`, `search` and `suggest` JSON endpoints.
+Library identity in requests is its current config index.
 Album lists accept `library`, `list`, and `page`; detail endpoints accept `library`
 and `id`. The authenticated `art/<library>/<id>?size=…&v=…` route returns
 `image/png`: a PNG the content worker made from the decoded art (8-bit RGBA,
 only `IHDR`, `IDAT` and `IEND`). Covers are made in
 edge lengths of 32, 64, 96, 128, 200, 300 and 400 pixels; a request gets the
 largest of these that is no larger than its `size`, so the page's few sizes share
-cache entries and worker jobs. Invalid images return 404, busy workers
-(two jobs) or a missing worker return 503. Library failures preserve the existing
-redacted errors.
+cache entries and worker jobs. Invalid images return 404. An uncached cover
+waits up to 10 seconds for one of 4 cover fetches, which have their own
+admission beside the 8 library calls for browsing; a cover another request
+finished meanwhile comes from the cache, otherwise the bot fetches the encoded
+image and takes its SHA-256. A PNG the worker already made from the same bytes
+at the same size comes from memory and is cached under the requested ID too.
+Navidrome gives every song its own cover ID and answers songs without art of
+their own with the album's image, so an album's songs cost one fetch each and
+one worker job together. Memory holds the last 512 such PNGs, at most 32 MiB,
+and the least recently used leave first. Requests with an image that is being
+made wait for that job; others wait up to 10 seconds for one of two jobs. Up to
+64 requests wait for a fetch or a job at once. A request beyond those 64, one
+still waiting after 10 seconds, or a missing worker gets 503, and a job that
+runs longer than 10 seconds gets 504. The page loads a failed cover again after
+0.25, 0.5, 1, 2, 4 and 5 seconds, then shows the placeholder. Library failures
+preserve the existing redacted errors.
 
 Successful answers are kept on disk in `covers/` below the state directory, up to
 `web.cover_cache_mib` MiB (64 by default, at most 4096; 0 turns the cache off and
@@ -743,12 +1179,55 @@ includes `sonic`, one boolean per library, from the extensions learned at startu
 the web page offers these actions only where it is true. Libraries without the
 extension answer these endpoints with an error instead of being queried.
 
-`add` also accepts `kind: "similar"` with the song in `id`, and `kind: "path"` with
-the start in `id` and the target in `to`. The bot asks the library again when
+`GET lyrics?library=N&id=ID` returns `{"lyrics":{"synced":bool,"lang":"eng"|null,
+"lines":[{"start_ms":N|null,"text":"…"}]}}`, or `{"lyrics":null}` when the
+library has none. `start_ms` is set on every line of synced lyrics and null
+otherwise. Library failures return the redacted errors of browsing.
+
+`GET genres?library=N` returns `{"genres":[{"name":"…","albums":N|null,
+"songs":N|null}],"truncated":bool}` from the library's `getGenres`: sorted by
+name ignoring case, each name once, at most 2,000, with `truncated` true when the
+library has more. The list holds the genres whose names have 1 to 200
+characters. Counts come from `albumCount` and `songCount`; whole numbers given
+as text count as numbers, and every other value gives null.
+`GET genre/albums?library=N&name=…&page=P` returns `{"albums":[Album],"more":bool}`,
+48 albums per page from `getAlbumList2` with `type=byGenre`, and
+`GET genre/songs?library=N&name=…&page=P` returns `{"songs":[Track],"more":bool}`,
+50 songs per page from `getSongsByGenre`. `name` is the genre's name as a
+percent-encoded query value, and the bot passes it to the library as one query
+value too. An empty name or one over 200 characters answers 400 before any
+library call. Pages run from 0 to 10,000; the bot keeps at most one page of
+what the library sends. Library failures answer with the redacted errors of
+browsing, and with all eight library calls in use the answer is 503 `the music
+library is busy`. The web page's routes are `#/genres?library=N` and
+`#/genre?library=N&name=…`.
+
+`GET suggest?q=…` returns `{"items":[{"library":N,"kind":"artist"|"album"|"song",
+"id":"ID","title":"…","subtitle":"…"|null,"cover_art":"ID"|null}]}` for the
+suggestions under the search field. `q` is trimmed and cut to 200 characters;
+fewer than 2 characters give no items without asking a library. Every library
+gets one `search3` with `artistCount=3`, `albumCount=3` and `songCount=5`, and
+the bot keeps at most that many of each kind per library. Items list the
+artists of every library in library order, then the albums, then the songs, and
+stop at 10. An item with the kind, title and artist of an earlier one (compared
+without case or extra spaces) is left out, so the same artist in two libraries
+or the same song on two albums shows once, from the first place it was found.
+`subtitle` is the artist of an album or song. Libraries that fail
+add no items. The calls share the admission of the other library calls: with
+all eight in use the answer is 503 `the music library is busy`, and the page
+then shows no suggestions. Subsonic and OpenSubsonic define no suggestion call;
+Navidrome's `search3` matches the start of each word, which suits typing.
+
+`add` also accepts `kind: "similar"` with the song in `id`, `kind: "path"` with
+the start in `id` and the target in `to`, and `kind: "genre"` with the genre's
+name in `id` and an optional `page` (from 0), which queues that page of the
+genre's songs, at most 50. The bot asks the library again when
 adding. A path skips its first song when that song is already playing in the queue.
-Adding similar songs leaves out the song itself and every match with a similarity
-of 100%, which are other copies of the same recording, so the same song is not
-queued again and again.
+Similar songs, listed and added, hold each recording once: the song itself, every
+match with a similarity of 100% and every match with its title and artist are left
+out, and of several copies of one recording (the same title and artist, compared
+without case or extra spaces, at most 3 seconds apart in length) the closest match
+stays.
 
 With an import service configured, State/SSE includes `import`:
 `{"library":N,"revision":N}`, the library added albums arrive in and a revision

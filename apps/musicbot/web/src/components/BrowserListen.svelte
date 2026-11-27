@@ -19,8 +19,8 @@
     </label>
   {/if}
   <button
-    class="icon-button"
-    class:on={active}
+    class="icon-btn"
+    class:active
     disabled={!active && !available}
     aria-label="Listen in this browser"
     aria-pressed={active}
@@ -36,5 +36,5 @@
   .local-volume { display: flex; align-items: center; min-width: 0; flex: 0 1 6rem; }
   .local-volume input { width: 100%; min-width: 2.5rem; margin: 0; }
   .large .local-volume { flex-basis: 10rem; }
-  .on { color: var(--accent); background: var(--surface-hover); }
+  .large .icon-btn { width: 3rem; height: 3rem; }
 </style>
