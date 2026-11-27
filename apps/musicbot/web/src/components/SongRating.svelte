@@ -112,21 +112,21 @@
   </div>
   <span class="visually-hidden" role="status">{pending ? "Saving rating…" : result.loading ? "Loading rating…" : confirmed === null ? "Rating unavailable" : confirmed === 0 ? "Unrated" : `${confirmed} of 5 stars`}</span>
   {#if error && !pending}
-    <span class="feedback error" role="alert" title={error}>Rating unavailable. <button class="retry" onclick={reload}>Retry</button></span>
+    <span class="feedback error" role="alert" title={error}>Rating unavailable. <button class="link-btn" onclick={reload}>Retry</button></span>
   {/if}
 </div>
 
 <style>
   .rating { flex: none; max-width: 100%; }
   .stars { display: flex; width: max-content; }
-  .star { display: grid; place-items: center; width: 24px; height: 28px; padding: 2px; border: none; border-radius: 4px; background: transparent; color: var(--muted); }
+  .star { display: grid; place-items: center; width: 24px; height: 28px; padding: 2px; border: none; border-radius: 999px; background: transparent; color: var(--muted); }
   .star.filled { color: var(--warning); }
   .star svg { display: block; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linejoin: round; }
   .star.filled svg { fill: currentColor; }
   .large .star { width: 44px; height: 48px; padding: 4px; }
   .large .star svg { width: 34px; height: 34px; }
   .large .feedback { font-size: 0.9rem; }
-  .star:hover:not(:disabled) { background: var(--surface-hover); }
+  .star:hover:not(:disabled) { background: var(--surface-2); }
   .feedback { display: block; max-width: 15rem; font-size: 0.75rem; overflow-wrap: anywhere; }
-  .retry { padding: 0; border: none; background: transparent; color: inherit; text-decoration: underline; font-size: inherit; }
+  .feedback .link-btn { text-decoration: underline; }
 </style>

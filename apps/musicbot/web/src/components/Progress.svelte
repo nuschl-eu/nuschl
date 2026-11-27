@@ -130,7 +130,7 @@
   .time {
     flex: none;
     min-width: 3.2em;
-    font-size: 0.75rem;
+    font-size: 0.8rem;
     color: var(--muted);
     font-variant-numeric: tabular-nums;
     text-align: center;
@@ -154,8 +154,7 @@
     background: var(--border);
     overflow: hidden;
   }
-  .fill { height: 100%; background: var(--text); }
-  .bar:hover .fill, .bar.active .fill, .bar:focus-visible .fill { background: var(--accent); }
+  .fill { height: 100%; background: var(--accent); }
   .thumb {
     position: absolute;
     top: 4px;
@@ -163,7 +162,8 @@
     height: 12px;
     margin-left: -6px;
     border-radius: 50%;
-    background: var(--text);
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
     opacity: 0;
   }
   .bar:hover .thumb, .bar.active .thumb, .bar:focus-visible .thumb { opacity: 1; }
@@ -171,10 +171,10 @@
     position: absolute;
     bottom: 22px;
     transform: translateX(-50%);
-    padding: 0.1rem 0.4rem;
-    border-radius: 4px;
-    background: var(--text);
-    color: var(--background);
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    background: var(--fg);
+    color: var(--bg);
     font-size: 0.75rem;
     font-variant-numeric: tabular-nums;
     pointer-events: none;

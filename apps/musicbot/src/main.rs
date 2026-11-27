@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! A Mumble music bot: plays songs from Subsonic servers in one or more
 //! channels; people control the queues on a web page they get a link to.
+mod beats;
+mod bpm;
 mod config;
 mod covers;
 mod decode;
@@ -9,7 +11,10 @@ mod library_keys;
 mod mumble;
 mod persist;
 mod player;
+mod playlists;
+mod preload;
 mod scrobble;
+mod spectrum;
 mod subsonic;
 mod tokens;
 mod web;
@@ -55,6 +60,8 @@ pub struct Bot {
     /// The fixed codec worker beside this executable (`nuschl_ipc::musicbot::worker_path`).
     pub codec_worker: PathBuf,
     pub libraries: Arc<Vec<Library>>,
+    /// DJ songs decoded ahead into memory; None when `audio.preload_mib` is 0.
+    pub preload: Option<Arc<preload::Pool>>,
     /// One per configured channel, in the same order; a channel can play another's.
     pub players: Vec<Arc<Player>>,
     pub connections: Vec<Connection>,
@@ -63,6 +70,10 @@ pub struct Bot {
     pub changes: Changes,
     /// Ephemeral invalidation for live, backend-owned song ratings.
     pub rating_revision: AtomicU64,
+    /// Who owns which personal playlist, and their change revision.
+    pub playlists: playlists::Playlists,
+    /// Per-person pseudonyms for import requests and playlist owners.
+    pub pseudonyms: import::Pseudonyms,
     /// Serializes checkpoints with the final shutdown save.
     pub persistence: Mutex<()>,
     /// Decoded covers in `covers/` below the state directory.
@@ -136,7 +147,7 @@ async fn run(arguments: Arguments) -> Result<(), String> {
     let libraries = config
         .libraries
         .iter()
-        .zip(keys)
+        .zip(keys.iter().cloned())
         .enumerate()
         .map(|(index, (library, key))| {
             Ok(Library::new(index, library, library.credentials()?, key))
@@ -145,10 +156,12 @@ async fn run(arguments: Arguments) -> Result<(), String> {
     let adding = config
         .import
         .as_ref()
-        .map(|import| {
-            import::Adding::open(import, &config.libraries, &state_directory).map(Arc::new)
-        })
+        .map(|import| import::Adding::open(import, &config.libraries).map(Arc::new))
         .transpose()?;
+    let pseudonyms = import::Pseudonyms::load(&state_directory)
+        .map_err(|error| format!("{}: {error}", import::SECRET_FILE))?;
+    let playlists = playlists::Playlists::load(state_directory.join(playlists::FILE), &keys)
+        .map_err(|error| format!("{}: {error}", playlists::FILE))?;
     let tokens = Tokens::load(state_directory.join("tokens.json"))
         .map_err(|error| format!("tokens.json: {error}"))?;
     let changes = Changes::default();
@@ -189,16 +202,31 @@ async fn run(arguments: Arguments) -> Result<(), String> {
         );
         covers::CoverCache::disabled()
     });
+    let libraries = Arc::new(libraries);
+    let preload = (config.audio.preload_mib > 0).then(|| {
+        let libraries = libraries.clone();
+        let worker = codec_worker.clone();
+        preload::Pool::new(
+            config.audio.preload_mib as usize * 1024 * 1024,
+            Arc::new(move |track, start| {
+                decode::start(libraries.clone(), worker.clone(), track, start)
+            }),
+            beats::Beats::open(&state_directory),
+        )
+    });
     let bot = Arc::new(Bot {
         state_directory,
         web_assets: arguments.web_assets,
         codec_worker,
-        libraries: Arc::new(libraries),
+        libraries,
+        preload,
         players,
         connections,
         tokens,
         changes,
         rating_revision: AtomicU64::new(0),
+        playlists,
+        pseudonyms,
         persistence: Mutex::new(()),
         covers,
         adding,
@@ -227,11 +255,12 @@ async fn run(arguments: Arguments) -> Result<(), String> {
             }
         });
     }
-    for player in &bot.players {
+    for (index, player) in bot.players.iter().enumerate() {
         tokio::spawn(player.clone().run(
             bot.libraries.clone(),
             bot.config.audio.bitrate,
             bot.codec_worker.clone(),
+            bot.preload.clone().map(|pool| (pool, index)),
         ));
     }
     for index in 0..bot.connections.len() {
@@ -287,6 +316,8 @@ fn prepare_state_directory(path: &std::path::Path) -> std::io::Result<()> {
         "tokens.json.new",
         "queues.json",
         "queues.json.new",
+        playlists::FILE,
+        "playlists.json.new",
     ] {
         match persist::open_private(&path.join(name)) {
             Ok(_) => {}
@@ -314,6 +345,8 @@ mod state_tests {
             "tokens.json.new",
             "queues.json",
             "queues.json.new",
+            "playlists.json",
+            "playlists.json.new",
         ] {
             let path = root.join(name);
             std::fs::write(&path, b"preserved secret").unwrap();
@@ -337,6 +370,8 @@ mod state_tests {
             "tokens.json.new",
             "queues.json",
             "queues.json.new",
+            "playlists.json",
+            "playlists.json.new",
         ] {
             let path = root.join(name);
             assert_eq!(

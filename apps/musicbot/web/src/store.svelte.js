@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 // Live state from the bot, the commands that change it, and the client-side
 // guesses (optimistic values) shown until the server confirms them.
-import { getJSON, postJSON, HttpError } from "./api.js";
+import { getJSON, postForJSON, postJSON, HttpError } from "./api.js";
 import { addressRoute, adoptSharedRoute, applyMove, browseItemIsCurrent, clamp, debounce, libraryForNamespace, parseRoute, queueStorageKey, routeForLibrary, routeForNamespace, seekSettled, selectedQueue } from "./logic.js";
 
 const storageKey = queueStorageKey(location.pathname);
@@ -31,6 +31,8 @@ class Store {
   browseKey = $state(null);
   browseSignal = $state.raw(null);
   toasts = $state([]);
+  /** The big screen shows the playing song's lyrics in place of the next songs. */
+  bigScreenLyrics = $state(false);
   /** Optimistic values by key (`queue:N`, `volume:N`, `ducking:N`): `{ value, version, settled }`. */
   overrides = $state.raw({});
   /** Seeks not yet reflected by the server, by queue index: `{ target, at, entry, version, sent }`. */
@@ -160,6 +162,39 @@ class Store {
   /** True when the latest state says library `library` supports OpenSubsonic sonic similarity. */
   supportsSonic(library) {
     return this.snapshot?.sonic?.[library] === true;
+  }
+
+  /** True when the viewer's Mumble client has a certificate: they may own, edit and favorite playlists. */
+  get canOwnPlaylists() {
+    return this.snapshot?.playlists?.can_own === true;
+  }
+
+  /** Advances whenever anybody changes a personal playlist. */
+  get playlistRevision() {
+    return this.snapshot?.playlists?.revision ?? 0;
+  }
+
+  /**
+   * Sends a playlist change to `path` for `body.library` in `namespace`. Returns the
+   * JSON reply with `reply`, otherwise true; null after showing why it failed.
+   * Changing the library or reconnecting aborts it.
+   */
+  async playlistChange(path, body, namespace, { reply = false } = {}) {
+    if (!this.browseItemCurrent({ library: body.library, namespace })) {
+      this.toast("The library changed or is reconnecting. Try again once it has loaded.");
+      return null;
+    }
+    const signal = this.browseSignal;
+    try {
+      if (reply) return await postForJSON(path, body, signal);
+      await postJSON(path, body, signal);
+      return true;
+    } catch (error) {
+      if (signal?.aborted) return null;
+      this.#checkInvalid(error);
+      this.toast(error instanceof Error ? error.message : String(error));
+      return null;
+    }
   }
 
   #connect() {
@@ -380,7 +415,8 @@ class Store {
       return;
     }
     const to = item.to == null ? {} : { to: item.to };
-    this.command({ command: "add", player, kind: item.kind, library: item.library, id: item.id, ...to, index }, this.browseSignal);
+    const page = item.page == null ? {} : { page: item.page };
+    this.command({ command: "add", player, kind: item.kind, library: item.library, id: item.id, ...to, ...page, index }, this.browseSignal);
   }
 
   attach(channel, player) {

@@ -72,3 +72,73 @@ class Listening {
 }
 
 export const listening = new Listening();
+
+/**
+ * Headphone cue in this browser: one DJ deck before its channel fader,
+ * private to this browser and beside the room's stream, with its own volume.
+ */
+class CueListening {
+  /** The deck heard, or null. */
+  deck = $state(null);
+  player = $state(null);
+  /** "off", "starting", "waiting" or "playing". */
+  mode = $state("off");
+  volume = $state(70);
+
+  #audio = new BrowserAudio(
+    (state) => {
+      this.mode = state;
+      if (state === "off") this.deck = null;
+    },
+    (failure) => store.toast(failure instanceof Error ? failure.message : String(failure)),
+    "api/cue",
+  );
+
+  /** Call once, during App's initialisation: stops when DJ mode or the connection goes. */
+  attach() {
+    this.#audio.setVolume(this.volume);
+    $effect(() => {
+      if (this.deck === null) return;
+      const player = store.snapshot?.players[this.player];
+      if (store.connection !== "open" || store.invalid || !player?.dj) this.stop();
+    });
+    $effect(() => {
+      const stop = () => this.stop();
+      window.addEventListener("pagehide", stop);
+      return () => {
+        window.removeEventListener("pagehide", stop);
+        stop();
+      };
+    });
+  }
+
+  // Must run directly in the click handler, like Listening.toggle.
+  toggle(player, deck) {
+    if (this.deck === deck && this.player === player) {
+      this.stop();
+      return;
+    }
+    if (this.deck !== null) {
+      this.player = player;
+      this.deck = deck;
+      this.#audio.select({ player, deck });
+      return;
+    }
+    if (store.connection !== "open" || store.invalid || !store.browseSignal) return;
+    this.player = player;
+    this.deck = deck;
+    this.#audio.start({ player, deck }, store.browseSignal);
+  }
+
+  setVolume(volume) {
+    this.volume = volume;
+    this.#audio.setVolume(volume);
+  }
+
+  stop() {
+    this.#audio.stop();
+    this.deck = null;
+  }
+}
+
+export const cueListening = new CueListening();

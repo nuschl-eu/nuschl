@@ -74,10 +74,15 @@ export class AudioRecordParser {
   }
 }
 
-/** Owns one user-started audio graph and at most one selected-queue fetch. */
+/**
+ * Owns one user-started audio graph and at most one fetch of `route`: the
+ * selected queue (`api/listen`, target: queue index) or a DJ deck's cue
+ * (`api/cue`, target: `{ player, deck }`).
+ */
 export class BrowserAudio {
   #onState;
   #onError;
+  #route;
   #wanted = false;
   #ready = false;
   #resuming = false;
@@ -103,9 +108,10 @@ export class BrowserAudio {
     this.stop(new Error(`Browser audio ${state === "closed" ? "closed" : "was suspended or interrupted"}. Press the headphones button to start again.`));
   };
 
-  constructor(onState, onError) {
+  constructor(onState, onError, route = "api/listen") {
     this.#onState = onState;
     this.#onError = onError;
+    this.#route = route;
   }
 
   setVolume(volume) {
@@ -114,7 +120,7 @@ export class BrowserAudio {
   }
 
   select(player) {
-    if (player === this.#player) return;
+    if (JSON.stringify(player) === JSON.stringify(this.#player)) return;
     this.#player = player;
     if (this.#wanted && this.#ready) this.#replaceStream();
   }
@@ -229,7 +235,8 @@ export class BrowserAudio {
     let response = null;
     let reader = null;
     try {
-      response = await fetch(query("api/listen", { player }), {
+      const params = typeof player === "object" && player !== null ? player : { player };
+      response = await fetch(query(this.#route, params), {
         signal: controller.signal,
         cache: "no-store",
         headers: { Accept: "application/octet-stream" },

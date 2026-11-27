@@ -6,6 +6,10 @@
 //! receives. File names are hashes of the key; the stored key is compared on
 //! every read, so a name collision is only a miss. Answers are checked again
 //! when read, so only well-formed thumbnail PNGs leave the cache.
+//!
+//! In memory, the cache also keeps recent worker-made PNGs by the SHA-256 of
+//! the encoded image they were made from, so covers with byte-identical images
+//! (an album's songs without art of their own) share one worker job per size.
 use axum::body::Bytes;
 use md5::{Digest, Md5};
 use std::{
@@ -20,10 +24,17 @@ pub const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// At most this many covers, however small, so the index and its scans stay
 /// small too.
 pub const MAX_ENTRIES: usize = 4096;
+/// Worker-made PNGs kept in memory by image hash, at most this many and this
+/// many bytes; the least recently used leave first.
+pub const MAX_MADE: usize = 512;
+pub const MAX_MADE_BYTES: usize = 32 * 1024 * 1024;
 const TEMPORARY: &str = ".tmp-";
 
 /// The library's key (or [`IMPORT_NAMESPACE`]), the cover ID and the edge length.
 pub type CoverKey = (String, String, u32);
+
+/// The SHA-256 of an encoded image and the edge length of the PNG made from it.
+pub type ImageKey = ([u8; 32], u32);
 
 /// Stands in for the library key in keys of import service covers. Library
 /// keys are 32 hexadecimal digits, so none can take this name.
@@ -33,6 +44,7 @@ pub struct CoverCache {
     directory: PathBuf,
     budget: u64,
     index: Mutex<Index>,
+    made: Mutex<Made>,
 }
 
 #[derive(Default)]
@@ -48,6 +60,14 @@ struct Entry {
     size: u64,
     stored: SystemTime,
     used: u64,
+}
+
+#[derive(Default)]
+struct Made {
+    bytes: usize,
+    tick: u64,
+    /// The PNG and when it was last used.
+    entries: HashMap<ImageKey, (Bytes, u64)>,
 }
 
 impl CoverCache {
@@ -88,6 +108,7 @@ impl CoverCache {
             directory,
             budget,
             index: Mutex::new(Index::default()),
+            made: Mutex::new(Made::default()),
         };
         for name in cache.make_room(&mut index, 0, 0) {
             remove(&cache.directory.join(name));
@@ -96,13 +117,54 @@ impl CoverCache {
         Ok(cache)
     }
 
-    /// A cache that keeps nothing and touches no files.
+    /// A cache that keeps nothing on disk and touches no files.
     pub fn disabled() -> Self {
         Self {
             directory: PathBuf::new(),
             budget: 0,
             index: Mutex::new(Index::default()),
+            made: Mutex::new(Made::default()),
         }
+    }
+
+    /// The PNG the worker made from the image with this hash at this size, while
+    /// it is in memory.
+    pub fn made(&self, image: &ImageKey) -> Option<Bytes> {
+        let mut made = self.made_lock();
+        made.tick += 1;
+        let tick = made.tick;
+        let (body, used) = made.entries.get_mut(image)?;
+        *used = tick;
+        Some(body.clone())
+    }
+
+    /// Keeps the PNG the worker made from `image` in memory within [`MAX_MADE`]
+    /// entries and [`MAX_MADE_BYTES`].
+    pub fn remember(&self, image: ImageKey, body: Bytes) {
+        if body.len() > MAX_MADE_BYTES {
+            return;
+        }
+        let mut made = self.made_lock();
+        if let Some((old, _)) = made.entries.remove(&image) {
+            made.bytes -= old.len();
+        }
+        while made.entries.len() >= MAX_MADE || made.bytes + body.len() > MAX_MADE_BYTES {
+            let Some(oldest) = made
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(image, _)| *image)
+            else {
+                break;
+            };
+            if let Some((old, _)) = made.entries.remove(&oldest) {
+                made.bytes -= old.len();
+            }
+        }
+        made.tick += 1;
+        made.bytes += body.len();
+        let used = made.tick;
+        made.entries.insert(image, (body, used));
     }
 
     pub async fn get(&self, key: &CoverKey) -> Option<Bytes> {
@@ -226,6 +288,12 @@ impl CoverCache {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Index> {
         self.index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn made_lock(&self) -> std::sync::MutexGuard<'_, Made> {
+        self.made
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -422,5 +490,42 @@ mod tests {
         let cache = CoverCache::disabled();
         cache.insert(&key("a"), BODY).await;
         assert!(cache.get(&key("a")).await.is_none());
+    }
+
+    #[test]
+    fn made_pngs_stay_within_their_entry_and_byte_bounds() {
+        let cache = CoverCache::disabled();
+        let image = |index: usize| -> ImageKey {
+            let mut hash = [0; 32];
+            hash[..8].copy_from_slice(&index.to_le_bytes());
+            (hash, 300)
+        };
+        for index in 0..MAX_MADE {
+            cache.remember(image(index), Bytes::from_static(BODY));
+        }
+        // Reading the first makes the second the least recently used one.
+        assert_eq!(cache.made(&image(0)).as_deref(), Some(BODY));
+        cache.remember(image(MAX_MADE), Bytes::from_static(BODY));
+        assert_eq!(cache.made_lock().entries.len(), MAX_MADE);
+        assert!(cache.made(&image(1)).is_none());
+        assert!(cache.made(&image(0)).is_some());
+        assert!(
+            cache.made(&(image(0).0, 64)).is_none(),
+            "sizes are separate"
+        );
+
+        // A quarter of the bytes each: four fit, a fifth pushes out the oldest.
+        let large = Bytes::from(vec![0; MAX_MADE_BYTES / 4]);
+        for index in 0..5 {
+            cache.remember(image(index), large.clone());
+        }
+        let made = cache.made_lock();
+        assert_eq!(made.entries.len(), 4);
+        assert!(made.bytes <= MAX_MADE_BYTES);
+        assert!(!made.entries.contains_key(&image(0)));
+        drop(made);
+        cache.remember(image(9), Bytes::from(vec![0; MAX_MADE_BYTES + 1]));
+        assert!(cache.made(&image(9)).is_none(), "too large to keep");
+        assert_eq!(cache.made_lock().entries.len(), 4);
     }
 }

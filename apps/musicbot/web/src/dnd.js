@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 // HTML5 drag and drop: library items (songs, albums, playlists) carry JSON
 // under DRAG_TYPE; queue entries being reordered carry their id under DRAG_ENTRY_TYPE.
-import { DRAG_ENTRY_TYPE, DRAG_TYPE, decodeDragItem, encodeDragItem } from "./logic.js";
+import { DRAG_ENTRY_TYPE, DRAG_TYPE, clamp, decodeDragItem, encodeDragItem, moveTarget } from "./logic.js";
 import { store } from "./store.svelte.js";
 
 /** dragstart handler for a library item. */
@@ -39,4 +39,14 @@ export function droppedEntry(event) {
 /** True when the pointer left `element` for something outside it. */
 export function leftElement(event, element) {
   return !event.relatedTarget || !element.contains(event.relatedTarget);
+}
+
+/**
+ * Index for dropping entry `entryId` into gap `gap` of `list`: for an entry of
+ * `list`, the move index (null when the order stays); for an entry from
+ * another queue, the gap itself.
+ */
+export function entryDropIndex(list, entryId, gap) {
+  const from = list.findIndex((item) => item.id === entryId);
+  return from < 0 ? clamp(gap, 0, list.length) : moveTarget(from, gap, list.length);
 }

@@ -1,6 +1,7 @@
 <!-- SPDX-License-Identifier: EUPL-1.2 -->
 <script>
   import { artUrl, importArtUrl } from '../api.js';
+  import { coverRetryDelay } from '../logic.js';
   import Icon from './Icon.svelte';
   import { store } from '../store.svelte.js';
 
@@ -16,18 +17,39 @@
     : art ? artUrl(library, art, bound, store.snapshot?.library_keys?.[library]) : null);
   let loaded = $state(null);
   const ready = $derived(src !== null && loaded === src);
+  // Failed loads of `src` so far; a new image element loads it again after a
+  // growing delay, since the bot refuses covers while its artwork worker is busy.
+  let failures = $state({ src: null, count: 0 });
+  const attempt = $derived(failures.src === src ? failures.count : 0);
+  let retry = $state({ src: null, count: 0 });
+  const shown = $derived(retry.src === src ? retry.count : 0);
+  let timer;
+  function failed() {
+    loaded = null;
+    const count = attempt + 1;
+    failures = { src, count };
+    const delay = coverRetryDelay(count);
+    clearTimeout(timer);
+    if (delay !== null) {
+      const again = src;
+      timer = setTimeout(() => { if (again === src) retry = { src: again, count }; }, delay);
+    }
+  }
+  $effect(() => () => clearTimeout(timer));
 </script>
 
 <div class="cover" class:fill={px === null} class:round style:width={px === null ? null : `${px}px`} style:height={px === null ? null : `${px}px`}>
   {#if src}
-    <img {src} alt="" aria-hidden="true" loading="lazy" decoding="async" class:ready
-         onload={() => (loaded = src)} onerror={() => (loaded = null)} />
+    {#key shown}
+      <img {src} alt="" aria-hidden="true" loading="lazy" decoding="async" class:ready
+           onload={() => (loaded = src)} onerror={failed} />
+    {/key}
   {/if}
   {#if !ready}<div class="placeholder"><Icon name="note" size={px ? Math.max(16, Math.round(px * 0.4)) : 48} /></div>{/if}
 </div>
 
 <style>
-  .cover { position: relative; flex: none; overflow: hidden; border-radius: 6px; background: var(--placeholder); }
+  .cover { position: relative; flex: none; overflow: hidden; border-radius: 6px; background: var(--surface-2); }
   .cover.fill { width: 100%; aspect-ratio: 1; }
   .cover.round { border-radius: 50%; }
   img { display: block; width: 100%; height: 100%; object-fit: cover; opacity: 0; }

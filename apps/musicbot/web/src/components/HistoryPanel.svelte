@@ -80,18 +80,18 @@
       </select>
     </label>
     <p class="muted">Played tracks, newest first. Transmitted time excludes pauses, seeks and waiting for listeners.</p>
-    {#if error}<p class="notice error" role="alert">Could not load history: {error}</p><button onclick={() => load()}>Retry history</button>{/if}
+    {#if error}<p class="notice error" role="alert">Could not load history: {error}</p><button class="btn" onclick={() => load()}>Retry history</button>{/if}
     {#if loading}<p class="muted" role="status">Loading history…</p>{/if}
     {#if loaded && !history.items.length}<p class="notice muted">No playback history for this queue yet.</p>{/if}
-    <ol class="history-list" aria-label="Played tracks">
+    <ol class="rows card history-list" aria-label="Played tracks">
       {#each history.items as item (item.id)}
         {@const track = item.entry.track}
         {@const available = connected && loaded && track.library != null}
         <li>
           <Cover library={track.library} art={available ? track.cover_art : null} size={128} px={56} />
-          <div class="description">
+          <div class="row-text">
             <div class="track-heading">
-              <div class="title">{#if available && track.id}<a href={buildRoute({ view: "song", library: track.library, id: track.id, namespace: store.browseKey })}>{track.title}</a>{:else}{track.title}{/if}</div>
+              <div class="row-title">{#if available && track.id}<a href={buildRoute({ view: "song", library: track.library, id: track.id, namespace: store.browseKey })}>{track.title}</a>{:else}{track.title}{/if}</div>
               <SongRating library={track.library} songId={track.id} title={track.title} namespace={store.browseKey} enabled={available} />
             </div>
             <div class="muted">{#if available && track.artist_id}<a href={buildRoute({ view: "artist", library: track.library, id: track.artist_id, namespace: store.browseKey })}>{track.artist || "Unknown artist"}</a>{:else}{track.artist || "Unknown artist"}{/if}</div>
@@ -101,30 +101,29 @@
               <div><dt>Started</dt><dd>{#if item.started_at_ms === null}<strong>Never started</strong>{:else}<time datetime={new Date(item.started_at_ms).toISOString()}>{localTime(item.started_at_ms)}</time>{/if}</dd></div>
               <div><dt>Ended</dt><dd><time datetime={new Date(item.ended_at_ms).toISOString()}>{localTime(item.ended_at_ms)}</time></dd></div>
               <div><dt>Transmitted</dt><dd>{formatDuration(item.played_ms / 1000)} ({item.played_ms.toLocaleString()} ms)</dd></div>
-              <div><dt>Outcome</dt><dd class:failed={item.outcome === "failed"}>{item.outcome === "completed" ? "Completed" : item.outcome === "skipped" ? "Skipped" : "Failed"}</dd></div>
+              <div><dt>Outcome</dt><dd><span class="badge" class:success={item.outcome === "completed"} class:error={item.outcome === "failed"}>{item.outcome === "completed" ? "Completed" : item.outcome === "skipped" ? "Skipped" : "Failed"}</span></dd></div>
             </dl>
             {#if item.error}<p class="failure">Failure reason: {item.error}</p>{/if}
           </div>
         </li>
       {/each}
     </ol>
-    {#if history.next_before !== null}<button disabled={loading || !connected} onclick={() => load(true)}>Load older</button>{/if}
+    {#if history.next_before !== null}<button class="btn" disabled={loading || !connected} onclick={() => load(true)}>Load older</button>{/if}
   {:else}<p class="notice muted">No playback queues are configured.</p>{/if}
 </section>
 
 <style>
   .queue-choice select { width: 100%; max-width: 24rem; }
-  .history-list { list-style: none; padding: 0; margin: 1rem 0; }
-  li { display: flex; gap: 0.85rem; padding: 1rem 0; border-bottom: 1px solid var(--border); }
-  .description { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+  .history-list { margin: 1rem 0; }
+  .history-list > li { align-items: flex-start; padding-block: 0.75rem; }
+  .row-text { overflow-wrap: anywhere; }
   .track-heading { display: flex; align-items: start; justify-content: space-between; gap: 0.5rem; }
-  .track-heading .title { min-width: 0; }
-  .title { font-weight: 650; }
-  .metadata { font-size: 0.85rem; margin: 0.4rem 0; }
-  dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.35rem 1rem; margin: 0.6rem 0 0; font-size: 0.85rem; }
-  dt { color: var(--muted); }
+  .track-heading .row-title { min-width: 0; white-space: normal; }
+  .row-text > .muted:not(.metadata) { font-size: 0.9rem; }
+  .metadata { font-size: 0.85rem; margin: 0.35rem 0; }
+  dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.4rem 1rem; margin: 0.6rem 0 0; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+  dt { color: var(--muted); font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
   dd { margin: 0; }
-  .failed, .failure { color: var(--danger); }
-  .failure { margin-bottom: 0; font-size: 0.9rem; }
+  .failure { margin-bottom: 0; color: var(--error); font-size: 0.9rem; }
   @media (max-width: 600px) { dl { grid-template-columns: 1fr; } }
 </style>

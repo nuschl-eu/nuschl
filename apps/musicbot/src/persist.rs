@@ -40,6 +40,9 @@ struct SavedPlayer {
     history: VecDeque<HistoryItem>,
     #[serde(default)]
     next_history_id: u64,
+    /// DJ mode's deck queues; they wait while DJ mode is off.
+    #[serde(default)]
+    deck_queues: [Vec<SavedEntry>; 2],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,7 +102,8 @@ fn capture(bot: &Bot) -> Saved {
                     hold_ms: state.ducking.hold.as_millis() as u64,
                     sensitivity: state.ducking.sensitivity,
                 },
-                current: state.current.as_ref().map(|playing| SavedCurrent {
+                // In DJ mode, the deck song the room hears; DJ mode itself starts off.
+                current: state.now_playing().map(|playing| SavedCurrent {
                     entry: entry(&playing.entry, playing.source.as_ref()),
                     position_ms: playing.elapsed().as_millis() as u64,
                     started_at_ms: playing.started_at_ms,
@@ -110,6 +114,10 @@ fn capture(bot: &Bot) -> Saved {
                     .iter()
                     .map(|queued| entry(queued, None))
                     .collect(),
+                deck_queues: state
+                    .deck_queues
+                    .each_ref()
+                    .map(|queue| queue.iter().map(|queued| entry(queued, None)).collect()),
                 next_id: state.next_id,
                 history: state.history.clone(),
                 next_history_id: state.next_history_id,
@@ -248,14 +256,17 @@ pub fn restore(bot: &Bot) -> io::Result<()> {
                 played_ms: current.played_ms,
             }
         });
-        let queue = saved
-            .queue
-            .into_iter()
-            .filter_map(|entry| {
-                let (entry, _, available) = restore_entry(entry);
-                available.then_some(entry)
-            })
-            .collect();
+        let available = |entries: Vec<SavedEntry>| -> Vec<Entry> {
+            entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let (entry, _, available) = restore_entry(entry);
+                    available.then_some(entry)
+                })
+                .collect()
+        };
+        let queue = available(saved.queue);
+        let deck_queues = saved.deck_queues.map(available);
         player.restore(Restored {
             paused: saved.paused,
             volume: saved.volume,
@@ -267,6 +278,7 @@ pub fn restore(bot: &Bot) -> io::Result<()> {
             },
             current,
             queue,
+            deck_queues,
             next_id: saved.next_id,
             history: saved.history,
             next_history_id: saved.next_history_id,
@@ -307,7 +319,7 @@ pub async fn keep(bot: std::sync::Arc<Bot>) {
             _ = interval.tick() => {
                 if !bot.players.iter().any(|player| {
                     let state = player.state();
-                    state.current.is_some() && !state.paused && player.listeners() > 0
+                    state.now_playing().is_some() && !state.paused && player.listeners() > 0
                 }) { continue; }
             }
         }

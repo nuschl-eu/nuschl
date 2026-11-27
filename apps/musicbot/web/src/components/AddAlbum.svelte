@@ -51,7 +51,7 @@
 <section aria-labelledby="add-album-title" aria-busy={result.loading}>
   <div class="section-heading">
     <h1 id="add-album-title">{album?.title ?? "Add music"}</h1>
-    <a class="requests-link" href={buildRoute({ view: "requests" })}><Icon name="queue" size={18} /> Requests</a>
+    <a class="heading-link" href={buildRoute({ view: "requests" })}><Icon name="queue" size={18} /> Requests</a>
   </div>
   {#if !available}
     <p class="notice muted">Adding music is not available on this bot.</p>
@@ -60,7 +60,7 @@
   {:else if result.loading}
     <p class="notice" role="status">Loading album…</p>
   {:else if result.error}
-    <div class="notice error" role="alert"><p>{result.error}</p><button onclick={() => result.reload()}>Try again</button></div>
+    <div class="notice error" role="alert"><p>{result.error}</p><button class="btn" onclick={() => result.reload()}>Try again</button></div>
   {:else if album}
     <div class="detail-header">
       <div class="detail-art"><Cover importId={album.has_cover ? album.id : null} size={400} /></div>
@@ -76,7 +76,7 @@
           <p class="in-library" id="in-library-hint">Your library already has an album with this name.{#if libraryLink}{" "}<a href={libraryLink}>Open it in the library</a>{/if}</p>
         {/if}
         <div class="detail-actions">
-          <button class="primary" disabled={!canAdd} aria-describedby={inLibrary ? "in-library-hint" : undefined} onclick={add}><Icon name="add" /> {inLibrary ? "Add anyway" : "Add to library"}</button>
+          <button class="btn primary" disabled={!canAdd} aria-describedby={inLibrary ? "in-library-hint" : undefined} onclick={add}><Icon name="add" /> {inLibrary ? "Add anyway" : "Add to library"}</button>
         </div>
         {#if addError}<p class="notice error" role="alert">{addError}</p>{/if}
         <div class="add-status" role="status">
@@ -89,15 +89,15 @@
         </div>
       </div>
     </div>
-    <ol class="track-list" aria-label="Tracks">
+    <ol class="rows card" aria-label="Tracks">
       {#each tracks as track, i (i)}
         <li>
-          <span class="number">{track.position ?? i + 1}</span>
-          <div class="description">
-            <div class="title" title={track.title}>{track.title}</div>
-            {#if track.artist}<div class="secondary muted" title={track.artist}>{track.artist}</div>{/if}
+          <span class="row-number">{track.position ?? i + 1}</span>
+          <div class="row-text">
+            <div class="row-title" title={track.title}>{track.title}</div>
+            {#if track.artist}<div class="row-sub" title={track.artist}>{track.artist}</div>{/if}
           </div>
-          <span class="duration muted">{formatDuration(track.duration)}</span>
+          <span class="row-duration">{formatDuration(track.duration)}</span>
         </li>
       {/each}
     </ol>
@@ -106,27 +106,9 @@
 </section>
 
 <style>
-  .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
-  h1 { margin: 0; overflow-wrap: anywhere; }
-  .requests-link { display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap; }
-  .detail-header { display: flex; gap: 1.5rem; align-items: center; margin: 1rem 0 2rem; }
-  .detail-art { width: 11rem; flex: none; }
-  .detail-info { min-width: 0; overflow-wrap: anywhere; }
-  .metadata { display: flex; flex-wrap: wrap; gap: 0.7rem; }
   .in-library { color: var(--warning); }
-  .in-library a { text-decoration: underline; }
-  .detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .in-library a, .add-status a { text-decoration: underline; }
   .add-status p { margin: 0.5rem 0 0; }
-  .add-status a { text-decoration: underline; }
-  .add-status .failed { color: var(--danger); }
-  progress { width: 100%; max-width: 20rem; margin-top: 0.5rem; accent-color: var(--accent); }
-  .track-list { list-style: none; padding: 0; margin: 0; }
-  li { display: flex; align-items: center; gap: 0.65rem; min-height: 3.6rem; padding: 0.4rem; border-bottom: 1px solid var(--border); border-radius: 4px; }
-  li:hover { background: var(--surface-hover); }
-  .number { flex: none; min-width: 2rem; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 0.85rem; }
-  .description { flex: 1; min-width: 0; }
-  .title, .secondary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .secondary { font-size: 0.8rem; }
-  .duration { font-variant-numeric: tabular-nums; font-size: 0.85rem; }
-  @media (max-width: 600px) { .detail-header { gap: 1rem; align-items: flex-start; } .detail-art { width: 6.5rem; } }
+  .add-status .failed { color: var(--error); }
+  progress { width: 100%; max-width: 20rem; margin-top: 0.5rem; }
 </style>

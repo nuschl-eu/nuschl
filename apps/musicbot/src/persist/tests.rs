@@ -84,11 +84,15 @@ username = "DJ2"
         state_directory: directory.into(),
         web_assets: None,
         codec_worker: std::path::PathBuf::from("/nonexistent/nuschl-musicbot-codec-worker"),
+        preload: None,
         tokens: Tokens::load(directory.join("tokens.json")).unwrap(),
         persistence: Mutex::new(()),
         covers: crate::covers::CoverCache::disabled(),
         adding: None,
         rating_revision: std::sync::atomic::AtomicU64::new(0),
+        playlists: crate::playlists::Playlists::load(directory.join("playlists.json"), &[])
+            .unwrap(),
+        pseudonyms: crate::import::Pseudonyms::load(directory).unwrap(),
     }
 }
 
@@ -109,6 +113,7 @@ fn entry(id: u64) -> Entry {
             suffix: Some("flac".into()),
             content_type: Some("audio/flac".into()),
             cover_art: None,
+            bpm: None,
         },
     }
 }
@@ -133,6 +138,7 @@ fn deployment_restores_identity_position_duplicates_and_settings() {
             played_ms: 1800,
         }),
         queue: vec![entry(42), entry(43)],
+        deck_queues: [vec![entry(44)], Vec::new()],
         next_id: 50,
         history: VecDeque::new(),
         next_history_id: 1,
@@ -171,6 +177,12 @@ fn deployment_restores_identity_position_duplicates_and_settings() {
         [42, 43]
     );
     assert_eq!(restored.next_id, 50);
+    let deck_queues = restored
+        .deck_queues
+        .each_ref()
+        .map(|queue| queue.iter().map(|entry| entry.id).collect::<Vec<_>>());
+    assert_eq!(deck_queues, [vec![44], vec![]], "deck queues are saved");
+    assert_eq!(restored.deck_queues[0][0].track.library, 0);
     assert_eq!(*restarted.connections[0].player.borrow(), 1);
     drop(restored);
     restarted.players[1].enqueue(vec![entry(1).track], "bob", None);
@@ -255,6 +267,7 @@ fn historical_metadata_survives_reordered_and_removed_libraries() {
             played_ms: 240,
         }),
         queue: vec![entry(42)],
+        deck_queues: Default::default(),
         next_id: 43,
         history: VecDeque::new(),
         next_history_id: 1,
@@ -393,6 +406,7 @@ fn a_removed_current_library_archives_the_ongoing_interval_once() {
             played_ms: 160,
         }),
         queue: Vec::new(),
+        deck_queues: Default::default(),
         next_id: 42,
         history: VecDeque::new(),
         next_history_id: 1,
