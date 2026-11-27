@@ -124,15 +124,27 @@ the program and the profile; your settings and history stay in your home folder
 
 ## Arch Linux
 
-The AUR package `nuschl-bin` repackages the same `.deb` after checking its
-SHA-256 and archive signature. Import the key from its
-`keys/pgp/` folder (AUR helpers offer to), then build it:
+The AUR package [`nuschl-bin`](https://aur.archlinux.org/packages/nuschl-bin)
+repackages the same `.deb` after checking its
+SHA-256 and archive signature. Download the public key from the Nuschl archive
+before installing. Paru's automatic import looks up the key on a keyserver.
 
 ```sh
-git clone https://aur.archlinux.org/nuschl-bin.git && cd nuschl-bin
-gpg --import keys/pgp/*.asc
-makepkg -si
+curl -fsSLo nuschl-archive-keyring.gpg https://dl.nuschl.eu/apt/nuschl-archive-keyring.gpg
+gpg --show-keys nuschl-archive-keyring.gpg
 ```
+
+Check the fingerprint against the value in [Debian and Ubuntu](#debian-and-ubuntu).
+Import it into your user keyring and install with Paru:
+
+```sh
+gpg --import nuschl-archive-keyring.gpg
+paru -S nuschl-bin
+```
+
+To install with `makepkg`, clone `https://aur.archlinux.org/nuschl-bin.git` and run
+`makepkg -si` in the checkout after importing the key. The checkout also includes
+the public key in `keys/pgp/`.
 
 ## Other Linux distributions
 

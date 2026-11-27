@@ -30,7 +30,7 @@ through a link in chat.
 | Windows x86_64 | [Installer](https://github.com/nuschl-eu/nuschl/releases/download/v0.3.0/nuschl-0.3.0-windows-x86_64-setup.exe) or [portable ZIP](https://github.com/nuschl-eu/nuschl/releases/download/v0.3.0/nuschl-0.3.0-windows-x86_64.zip) |
 | macOS Intel and Apple silicon | [Universal app ZIP](https://github.com/nuschl-eu/nuschl/releases/download/v0.3.0/nuschl-0.3.0-macos-universal.zip) |
 | Debian 13 and Ubuntu 24.04 (amd64) | [APT setup](docs/install.md#debian-and-ubuntu) or [download the .deb](https://github.com/nuschl-eu/nuschl/releases/download/v0.3.0/nuschl_0.3.0-1_amd64.deb) |
-| Arch Linux x86_64 | [`nuschl-bin` on the AUR](https://aur.archlinux.org/packages/nuschl-bin) |
+| Arch Linux x86_64 | [AUR installation and signing key](docs/install.md#arch-linux) |
 | Linux with Nix | [Nix installation](#nixos-and-nix) |
 
 The installer, ZIPs and Linux packages include the required helper programs and
@@ -67,7 +67,7 @@ inputs, not by itself. Details, and what to do about `No GPU adapters found`:
 ### Other Linux distributions
 
 Install with [APT on Debian or Ubuntu](docs/install.md#debian-and-ubuntu) or
-[makepkg on Arch Linux](docs/install.md#arch-linux). To build from source on
+[the AUR on Arch Linux](docs/install.md#arch-linux). To build from source on
 another distribution, see [Development](#development). The desktop needs a
 Vulkan driver and uses bubblewrap (`bwrap`) to sandbox its helpers.
 
