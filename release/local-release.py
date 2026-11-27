@@ -49,9 +49,9 @@ def require(value, reason):
         raise ValueError(reason)
 
 
-def run(args, **kwargs):
-    return subprocess.run(list(map(str, args)), check=True, capture_output=True, text=True,
-                          timeout=kwargs.pop('timeout', 300), **kwargs).stdout
+def run(args, *, capture_output=True, timeout=300, **kwargs):
+    return subprocess.run(list(map(str, args)), check=True, capture_output=capture_output,
+                          text=True, timeout=timeout, **kwargs).stdout
 
 
 def sha(path):
@@ -926,7 +926,7 @@ def publish(args, *, before_upload=None):
         before_upload()
     run([args.gh, 'release', 'create', tag, '--repo', repo, '--verify-tag', '--draft',
          '--title', 'Nuschl ' + ledger['version'], '--notes-file', notes_file,
-         *sorted((stage / 'dist').iterdir())], timeout=1800)
+         *sorted((stage / 'dist').iterdir())], timeout=1800, capture_output=False)
     drafts = json.loads(run([args.gh, 'api', '--paginate', '--slurp', f'repos/{repo}/releases?per_page=100']))
     matches = [r for page in drafts for r in page if r['tag_name'] == tag]
     require(len(matches) == 1 and matches[0]['draft'] is True, 'created draft missing/ambiguous')
@@ -946,7 +946,7 @@ def publish(args, *, before_upload=None):
                          for p in (stage / 'dist').iterdir()}, 'local bytes changed during upload')
     final_remote = json.loads(run([args.gh, 'api', f'repos/{repo}/releases/{remote["id"]}']))
     require(final_remote == remote, 'remote draft changed during final validation')
-    run([args.gh, 'release', 'edit', tag, '--repo', repo, '--draft=false'])
+    run([args.gh, 'release', 'edit', tag, '--repo', repo, '--draft=false'], capture_output=False)
     print('Published the complete pre-signed release; no key was uploaded.')
 
 

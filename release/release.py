@@ -289,22 +289,22 @@ def publish_apt(root, selection, publication):
     # Use the publisher checkout's tooling with the package from the signed stage.
     flake = 'git+' + ROOT.as_uri() + '?rev=' + selection['head']
     backend.run(['nix', 'run', flake + '#apt-repository', '--',
-                 archive, fingerprint, package], timeout=600)
+                 archive, fingerprint, package], timeout=600, capture_output=False)
     sync = ['rsync', '-rt', '--chmod=D755,F644', '--delay-updates']
     # Keep already published package versions immutable on the mirror.
     pool = [archive / 'pool', destination]
-    backend.run([*sync, '--ignore-existing', '--', *pool], timeout=900)
+    backend.run([*sync, '--ignore-existing', '--', *pool], timeout=900, capture_output=False)
     changes = backend.run(['rsync', '-rnc', '--itemize-changes', '--out-format=%i',
-                           '--', *pool], timeout=300)
+                           '--', *pool], timeout=300, capture_output=False, stdout=subprocess.PIPE)
     require(not changes.strip(), 'The APT mirror has different bytes for an existing package or signature.')
     # Publish by-hash indices before exposing their signed Release.
     source = str(archive) + '/'
     metadata = ('InRelease', 'Release', 'Release.gpg')
     backend.run([*sync, '--exclude=/pool/', *('--exclude=/dists/*/' + name for name in metadata),
-                 '--', source, destination], timeout=900)
+                 '--', source, destination], timeout=900, capture_output=False)
     backend.run([*sync, '--include=/dists/', '--include=/dists/*/',
                  *('--include=/dists/*/' + name for name in metadata),
-                 '--exclude=*', '--', source, destination], timeout=300)
+                 '--exclude=*', '--', source, destination], timeout=300, capture_output=False)
     print('Published the signed APT archive to ' + destination)
 
 
@@ -326,7 +326,8 @@ def publish_aur(flake, stage, ledger, fingerprint):
                 {line.strip() for line in srcinfo.splitlines()},
                 'AUR metadata differs from the staged Debian package or APT signing key.')
         checkout = root / 'nuschl-bin'
-        backend.run(['git', '-c', 'init.defaultBranch=master', 'clone', AUR_REPOSITORY, checkout])
+        backend.run(['git', '-c', 'init.defaultBranch=master', 'clone', AUR_REPOSITORY, checkout],
+                    capture_output=False)
         files = ['.SRCINFO', 'PKGBUILD', f'keys/pgp/{fingerprint}.asc']
         for name in files:
             destination = checkout / name
@@ -336,10 +337,12 @@ def publish_aur(flake, stage, ledger, fingerprint):
                         'The AUR already lists a newer Nuschl version.')
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(output / name, destination)
-        backend.run(['git', '-C', checkout, 'add', '--', *files])
+        backend.run(['git', '-C', checkout, 'add', '--', *files], capture_output=False)
         if git(checkout, 'diff', '--cached', '--name-only'):
-            backend.run(['git', '-C', checkout, 'commit', '-m', 'nuschl-bin ' + ledger['version']])
-            backend.run(['git', '-C', checkout, 'push', '--no-follow-tags', 'origin', 'HEAD:refs/heads/master'])
+            backend.run(['git', '-C', checkout, 'commit', '-m', 'nuschl-bin ' + ledger['version']],
+                        capture_output=False)
+            backend.run(['git', '-C', checkout, 'push', '--no-follow-tags', 'origin', 'HEAD:refs/heads/master'],
+                        capture_output=False)
             print('Published nuschl-bin to the AUR.')
 
 
@@ -392,7 +395,8 @@ def execute(publish=False, *, confirm=None):
                         publish_aur(flake, stage, ledger, apt[1])
 
                 backend.run(['git', '-C', ROOT, 'push', '--no-follow-tags', 'origin',
-                             'refs/tags/' + selection['tag'] + ':refs/tags/' + selection['tag']], timeout=300)
+                             'refs/tags/' + selection['tag'] + ':refs/tags/' + selection['tag']],
+                            timeout=300, capture_output=False)
                 backend.publish(argparse.Namespace(stage=stage, signer=signer, gh=gh),
                                 before_upload=publish_linux if apt else None)
             record['published'] = True

@@ -53,7 +53,10 @@ Official releases upload the Debian package to `root@dl.nuschl.eu:/srv/dl.nuschl
 and update `nuschl-bin` on the AUR before the GitHub release. Set
 `NUSCHL_APT_DESTINATION` to use a different SSH destination. See the
 [package publishing setup](distro-packaging.md#publishing) for the download host,
-OpenPGP key and AUR SSH access.
+OpenPGP key and AUR SSH access. GPG Pinentry and SSH use the release terminal,
+along with upload diagnostics. If an APT or AUR step fails, rerun
+`just release --publish` to reuse the signed stage. If a GitHub upload leaves a
+draft, inspect and reconcile it before retrying.
 
 Both commands use the existing local publisher below; the manual commands are
 available for inspecting individual steps or supplying optional native Mac proof.
