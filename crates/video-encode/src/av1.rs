@@ -61,9 +61,9 @@ impl Sequence {
     pub(crate) fn expand(&mut self, fps: u16, bitrate: u32, tile_size_bytes: Option<u8>) -> bool {
         let current = (self.level, self.high_tier);
         let next = current.max(level(self.width, self.height, fps, bitrate));
-        let tiles = self.tile_size_bytes.or(tile_size_bytes.filter(|size| {
-            (1..=4).contains(size) && self.height.div_ceil(64) > 1
-        }));
+        let tiles =
+            self.tile_size_bytes.or(tile_size_bytes
+                .filter(|size| (1..=4).contains(size) && self.height.div_ceil(64) > 1));
         let changed = current != next || tiles != self.tile_size_bytes;
         (self.level, self.high_tier) = next;
         self.tile_size_bytes = tiles;
