@@ -288,8 +288,9 @@ def publish_apt(root, selection, publication):
                 'The local APT archive uses a different signing key.')
     # Use the publisher checkout's tooling with the package from the signed stage.
     flake = 'git+' + ROOT.as_uri() + '?rev=' + selection['head']
+    # Let the operator unlock the archive key at the Pinentry prompt.
     backend.run(['nix', 'run', flake + '#apt-repository', '--',
-                 archive, fingerprint, package], timeout=600, capture_output=False)
+                 archive, fingerprint, package], timeout=None, capture_output=False)
     sync = ['rsync', '-rt', '--chmod=D755,F644', '--delay-updates']
     # Keep already published package versions immutable on the mirror.
     pool = [archive / 'pool', destination]
