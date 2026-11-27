@@ -23,6 +23,7 @@ mod global_shortcuts;
 mod icons;
 mod identity;
 mod images;
+mod integrations;
 mod layout;
 mod link_preview;
 mod math;

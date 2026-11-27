@@ -9,7 +9,7 @@ use crate::{
 use nuschl_core::audio::SILENT_OPUS;
 use nuschl_ipc::musicbot::{Ducker, Unavailable, speech_threshold};
 use nuschl_legacy_html::escape_html;
-use nuschl_protocol::voice::VoicePacket;
+use nuschl_protocol::{plugin::Payload, voice::VoicePacket};
 use nuschl_session::{
     config::{Profile, ServerBookmark},
     connection::{
@@ -125,7 +125,7 @@ pub async fn run(bot: Arc<Bot>, index: usize) {
 
 /// Server state the bot follows.
 #[derive(Default)]
-struct View {
+pub(crate) struct View {
     channels: HashMap<u32, Channel>,
     users: HashMap<u32, User>,
     own: Option<u32>,
@@ -139,6 +139,37 @@ impl View {
         self.own
             .and_then(|own| self.users.get(&own))
             .map(|user| user.channel)
+    }
+
+    /// The presences that hear this connection's channel now.
+    pub(crate) fn listener_sessions(&self) -> Vec<(u32, u64)> {
+        let Some(channel) = self.own_channel() else {
+            return Vec::new();
+        };
+        self.users
+            .values()
+            .filter(|user| {
+                Some(user.session) != self.own
+                    && (user.channel == channel || user.listening.contains(&channel))
+                    && !user.deafened
+                    && !user.self_deafened
+            })
+            .map(|user| (user.session, user.instance))
+            .collect()
+    }
+
+    /// Whether `session`/`instance` is a listener of this connection now.
+    fn is_listener(&self, session: u32, instance: u64) -> bool {
+        let Some(channel) = self.own_channel() else {
+            return false;
+        };
+        self.users.get(&session).is_some_and(|user| {
+            user.instance == instance
+                && Some(user.session) != self.own
+                && (user.channel == channel || user.listening.contains(&channel))
+                && !user.deafened
+                && !user.self_deafened
+        })
     }
 
     fn listeners(&self) -> usize {
@@ -259,7 +290,9 @@ async fn session(bot: &Arc<Bot>, index: usize, detector: &mut impl Detector) -> 
     let mut running = tokio::spawn(connection::run(options, receiver, events_sender));
     let _abort_on_exit = AbortSession(running.abort_handle());
     let mut attached = connection.player.subscribe();
+    let mut changes = bot.changes.subscribe();
     let mut view = View::default();
+    let mut cards = crate::integration::Cards::default();
     let mut subscription: Option<Subscription> = None;
     let mut sequence = 0u64;
     let mut completed = false;
@@ -325,18 +358,24 @@ async fn session(bot: &Arc<Bot>, index: usize, detector: &mut impl Detector) -> 
                     detector.forget(*session).await.map_err(unavailable)?;
                 }
                 let previous_bandwidth = view.max_bandwidth;
-                handle(bot, index, &commands, &mut view, event);
+                let player = *attached.borrow();
+                handle(bot, index, player, &commands, &mut view, &mut cards, event);
                 if view.max_bandwidth != previous_bandwidth
                     && let Some(subscription) = &subscription
                 {
                     bot.players[subscription.player].update_bandwidth(index, view.max_bandwidth);
                 }
                 publish(bot, index, &view, detector);
+                cards.sync(&bot.players[player], &view, &commands);
             }
             changed = attached.changed() => {
                 if changed.is_err() {
                     return Ok(());
                 }
+                cards.sync(&bot.players[*attached.borrow()], &view, &commands);
+            }
+            _ = changes.changed() => {
+                cards.sync(&bot.players[*attached.borrow()], &view, &commands);
             }
             packet = next_packet(&mut subscription) => match packet {
                 Ok(packet) => voice(&commands, &mut sequence, packet.opus.clone(), packet.end),
@@ -430,6 +469,40 @@ async fn next_packet(
     }
 }
 
+/// Answers a card's web control with the user's own page link, in one message to
+/// that session: the link carries a token minted for them.
+fn web_link(
+    bot: &Arc<Bot>,
+    index: usize,
+    commands: &mpsc::Sender<Command>,
+    view: &View,
+    cards: &mut crate::integration::Cards,
+    session: u32,
+    instance: u64,
+) {
+    let Some(user) = view
+        .users
+        .get(&session)
+        .filter(|user| user.instance == instance)
+    else {
+        return;
+    };
+    let Some(link) = page_link(bot, index, owner(bot, index, user), false) else {
+        return;
+    };
+    let Ok(payload) = Payload::new(
+        nuschl_core::integration::KIT_LINK_DATA_ID.to_owned(),
+        link.into_bytes(),
+    ) else {
+        return;
+    };
+    let _ = commands.try_send(Command::PluginData {
+        request: cards.link_request(),
+        receivers: vec![(session, instance)],
+        payload,
+    });
+}
+
 /// Sends a voice packet; when the session is busy, the packet is dropped
 /// rather than delayed.
 fn voice(commands: &mpsc::Sender<Command>, sequence: &mut u64, opus: Vec<u8>, end: bool) {
@@ -448,8 +521,10 @@ fn voice(commands: &mpsc::Sender<Command>, sequence: &mut u64, opus: Vec<u8>, en
 fn handle(
     bot: &Arc<Bot>,
     index: usize,
+    player: usize,
     commands: &mpsc::Sender<Command>,
     view: &mut View,
+    cards: &mut crate::integration::Cards,
     event: SessionEvent,
 ) {
     let config = &bot.config.channels[index];
@@ -483,6 +558,8 @@ fn handle(
                 config.host,
                 config.port
             );
+            // Our card's presses arrive as plugin data.
+            let _ = commands.try_send(Command::AcceptPluginData(true));
             let url = escape_html(&format!(
                 "{}/",
                 bot.config.web.public_url.trim_end_matches('/')
@@ -526,6 +603,29 @@ fn handle(
                 }
             }
         }
+        SessionEvent::PluginData(data)
+            if data.payload.data_id() == nuschl_core::integration::KIT_ACTION_DATA_ID =>
+        {
+            let Ok(action) = nuschl_core::integration::Action::decode(data.payload.data()) else {
+                return;
+            };
+            if !view.is_listener(data.sender, data.sender_instance) {
+                return;
+            }
+            match cards.press(&bot.players[player], action) {
+                Some(crate::integration::Pressed::Web) => web_link(
+                    bot,
+                    index,
+                    commands,
+                    view,
+                    cards,
+                    data.sender,
+                    data.sender_instance,
+                ),
+                Some(crate::integration::Pressed::Applied) | None => {}
+            }
+        }
+        SessionEvent::PluginDataAdmission { result: Err(_), .. } => cards.retry(),
         SessionEvent::Text(text) if !text.outgoing => answer(bot, index, commands, text),
         SessionEvent::PermissionDenied(reason) => {
             // Typically: the bot may not enter its channel, or not speak there.
@@ -534,6 +634,33 @@ fn handle(
         }
         SessionEvent::Notice(notice) => tracing::info!("{}: {notice}", config.name),
         _ => {}
+    }
+}
+
+/// The page link of `owner`, minted or reused; `renew` replaces it.
+fn page_link(bot: &Arc<Bot>, index: usize, owner: Owner, renew: bool) -> Option<String> {
+    let owner = Owner {
+        server: bot.connections[index].server.clone(),
+        ..owner
+    };
+    match bot.tokens.issue(owner, renew) {
+        Ok(token) => Some(format!(
+            "{}/u/{token}/",
+            bot.config.web.public_url.trim_end_matches('/')
+        )),
+        Err(error) => {
+            tracing::error!("cannot save the links: {error}");
+            None
+        }
+    }
+}
+
+/// The owner of a user's connection, as the link store names it.
+fn owner(bot: &Arc<Bot>, index: usize, user: &User) -> Owner {
+    Owner {
+        server: bot.connections[index].server.clone(),
+        name: user.name.clone(),
+        certificate: user.certificate_hash.clone(),
     }
 }
 
@@ -551,12 +678,8 @@ fn answer(bot: &Arc<Bot>, index: usize, commands: &mpsc::Sender<Command>, text: 
         name: peer.name.clone(),
         certificate: peer.certificate_hash.clone(),
     };
-    let body = match bot.tokens.issue(owner, renew) {
-        Ok(token) => {
-            let link = format!(
-                "{}/u/{token}/",
-                bot.config.web.public_url.trim_end_matches('/')
-            );
+    let body = match page_link(bot, index, owner, renew) {
+        Some(link) => {
             if peer.certificate_hash.is_some() {
                 format!(
                     "Your link to the music queue: {link} (keep it to yourself; \"!web new\" replaces it)"
@@ -565,10 +688,7 @@ fn answer(bot: &Arc<Bot>, index: usize, commands: &mpsc::Sender<Command>, text: 
                 format!("Your link to the music queue: {link} (keep it to yourself)")
             }
         }
-        Err(error) => {
-            tracing::error!("cannot save the links: {error}");
-            "Sorry, I cannot make a link right now.".to_owned()
-        }
+        None => "Sorry, I cannot make a link right now.".to_owned(),
     };
     let _ = commands.try_send(Command::SendText {
         target: TextTarget::Direct(peer.session),

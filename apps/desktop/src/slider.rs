@@ -290,6 +290,9 @@ pub fn previewed(
 pub enum Owner {
     Menu(u64),
     Settings(u64),
+    /// A card in the sidebar. It lives while the card is drawn, so a drag that
+    /// outlives the card still edits the same person's setting.
+    Card,
 }
 
 impl Owner {
@@ -299,6 +302,7 @@ impl Owner {
         match self {
             Owner::Menu(invocation) => menu == Some(invocation),
             Owner::Settings(invocation) => settings == Some(invocation),
+            Owner::Card => true,
         }
     }
 }

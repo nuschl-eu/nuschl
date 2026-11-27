@@ -4,6 +4,7 @@
 //! badge on each server you listen to, pulsing while someone talks there;
 //! a server-scoped voice card distinguishing destination intent from observed
 //! speech, whose rows take you there; and the question before your voice goes to a second server.
+use crate::menus::{MenuAnchor, MenuTarget};
 use crate::{
     assets::icon,
     dialogs::{Tone, mix, modal, styled_button},
@@ -14,7 +15,7 @@ use crate::{
 };
 use gpui_kit::{Role as Role_, prelude::*, *};
 use nuschl_client::{Client, SecondServer, model::TextTarget};
-use std::{collections::BTreeMap, time::Duration};
+use std::{cell::Cell, collections::BTreeMap, rc::Rc, time::Duration};
 
 mod status;
 use status::{Availability, Connection, Facts, State};
@@ -499,7 +500,7 @@ fn place_link(place: &Place, cx: &mut Context<Desktop>) -> AnyElement {
 /// Every connected/pending voice context you hear ([`shown`]), independent of
 /// text navigation. Each hang-up names and targets its own connection (voice AND chat).
 pub fn card(
-    _this: &Desktop,
+    this: &Desktop,
     places: &[Place],
     window: &mut Window,
     cx: &mut Context<Desktop>,
@@ -632,7 +633,10 @@ pub fn card(
                             .font_weight(FontWeight::BOLD)
                             .text_sm()
                             .child(layout::label("voice-connection-status", heading)),
-                    ),
+                    )
+                    .when_some(integrations_trigger(this, cx), |row, trigger| {
+                        row.child(trigger)
+                    }),
             )
             .child(
                 layout::scroll_region(
@@ -650,6 +654,59 @@ pub fn card(
             )
             .into_any_element(),
     )
+}
+
+/// The integrations picker's trigger, at the right of the voice card's heading.
+/// It appears only while the selected server has a card to show or hide.
+fn integrations_trigger(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
+    let (server, _) = this.selected_indices()?;
+    if this.client.surfaces(server).is_empty() {
+        return None;
+    }
+    let open = this
+        .menu
+        .as_ref()
+        .is_some_and(|menu| menu.target == MenuTarget::Integrations);
+    // The menu opens above the header row it hangs off.
+    let anchor = Rc::new(Cell::new(Bounds::default()));
+    let position = anchor.clone();
+    let hidden = crate::integrations::hidden(this, server);
+    let trigger = div()
+        .relative()
+        .flex_shrink_0()
+        .child(
+            canvas(move |bounds, _, _| position.set(bounds), |_, _, _, _| {})
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+        )
+        .child(crate::dialogs::icon_button(
+            "integrations-trigger",
+            "menu",
+            "Menu",
+            TEXT_MUTED,
+            (open || hidden).then_some(SELECTED),
+            move |this, window, cx| {
+                if this
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.target == MenuTarget::Integrations)
+                {
+                    this.menu = None;
+                    window.focus(&this.window_focus, cx);
+                } else {
+                    this.make_menu(
+                        server,
+                        MenuTarget::Integrations,
+                        MenuAnchor::Above(anchor.get()),
+                    );
+                }
+                cx.notify();
+            },
+            cx,
+        ));
+    Some(trigger.into_any_element())
 }
 
 /// An explicit answer is valid only for the named places that were shown.

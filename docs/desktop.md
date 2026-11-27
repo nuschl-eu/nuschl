@@ -90,6 +90,12 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
   Entries appear only where the server's permissions allow them.
 - Drag the channel list's edge to fit long names. Collapsed branches show how many
   people are inside; branches with people open on connect.
+- A bot's card sits between the channel list and the voice card, and the list gives
+  up the height it takes. The button at the right of the voice card's heading opens
+  the integrations picker, one checked row per card, open while several are shown
+  or hidden; a hidden card takes no room. Each card carries a listen control that
+  joins the channel the bot speaks in, a volume slider for that bot alone, and the
+  controls it publishes ([docs/integrations-kit.md](integrations-kit.md)).
 - Search (Ctrl+F) finds messages saved on this device. History and the channel
   trees survive restarts, so you can browse offline.
 

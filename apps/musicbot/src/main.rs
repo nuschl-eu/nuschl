@@ -7,6 +7,7 @@ mod config;
 mod covers;
 mod decode;
 mod import;
+mod integration;
 mod library_keys;
 mod mumble;
 mod persist;

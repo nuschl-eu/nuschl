@@ -148,7 +148,10 @@ local cache it leaves, in a private headless GNOME Shell) and `emoji_smoke.py
 colours: `™` stays text and `™️` is an image; the picker's search, skin tone,
 Shift+Enter, Shift+click and click insert the expected text, and it is what is sent;
 short codes type emoji; an emoji in a message shows its tooltip and card;
-docs/emoji.md). The client SDK without a
+docs/emoji.md) and `integration_screenshots.py <binaries> --output DIR` (a scripted
+bot publishing a `nuschl/kit/1` player card: above the voice card, taking its height
+from the channel list, `--dismiss` hiding and showing a card through the picker, `--stack`
+adding a second bot's card; docs/integrations-kit.md). The client SDK without a
 UI: `with_local_nuschld.py <binaries> sdk_headless.py <binaries> --port PORT` runs
 `crates/client/examples/headless.rs` (three people connect, register, meet in a
 channel, send, receive, edit, and load the server's history through the SDK alone).
