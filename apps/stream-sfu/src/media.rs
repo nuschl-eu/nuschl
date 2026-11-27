@@ -192,6 +192,8 @@ struct Forward {
     mid: Option<Mid>,
     open: bool,
     stopping: bool,
+    /// When the allocation first left this source without a share.
+    unallocated_since: Option<Instant>,
     view: quality::View,
 }
 
@@ -1454,10 +1456,22 @@ impl Core {
                 Some(budget::Limit::Network) => VideoLimit::ReceiverBandwidth,
                 None => planned.limit,
             };
-            if share.layers == 0 && !planned.choices.is_empty() {
+            let layers = if share.layers == 0 && !planned.choices.is_empty() {
+                // Measurements can briefly outlast a burst. Keep the base
+                // layer for one interval under packet budgets and queue limits.
+                let began = *forward.unallocated_since.get_or_insert(now);
+                usize::from(
+                    view.selector.current().is_some()
+                        && now.saturating_duration_since(began) < Throttle::INTERVAL,
+                )
+            } else {
+                forward.unallocated_since = None;
+                share.layers
+            };
+            if layers == 0 && !planned.choices.is_empty() {
                 view.backlog.overloaded(limit);
             }
-            let target = share.layers.checked_sub(1).map(|ceiling| {
+            let target = layers.checked_sub(1).map(|ceiling| {
                 let smooth = planned.mode.prefer == protocol::Prefer::Smooth;
                 let (point, target) = dd::pick(
                     &planned.choices,
@@ -1746,12 +1760,151 @@ fn forward(from: PeerId, source: Mid, kind: MediaKind, label: &'static str) -> F
         mid: None,
         open: false,
         stopping: false,
+        unallocated_since: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use str0m::rtp::StreamTxQueueInfo;
+
+    struct QueueSample {
+        at: Instant,
+        stalled: bool,
+    }
+
+    impl StreamTxQueueInfo for QueueSample {
+        fn created_at(&self) -> Instant {
+            self.at
+        }
+
+        fn byte_size(&self) -> usize {
+            if self.stalled { 100_000 } else { 0 }
+        }
+
+        fn packet_count(&self) -> usize {
+            usize::from(self.stalled)
+        }
+
+        fn first_unsent(&self) -> Option<Instant> {
+            self.stalled.then_some(self.at - Duration::from_secs(1))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_room_share_dip_keeps_the_active_base_layer() {
+        let address = SocketAddr::from(([127, 0, 0, 1], 0));
+        let socket = Arc::new(UdpSocket::bind(address).await.unwrap());
+        let config = Arc::new(Config {
+            room_bitrate: 12_000,
+            ..Config::default()
+        });
+        let mut core = Core::new(config, socket, None, None).unwrap();
+        let now = core.origin;
+        let (admit, host, nonce) = ([1; 32], [2; 32], [3; 32]);
+        let room = ([0; 16], rooms::verifier(&host));
+        for id in 1..=3 {
+            core.join(
+                id,
+                address.ip(),
+                &nonce,
+                Join {
+                    room,
+                    proof: rooms::prove(&admit, rooms::ADMIT_LABEL, &nonce),
+                    host_proof: (id == 1).then(|| rooms::prove(&host, rooms::HOST_LABEL, &nonce)),
+                    create: (id == 1).then_some((admit, host)),
+                    decoders: Decoders::new(&[protocol::Codec::Av1]).unwrap(),
+                    video_limits: true,
+                    screen_rate: None,
+                },
+                mpsc::channel(16).0,
+                now,
+            );
+        }
+        let mid = Mid::from("screen");
+        core.peers.get_mut(&1).unwrap().screens.push(mid);
+        core.add_source(1, mid, MediaKind::Video);
+
+        let send = |core: &mut Core, seq: u8, key, payload, millis, stall_one_queue| {
+            let elapsed = Duration::from_millis(millis);
+            let timestamp = millis * 90;
+            let descriptor = if key {
+                vec![0xc0, 0, seq, 0x80, 0, 0x3a, 0x40, 0]
+            } else {
+                vec![0xc1, 0, seq]
+            };
+            let layers = &mut core.peers.get_mut(&1).unwrap().sources[0]
+                .video
+                .as_mut()
+                .unwrap()
+                .layers;
+            let frame = layers
+                .packet(&descriptor, payload, timestamp, elapsed)
+                .unwrap();
+            let targets = Some((layers.generation(), layers.lowest()));
+            core.quality(now + elapsed);
+            let room = &mut core.rooms.get_mut(&room).unwrap().budget;
+            [2, 3].map(|id| {
+                let peer = core.peers.get_mut(&id).unwrap();
+                let arrival = quality::Arrival {
+                    frame: Some(Some(frame)),
+                    video: true,
+                    seq: u64::from(seq),
+                    timestamp,
+                    marker: true,
+                    payload,
+                    cost: (payload + PACKET_OVERHEAD) as u64,
+                    bound: quality::QUEUE_BOUND,
+                    can_request: true,
+                    targets,
+                };
+                let (out, keyframe) = peer.forwards[0].view.admit(
+                    &arrival,
+                    Some(&QueueSample {
+                        at: now + elapsed,
+                        stalled: stall_one_queue && id == 2,
+                    }),
+                    peer.estimate,
+                    [&mut peer.budget, room],
+                    Some((&mut core.host_budget, VideoLimit::SfuHost)),
+                    now + elapsed,
+                );
+                (out.is_some(), keyframe)
+            })
+        };
+        let forwarded = [(true, false); 2];
+        let stopped = [(false, false); 2];
+        assert_eq!(send(&mut core, 1, true, 1000, 0, false), forwarded);
+        assert_eq!(send(&mut core, 2, false, 800, 50, false), forwarded);
+        // The last window measured 14.4 kb/s per viewer against a 12 kb/s
+        // room. The room bucket still has credit for both smaller frames.
+        assert_eq!(send(&mut core, 3, false, 500, 1000, false), forwarded);
+        // Both subscribers keep the chain as the estimate catches up.
+        assert_eq!(send(&mut core, 4, false, 500, 2000, false), forwarded);
+
+        let estimate = |core: &mut Core, bitrate| {
+            for id in [2, 3] {
+                core.peers.get_mut(&id).unwrap().estimate = bitrate;
+            }
+        };
+        // A share that stays too small still stops forwarding.
+        estimate(&mut core, 1000);
+        assert_eq!(send(&mut core, 5, false, 500, 3000, false), forwarded);
+        assert_eq!(send(&mut core, 6, false, 500, 4000, false), stopped);
+        estimate(&mut core, INITIAL_ESTIMATE);
+        assert_eq!(send(&mut core, 7, true, 500, 5000, false), forwarded);
+
+        // During the next grace interval, one viewer's queue is too old and
+        // the other viewer's packet costs more than the room bucket holds.
+        estimate(&mut core, 1000);
+        assert_eq!(send(&mut core, 8, false, 5000, 6000, true), stopped);
+        for (id, limit) in [(2, VideoLimit::ForwardingBacklog), (3, VideoLimit::SfuRoom)] {
+            let backlog = &mut core.peers.get_mut(&id).unwrap().forwards[0].view.backlog;
+            backlog.tick(now + Duration::from_secs(6));
+            assert_eq!(backlog.limit(), Some(limit));
+        }
+    }
 
     #[test]
     fn a_gap_in_a_requested_keyframe_has_one_early_retry() {
