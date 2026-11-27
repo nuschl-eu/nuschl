@@ -1,10 +1,7 @@
 # Installing and updating Nuschl
 
-The README has the short version. This page has the details: the Nix package and
-the Home Manager module, the Debian, Ubuntu and Arch packages, the Windows and
-macOS downloads, how releases are made and
-signed, and how Nuschl updates itself. No release has been published yet; the
-first publication still requires enrolled signing trust and complete notices ([How releases are made](#how-releases-are-made)).
+See the [README](../README.md#install) for download links. This guide covers
+installation, updates and release signing.
 
 ## Nix and NixOS
 
@@ -95,8 +92,8 @@ Nuschl and managed settings show as set by the system configuration and stay so.
 
 ## Debian and Ubuntu
 
-Use the APT instructions below once the first package is published. The
-packages target amd64 on Debian 13 (trixie) and Ubuntu 24.04 (noble).
+The APT repository serves amd64 packages for Debian 13 (trixie) and
+Ubuntu 24.04 (noble).
 
 ```sh
 sudo curl -fsSLo /usr/share/keyrings/nuschl-archive-keyring.gpg https://dl.nuschl.eu/apt/nuschl-archive-keyring.gpg
@@ -127,8 +124,8 @@ the program and the profile; your settings and history stay in your home folder
 
 ## Arch Linux
 
-Once published, the AUR package `nuschl-bin` installs the same `.deb` after
-checking its SHA-256 and archive signature. Import the key from its
+The AUR package `nuschl-bin` repackages the same `.deb` after checking its
+SHA-256 and archive signature. Import the key from its
 `keys/pgp/` folder (AUR helpers offer to), then build it:
 
 ```sh
@@ -145,7 +142,7 @@ the `PATH`: it refuses to start a worker it cannot sandbox.
 
 ## Windows
 
-Each release publishes an installer, `nuschl-<version>-windows-x86_64-setup.exe`,
+Windows downloads include an installer, `nuschl-<version>-windows-x86_64-setup.exe`,
 and a portable zip, `nuschl-<version>-windows-x86_64.zip`, with the same files.
 
 The installer needs no administrator rights. It installs for your user account into
