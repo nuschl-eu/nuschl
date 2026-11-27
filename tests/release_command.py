@@ -231,6 +231,9 @@ class ReleaseCommand(unittest.TestCase):
             front.publish_apt(self.pointer_path().parent, {'head': self.pointer()['commit']},
                               (destination, 'A' * 40, package))
         build, pool, check, files, metadata = [call.args[0] for call in run.call_args_list]
+        self.assertTrue(all(call.kwargs.get('capture_output') is False for call in run.call_args_list))
+        self.assertIsNone(run.call_args_list[0].kwargs['timeout'])
+        self.assertEqual(run.call_args_list[2].kwargs.get('stdout'), subprocess.PIPE)
         self.assertEqual(build[:2], ['nix', 'run'])
         self.assertEqual(build[-1], package)
         self.assertEqual(files[-1], destination)
