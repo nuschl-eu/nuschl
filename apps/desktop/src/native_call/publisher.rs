@@ -642,7 +642,10 @@ impl Encoding {
 
     fn upload_drop_limits(&self, preference: Preference, applied: CaptureLimits) -> CaptureLimits {
         CaptureLimits {
-            bitrate: self.limits(preference, applied).bitrate.min(applied.bitrate),
+            bitrate: self
+                .limits(preference, applied)
+                .bitrate
+                .min(applied.bitrate),
             ..applied
         }
     }
