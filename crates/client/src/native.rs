@@ -531,6 +531,9 @@ pub enum Event {
         ticket: HistoryTicket,
         reason: String,
     },
+    /// Content that never reached local history: a message, or an edit or
+    /// deletion of one.
+    HistoryLoss(String),
     /// The server offers less than it did before (the sticky policy).
     Downgrade {
         server: String,
@@ -2269,7 +2272,12 @@ async fn connect_once(
                                 let author = if outgoing { server.username.clone() } else if let Received::Message { sender, .. } = received { nuschl_session::mls::authenticated_sender_label(sender) } else { "Encrypted member".into() };
                                 let text = IncomingText { target, author, peer: None, body, html: false, outgoing, observed_at_ms, seq: Some(seq), pending: None };
                                 let job = ContentJob { server: id.clone(), generation, identity: server.history_identity(peer), nonce: nonce.clone(), text, archived: true };
-                                if content.send(ContentWork::Text(Box::new(job))).await.is_err() { break; }
+                                if content.send(ContentWork::Text(Box::new(job))).await.is_err() {
+                                    // Content processing has stopped: this message stays
+                                    // out of local history.
+                                    let _ = events.send(Event::HistoryLoss(LOSS_STOPPED.into())).await;
+                                    break;
+                                }
                             }
                         }
                         _ => {}
@@ -2280,9 +2288,15 @@ async fn connect_once(
                     if text.outgoing { let _ = events.send(Event::Sent { server: id.clone(), generation, target: text.target.clone(), body: text.body.clone() }).await; }
                     let archived = server_history && matches!(text.target, TextTarget::Channel(_) | TextTarget::DirectConversation(_));
                     let job = ContentJob { server: id.clone(), generation, identity: server.history_identity(peer), nonce: nonce.clone(), text, archived };
-                    if content.try_send(ContentWork::Text(Box::new(job))).is_err() {
-                        if !content_gap { let _ = events.send(Event::HistoryError("Chat processing is overloaded; some received messages could not be saved.".into())).await; content_gap = true; }
-                    } else { content_gap = false; }
+                    match content.try_send(ContentWork::Text(Box::new(job))) {
+                        Ok(()) => content_gap = false,
+                        Err(error) => {
+                            if !content_gap {
+                                report_loss(events, &error).await;
+                                content_gap = true;
+                            }
+                        }
+                    }
                 },
                 SessionEvent::Welcome(body) => {
                     let (_, document) = prepare(&body, true).await;
@@ -2775,18 +2789,30 @@ async fn reply_error(
     let _ = events.send(event).await;
 }
 
+/// What a loss report says when the content queue is full.
+const LOSS_BEHIND: &str = "Chat processing cannot keep up; some messages or changes are missing from this device's history.";
+/// What a loss report says when content processing has stopped.
+const LOSS_STOPPED: &str = "History processing has stopped; some messages or changes are missing from this device's history.";
+
+/// Report content that never reached local history. The user keeps seeing it
+/// until the notice is dismissed: a later successful save leaves the content
+/// missing.
+async fn report_loss(events: &mpsc::Sender<Event>, error: &mpsc::error::TrySendError<ContentWork>) {
+    let what = match error {
+        mpsc::error::TrySendError::Full(_) => LOSS_BEHIND,
+        mpsc::error::TrySendError::Closed(_) => LOSS_STOPPED,
+    };
+    let _ = events.send(Event::HistoryLoss(what.into())).await;
+}
+
 /// An edit or deletion joins the messages on their way to the timeline.
 async fn queue_change(
     content: &mpsc::Sender<ContentWork>,
     events: &mpsc::Sender<Event>,
     job: ChangeJob,
 ) {
-    if content.try_send(ContentWork::Change(job)).is_err() {
-        let _ = events
-            .send(Event::HistoryError(
-                "Chat processing is overloaded; an edit or deletion was not shown.".into(),
-            ))
-            .await;
+    if let Err(error) = content.try_send(ContentWork::Change(job)) {
+        report_loss(events, &error).await;
     }
 }
 
@@ -2896,11 +2922,7 @@ async fn content_loop(
                 },
             };
             if storage.send(command).await.is_err() {
-                let _ = events
-                    .send(Event::HistoryError(
-                        "Local history worker has stopped.".into(),
-                    ))
-                    .await;
+                let _ = events.send(Event::HistoryLoss(LOSS_STOPPED.into())).await;
                 return;
             }
         }
@@ -2980,6 +3002,7 @@ fn retire(storage: &mut Option<Storage>) {
 async fn keep_change(
     storage: &mut Option<Storage>,
     recent: &mut RecentChanges,
+    events: &mpsc::Sender<Event>,
     cache: Option<CacheKey>,
     seq: u64,
     change: &CacheChange,
@@ -2988,30 +3011,37 @@ async fn keep_change(
         // Remembered for a page already on its way with the
         // older text, which is kept after this.
         recent.note(&cache, seq as i64, change);
-        if let Some(worker) = storage {
-            let result = match change {
-                CacheChange::Edit {
-                    source, edited_ms, ..
-                } => {
-                    worker
-                        .edit(
-                            cache.identity,
-                            cache.channel,
-                            seq as i64,
-                            source.clone(),
-                            *edited_ms,
-                        )
-                        .await
-                }
-                CacheChange::Delete(deletion) => {
-                    worker
-                        .delete(cache.identity, cache.channel, seq as i64, deletion.at_ms)
-                        .await
-                }
-            };
-            if result.is_err() {
-                retire(storage);
+        let Some(worker) = storage else {
+            let _ = events.send(Event::HistoryLoss(LOSS_STOPPED.into())).await;
+            return;
+        };
+        let result = match change {
+            CacheChange::Edit {
+                source, edited_ms, ..
+            } => {
+                worker
+                    .edit(
+                        cache.identity,
+                        cache.channel,
+                        seq as i64,
+                        source.clone(),
+                        *edited_ms,
+                    )
+                    .await
             }
+            CacheChange::Delete(deletion) => {
+                worker
+                    .delete(cache.identity, cache.channel, seq as i64, deletion.at_ms)
+                    .await
+            }
+        };
+        if let Err(error) = result {
+            retire(storage);
+            let _ = events
+                .send(Event::HistoryLoss(format!(
+                    "This device's history did not save a change: {error}"
+                )))
+                .await;
         }
     }
 }
@@ -3122,9 +3152,17 @@ async fn storage_loop<F: Future<Output = Result<Storage, Error>>>(
                         }
                         Err(error) => {
                             retire(&mut storage);
-                            let _ = events.send(Event::HistoryError(error.to_string())).await;
+                            let _ = events
+                                .send(Event::HistoryLoss(format!(
+                                    "This device's history did not save a message: {error}"
+                                )))
+                                .await;
                         }
                     }
+                } else {
+                    // No worker could be started, so the message stays out of
+                    // this device's history.
+                    let _ = events.send(Event::HistoryLoss(LOSS_STOPPED.into())).await;
                 }
                 if id.is_some() {
                     let _ = events.send(Event::HistoryRecovered).await;
@@ -3192,6 +3230,7 @@ async fn storage_loop<F: Future<Output = Result<Storage, Error>>>(
                     keep_change(
                         &mut storage,
                         &mut recent,
+                        &events,
                         change.cache,
                         change.seq,
                         &change.change,
@@ -3222,7 +3261,7 @@ async fn storage_loop<F: Future<Output = Result<Storage, Error>>>(
                 cache,
                 change,
             } => {
-                keep_change(&mut storage, &mut recent, cache, seq, &change).await;
+                keep_change(&mut storage, &mut recent, &events, cache, seq, &change).await;
                 let event = match change {
                     CacheChange::Edit {
                         source,
@@ -3751,6 +3790,7 @@ impl Event {
                 ticket,
                 reason,
             },
+            Event::HistoryLoss(reason) => Input::HistoryLoss(reason),
             Event::Downgrade {
                 server,
                 generation,
@@ -4724,6 +4764,58 @@ mod reply_owner_tests {
         }
     }
 
+    #[tokio::test]
+    async fn dropped_content_is_reported_as_a_loss_that_names_its_cause() {
+        let (content, jobs) = mpsc::channel(1);
+        let (events, mut reported) = mpsc::channel(4);
+        let change = |seq: u64| {
+            ContentWork::Change(ChangeJob {
+                server: "a".into(),
+                conversation: [5; 16],
+                seq,
+                cache: None,
+                change: ChangeKind::Delete(Deletion {
+                    at_ms: seq as i64,
+                    moderator: false,
+                }),
+            })
+        };
+        content.send(change(1)).await.unwrap();
+        assert!(matches!(
+            content.try_send(change(2)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        // A full queue cannot keep up, and the loss says why.
+        queue_change(
+            &content,
+            &events,
+            match change(2) {
+                ContentWork::Change(job) => job,
+                _ => unreachable!(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            reported.try_recv(),
+            Ok(Event::HistoryLoss(text)) if text == LOSS_BEHIND
+        ));
+        // A stopped history loop loses content too.
+        drop(jobs);
+        queue_change(
+            &content,
+            &events,
+            match change(3) {
+                ContentWork::Change(job) => job,
+                _ => unreachable!(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            reported.try_recv(),
+            Ok(Event::HistoryLoss(text)) if text == LOSS_STOPPED
+        ));
+    }
+
     fn has_page(pending: &Pending, request_id: u64) -> bool {
         pending_replies(pending).pages.contains_key(&request_id)
     }
@@ -5483,6 +5575,56 @@ mod storage_loop_tests {
     }
 
     #[tokio::test]
+    async fn an_append_without_a_storage_worker_reports_the_missing_message() {
+        let (jobs, receiver) = mpsc::channel(4);
+        let (sender, mut events) = mpsc::channel(16);
+        tokio::spawn(storage_loop(
+            move || async { Err(Error::Worker("no worker".into())) },
+            receiver,
+            sender,
+        ));
+        jobs.send(append()).await.unwrap();
+        let mut failed = false;
+        loop {
+            match events.recv().await.unwrap() {
+                Event::HistoryError(_) => failed = true,
+                Event::HistoryLoss(text) => {
+                    assert!(failed, "the loss came before the writer's own notice");
+                    assert_eq!(text, LOSS_STOPPED);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_without_a_worker_is_reported_as_a_loss() {
+        let (sender, mut events) = mpsc::channel(4);
+        let mut storage = None;
+        let mut recent = RecentChanges::default();
+        keep_change(
+            &mut storage,
+            &mut recent,
+            &sender,
+            Some(CacheKey {
+                identity: "identity".into(),
+                channel: "1".into(),
+            }),
+            1,
+            &CacheChange::Delete(Deletion {
+                at_ms: 2,
+                moderator: false,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::HistoryLoss(text)) if text == LOSS_STOPPED
+        ));
+    }
+
+    #[tokio::test]
     async fn an_append_whose_worker_exits_fails_once_and_the_next_request_starts_a_worker() {
         let mut reply = Vec::new();
         let page = nuschl_core::SearchPage {
@@ -5515,7 +5657,9 @@ mod storage_loop_tests {
         jobs.send(append()).await.unwrap();
         loop {
             match events.recv().await.unwrap() {
-                Event::HistoryError(_) => break,
+                // The worker refused this message, and it is not retried: the
+                // loss stays visible.
+                Event::HistoryLoss(_) => break,
                 Event::HistoryRecovered => panic!("the append was sent again"),
                 _ => {}
             }

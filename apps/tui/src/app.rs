@@ -231,6 +231,9 @@ pub struct App {
     registered: BTreeSet<String>,
     /// Local history failed and has not said it works again.
     local_history_failed: bool,
+    /// Content missing from this device's history. It stays on the note line
+    /// while the line has nothing newer to say.
+    pub history_loss: Option<String>,
     requests: u64,
     /// The requested voice bitrate (`/bitrate`).
     pub bitrate: Bitrate,
@@ -264,6 +267,7 @@ impl App {
             prompted: BTreeSet::new(),
             registered: BTreeSet::new(),
             local_history_failed: false,
+            history_loss: None,
             requests: 0,
             bitrate: Bitrate::default(),
         }
@@ -537,6 +541,12 @@ impl App {
                         self.local_history_failed |= error.starts_with("Local history");
                         self.warn(error);
                     }
+                }
+                Update::HistoryLoss(reason) => {
+                    // The same text stays on the line after the note expires,
+                    // so it carries the warning style from the start.
+                    self.warn(reason.clone());
+                    self.history_loss = Some(reason);
                 }
                 Update::HistoryRecovered => {
                     if std::mem::take(&mut self.local_history_failed) {

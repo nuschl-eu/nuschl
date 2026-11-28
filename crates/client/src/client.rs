@@ -195,6 +195,11 @@ pub enum Update {
     PageShown { page: Page, used: bool },
     /// History could not be read or kept: what to tell the user.
     HistoryFailed(String),
+    /// Content that never reached local history, which is therefore
+    /// incomplete: a message, or an edit or deletion of one. The UI keeps it
+    /// visible until the user dismisses it; [`Self::HistoryRecovered`]
+    /// reports the writer, and this reports the content the writer missed.
+    HistoryLoss(String),
     /// History works again.
     HistoryRecovered,
     /// Our own message appeared in the open conversation: it follows the
@@ -2118,6 +2123,7 @@ impl Client {
                     self.apply_change(&server, conversation, seq, change);
                 }
             }
+            Input::HistoryLoss(reason) => self.updates.push(Update::HistoryLoss(reason)),
             Input::HistoryRecovered => self.updates.push(Update::HistoryRecovered),
             Input::Edited {
                 server,
@@ -4117,6 +4123,32 @@ mod tests {
             result: Err(crate::preview::Unavailable::Network),
         });
         assert_eq!(client.link_preview_status(), crate::preview::Status::None);
+    }
+
+    #[test]
+    fn a_dropped_message_stays_a_loss_while_history_works_again() {
+        let (mut client, _recorder, _id) = connected();
+        client.take_updates();
+        let reason = "Chat processing cannot keep up; some messages or changes \
+                      are missing from this device's history.";
+        client.handle(Input::HistoryLoss(reason.into()));
+        // The loss carries its own update. A later recovery adds its notice to
+        // the loss the user still has to see.
+        assert!(matches!(
+            client.take_updates().as_slice(),
+            [Update::HistoryLoss(text)] if text == reason
+        ));
+        client.handle(Input::HistoryRecovered);
+        assert!(matches!(
+            client.take_updates().as_slice(),
+            [Update::HistoryRecovered]
+        ));
+        // A failure of the writer keeps its own, recoverable, update.
+        client.handle(Input::HistoryError("disk full".into()));
+        assert!(matches!(
+            client.take_updates().as_slice(),
+            [Update::HistoryFailed(text)] if text == "Local history: disk full"
+        ));
     }
 
     #[test]

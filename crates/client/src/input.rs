@@ -140,6 +140,10 @@ pub enum Input {
     },
     /// Local history failed.
     HistoryError(String),
+    /// Content that never reached this device's history: a message, or an
+    /// edit or deletion of one. The UI keeps it visible until the user
+    /// dismisses it.
+    HistoryLoss(String),
     /// History writes work again after an earlier failure.
     HistoryRecovered,
     /// A message on a Nuschl server was edited (by its author, perhaps us).

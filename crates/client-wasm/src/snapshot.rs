@@ -196,7 +196,7 @@ pub fn update(update: &Update) -> Option<UpdateView> {
             channel: conversation.channel,
             body: body.clone(),
         },
-        Update::HistoryFailed(message) => UpdateView::Error {
+        Update::HistoryFailed(message) | Update::HistoryLoss(message) => UpdateView::Error {
             message: message.clone(),
         },
         _ => UpdateView::Changed,
