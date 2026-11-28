@@ -4,7 +4,7 @@
 // who is in the call, and this page's own camera and screen on the publish
 // connection, encrypted in the stream worker and encoded in the call codec.
 import { DirectPaths, ENCODINGS } from "./direct.js";
-import { MAX_PEERS, join, parse, publishTier } from "./signal.js";
+import { MAX_PEERS, join, parse, publishCaps } from "./signal.js";
 import { HINTS, preferences, scalabilityMode, sendCodecs, setLatency } from "./support.js";
 
 /** A publisher whose keys have not arrived is asked again after this. */
@@ -26,6 +26,8 @@ export class Call extends EventTarget {
   sources = new Map();
   /** The user's Sharp/Smooth and Low latency choice per video source. */
   modes = { camera: { prefer: "smooth", low_latency: false }, screen: { prefer: "sharp", low_latency: false } };
+  /** The user's outgoing resolution and frame rate limits by source kind. */
+  publishLimits = {};
   self = null;
   role = null;
   codec = null;
@@ -242,9 +244,9 @@ export class Call extends EventTarget {
 
   /** Publishes `track`, from the user's own Start camera or Share screen, as this
    * page's camera, screen or tab audio source. */
-  async publish(kind, track, tier) {
+  async publish(kind, track) {
     const pending = Promise.resolve(this.publishing).catch(() => {})
-      .then(() => this.publishTrack(kind, track, tier));
+      .then(() => this.publishTrack(kind, track));
     this.publishing = pending;
     try {
       await pending;
@@ -256,7 +258,7 @@ export class Call extends EventTarget {
     }
   }
 
-  async publishTrack(kind, track, tier) {
+  async publishTrack(kind, track) {
     const audio = kind === "audio";
     if (audio !== (track.kind === "audio") || (audio && !this.sources.has("screen"))) return track.stop();
     if (audio && !sendCodecs(globalThis, "opus", "audio").length) throw new Error("Opus unavailable");
@@ -277,7 +279,7 @@ export class Call extends EventTarget {
       }, TICK_MS);
     }
     const transceiver = this.sender(kind, track, mode);
-    const source = { track, transceiver, stream: new MediaStream([track]), tier };
+    const source = { track, transceiver, stream: new MediaStream([track]) };
     this.sources.set(kind, source);
     // The browser's own Stop sharing, or an unplugged camera.
     track.addEventListener("ended", () => {
@@ -327,11 +329,10 @@ export class Call extends EventTarget {
     }
   }
 
-  setPublishTier(kind, tier) {
+  setPublishLimits(kind, limits) {
+    this.publishLimits[kind] = limits;
     const source = this.sources.get(kind);
-    if (!source) return;
-    source.tier = tier;
-    return this.applyCap(kind, source);
+    if (source) return this.applyCap(kind, source);
   }
 
   /** Sets `kind`'s Sharp/Smooth and Low latency choice, also for its live source. */
@@ -357,7 +358,7 @@ export class Call extends EventTarget {
     if (kind === "audio") return;
     source.applying = Promise.resolve(source.applying).then(async () => {
       if (this.sources.get(kind) !== source || this.ended) return;
-      const [localHeight, localFps, localRate] = publishTier(kind, source.tier);
+      const [localHeight, localFps, localRate] = publishCaps(kind, this.publishLimits[kind]);
       const [remoteHeight, remoteFps, remoteRate] = source.remoteCap ?? [localHeight, localFps, localRate];
       const height = Math.min(localHeight, remoteHeight);
       const fps = Math.min(localFps, remoteFps);

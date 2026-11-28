@@ -68,7 +68,7 @@ function displayReceiver(target, rates = {}, status = "") {
   const reported = limit();
   display(target, [dimensions(width, height), number(rates.decoded, "fps"), number(rates.presented, "fps"),
     bitrateText(rates.bitrate), number(rates.jitterBufferMs, "ms"), tier(requested()),
-    reported === "within_target" ? "SFU within selected quality" : videoLimitLabel(reported)], status);
+    reported === "within_target" ? "SFU within receive target" : videoLimitLabel(reported)], status);
 }
 
 const limitations = new Map([

@@ -36,7 +36,9 @@ from local_murmur import Murmur, eventually, free_port  # noqa: E402
 from mumble_client import Client  # noqa: E402
 from voice_servers import VoiceTest  # noqa: E402
 
+AT_SPI_CHECK_MENU_ITEM = "role 8"
 AT_SPI_RADIO_MENU_ITEM = "role 45"
+AT_SPI_CHECKED = 1 << 4
 
 
 class CallTest(VoiceTest):
@@ -111,7 +113,7 @@ class CallTest(VoiceTest):
                    "the fixture window did not resize", timeout=15)
         return previous
 
-    def select_quality(self, app, current, selected, *, above):
+    def select_quality(self, app, current, choices, *, result):
         trigger = self.control(app, f"Quality · {current}")
         chat = self.timeline(app)
         chat_bounds = chat.extents()
@@ -121,16 +123,26 @@ class CallTest(VoiceTest):
                            "video quality dropdown did not open")
         _, menu_y, _, menu_height = menu.extents()
         geometry = f"trigger at {trigger_y} with height {trigger_height}, menu at {menu_y} with height {menu_height}"
-        if above:
+        # The dropdown prefers the space above the trigger when its measured
+        # rows fit with the four-pixel gap and eight-pixel viewport margin.
+        if menu_height + 12 <= trigger_y:
             assert menu_y + menu_height <= trigger_y, f"quality menu should open above: {geometry}"
         else:
             assert menu_y >= trigger_y + trigger_height, f"quality menu should fit below: {geometry}"
         assert chat.extents() == chat_bounds, "opening the quality menu moved the chat"
-        eventually(lambda: self.find(menu, AT_SPI_RADIO_MENU_ITEM, selected),
-                   f"quality radio menu item missing: {selected}").press()
-        self.control(app, f"Quality · {selected}")
+        for choice in choices:
+            role = AT_SPI_CHECK_MENU_ITEM if choice == "Low latency" else AT_SPI_RADIO_MENU_ITEM
+            item = eventually(lambda: self.find(app, role, choice),
+                              f"quality menu item missing: {choice}")
+            item.press()
+            eventually(lambda: any(item_role == role and label == choice and state & AT_SPI_CHECKED
+                                   for _, item_role, label, state in items(app)),
+                       f"quality menu item did not become checked: {choice}")
+            assert self.find(app, "menu", "Video quality"), f"selecting {choice} closed the menu"
+        self.control(app, f"Quality · {result}")
+        self.shell.key("Escape")
         eventually(lambda: not self.find(app, "menu", "Video quality"),
-                   "video quality dropdown did not close")
+                   "Escape did not close the video quality dropdown")
         assert chat.extents() == chat_bounds, "selecting a quality moved the chat"
 
     def toggle_quality(self, app):
@@ -427,15 +439,20 @@ class CallTest(VoiceTest):
             self.control(andi, "Open in browser", shown=False)
             self.toggle_quality(andi)
             self.video_stats(andi, show=True)
-            self.select_quality(andi, "Auto", "720p30", above=True)
-            self.video_stats(andi, show=False)
+            self.select_quality(andi, "Auto", ("Sharp", "Low latency", "Max 180p", "Max 30 fps"),
+                                result="Max 180p · 30 fps")
+            assert self.witness_link()[0] == {"kind": "channel", "id": 1}
+            self.press(andi, "End call")
+
             height = self.resize_desktop(andi_pid, 520)
             settings = self.root / "Andi" / "config/settings.json"
             for _ in range(2):
                 self.shell.chord("Control_L", "equal")
             eventually(lambda: json.loads(settings.read_text()).get("appearance", {}).get("zoom") == 1.25,
                        "the short fixture window did not reach 125% zoom", timeout=15)
-            self.select_quality(andi, "720p30", "Auto", above=False)
+            self.press(andi, "Start camera")
+            self.inline(andi)
+            self.select_quality(andi, "Auto", ("Max 180p", "Auto frame rate"), result="Max 180p")
             self.shell.chord("Control_L", "0")
             self.resize_desktop(andi_pid, height)
             self.inline(andi)

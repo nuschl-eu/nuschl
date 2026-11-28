@@ -6,7 +6,7 @@ use super::{
     gallery::{REMOTE_SOURCES, REMOTE_TILES},
     stats, text,
 };
-use nuschl_client::native::sfu::{Media, MediaEvent, VideoKind};
+use nuschl_client::native::sfu::{Media, MediaEvent, Quality, VideoKind};
 use nuschl_ipc::video::{CaptureLimits, DecodeError, Decoder};
 use nuschl_protocol::sfu::VideoLimit;
 use std::{
@@ -249,10 +249,10 @@ impl Viewer {
         }
         for stream in tiles.into_iter().flatten() {
             let feed = stream.feed;
-            let Some(publisher) = feed.publisher else {
+            let (Some(publisher), Some(slot)) = (feed.publisher, self.position(feed)) else {
                 continue;
             };
-            let limit = self.position(feed).and_then(|slot| self.limits[slot]);
+            let limit = self.limits[slot];
             let lane = self
                 .lanes
                 .iter()
@@ -264,14 +264,14 @@ impl Viewer {
                 lane.select(Some(stream), limit);
                 lane.request_keyframe(media, stream)?;
             }
-            let preference = selection.preference(feed);
+            let pixels = selection.tile_pixels(slot, stream);
             let pixels = if feed.kind == VideoKind::Screen {
-                preference.pixels.max(1080)
+                pixels.max(1080)
             } else {
-                preference.pixels
+                pixels
             };
-            let _ = media.set_quality(publisher, feed.purpose(), preference.quality, pixels);
-            let requested = feed.kind.ladder()[feed.kind.request(preference.quality, pixels)];
+            let _ = media.set_quality(publisher, feed.purpose(), Quality::Auto, pixels);
+            let requested = feed.kind.ladder()[feed.kind.request(Quality::Auto, pixels)];
             lane.stats.requested(CaptureLimits {
                 height: requested.height,
                 fps: requested.fps.into(),

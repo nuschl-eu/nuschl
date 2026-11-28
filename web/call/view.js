@@ -4,8 +4,7 @@
 // strings (the stream host requires Trusted Types). This page's own sources show as
 // tiles too; `controls.js` starts and stops them.
 
-import { qualityOptions } from "./controls.js";
-import { TIERS, fitTier, publishTier, qualityRequest } from "./signal.js";
+import { TIERS, fitTier, publishCaps, qualityRequest } from "./signal.js";
 import { VideoStats } from "./receiver-stats.js";
 
 const endings = {
@@ -72,8 +71,6 @@ export class View {
   audio = new Map();
   /** Each publisher's shared audio as this viewer set it, for the rest of the call. */
   levels = new Map();
-  /** Explicit viewer choices survive a publisher's encoder restart. */
-  tiers = new Map();
   sentTiers = new WeakMap();
   sizes = new Map();
   /** Each received video track's picture size, from its keyframes. */
@@ -172,7 +169,6 @@ export class View {
       tile.remove();
       this.tiles.delete(key);
     }
-    for (const peer of this.tiers.keys()) if (!call.peers.has(peer)) this.tiers.delete(peer);
     // A pin stays while its source is away, as during an encoder restart.
     const pinned = videos.find(([, track]) => pin(track) === this.pinned)?.[0];
     const featured = pinned ?? videos.find(([, track]) => track.screen && !track.own)?.[0] ?? null;
@@ -321,13 +317,12 @@ export class View {
       return value;
     });
     const kind = track.screen ? "screen" : "camera";
-    const quality = track.own ? null : this.viewerQuality(mid, video, track, label);
+    const requested = track.own ? null : this.requestTileQuality(mid, video, track);
     const message = element(doc, "p", { hidden: "" });
     details.append(element(doc, "summary", { "aria-label": `Video stats for ${label}` }, "Video stats"));
-    if (quality) details.append(quality.control);
     details.append(message, list);
-    const target = { details, video, message, values, ...(quality ? {
-      receiver: track.receiver, requested: quality.requested,
+    const target = { details, video, message, values, ...(requested ? {
+      receiver: track.receiver, requested,
       limit: () => {
         const current = this.call.tracks.get(mid);
         if (current?.receiver === track.receiver && current.peer === track.peer && current.source === track.source) {
@@ -337,7 +332,7 @@ export class View {
     } : {
       source: track.source,
       sender: () => this.call.direct.sender(track.source.transceiver.sender),
-      requested: () => publishTier(kind, track.source.tier),
+      requested: () => publishCaps(kind, this.call.publishLimits[kind]),
       screenRate: kind === "screen" && this.call.screenRate,
     }) };
     details.addEventListener("toggle", () => {
@@ -347,30 +342,17 @@ export class View {
     return details;
   }
 
-  viewerQuality(mid, video, track, label) {
+  requestTileQuality(mid, video, track) {
     const kind = track.screen ? "screen" : "camera";
-    const select = element(this.document, "select", { "aria-label": `Quality for ${label}` });
-    qualityOptions(select, kind);
-    const tiers = this.tiers.get(track.peer) ?? {};
-    this.tiers.set(track.peer, tiers);
-    select.value = tiers[kind] ?? "";
-
     const original = this.call.tracks.get(mid);
     const sent = this.sentTiers.get(original) ?? { at: -Infinity };
     this.sentTiers.set(original, sent);
-    let size = 0, timer;
-    // Auto fits the tile; a chosen tier limits it.
-    const chosen = () => {
-      const limit = select.value !== "" && TIERS[kind][Number(select.value)] ? Number(select.value) : undefined;
-      if (size === 0) return limit;
-      return Math.min(fitTier(kind, size), limit ?? Infinity);
-    };
+    let tier, timer;
     const send = () => {
       clearTimeout(timer);
       if (this.call.tracks.get(mid) !== original || this.call.ended) return;
-      const tier = chosen();
       if (tier === undefined || tier === sent.tier) return;
-      // The SFU accepts one request per second. Keep the latest choice until then.
+      // The SFU accepts one request per second. Keep the latest tier until then.
       const wait = sent.at + 1100 - performance.now();
       if (wait > 0) {
         timer = setTimeout(send, wait);
@@ -380,17 +362,15 @@ export class View {
       sent.tier = tier;
       sent.at = performance.now();
     };
-    select.addEventListener("change", () => {
-      tiers[kind] = select.value;
-      send();
+    this.sizes.set(video, {
+      resize: (pixels) => {
+        tier = pixels > 0 ? fitTier(kind, pixels) : undefined;
+        send();
+      },
+      cancel: () => clearTimeout(timer),
     });
-    this.sizes.set(video, { resize: (pixels) => { size = pixels; send(); }, cancel: () => clearTimeout(timer) });
     this.observer.observe(video, { box: "device-pixel-content-box" });
-    send();
-    return {
-      control: element(this.document, "label", { class: "viewer-quality" }, "Receive limit", select),
-      requested: () => TIERS[kind][chosen()],
-    };
+    return () => TIERS[kind][tier];
   }
 
   person(id, role) {

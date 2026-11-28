@@ -191,44 +191,29 @@ test("viewer quality uses tile pixels and the v1 request layout", () => {
   assert.equal(qualityRequest(23, "camera", 0).request, "0100000000000000170000");
 });
 
-test("a receive limit applies before layout and caps the tile's tier", () => {
-  class Element extends EventTarget {
-    constructor(ownerDocument) {
-      super();
-      this.ownerDocument = ownerDocument;
-      this.children = [];
-    }
-    setAttribute() {}
-    replaceChildren(...children) { this.children = children; }
-    append(...children) { this.children.push(...children); }
-  }
-  const document = { createElement: () => new Element(document) };
+test("automatic receive quality follows a visible tile's size", () => {
   const track = { peer: 4, screen: true };
   const video = {};
   const sent = [];
   const view = {
-    document,
     call: { tracks: new Map([["source", track]]), send: (message) => sent.push(message) },
-    tiers: new Map(),
     sentTiers: new WeakMap(),
     sizes: new Map(),
     observer: { observe() {} },
   };
-  const { control, requested } = View.prototype.viewerQuality.call(view, "source", video, track, "Screen");
+  const requested = View.prototype.requestTileQuality.call(view, "source", video, track);
+  const size = view.sizes.get(video);
+  size.resize(0);
   assert.equal(requested(), undefined);
   assert.deepEqual(sent, []);
-  const select = control.children[1];
-  select.value = "2";
-  select.dispatchEvent(new Event("change"));
+  size.resize(1200);
   assert.equal(requested(), TIERS.screen[2]);
   assert.deepEqual(sent, [{ type: "quality", request: "0100000000000000040102" }]);
-  view.sizes.get(video).resize(400);
+  size.resize(400);
   assert.equal(requested(), TIERS.screen[0]);
-  view.sizes.get(video).resize(4000);
-  assert.equal(requested(), TIERS.screen[2]);
-  select.value = "";
-  select.dispatchEvent(new Event("change"));
+  size.resize(4000);
   assert.equal(requested(), TIERS.screen[3]);
+  size.cancel();
 });
 
 test("negotiated video limits follow only the accepted video track", async () => {
@@ -288,25 +273,32 @@ test("publisher quality applies bounded encoder limits to the matching MID", asy
   assert.equal(applied.length, 1);
   await call.receive({ ...quality, source: "4", max_height: 2160, max_fps: 60, max_bitrate: 15_000_000 });
   assert.deepEqual(applied[1], { scaleResolutionDownBy: 1, maxFramerate: 60, maxBitrate: 15_000_000 });
-  await call.setPublishTier("screen", "2");
+  await call.setPublishLimits("screen", { height: 1440 });
   assert.deepEqual(applied[2], { scaleResolutionDownBy: 1, maxFramerate: 60, maxBitrate: 8_000_000 });
-  await call.setPublishTier("screen", "1");
+  await call.setPublishLimits("screen", { height: 1080 });
   assert.deepEqual(applied[3], {
+    scaleResolutionDownBy: 1440 / 1080, maxFramerate: 60, maxBitrate: 3_000_000,
+  });
+  await call.setPublishLimits("screen", { height: 1080, fps: 30 });
+  assert.deepEqual(applied.at(-1), {
     scaleResolutionDownBy: 1440 / 1080, maxFramerate: 30, maxBitrate: 3_000_000,
   });
   await call.receive({ ...quality, source: "4" });
-  assert.deepEqual(applied[4], { scaleResolutionDownBy: 2, maxFramerate: 15, maxBitrate: 800_000 });
+  assert.deepEqual(applied.at(-1), { scaleResolutionDownBy: 2, maxFramerate: 15, maxBitrate: 800_000 });
 
   call.screenRate = true;
   await call.receive(parse(JSON.stringify({ ...quality, source: "4", max_height: 2160, max_fps: 60, max_bitrate: 24_000_000 })));
-  assert.deepEqual(applied[5], { scaleResolutionDownBy: 1440 / 1080, maxFramerate: 30, maxBitrate: 24_000_000 });
-  await call.setPublishTier("screen", "2");
-  assert.deepEqual(applied[6], { scaleResolutionDownBy: 1, maxFramerate: 60, maxBitrate: 24_000_000 });
+  assert.deepEqual(applied.at(-1), { scaleResolutionDownBy: 1440 / 1080, maxFramerate: 30, maxBitrate: 24_000_000 });
+  await call.setPublishLimits("screen", { height: 1440, fps: 30 });
+  assert.deepEqual(applied.at(-1), { scaleResolutionDownBy: 1, maxFramerate: 30, maxBitrate: 24_000_000 });
+  await call.setPublishLimits("screen", { height: 1440 });
+  assert.deepEqual(applied.at(-1), { scaleResolutionDownBy: 1, maxFramerate: 60, maxBitrate: 24_000_000 });
   await call.receive({ ...quality, source: "4", max_height: 1440, max_fps: 60, max_bitrate: 6_000_000 });
-  assert.deepEqual(applied[7], { scaleResolutionDownBy: 1, maxFramerate: 60, maxBitrate: 6_000_000 });
-  call.sources.set("camera", { transceiver: { mid: "5", sender }, track, tier: "2" });
+  assert.deepEqual(applied.at(-1), { scaleResolutionDownBy: 1, maxFramerate: 60, maxBitrate: 6_000_000 });
+  call.setPublishLimits("camera", { height: 720 });
+  call.sources.set("camera", { transceiver: { mid: "5", sender }, track });
   await call.receive({ ...quality, source: "5", max_height: 1080, max_fps: 30, max_bitrate: 4_000_000 });
-  assert.deepEqual(applied[8], { scaleResolutionDownBy: 2, maxFramerate: 30, maxBitrate: 2_000_000 });
+  assert.deepEqual(applied.at(-1), { scaleResolutionDownBy: 2, maxFramerate: 30, maxBitrate: 2_000_000 });
 });
 
 test("a source's mode sets its sender's hints and reaches the SFU", async () => {
@@ -324,7 +316,7 @@ test("a source's mode sets its sender's hints and reaches the SFU", async () => 
   globalThis.RTCRtpScriptTransform = class {};
   const transceiver = call.sender("screen", screen);
   assert.equal(screen.contentHint, "detail");
-  call.sources.set("screen", { track: screen, transceiver, tier: "" });
+  call.sources.set("screen", { track: screen, transceiver });
   await call.applyCap("screen", call.sources.get("screen"));
   assert.equal(parameters.at(-1).degradationPreference, "maintain-resolution");
   await call.setMode("screen", { prefer: "smooth", low_latency: true });

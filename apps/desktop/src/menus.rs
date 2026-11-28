@@ -18,7 +18,7 @@ use gpui_kit::{
     prelude::*,
     *,
 };
-use nuschl_client::native::{Presences, UserKey, sfu::Quality};
+use nuschl_client::native::{Presences, UserKey};
 use nuschl_session::{
     connection::{ActionSubject, Command, CommandAuthority, TextTarget, User},
     model::{ChannelEdit, UserAction, VoiceTargetSpec, permission as perm},
@@ -321,7 +321,7 @@ enum Entry {
         label: String,
         icon: &'static str,
         danger: bool,
-        choice: Option<bool>,
+        choice: Option<(Role, bool)>,
         action: Action,
     },
     Volume {
@@ -867,8 +867,12 @@ impl Desktop {
         }
         if let MenuTarget::VideoQuality(generation, feed) = menu.target {
             for (video, label, selected) in self.video_quality_commands(generation, feed) {
-                // The tier limits follow an own source's modes.
-                if video == VideoChoice::Quality(Quality::Auto) && !entries.is_empty() {
+                if matches!(
+                    video,
+                    VideoChoice::LowLatency
+                        | VideoChoice::Resolution(None)
+                        | VideoChoice::FrameRate(None)
+                ) {
                     entries.push(Entry::Separator);
                 }
                 let mut entry = local_item(label, "check", move |this, _, _, cx| {
@@ -876,7 +880,12 @@ impl Desktop {
                 })
                 .key(format!("quality:{video:?}"));
                 if let Entry::Item { choice, .. } = &mut entry {
-                    *choice = Some(selected);
+                    let role = if video == VideoChoice::LowLatency {
+                        Role::MenuItemCheckBox
+                    } else {
+                        Role::MenuItemRadio
+                    };
+                    *choice = Some((role, selected));
                 }
                 entries.push(entry);
             }
@@ -892,7 +901,7 @@ impl Desktop {
                     })
                     .key(format!("feed:{feed:?}"));
                     if let Entry::Item { choice, .. } = &mut entry {
-                        *choice = Some(selected);
+                        *choice = Some((Role::MenuItemRadio, selected));
                     }
                     entry
                 })
@@ -1717,8 +1726,10 @@ impl Desktop {
             },
         };
         let mut activate = |this: &mut Self| {
-            this.menu = None;
-            window.focus(&this.window_focus, cx);
+            if !matches!(menu.target, MenuTarget::VideoQuality(..)) {
+                this.menu = None;
+                window.focus(&this.window_focus, cx);
+            }
             action(this, index, window, cx);
         };
         if matches!(access, Access::Live) {
@@ -2176,6 +2187,7 @@ pub fn menu(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                 action,
             } => {
                 let _ = action;
+                let selected = choice.map(|(_, selected)| selected);
                 let element_key = format!("{}:{key}", menu.invocation);
                 let pointer_key = key.clone();
                 let keyboard_key = key.clone();
@@ -2198,13 +2210,9 @@ pub fn menu(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                 let control = div()
                     .id(SharedString::from(format!("menu-item:{element_key}")))
                     .group(SharedString::from(format!("menu-item:{element_key}")))
-                    .role(if choice.is_some() {
-                        Role::MenuItemRadio
-                    } else {
-                        Role::MenuItem
-                    })
+                    .role(choice.map_or(Role::MenuItem, |(role, _)| role))
                     .aria_label(label.clone())
-                    .when_some(choice, |control, selected| {
+                    .when_some(selected, |control, selected| {
                         control
                             .aria_toggled(selected.into())
                             .when(selected, |control| control.bg(color(SELECTED)))
@@ -2237,7 +2245,7 @@ pub fn menu(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                             cx.stop_propagation();
                         }
                     }))
-                    .child(if choice == Some(false) {
+                    .child(if selected == Some(false) {
                         div().w(px(15.)).flex_shrink_0().into_any_element()
                     } else {
                         icon(name, 15., color(icon_color))

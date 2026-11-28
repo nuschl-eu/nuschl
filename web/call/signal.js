@@ -28,7 +28,7 @@ const optional = (check) => (value) => value === undefined || check(value);
 
 const videoLimits = new Map([
   ["within_target", "Within selected quality"],
-  ["receiver_quality", "Viewer quality selection"],
+  ["receiver_quality", "Viewer quality target"],
   ["receiver_decode", "Viewer decoding capacity"],
   ["receiver_bandwidth", "Viewer connection"],
   ["sfu_host", "SFU host upload cap"],
@@ -83,8 +83,12 @@ export const TIERS = {
   screen: [[720, 15, 800_000], [1080, 30, 3_000_000], [1440, 60, 8_000_000], [2160, 60, 15_000_000]],
 };
 
-export function publishTier(kind, choice) {
-  return TIERS[kind][choice] ?? TIERS[kind].at(-1);
+/** The sender's resolution sets its baseline bitrate. Frame rate is a separate cap. */
+export function publishCaps(kind, { height, fps } = {}) {
+  const tiers = TIERS[kind];
+  const ceiling = tiers.at(-1);
+  const [maxHeight, , bitrate] = tiers.find(([limit]) => limit === height) ?? ceiling;
+  return [maxHeight, Math.min(fps ?? ceiling[1], ceiling[1]), bitrate];
 }
 
 export function fitTier(kind, pixels) {

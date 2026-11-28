@@ -142,10 +142,6 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) fn height(self) -> Option<u16> {
-        self.resolution.map(|(width, height)| width.min(height))
-    }
-
     fn receiver_limit(self) -> &'static str {
         match self.path.map(|path| path.route) {
             Some(Route::Direct) => "Direct connection · unavailable",
@@ -238,7 +234,7 @@ pub(super) fn rows(
 pub(super) fn limit_label(limit: VideoLimit) -> &'static str {
     match limit {
         VideoLimit::WithinTarget => "Within selected quality",
-        VideoLimit::ReceiverQuality => "Viewer quality selection",
+        VideoLimit::ReceiverQuality => "Viewer quality target",
         VideoLimit::ReceiverDecode => "Viewer decoding capacity",
         VideoLimit::ReceiverBandwidth => "Viewer connection",
         VideoLimit::SfuHost => "SFU host upload cap",
