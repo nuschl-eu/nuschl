@@ -174,17 +174,17 @@ mod supervisor {
             let exchange = async {
                 process.worker.input.write_all(&frame).await?;
                 process.worker.input.flush().await?;
-                read_reply::<MathResponse>(&mut process.worker.output, MAX_FRAME_BYTES).await
+                read_reply::<MathResponse>(&mut process.worker.output, MAX_FRAME_BYTES, id).await
             };
             let reply = match timeout(DEADLINE, exchange).await {
-                Ok(Ok(reply)) if reply.request_id == id => reply,
-                outcome => {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(error)) => {
                     self.kill().await;
-                    return Err(match outcome {
-                        Err(_) => Error::Timeout,
-                        Ok(Err(error)) => error,
-                        Ok(Ok(_)) => Error::InvalidResponse,
-                    });
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.kill().await;
+                    return Err(Error::Timeout);
                 }
             };
             process.served += 1;

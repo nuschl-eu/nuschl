@@ -20,9 +20,10 @@ pub mod thumbnail;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod video;
 
-pub(crate) use framing::decode_frame_body;
+pub(crate) use framing::decode_reply;
 pub use framing::{
-    Error, read_frame, read_frame_async, read_frame_within, write_frame, write_frame_within,
+    Error, read_frame, read_frame_async, read_frame_within, read_reply, read_reply_within,
+    write_frame, write_frame_within,
 };
 use nuschl_core::{ChatMessage, ContentBlock, HistoryPage, MessageDocument};
 use serde::{Deserialize, Serialize};

@@ -5,7 +5,7 @@
 mod supervisor;
 pub use supervisor::{Error as WorkerError, Worker};
 
-use crate::{Envelope, Error, read_frame_async, read_frame_within, write_frame_within};
+use crate::{Envelope, Error, read_frame_within, write_frame_within};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Read, Write},
@@ -388,8 +388,13 @@ async fn read_reply(
     reader: &mut (impl AsyncRead + Unpin),
     request: &Packet<Command>,
 ) -> Result<Packet<Reply>, Error> {
-    let envelope: Envelope<Metadata<Reply>> = read_frame_async(reader, MAX_METADATA).await?;
-    if envelope.request_id != request.id || !envelope.payload.kind.matches(&request.kind) {
+    let envelope: Envelope<Metadata<Reply>> =
+        match crate::read_reply(reader, MAX_METADATA, request.id).await {
+            Ok(envelope) => envelope,
+            Err(crate::Error::WrongRequest { .. }) => return Err(invalid()),
+            Err(error) => return Err(error),
+        };
+    if !envelope.payload.kind.matches(&request.kind) {
         return Err(invalid());
     }
     let mut packet = frame(envelope, Reply::permits)?;

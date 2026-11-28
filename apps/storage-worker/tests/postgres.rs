@@ -9,7 +9,7 @@
 //! socket there. Without those binaries the PostgreSQL test is skipped with a
 //! message; `just test-postgres` runs it with PostgreSQL from nixpkgs.
 use nuschl_ipc::{
-    Envelope, read_frame,
+    Envelope, MAX_FRAME_BYTES, read_reply_within,
     server::{
         Anchor, MessageKind, PageQuery, Retention, ServerStorageRequest as Request,
         ServerStorageResponse as Response, StoredBan, StoredMessage, StoredRetention, StoredUser,
@@ -71,11 +71,9 @@ impl Worker {
         self.next += 1;
         write_frame(&mut self.input, &Envelope::new(self.next, request)).unwrap();
         self.input.flush().unwrap();
-        let answer: Envelope<Response> = read_frame(&mut self.output)
-            .unwrap()
-            .expect("the worker answers");
-        assert_eq!(answer.request_id, self.next);
-        answer.payload
+        read_reply_within(&mut self.output, MAX_FRAME_BYTES, self.next)
+            .expect("the worker answers")
+            .payload
     }
 
     fn count(&mut self, request: Request) -> u64 {

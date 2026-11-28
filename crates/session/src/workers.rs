@@ -68,10 +68,7 @@ impl Storage {
             write_frame(&mut bytes, &Envelope::new(id, payload))?;
             self.worker.input.write_all(&bytes).await?;
             let response: Envelope<StorageResponse> =
-                read_frame_async(&mut self.worker.output, MAX_FRAME_BYTES).await?;
-            if response.request_id != id {
-                return Err(Error::Worker("storage response ID mismatch".into()));
-            }
+                nuschl_ipc::read_reply(&mut self.worker.output, MAX_FRAME_BYTES, id).await?;
             Ok(response.payload)
         };
         let limit = if id == 1 {

@@ -6,7 +6,7 @@ use nuschl_ipc::{
     Envelope,
     crypto::call::{MAX_REPLY_FRAME_BYTES, Reply, Request},
     host::preview_lifecycle::Retirement,
-    read_frame_async, write_frame_within,
+    write_frame_within,
 };
 use std::{io, process::Stdio, time::Duration};
 use tokio::{
@@ -55,17 +55,17 @@ impl Keys {
                         write_frame_within(&mut data, &request, MAX_REPLY_FRAME_BYTES)
                             .map_err(io::Error::from)?;
                         worker.input.write_all(&data).await?;
-                        let reply = read_frame_async::<Option<Reply>>(
+                        let reply = nuschl_ipc::read_reply::<Option<Reply>>(
                             &mut worker.output,
                             MAX_REPLY_FRAME_BYTES,
+                            id,
                         )
                         .await
                         .map_err(io::Error::from)?;
-                        if reply.request_id != id
-                            || reply
-                                .payload
-                                .as_ref()
-                                .is_some_and(|reply| !reply.matches(&request.payload))
+                        if reply
+                            .payload
+                            .as_ref()
+                            .is_some_and(|reply| !reply.matches(&request.payload))
                         {
                             return Err(Error::Protocol("invalid call key reply"));
                         }

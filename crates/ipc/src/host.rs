@@ -269,10 +269,7 @@ async fn bounded_content_request(
                     io::Result::Ok(())
                 };
                 let read = async {
-                    let reply = read_reply::<ContentResponse>(&mut output, maximum).await?;
-                    if reply.request_id != 1 {
-                        return Err(Error::InvalidResponse);
-                    }
+                    let reply = read_reply::<ContentResponse>(&mut output, maximum, 1).await?;
                     Ok(reply.payload)
                 };
                 let (_, response) =
@@ -650,15 +647,13 @@ async fn converse(
         };
         let read = async {
             for budget in budgets {
+                let expected = results.len() as u64 + 1;
                 let reply = timeout(
                     Duration::from_secs(*budget),
-                    read_reply::<ContentResponse>(&mut output, MAX_FRAME_BYTES),
+                    read_reply::<ContentResponse>(&mut output, MAX_FRAME_BYTES, expected),
                 )
                 .await
                 .map_err(|_| Error::Timeout)??;
-                if reply.request_id != results.len() as u64 + 1 {
-                    return Err(Error::InvalidResponse);
-                }
                 results.push(match reply.payload {
                     ContentResponse::Rejected(reason) => Err(Error::Rejected(reason)),
                     response => Ok(response),
@@ -690,17 +685,19 @@ async fn converse(
     outcome
 }
 
-/// A worker's reply of at most `maximum` bytes. A closed pipe stays
-/// [`Error::Io`]; another protocol version is an invalid response.
+/// The reply to request `expected` of at most `maximum` bytes. A closed pipe
+/// stays [`Error::Io`]; another protocol version or another request's answer is
+/// an invalid response.
 pub(crate) async fn read_reply<T: DeserializeOwned>(
     output: &mut tokio::process::ChildStdout,
     maximum: usize,
+    expected: u64,
 ) -> Result<Envelope<T>, Error> {
-    crate::read_frame_async(output, maximum)
+    crate::read_reply(output, maximum, expected)
         .await
         .map_err(|error| match error {
             crate::Error::Io(error) => Error::Io(error),
-            crate::Error::Version(_) => Error::InvalidResponse,
+            crate::Error::Version(_) | crate::Error::WrongRequest { .. } => Error::InvalidResponse,
             error => Error::Frame(error),
         })
 }
