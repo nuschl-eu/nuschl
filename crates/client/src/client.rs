@@ -754,6 +754,8 @@ impl Client {
         server.calls.clear();
         server.talking.clear();
         server.transport = None;
+        // The next call's playout counters start from its own first window.
+        server.audio.playout = Default::default();
         server.audio_status = "Audio disconnected".into();
         if self
             .navigation
@@ -2461,6 +2463,15 @@ impl Client {
                     self.servers[index].audio.health = health;
                 }
             }
+            Input::AudioPlayout {
+                server,
+                generation,
+                playout,
+            } => {
+                if let Some(index) = self.current(&server, generation) {
+                    self.servers[index].audio.playout = playout;
+                }
+            }
             Input::AudioStatus {
                 server,
                 generation,
@@ -4086,6 +4097,32 @@ mod tests {
         client.settle();
         client.take_updates();
         (client, recorder, id)
+    }
+
+    #[test]
+    fn playout_counters_bind_to_the_connection_that_reported_them() {
+        let (mut client, _, id) = connected();
+        let playout = nuschl_core::audio::AudioPlayout {
+            received: 12,
+            concealed_frames: 2,
+            buffered_ms: 60,
+            target_ms: 60,
+            speakers: 1,
+            ..Default::default()
+        };
+        client.handle(Input::AudioPlayout {
+            server: id.clone(),
+            generation: 1,
+            playout,
+        });
+        assert_eq!(client.servers[0].audio.playout, playout);
+        // A retired generation cannot report for its successor.
+        client.handle(Input::AudioPlayout {
+            server: id,
+            generation: 0,
+            playout: nuschl_core::audio::AudioPlayout::default(),
+        });
+        assert_eq!(client.servers[0].audio.playout, playout);
     }
 
     fn prepare_link(client: &mut Client, recorder: &Recorder) -> crate::preview::FetchTicket {

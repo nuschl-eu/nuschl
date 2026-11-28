@@ -11,6 +11,7 @@ mod autostart;
 mod bitrate;
 mod call;
 mod chrome;
+mod diagnostics;
 mod dialogs;
 mod document;
 mod document_links;

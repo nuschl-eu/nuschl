@@ -184,6 +184,55 @@ pub struct AudioDevice {
     pub name: String,
 }
 
+/// What this device's voice playout did in one two-second window (issue
+/// #17): the packets a buffer refused, the frames it rebuilt, and the delay
+/// it held. The connection's own counters say what the server sent; these say
+/// what this machine made of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioPlayout {
+    /// Voice packets a jitter buffer accepted for playout; the refused ones
+    /// are counted below.
+    pub received: u32,
+    /// Packets that arrived after their slot had played.
+    pub late: u32,
+    /// Packets whose slot was already filled.
+    pub duplicate: u32,
+    /// Accepted packets dropped to catch up with the target delay.
+    pub caught_up: u32,
+    /// 10 ms frames played by concealment because no packet arrived.
+    pub concealed_frames: u32,
+    /// 10 ms frames rebuilt from the following packet's Opus in-band FEC.
+    pub recovered_frames: u32,
+    /// Talkspurts whose audio ran out before the next packet arrived.
+    pub dry_talkspurts: u32,
+    /// Accepted packets the decoder refused.
+    pub decoder_errors: u32,
+    /// Audio the fullest buffer holds ahead of its playout position.
+    pub buffered_ms: u32,
+    /// That buffer's target delay.
+    pub target_ms: u32,
+    /// Speakers the mixer holds for this device.
+    pub speakers: u32,
+}
+
+impl AudioPlayout {
+    /// Fold another window or speaker in: counts add up, the delay becomes the
+    /// larger of the two, and `speakers` adds up as well.
+    pub fn add(&mut self, other: &AudioPlayout) {
+        self.received = self.received.saturating_add(other.received);
+        self.late = self.late.saturating_add(other.late);
+        self.duplicate = self.duplicate.saturating_add(other.duplicate);
+        self.caught_up = self.caught_up.saturating_add(other.caught_up);
+        self.concealed_frames = self.concealed_frames.saturating_add(other.concealed_frames);
+        self.recovered_frames = self.recovered_frames.saturating_add(other.recovered_frames);
+        self.dry_talkspurts = self.dry_talkspurts.saturating_add(other.dry_talkspurts);
+        self.decoder_errors = self.decoder_errors.saturating_add(other.decoder_errors);
+        self.buffered_ms = self.buffered_ms.max(other.buffered_ms);
+        self.target_ms = self.target_ms.max(other.target_ms);
+        self.speakers = self.speakers.saturating_add(other.speakers);
+    }
+}
+
 /// The sound effects the media worker plays. Pitch rises for on, joined and
 /// connected, and falls for their opposites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

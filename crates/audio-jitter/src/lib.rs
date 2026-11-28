@@ -37,6 +37,20 @@ pub enum Pull<P = Vec<u8>> {
     Idle,
 }
 
+/// What a buffer did with the packets it was given, taken by the caller that
+/// reports diagnostics (issue #17) and then cleared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// Packets accepted for playout.
+    pub received: u32,
+    /// Packets that arrived after their slot had played.
+    pub late: u32,
+    /// Packets whose slot was already filled.
+    pub duplicate: u32,
+    /// Packets dropped to catch up with the target delay.
+    pub caught_up: u32,
+}
+
 struct Packet<P> {
     opus: P,
     end: bool,
@@ -51,6 +65,7 @@ pub struct JitterBuffer<P = Vec<u8>> {
     concealed: u32,
     frames_per_packet: u64,
     delay: Delay,
+    counters: Counters,
 }
 
 impl<P> Default for JitterBuffer<P> {
@@ -66,6 +81,7 @@ impl<P> Default for JitterBuffer<P> {
                 jitter_ms: 0.,
                 last_arrival: None,
             },
+            counters: Counters::default(),
         }
     }
 }
@@ -211,6 +227,12 @@ impl<P: Clone> JitterBuffer<P> {
         self.playing
     }
 
+    /// The counters so far, cleared for the next window. Saturating, so a
+    /// caller that forgets a window still reports the work that was done.
+    pub fn take_counters(&mut self) -> Counters {
+        std::mem::take(&mut self.counters)
+    }
+
     /// Whether a continuous packet is queued after the current one.
     pub fn has_next_packet(&self) -> bool {
         self.next
@@ -228,12 +250,18 @@ impl<P: Clone> JitterBuffer<P> {
     }
 
     pub fn push(&mut self, sequence: u64, opus: P, end: bool, now: Duration) {
-        if sequence > MAX_SEQUENCE
-            || self.next.is_some_and(|next| sequence < next)
-            || self.packets.contains_key(&sequence)
-        {
+        if sequence > MAX_SEQUENCE {
             return;
         }
+        if self.next.is_some_and(|next| sequence < next) {
+            self.counters.late = self.counters.late.saturating_add(1);
+            return;
+        }
+        if self.packets.contains_key(&sequence) {
+            self.counters.duplicate = self.counters.duplicate.saturating_add(1);
+            return;
+        }
+        self.counters.received = self.counters.received.saturating_add(1);
         // Packet spacing is the smallest gap to a neighbour; the decoder
         // corrects it from the actual packet duration via `observe_frames`.
         let before = self
@@ -285,6 +313,7 @@ impl<P: Clone> JitterBuffer<P> {
         {
             if let Some((sequence, _)) = self.packets.pop_first() {
                 self.next = Some(sequence + self.frames_per_packet);
+                self.counters.caught_up = self.counters.caught_up.saturating_add(1);
             }
         }
         let Some(next) = self.next else {
@@ -630,5 +659,45 @@ mod tests {
         }
         assert!(matches!(burst.pull(), Pull::Packet { .. }));
         assert!(burst.buffered_ms() <= burst.target_ms() + CATCH_UP_MS + 20.);
+    }
+    #[test]
+    fn counters_separate_late_and_duplicate_packets_and_clear_on_take() {
+        let start = Duration::ZERO;
+        let mut buffer = JitterBuffer::default();
+        feed(&mut buffer, start, &[(0, 0), (2, 20), (4, 40)]);
+        assert_eq!(
+            buffer.pull(),
+            Pull::Packet {
+                opus: vec![0],
+                end: false
+            }
+        );
+        // Slot 0 has played and 2 is queued: both are refused, differently.
+        buffer.push(0, vec![9], false, start + Duration::from_millis(30));
+        buffer.push(2, vec![9], false, start + Duration::from_millis(30));
+        assert_eq!(
+            buffer.take_counters(),
+            Counters {
+                received: 3,
+                late: 1,
+                duplicate: 1,
+                caught_up: 0
+            }
+        );
+        assert_eq!(buffer.take_counters(), Counters::default());
+    }
+
+    #[test]
+    fn counters_report_the_packets_a_burst_drops_to_catch_up() {
+        let mut buffer: JitterBuffer = JitterBuffer::default();
+        for index in 0..50_u64 {
+            buffer.push(index * 2, vec![], false, Duration::ZERO);
+        }
+        let mut caught_up = 0;
+        while buffer.buffered_ms() > buffer.target_ms() + CATCH_UP_MS {
+            assert!(matches!(buffer.pull(), Pull::Packet { .. }));
+            caught_up += buffer.take_counters().caught_up;
+        }
+        assert!(caught_up > 0, "a burst above the target drops packets");
     }
 }

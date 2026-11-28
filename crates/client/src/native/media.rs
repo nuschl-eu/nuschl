@@ -586,6 +586,9 @@ async fn run_with_start<Starting>(
                         let _ = events.try_send(Event::Echo { server: server.clone(), generation: stream.generation, erle_db, residual_likelihood });
                     }
                 },
+                Some(LiveMediaEvent::Playout(playout)) => {
+                    broadcast(&streams, &events, |server, generation| Event::AudioPlayout { server, generation, playout }).await;
+                }
                 Some(LiveMediaEvent::Health { clipping, echo_guard, double_talk, underruns, playback_ms }) => {
                     let health = crate::server::AudioHealth { clipping, echo_guard, double_talk, underruns, playback_ms };
                     broadcast(&streams, &events, |server, generation| Event::AudioHealth { server, generation, health }).await;

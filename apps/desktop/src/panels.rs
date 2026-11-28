@@ -377,50 +377,12 @@ pub fn panel(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                 ),
             ];
             if let Some(stats) = &view.transport {
-                rows.push(row(
-                    "Voice transport",
-                    if stats.udp_active {
-                        "UDP".into()
-                    } else if stats.forced_tcp {
-                        "TCP (forced)".into()
-                    } else {
-                        "TCP tunnel (UDP unavailable)".into()
-                    },
-                    4,
-                ));
-                rows.push(row(
-                    "UDP ping",
-                    format!(
-                        "{:.1} ms ± {:.1} ({} pings)",
-                        stats.udp.average_ms,
-                        stats.udp.variance_ms.sqrt(),
-                        stats.udp.packets
-                    ),
-                    5,
-                ));
-                rows.push(row(
-                    "TCP ping",
-                    format!(
-                        "{:.1} ms ± {:.1} ({} pings)",
-                        stats.tcp.average_ms,
-                        stats.tcp.variance_ms.sqrt(),
-                        stats.tcp.packets
-                    ),
-                    6,
-                ));
-                let total = (f64::from(stats.good) + f64::from(stats.lost)).max(1.);
-                rows.push(row(
-                    "UDP from server",
-                    format!(
-                        "{} good · {} late · {} lost ({:.1}%) · {} resyncs",
-                        stats.good,
-                        stats.late,
-                        stats.lost,
-                        f64::from(stats.lost) * 100. / total,
-                        stats.resync
-                    ),
-                    7,
-                ));
+                for (index, (label, value)) in crate::diagnostics::transport_rows(stats)
+                    .into_iter()
+                    .enumerate()
+                {
+                    rows.push(row(label, value, 4 + index));
+                }
             }
             if let Some(limits) = &view.limits {
                 rows.push(row(

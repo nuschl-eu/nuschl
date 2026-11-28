@@ -195,6 +195,14 @@ silencing the microphone does not count as better cancellation. Apply hysteresis
 allow AEC to converge. Do not claim ERLE when the required unprocessed reference is
 unavailable. Monitoring is local and does not save microphone audio by default.
 
+Transport counters and playout counters are reported apart (issue #17). The
+connection counts the voice packets the server sent (good, late, lost, resync).
+The media worker counts, in two-second windows, what each stage after that did:
+jitter-buffer late, duplicate and catch-up drops, frames rebuilt from in-band
+FEC or concealed, talkspurts that ran dry, decoder failures, output-device
+dropouts and the fullest buffer's delay. The desktop shows the two groups one
+above the other, each labelled with the period it covers.
+
 Device changes and audio-server restarts invalidate device handles, link IDs, reference
 timing, and DSP state. Increment the route generation; stop old callbacks; discard old
 queued PCM; re-enumerate; recreate Nuschl-owned resources; re-evaluate effects; resume.

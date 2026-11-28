@@ -1479,6 +1479,9 @@ pub fn dialog(
                 .child(section("SHORTCUTS", shortcut_rows(this, cx)))
                 .child(section("PROCESSING", processing))
                 .child(section("DEVICES", devices))
+                .when_some(crate::diagnostics::audio(server), |dialog, block| {
+                    dialog.child(section("DIAGNOSTICS", vec![block]))
+                })
                 .child(section("NETWORK", network))
                 .child(section("APPEARANCE", crate::appearance::settings(this, cx)))
                 .child(section("GENERAL", general))

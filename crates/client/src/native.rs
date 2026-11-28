@@ -567,6 +567,13 @@ pub enum Event {
         generation: u64,
         health: AudioHealth,
     },
+    /// What this device's playout did in its last two-second window (issue
+    /// #17).
+    AudioPlayout {
+        server: String,
+        generation: u64,
+        playout: nuschl_core::audio::AudioPlayout,
+    },
     /// Inert rendering of untrusted Mumble HTML (descriptions, comments).
     Rendered {
         server: String,
@@ -3802,6 +3809,15 @@ impl Event {
                 server,
                 generation,
                 health,
+            },
+            Event::AudioPlayout {
+                server,
+                generation,
+                playout,
+            } => Input::AudioPlayout {
+                server,
+                generation,
+                playout,
             },
             Event::Rendered {
                 server,

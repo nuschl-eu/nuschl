@@ -52,6 +52,9 @@ pub struct AudioInfo {
     pub erle_db: Option<f32>,
     pub residual_echo: Option<f32>,
     pub health: AudioHealth,
+    /// What this device's playout did in its last two-second window (issue
+    /// #17), beside the connection's own counters.
+    pub playout: nuschl_core::audio::AudioPlayout,
 }
 
 /// The media worker's adaptive controller: what it measured and what it did
