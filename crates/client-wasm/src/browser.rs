@@ -1479,7 +1479,9 @@ impl WebClient {
         // Content deadlines (including a cancelled job's ACK bound) must not
         // wait for unrelated network traffic to be observed.
         let due = self.shared.jobs.borrow().due(now_ms.max(0.0) as u64);
-        changed || expired || due
+        // Events from this tick (an exhausted self-state retry among them) are
+        // observed on the next poll, without waiting for a network frame.
+        changed || expired || due || !self.shared.inputs.borrow().is_empty()
     }
 
     /// Apply what arrived; what changed, as JSON (`[{"kind": …}]`).

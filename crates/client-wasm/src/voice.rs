@@ -28,6 +28,9 @@ pub struct VoiceView {
 pub struct Shown {
     #[serde(flatten)]
     view: VoiceView,
+    /// Whether the adapter still waits for the echo of its own self-state
+    /// change: the page offers a toggle only once this is false.
+    settling: bool,
     /// "Voice 48 of 128 kb/s · server limit", for the voice bar.
     bitrate_line: String,
     /// Why, in one sentence (`VoiceBitrate::explanation`).
@@ -80,6 +83,8 @@ pub struct Route {
     last_sequence: Option<u64>,
     /// The user's requested target; `None`: the default.
     requested: Option<u32>,
+    /// `Session::self_state_settling` for this route's server.
+    settling: bool,
 }
 
 impl Route {
@@ -101,6 +106,7 @@ impl Route {
         };
         let reason = target.reason().map(|reason| format!(" · {reason}"));
         Some(Shown {
+            settling: self.settling,
             bitrate_line: format!("Voice {}{}", target.summary(), reason.unwrap_or_default()),
             bitrate_why: target.explanation(),
             view,
@@ -179,6 +185,7 @@ impl Route {
     /// retries ran out), so that echo cannot replace the first joined view;
     /// a joined route stays joined while later changes settle.
     pub fn observe(&mut self, present: bool, settling: bool, muted: bool, deafened: bool) {
+        self.settling = settling;
         let joined = present && (!settling || self.view.as_ref().is_some_and(|v| v.joined));
         self.policy(joined, muted, deafened);
     }

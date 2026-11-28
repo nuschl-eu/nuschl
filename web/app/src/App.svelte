@@ -2,6 +2,7 @@
 <script>
   import { onMount, tick } from "svelte";
   import {actionProof,serverReference} from "./action-context.js";
+  import { audioPending, audioPendingSettled } from "./audio-pending.js";
   import { ContentBridge } from "./content-bridge.js";
   import { flip } from "svelte/animate";
   import { cubicOut } from "svelte/easing";
@@ -342,10 +343,7 @@
         timeline = data.timeline;
         voice = data.voice || null;
         audio.syncVoice(voice);
-        if (audioActionPending) {
-          const state=servers.find(server=>server.id===audioActionPending.server);
-          if (!voice || !state || (state.muted===audioActionPending.muted && state.deafened===audioActionPending.deafened)) audioActionPending=null;
-        }
+        if (audioActionPending && audioPendingSettled(audioActionPending, voice, performance.now())) audioActionPending = null;
         for (const update of data.updates || []) {
           if (update.kind === "error") setError(update.message);
           if (update.kind === "sent") {
@@ -464,14 +462,14 @@
   }
   function toggleMicrophone() {
     if (voiceIndex < 0 || !voice?.joined || audioActionPending) return;
-    audioActionPending={server:voice.server_id,muted:!microphoneMuted,deafened:false};
+    audioActionPending=audioPending(voice, performance.now());
     if (microphoneMuted) void activateAudio({microphone:true});
     else audio?.setLocalPolicy({muted:true});
     void command("toggle_mute",voiceIndex).catch(reason=>{audioActionPending=null;setError(String(reason?.message || reason));});
   }
   function togglePlayback() {
     if (voiceIndex < 0 || !voice?.joined || audioActionPending) return;
-    audioActionPending={server:voice.server_id,muted:true,deafened:!playbackDeafened};
+    audioActionPending=audioPending(voice, performance.now());
     if (playbackDeafened) void activateAudio({microphone:false});
     else audio?.setLocalPolicy({muted:true,deafened:true});
     void command("toggle_deaf",voiceIndex).catch(reason=>{audioActionPending=null;setError(String(reason?.message || reason));});
@@ -814,8 +812,8 @@
       <section class="voice-bar" aria-label="Voice controls">
         <div class="voice-description"><strong>{voiceChannel?.name || "Voice channel"}</strong><small>{voiceServer?.name} · {voiceStatus}</small>{#if voice.bitrate_line}<small class="voice-bitrate" title={voice.bitrate_why}>{voice.bitrate_line}</small>{/if}</div>
         <div class="voice-actions">
-          <button class="icon-button voice-toggle" disabled={!voice.joined || !!audioActionPending} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted} title={microphoneMuted ? "Unmute microphone" : "Mute microphone"} onclick={toggleMicrophone}>{@render icon("mic", microphoneMuted)}</button>
-          <button class="icon-button voice-toggle" disabled={!voice.joined || !!audioActionPending} aria-label={playbackDeafened ? "Enable sound" : "Deafen"} aria-pressed={playbackDeafened} title={playbackDeafened ? "Enable sound" : "Deafen (also mutes microphone)"} onclick={togglePlayback}>{@render icon("headphones", playbackDeafened)}</button>
+          <button class="icon-button voice-toggle" disabled={!voice.joined || !!audioActionPending || voice.settling === true} aria-label={microphoneMuted ? "Unmute microphone" : "Mute microphone"} aria-pressed={microphoneMuted} title={microphoneMuted ? "Unmute microphone" : "Mute microphone"} onclick={toggleMicrophone}>{@render icon("mic", microphoneMuted)}</button>
+          <button class="icon-button voice-toggle" disabled={!voice.joined || !!audioActionPending || voice.settling === true} aria-label={playbackDeafened ? "Enable sound" : "Deafen"} aria-pressed={playbackDeafened} title={playbackDeafened ? "Enable sound" : "Deafen (also mutes microphone)"} onclick={togglePlayback}>{@render icon("headphones", playbackDeafened)}</button>
           {#if !voice.deafened && (audioState?.contextState !== "running" || audioState?.phase === "deafened")}<button class="control-button" onclick={() => activateAudio({microphone:false})}>Enable audio</button>{/if}
           <button class="icon-button" aria-label="Stop audio" title="Stop audio; stay connected for chat" onclick={stopAudio}>{@render icon("leave")}</button>
         </div>

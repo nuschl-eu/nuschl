@@ -3042,6 +3042,89 @@ mod tests {
         assert!(!fresh.joined && fresh.muted && fresh.deafened && !fresh.can_transmit);
     }
 
+    /// A toggle is offered only once its echo moved the voice view: the view a
+    /// click carries is then the one the adapter accepts (issue #248).
+    #[test]
+    fn a_toggle_is_accepted_only_once_its_echo_moved_the_view() {
+        use crate::actions::{Catalog, ServerRef, validate};
+        use crate::voice::{Route, VoiceView};
+        use nuschl_client::server::ServerState;
+        use serde_json::json;
+
+        let mut s = voice_session();
+        let own = s.users.get_mut(&3).unwrap();
+        own.channel = 0;
+        own.self_muted = true;
+        own.self_deafened = true;
+        let mut server = joined_server(&s);
+        server.deafened = true;
+        let mut route = Route::default();
+        route.select(server.id.clone(), server.generation, 0);
+        let mut catalog = Catalog::default();
+        let stamp = catalog.reserve(0, None).unwrap();
+        catalog.commit(0, stamp);
+        let settling = |route: &Route| {
+            serde_json::to_value(route.shown().unwrap()).unwrap()["settling"].clone()
+        };
+        let toggle = json!({"method": "toggle_mute", "index": 0}).to_string();
+        let accepts =
+            |server: &ServerState, current: &VoiceView, view: &VoiceView| -> Result<(), String> {
+                let proof = json!({
+                    "server": ServerRef::capture(server, catalog.get(0).unwrap()),
+                    "voice": {"server_id": view.server_id,
+                        "connection_generation": view.connection_generation,
+                        "voice_generation": view.voice_generation, "channel_id": view.channel_id,
+                        "muted": view.muted, "deafened": view.deafened},
+                })
+                .to_string();
+                validate(
+                    std::slice::from_ref(server),
+                    &catalog,
+                    None,
+                    Some(current),
+                    &toggle,
+                    &proof,
+                )
+            };
+
+        reconcile_voice_route(&mut route, &server, 0, Some(&s));
+        let before = route.view().unwrap();
+        assert!(before.deafened, "sound is off before the toggle");
+        assert_eq!(settling(&route), json!(false), "nothing was sent yet");
+        // "Enable sound": readiness is revoked, the target applied, the change
+        // waits for its echo.
+        route.policy(true, true, true);
+        server.deafened = false;
+        s.set_self(true, false);
+        reconcile_voice_route(&mut route, &server, 0, Some(&s));
+        let sent = route.view().unwrap();
+        assert!(sent.deafened, "the view shows sound off until the echo");
+        assert_eq!(settling(&route), json!(true), "the change is not settled");
+        s.control(
+            kind::USER_STATE,
+            proto::UserState {
+                session: Some(3),
+                self_mute: Some(true),
+                self_deaf: Some(false),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        );
+        reconcile_voice_route(&mut route, &server, 0, Some(&s));
+        let echoed = route.view().unwrap();
+        assert!(!echoed.deafened);
+        assert_ne!(
+            sent.voice_generation, echoed.voice_generation,
+            "the echo moves the view the next click would carry"
+        );
+        assert_eq!(settling(&route), json!(false), "the echo settled it");
+        // The view the page held before the echo is refused, the echoed one is
+        // taken: the page waits for `settling` before it offers the toggle.
+        assert!(accepts(&server, &echoed, &sent).is_err());
+        assert_eq!(accepts(&server, &echoed, &echoed), Ok(()));
+    }
+
     #[test]
     fn an_unconfirmed_join_self_state_joins_muted_once_retries_are_exhausted() {
         use crate::voice::Route;
