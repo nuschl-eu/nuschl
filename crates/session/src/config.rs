@@ -752,6 +752,178 @@ impl ManagedSettings {
     }
 }
 
+/// How many "does this still read?" attempts one settings file may cost, so a
+/// corrupt or hostile file cannot stall startup. A map of 1024 entries with one
+/// bad value needs about 1030.
+const MAX_SETTINGS_ATTEMPTS: usize = 4096;
+/// How many earlier `.invalid` copies a start compares before writing one.
+const MAX_COPY_SCAN: usize = 8;
+
+/// The `n`th copy of `name`: `name.invalid`, then `name.invalid.1` and up.
+fn copy_name(name: &str, n: usize) -> String {
+    match n {
+        0 => format!("{name}.invalid"),
+        n => format!("{name}.invalid.{n}"),
+    }
+}
+
+/// settings.json's values without the ones this build cannot read, and the
+/// dotted paths of those (issue #46). A newer build's field, or a hand-edited
+/// wrong type, costs that value alone; the caller reports the paths and applies
+/// the fail-safe value. `None`: the file costs more pruning than startup may
+/// spend, so it is set aside whole.
+fn readable(saved: Map<String, Value>) -> Option<(Map<String, Value>, Vec<String>)> {
+    let mut prune = Prune {
+        attempts: 0,
+        dropped: Vec::new(),
+        gave_up: false,
+    };
+    // A file with no readable value keeps its place in the folder and is
+    // reported like any other.
+    let kept = prune.object(&mut Vec::new(), saved)?;
+    prune.accepts(&[], &kept).then_some((kept, prune.dropped))
+}
+
+/// Prunes one settings.json by asking `ClientSettings` which values it reads.
+struct Prune {
+    attempts: usize,
+    dropped: Vec<String>,
+    gave_up: bool,
+}
+
+impl Prune {
+    /// Whether `ClientSettings` reads with `saved` as the object at `above`.
+    fn accepts(&mut self, above: &[String], saved: &Map<String, Value>) -> bool {
+        if self.gave_up {
+            return false;
+        }
+        self.attempts += 1;
+        self.gave_up = self.attempts > MAX_SETTINGS_ATTEMPTS;
+        let mut value = Value::Object(saved.clone());
+        for key in above.iter().rev() {
+            value = Value::Object(Map::from_iter([(key.clone(), value)]));
+        }
+        serde_json::from_value::<ClientSettings>(value).is_ok()
+    }
+
+    /// `saved` at `above` with every unreadable value removed, or `None` when
+    /// the object as a whole does not read and its siblings must go without it.
+    fn object(
+        &mut self,
+        above: &mut Vec<String>,
+        saved: Map<String, Value>,
+    ) -> Option<Map<String, Value>> {
+        if self.attempts > MAX_SETTINGS_ATTEMPTS {
+            return None;
+        }
+        if self.accepts(above, &saved) {
+            return Some(saved);
+        }
+        let mut kept = Map::new();
+        for (key, value) in saved {
+            let leaf = Map::from_iter([(key.clone(), value.clone())]);
+            // A value of a type this build reads stays; a nested object keeps
+            // the part of itself that reads.
+            let pruned = if self.accepts(above, &leaf) {
+                Some(value)
+            } else {
+                match value {
+                    Value::Object(inner) => {
+                        let before = self.dropped.len();
+                        above.push(key.clone());
+                        let pruned = self.object(above, inner);
+                        above.pop();
+                        match pruned.filter(|kept| !kept.is_empty()) {
+                            Some(kept) => Some(Value::Object(kept)),
+                            None => {
+                                // The subtree goes as one drop; its leaves are
+                                // part of that same value.
+                                self.dropped.truncate(before);
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            match pruned {
+                Some(pruned) => {
+                    kept.insert(key, pruned);
+                }
+                None => self.dropped.push(with_key(above, &key)),
+            }
+        }
+        self.accepts(above, &kept).then_some(kept)
+    }
+}
+
+/// `parent.join(".") + "." + key`; a root key is its own path.
+fn with_key(parent: &[String], key: &str) -> String {
+    let mut path = parent.join(".");
+    if !path.is_empty() {
+        path.push('.');
+    }
+    path.push_str(key);
+    path
+}
+
+/// Whether managed.json's own value replaces `path` outright: a leaf at the
+/// path or above it. A managed object above the path declares its own keys and
+/// leaves the user's other values in place, so the path still counts.
+fn decided(managed: &Map<String, Value>, path: &str) -> bool {
+    let mut object = managed;
+    for key in path.split('.') {
+        let Some(value) = object.get(key) else {
+            return false;
+        };
+        match value.as_object() {
+            Some(inner) => object = inner,
+            None => return true,
+        }
+    }
+    false
+}
+
+/// The switches that reveal or fetch, and whose fail-safe value is not this
+/// build's default.
+const FAIL_SAFE: [&str; 5] = [
+    "relay_only",
+    "link_previews",
+    "server_icons",
+    "send_typing",
+    "check_updates",
+];
+
+/// The value a switch takes when settings.json's own cannot be read: the choice
+/// that reveals and fetches least. `None`: this build's own default.
+fn safer(settings: &mut ClientSettings, path: &str) -> Option<&'static str> {
+    // A value below a switch means the same thing for the switch.
+    let key = path.split('.').next().unwrap_or_default();
+    match key {
+        "relay_only" => {
+            settings.relay_only = true;
+            Some("Nuschl uses only locally configured servers and relays")
+        }
+        "link_previews" => {
+            settings.link_previews.mode = nuschl_link_preview::policy::Mode::Off;
+            Some("Nuschl fetches no link previews")
+        }
+        "server_icons" => {
+            settings.server_icons = false;
+            Some("Nuschl fetches no server icons")
+        }
+        "send_typing" => {
+            settings.send_typing = false;
+            Some("Nuschl tells nobody that you are typing")
+        }
+        "check_updates" => {
+            settings.check_updates = false;
+            Some("Nuschl looks for no updates")
+        }
+        _ => None,
+    }
+}
+
 /// Objects merge key by key; any other value of `over` replaces `base`'s.
 fn merge(base: &mut Map<String, Value>, over: &Map<String, Value>) {
     for (key, value) in over {
@@ -954,6 +1126,14 @@ pub struct Loaded {
     pub managed: ManagedSettings,
     pub servers: Vec<ServerBookmark>,
     /// What went wrong, in sentences to show.
+    pub problems: Vec<String>,
+}
+
+/// What settings.json and the managed layer yielded.
+pub struct SettingsLoad {
+    pub settings: ClientSettings,
+    pub managed: ManagedSettings,
+    /// Saved values this build could not read, and what it used instead.
     pub problems: Vec<String>,
 }
 
@@ -1349,15 +1529,27 @@ impl Profile {
                  voice bitrate is yours to choose: {error}."
             )),
         }
-        let (mut settings, managed_settings) =
-            self.load_settings(&declared).unwrap_or_else(|error| {
-                problems.push(self.set_aside(SETTINGS_FILE, &error, "default settings"));
-                let (mut settings, managed) = declared.settings_over(Map::new());
-                // The user's preview choice is unknown: fetch nothing until
-                // they choose again.
-                settings.link_previews.mode = nuschl_link_preview::policy::Mode::Off;
-                (settings, managed)
-            });
+        let SettingsLoad {
+            mut settings,
+            managed: managed_settings,
+            problems: unreadable,
+        } = self.load_settings(&declared).unwrap_or_else(|error| {
+            problems.push(self.set_aside(SETTINGS_FILE, &error, "default settings"));
+            let (mut settings, managed) = declared.settings_over(Map::new());
+            // Every choice is unknown, so each switch that reveals or fetches
+            // takes its fail-safe value until the user chooses again.
+            for path in FAIL_SAFE {
+                if !decided(&declared.settings, path) {
+                    safer(&mut settings, path);
+                }
+            }
+            SettingsLoad {
+                settings,
+                managed,
+                problems: Vec::new(),
+            }
+        });
+        problems.extend(unreadable);
         // Its own file, never set aside: a problem costs only the bitrate.
         match self.load_voice_quality() {
             Ok(saved) => {
@@ -1444,19 +1636,78 @@ impl Profile {
     }
 
     /// settings.json with the managed settings over it, and which those are.
-    pub fn load_settings(
-        &self,
-        managed: &Managed,
-    ) -> io::Result<(ClientSettings, ManagedSettings)> {
-        let own = match read_bounded(&self.config_dir.join(SETTINGS_FILE), MAX_SETTINGS_FILE) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Map::new(),
-            bytes => {
-                let own: Map<String, Value> = serde_json::from_slice(&bytes?)?;
-                ClientSettings::deserialize(&Value::Object(own.clone()))?;
-                own
+    ///
+    /// A value this build cannot read costs that value alone: the rest of the
+    /// file stays, the problem names the key, and a privacy or fetch switch
+    /// takes the choice that reveals and fetches least (issue #46). Only a file
+    /// that is not a JSON object, or that no amount of pruning makes readable,
+    /// is set aside.
+    pub fn load_settings(&self, managed: &Managed) -> io::Result<SettingsLoad> {
+        let (own, unreadable, kept) =
+            match read_bounded(&self.config_dir.join(SETTINGS_FILE), MAX_SETTINGS_FILE) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    (Map::new(), Vec::new(), Ok(None))
+                }
+                bytes => {
+                    let bytes = bytes?;
+                    let saved = serde_json::from_slice(&bytes)?;
+                    let (own, unreadable) = readable(saved).ok_or_else(|| {
+                        io::Error::other(
+                            "it holds more values this version cannot read than startup may prune",
+                        )
+                    })?;
+                    // The user's values that this build drops stay available
+                    // in a copy, so a later save writes over nothing lost. A
+                    // value the administrator decides needs no copy.
+                    let kept = unreadable
+                        .iter()
+                        .any(|path| !decided(&managed.settings, path))
+                        .then(|| self.preserve(SETTINGS_FILE, &bytes))
+                        .transpose();
+                    (own, unreadable, kept)
+                }
+            };
+        let (mut settings, managed_settings) = managed.settings_over(own);
+        let mut problems = Vec::new();
+        match kept {
+            Ok(Some(target)) => problems.push(format!(
+                "settings.json holds values this version does not read. It was copied to {target} \
+                 as it was, and the values Nuschl could read are in use."
+            )),
+            Ok(None) => {}
+            Err(error) => {
+                // Without a copy, a save would drop the values for good.
+                self.kept
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(SETTINGS_FILE);
+                problems.push(format!(
+                    "settings.json holds values this version does not read, and it could not be \
+                     copied ({error}). Nuschl will not save over it until it can."
+                ));
             }
-        };
-        Ok(managed.settings_over(own))
+        }
+        for path in unreadable {
+            // The administrator's value for the same key decides it.
+            if decided(&managed.settings, &path) {
+                continue;
+            }
+            problems.push(match safer(&mut settings, &path) {
+                Some(instead) => format!(
+                    "settings.json's {path} could not be read, so {instead} until you change it. \
+                     No other setting is affected."
+                ),
+                None => format!(
+                    "settings.json's {path} is a value this version does not read, so it stays \
+                     unused. No other setting is affected."
+                ),
+            });
+        }
+        Ok(SettingsLoad {
+            settings,
+            managed: managed_settings,
+            problems,
+        })
     }
 
     /// servers.json, with what the cache and state folders hold for each
@@ -1698,20 +1949,40 @@ impl Profile {
         atomic_private_write(&path, bytes)
     }
 
+    /// The first `<name>.invalid` (`.invalid.N`) that is still free.
+    fn free_copy(&self, name: &str) -> io::Result<String> {
+        (0..1000)
+            .map(|n| copy_name(name, n))
+            .find(|candidate| fs::symlink_metadata(self.config_dir.join(candidate)).is_err())
+            .ok_or_else(|| io::Error::other("too many earlier copies"))
+    }
+
+    /// Keep `bytes` as the next `<name>.invalid` copy of a file Nuschl reads
+    /// only in part. An existing copy of the same bytes is reused, so repeated
+    /// starts do not fill the folder.
+    fn preserve(&self, name: &str, bytes: &[u8]) -> io::Result<String> {
+        for n in 0..=MAX_COPY_SCAN {
+            let candidate = copy_name(name, n);
+            let path = self.config_dir.join(&candidate);
+            if fs::symlink_metadata(&path).is_err() {
+                break;
+            }
+            if read_bounded(&path, bytes.len() as u64).is_ok_and(|copy| copy == bytes) {
+                return Ok(candidate);
+            }
+        }
+        let target = self.free_copy(name)?;
+        atomic_private_write(&self.config_dir.join(&target), bytes)?;
+        Ok(target)
+    }
+
     /// Rename a file that could not be read to `<name>.invalid` (`.invalid.N`
     /// when taken), so that saving never overwrites it, and say so.
     fn set_aside(&self, name: &'static str, error: &io::Error, instead: &str) -> String {
-        let renamed = (0..1000)
-            .map(|n| match n {
-                0 => format!("{name}.invalid"),
-                n => format!("{name}.invalid.{n}"),
-            })
-            .find(|candidate| fs::symlink_metadata(self.config_dir.join(candidate)).is_err())
-            .ok_or_else(|| io::Error::other("too many earlier copies"))
-            .and_then(|target| {
-                fs::rename(self.config_dir.join(name), self.config_dir.join(&target))?;
-                Ok(target)
-            });
+        let renamed = self.free_copy(name).and_then(|target| {
+            fs::rename(self.config_dir.join(name), self.config_dir.join(&target))?;
+            Ok(target)
+        });
         match renamed {
             Ok(target) => format!(
                 "{name} could not be read ({error}). It was renamed to {target}, and Nuschl started with {instead}."
@@ -2665,7 +2936,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("nuschl-settings-{}", Uuid::new_v4()));
         let profile = Profile::open(Some(root.clone())).unwrap();
         assert_eq!(
-            profile.load_settings(&Managed::default()).unwrap().0,
+            profile.load_settings(&Managed::default()).unwrap().settings,
             ClientSettings::default()
         );
         let mut settings = ClientSettings::default();
@@ -2678,7 +2949,7 @@ mod tests {
         profile
             .save_settings(&settings, &ManagedSettings::default())
             .unwrap();
-        let loaded = profile.load_settings(&Managed::default()).unwrap().0;
+        let loaded = profile.load_settings(&Managed::default()).unwrap().settings;
         assert!(loaded.relay_only);
         assert_eq!(loaded.volume_for(Some("abc")), 4.);
         assert_eq!(loaded.sound_volume, 1.);
@@ -2741,7 +3012,7 @@ mod tests {
             r#"{"force_tcp": true, "sidebar_width": 300.0}"#,
         )
         .unwrap();
-        let loaded = profile.load_settings(&Managed::default()).unwrap().0;
+        let loaded = profile.load_settings(&Managed::default()).unwrap().settings;
         assert!(loaded.force_tcp);
         assert_eq!(loaded.appearance, AppearanceSettings::default());
         assert_eq!(loaded.appearance.theme, ThemeChoice::System);
@@ -2754,7 +3025,7 @@ mod tests {
         let loaded = profile
             .load_settings(&Managed::default())
             .unwrap()
-            .0
+            .settings
             .appearance;
         assert_eq!(loaded.theme, ThemeChoice::Light);
         assert_eq!((loaded.zoom, loaded.text_size), (3., 12.));
@@ -2766,7 +3037,7 @@ mod tests {
             .save_settings(&settings, &ManagedSettings::default())
             .unwrap();
         assert_eq!(
-            profile.load_settings(&Managed::default()).unwrap().0,
+            profile.load_settings(&Managed::default()).unwrap().settings,
             settings
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -2830,7 +3101,8 @@ mod tests {
             r#"{"settings":{"relay_only":true}}"#,
         );
         let declared = profile.load_managed().unwrap();
-        let (settings, managed) = profile.load_settings(&declared).unwrap();
+        let loaded = profile.load_settings(&declared).unwrap();
+        let (settings, managed) = (loaded.settings, loaded.managed);
         assert!(settings.relay_only);
         assert!(managed.contains("relay_only"));
         assert!(managed.apply(ClientSettings::default()).relay_only);
@@ -3100,15 +3372,175 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn a_newer_settings_field_keeps_every_known_value() {
+        let (root, profile) = temporary_profile("newer-settings");
+        let saved = r#"{"relay_only": true, "enter_sends": false, "audio": {"transmit": "push_to_talk"}, "future": {"thing": 1}}"#;
+        write(&profile, "settings.json", saved);
+        let loaded = profile.load();
+        assert!(loaded.settings.relay_only);
+        assert!(!loaded.settings.enter_sends);
+        assert_eq!(
+            loaded.settings.audio.transmit,
+            TransmitMode::PushToTalk,
+            "a newer field costs that field alone"
+        );
+        assert!(
+            loaded.problems.iter().any(|problem| problem
+                .contains("settings.json's future is a value this version does not read")
+                && problem.contains("No other setting is affected")),
+            "{:?}",
+            loaded.problems
+        );
+        // Nothing is renamed: the values that were read are in use, and the
+        // file as it was stays available as a copy.
+        assert_eq!(read(&profile, "settings.json"), saved);
+        assert_eq!(read(&profile, "settings.json.invalid"), saved);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_privacy_switch_takes_the_choice_that_reveals_least() {
+        let (root, profile) = temporary_profile("safer-switch");
+        write(
+            &profile,
+            "settings.json",
+            r#"{"relay_only": "yes", "server_icons": 3, "enter_sends": false}"#,
+        );
+        let loaded = profile.load();
+        assert!(
+            loaded.settings.relay_only,
+            "an unreadable relay switch stays private"
+        );
+        assert!(!loaded.settings.server_icons);
+        assert!(!loaded.settings.enter_sends, "the readable value survives");
+        for (key, instead) in [
+            ("relay_only", "only locally configured servers and relays"),
+            ("server_icons", "fetches no server icons"),
+        ] {
+            assert!(
+                loaded.problems.iter().any(|problem| problem
+                    .contains(&format!("{key} could not be read"))
+                    && problem.contains(instead)),
+                "{key}: {:?}",
+                loaded.problems
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_nested_value_keeps_its_siblings() {
+        let (root, profile) = temporary_profile("nested-value");
+        write(
+            &profile,
+            "settings.json",
+            r#"{"audio": {"transmit": "push_to_talk", "echo_cancellation": "sideways"}}"#,
+        );
+        let loaded = profile.load();
+        assert_eq!(loaded.settings.audio.transmit, TransmitMode::PushToTalk);
+        assert_eq!(
+            loaded.settings.audio.echo_cancellation,
+            nuschl_core::audio::EchoMode::default()
+        );
+        assert!(
+            loaded.problems.iter().any(|problem| problem
+                .contains("audio.echo_cancellation is a value this version does not read")),
+            "{:?}",
+            loaded.problems
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_managed_value_decides_its_unreadable_user_copy() {
+        let (root, profile) = temporary_profile("managed-decides");
+        write(&profile, "settings.json", r#"{"relay_only": "yes"}"#);
+        write(
+            &profile,
+            "managed.json",
+            r#"{"settings": {"relay_only": false}}"#,
+        );
+        let declared = profile.load_managed().unwrap();
+        let loaded = profile.load_settings(&declared).unwrap();
+        assert!(
+            !loaded.settings.relay_only,
+            "the administrator's value decides"
+        );
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_starts_keep_one_copy_of_the_same_file() {
+        let (root, profile) = temporary_profile("one-copy");
+        write(&profile, "settings.json", r#"{"future": 1}"#);
+        for _ in 0..3 {
+            let loaded = profile.load();
+            assert!(
+                loaded.problems[0].contains("copied to settings.json.invalid as it was"),
+                "{:?}",
+                loaded.problems
+            );
+        }
+        assert!(!profile.config_dir.join("settings.json.invalid.1").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_large_file_with_one_bad_value_keeps_the_rest() {
+        let (root, profile) = temporary_profile("large-file");
+        let mut saved = serde_json::Map::new();
+        let friends = (0..1024)
+            .map(|n| (format!("{n:064x}"), Value::from(format!("Friend {n}"))))
+            .collect::<Map<_, _>>();
+        saved.insert("friends".into(), Value::Object(friends));
+        // A name where a nickname string belongs: one value of many.
+        saved.insert(
+            "nicknames".into(),
+            Value::Object(Map::from_iter([("a".repeat(64), Value::from(5))])),
+        );
+        saved.insert("enter_sends".into(), Value::Bool(false));
+        write(&profile, "settings.json", &Value::Object(saved).to_string());
+        let loaded = profile.load();
+        assert!(!loaded.settings.enter_sends);
+        assert_eq!(loaded.settings.friends.len(), 1024);
+        assert!(loaded.settings.nicknames.is_empty());
+        assert!(
+            loaded.problems.iter().any(
+                |problem| problem.contains("settings.json's nicknames is a value this version")
+            ) && loaded.problems.iter().all(|problem| !problem.contains('5')),
+            "{:?}",
+            loaded.problems
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_settings_file_of_known_values_needs_no_copy() {
+        let (root, profile) = temporary_profile("known-values");
+        write(&profile, "settings.json", r#"{"enter_sends": false}"#);
+        let loaded = profile.load();
+        assert!(!loaded.settings.enter_sends);
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert!(!profile.config_dir.join("settings.json.invalid").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn broken_files_are_set_aside_and_never_overwritten() {
         let (root, profile) = temporary_profile("broken");
         let servers = ServerBookmark::new("", "voice.example.org", 64738, "me").unwrap();
         profile.save_servers(&[servers]).unwrap();
         write(&profile, "settings.json", r#"{"enter_sends": false,"#);
         let loaded = profile.load();
-        // The preview choice in the broken file is unknown, so previews stay off.
+        // Every choice in the broken file is unknown, so the switches that
+        // reveal or fetch take their fail-safe value.
         let mut expected = ClientSettings::default();
         expected.link_previews.mode = nuschl_link_preview::policy::Mode::Off;
+        expected.relay_only = true;
+        expected.server_icons = false;
+        expected.send_typing = false;
+        expected.check_updates = false;
         assert_eq!(loaded.settings, expected);
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.problems.len(), 1);
@@ -3128,13 +3560,24 @@ mod tests {
             .save_settings(&loaded.settings, &loaded.managed)
             .unwrap();
         assert!(profile.load().problems.is_empty());
-        // A later broken file does not replace the first one.
+        // A later file of unknown keys is copied, read as far as it goes, and
+        // keeps the earlier copy: nothing replaces the first one.
         write(&profile, "settings.json", r#"{"unknown": 1}"#);
         write(&profile, "servers.json", "[{}]");
         let loaded = profile.load();
-        assert_eq!(loaded.problems.len(), 2, "{:?}", loaded.problems);
+        assert_eq!(loaded.problems.len(), 3, "{:?}", loaded.problems);
         assert!(loaded.servers.is_empty());
-        assert!(loaded.problems[1].contains("renamed to servers.json.invalid,"));
+        assert!(
+            loaded.problems[0].contains("copied to settings.json.invalid.1"),
+            "{:?}",
+            loaded.problems
+        );
+        assert!(
+            loaded.problems[1].contains("settings.json's unknown is a value this version")
+                && loaded.problems[2].contains("renamed to servers.json.invalid,"),
+            "{:?}",
+            loaded.problems
+        );
         assert_eq!(
             read(&profile, "settings.json.invalid.1"),
             r#"{"unknown": 1}"#
@@ -3143,6 +3586,8 @@ mod tests {
             read(&profile, "settings.json.invalid"),
             r#"{"enter_sends": false,"#
         );
+        // The file itself stays in place for the next save.
+        assert_eq!(read(&profile, "settings.json"), r#"{"unknown": 1}"#);
         assert_eq!(read(&profile, "servers.json.invalid"), "[{}]");
         // Invalid values are refused just like invalid JSON.
         let pin = ServerBookmark::new("", "voice.example.org", 64738, "me").unwrap();
@@ -3151,7 +3596,10 @@ mod tests {
         write(&profile, "servers.json", &file.to_string());
         let loaded = profile.load();
         assert!(
-            loaded.problems[0].contains("servers.json.invalid.1"),
+            loaded
+                .problems
+                .iter()
+                .any(|problem| problem.contains("renamed to servers.json.invalid")),
             "{:?}",
             loaded.problems
         );
@@ -3893,7 +4341,8 @@ mod tests {
             br#"{"settings":{"relay_only":true,"link_previews":{"mode":"direct"}}}"#,
         )
         .unwrap();
-        let (settings, keys) = profile.load_settings(&managed).unwrap();
+        let loaded = profile.load_settings(&managed).unwrap();
+        let (settings, keys) = (loaded.settings, loaded.managed);
         assert!(settings.relay_only);
         assert_eq!(settings.link_previews.mode, Mode::Direct);
         assert!(!keys.contains("link_previews"));
@@ -3901,13 +4350,18 @@ mod tests {
             br#"{"settings":{"relay_only":true,"link_previews":{"mode":"invalid","proxy":123}}}"#,
         )
         .unwrap();
-        let (mut settings, keys) = profile.load_settings(&malformed).unwrap();
+        let loaded = profile.load_settings(&malformed).unwrap();
+        let (mut settings, keys) = (loaded.settings, loaded.managed);
         assert!(settings.relay_only);
         assert_eq!(settings.link_previews.mode, Mode::Direct);
         settings.link_previews.mode = Mode::Off;
         profile.save_settings(&settings, &keys).unwrap();
         assert_eq!(
-            profile.load_settings(&malformed).unwrap().0.link_previews,
+            profile
+                .load_settings(&malformed)
+                .unwrap()
+                .settings
+                .link_previews,
             settings.link_previews
         );
     }
@@ -3950,10 +4404,11 @@ mod tests {
         let loaded = profile.load();
         assert_eq!(loaded.settings.link_previews.mode, Mode::Off);
         assert!(
-            loaded
-                .problems
-                .iter()
-                .any(|problem| problem.contains("invalid link preview settings"))
+            loaded.problems.iter().any(|problem| problem
+                .contains("link_previews could not be read")
+                && problem.contains("fetches no link previews")),
+            "{:?}",
+            loaded.problems
         );
         assert!(
             loaded

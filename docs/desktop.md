@@ -405,7 +405,13 @@ compositor can still overrule either. On NixOS, set it for every user with
 `environment.sessionVariables.NUSCHL_WINDOW_DECORATIONS = "server";`. With Home
 Manager, use `programs.nuschl.windowDecorations` ([install.md](install.md)).
 
-**A broken configuration file.** Nuschl never overwrites a configuration file it
-cannot read: a broken `settings.json` or `servers.json` is renamed to
-`settings.json.invalid` (or `.invalid.1`, …), and the app starts without it and says
-so. An invalid `managed.json` is reported and ignored until it is fixed.
+**A configuration file this version reads only in part.** Nuschl keeps every value
+of `settings.json` it understands and reports each one it does not, so a file
+written by a newer version leaves the rest of your settings in place. Reading it
+also copies the file as it was to `settings.json.invalid` (or `.invalid.1`, …), so
+the values this version leaves out stay available. A switch Nuschl cannot read
+takes its fail-safe value: relay-only stays on, icon, update, typing and preview
+fetches stay off. A value the administrator sets in `managed.json` decides its own
+key. A `settings.json` or `servers.json` that is not JSON at all is renamed to
+`.invalid` and the app starts without it; an invalid `managed.json` is reported and
+ignored until it is fixed. Every problem is reported at startup.
