@@ -79,6 +79,91 @@ impl Panel {
     }
 }
 
+/// The loss of the last ten minutes as bars, one row per direction: each bar is
+/// one 20 s bucket, its height and colour the loss of that bucket. Buckets that
+/// hold nothing yet show as a stub, so the strip always reads as ten minutes.
+fn loss_histogram(loss: &crate::loss::Loss) -> AnyElement {
+    let strip = |ring: &crate::loss::Ring, direction: &'static str| {
+        let mut bars: Vec<AnyElement> = ring
+            .bars()
+            .map(|percent| {
+                let height = 3. + f32::from(percent) * 0.25;
+                let colour = match percent {
+                    0 => SUCCESS,
+                    1..=9 => WARNING,
+                    _ => DANGER,
+                };
+                div()
+                    .w(px(6.))
+                    .h(px(height))
+                    .rounded(px(1.))
+                    .bg(color(colour))
+                    .into_any_element()
+            })
+            .collect();
+        // The ring starts with the oldest bucket; the picture reads left to right
+        // with the newest at the right, so the few bars of a fresh call stay
+        // there instead of crawling from the middle.
+        let empty = crate::loss::SLOTS.saturating_sub(bars.len());
+        let mut picture: Vec<AnyElement> = (0..empty)
+            .map(|_| {
+                div()
+                    .w(px(6.))
+                    .h(px(2.))
+                    .rounded(px(1.))
+                    .bg(color(TEXT_MUTED))
+                    .into_any_element()
+            })
+            .collect();
+        picture.append(&mut bars);
+        div()
+            .flex()
+            .items_end()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(56.))
+                    .pb(px(2.))
+                    .text_xs()
+                    .text_color(color(TEXT_MUTED))
+                    .child(text!(direction)),
+            )
+            .child(
+                div()
+                    .h(px(28.))
+                    .flex()
+                    .items_end()
+                    .gap(px(2.))
+                    .children(picture),
+            )
+            .child(
+                div()
+                    .w(px(40.))
+                    .pb(px(2.))
+                    .text_xs()
+                    .text_color(color(TEXT_MUTED))
+                    .child(text!(match ring.recent() {
+                        Some(percent) => format!("{percent}%"),
+                        None => "–".to_string(),
+                    })),
+            )
+    };
+    div()
+        .id("loss-histogram")
+        .role(Role::Group)
+        .aria_label(loss.label())
+        .py(px(6.))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(strip(&loss.received, "Received"))
+        .child(strip(&loss.sent, "Sent"))
+        .child(div().text_xs().text_color(color(TEXT_MUTED)).child(text!(
+            "Last 10 minutes of voice, the newest bucket on the right."
+        )))
+        .into_any_element()
+}
+
 fn row(label: &'static str, value: String, index: usize) -> AnyElement {
     div()
         .flex()
@@ -468,6 +553,10 @@ pub fn panel(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                 let bitrate = crate::bitrate::place_line(&bitrate);
                 rows.push(row("Voice bitrate", bitrate, 12));
             }
+            let histogram = match this.loss.get(&view.id) {
+                Some(loss) => div().px_6().child(loss_histogram(loss)).into_any_element(),
+                None => div().into_any_element(),
+            };
             (
                 "Connection".into(),
                 560.,
@@ -476,6 +565,7 @@ pub fn panel(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                     .pb_6()
                     .flex()
                     .flex_col()
+                    .child(histogram)
                     .children(rows)
                     .into_any_element(),
             )

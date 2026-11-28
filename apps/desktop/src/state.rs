@@ -193,6 +193,9 @@ pub struct Desktop {
     pub ui: BTreeMap<String, ServerUi>,
     /// What drawing derives from the timelines' messages (presentation.rs).
     pub presentation: crate::presentation::Presentation,
+    /// Packet loss over time, per server: what arrived and what the server
+    /// counted of ours (loss.rs).
+    pub loss: BTreeMap<String, crate::loss::Loss>,
     pub history_enabled: bool,
     /// The native driver (the client's platform), for what the client does
     /// not model yet: administration, identities, settings, push-to-talk.
@@ -534,6 +537,7 @@ impl Desktop {
             client,
             ui,
             presentation: Default::default(),
+            loss: BTreeMap::new(),
             history_enabled: true,
             notes: crate::notify::start(&handle),
             driver,
@@ -1022,6 +1026,33 @@ impl Desktop {
     pub fn reveal_server(&mut self, slot: usize) {
         self.server_motion.cancel();
         self.server_scroll.scroll_to_item(slot);
+    }
+    /// Take each server's packet counters into its loss ring (loss.rs). The
+    /// counters only grow while a connection lives, so a frame that finds
+    /// nothing new counts nothing.
+    pub fn sample_loss(&mut self) {
+        let now = monotonic_ms();
+        for server in &self.client.servers {
+            let Some(received) = &server.transport else {
+                continue;
+            };
+            // What arrived is what our own counters counted; only the server
+            // knows what of ours it received, and it says so in its replies.
+            let received = (received.good, received.late, received.lost);
+            let sent = server
+                .own_session
+                .and_then(|session| server.stats.get(&session))
+                .and_then(|stats| stats.from_client.as_ref())
+                .map_or((0, 0, 0), |counters| {
+                    (counters.good, counters.late, counters.lost)
+                });
+            self.loss
+                .entry(server.id.clone())
+                .or_default()
+                .sample(received, sent, now);
+        }
+        self.loss
+            .retain(|id, _| self.client.servers.iter().any(|server| &server.id == id));
     }
     /// Direct manipulation replaces easing before the first thumb movement.
     pub fn cancel_modal_scroll(&mut self) {
