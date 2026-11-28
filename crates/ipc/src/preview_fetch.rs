@@ -5,7 +5,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::io;
 
-use crate::{Envelope, decode_frame_body, read_frame_within, write_frame_within};
+use crate::{Envelope, read_frame_within, write_frame_within};
 
 pub const SCHEMA: u16 = 1;
 pub const MAX_CHUNK_BYTES: usize = 16 * 1024;
@@ -124,19 +124,16 @@ pub fn write_reply(writer: &mut impl io::Write, id: u64, reply: &Reply) -> io::R
 }
 pub fn decode_reply(id: u64, bytes: &[u8]) -> io::Result<Reply> {
     use io::{Error, ErrorKind};
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "preview parser reply frame limit",
-        ));
-    }
-    let reply: Envelope<Reply> = decode_frame_body(bytes)?;
-    if reply.request_id != id {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "preview parser reply identity",
-        ));
-    }
+    let reply: Envelope<Reply> =
+        crate::decode_reply(bytes, MAX_RESPONSE_BYTES, id).map_err(|error| match error {
+            crate::Error::WrongRequest { .. } => {
+                Error::new(ErrorKind::InvalidData, "preview parser reply identity")
+            }
+            crate::Error::TooLarge => {
+                Error::new(ErrorKind::InvalidData, "preview parser reply frame limit")
+            }
+            error => error.into(),
+        })?;
     Ok(reply.payload)
 }
 

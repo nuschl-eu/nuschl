@@ -131,6 +131,7 @@ fn read_error(error: crate::Error) -> String {
         crate::Error::Io(_) => "codec IPC read failed or truncated",
         crate::Error::TooLarge => "codec IPC frame exceeds its budget",
         crate::Error::Version(_) => "unsupported codec IPC version",
+        crate::Error::WrongRequest { .. } => "codec response belongs to another request",
         _ => "invalid codec IPC message",
     }
     .into()
@@ -392,12 +393,9 @@ pub async fn write_request(
 }
 
 pub async fn read_response(output: &mut ChildStdout, id: u64) -> Result<Response, String> {
-    let reply: Envelope<Response> = crate::read_frame_async(output, MAX_MESSAGE_BYTES)
+    let reply: Envelope<Response> = crate::read_reply(output, MAX_MESSAGE_BYTES, id)
         .await
         .map_err(read_error)?;
-    if reply.request_id != id {
-        return Err("codec response belongs to another request".into());
-    }
     if let Response::Error { message } = &reply.payload
         && (message.len() > MAX_ERROR_BYTES || message.chars().any(char::is_control))
     {

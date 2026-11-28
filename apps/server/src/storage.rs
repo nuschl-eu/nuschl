@@ -8,7 +8,7 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use nuschl_ipc::{
-    Envelope, MAX_FRAME_BYTES, read_frame_async,
+    Envelope, MAX_FRAME_BYTES, read_reply,
     server::{
         HISTORY_LOAD_PAGE, MessageKind, Retention, SeqRows, ServerSnapshot,
         ServerStorageRequest as Request, ServerStorageResponse as Response, StoredAccess,
@@ -436,12 +436,9 @@ impl Worker {
         write_frame(&mut bytes, &Envelope::new(id, request))?;
         self.input.write_all(&bytes).await?;
         self.input.flush().await?;
-        let envelope: Envelope<Response> =
-            read_frame_async(&mut self.output, MAX_FRAME_BYTES).await?;
-        if envelope.request_id != id {
-            return Err(std::io::Error::other("storage protocol mismatch"));
-        }
-        Ok(envelope.payload)
+        Ok(read_reply(&mut self.output, MAX_FRAME_BYTES, id)
+            .await?
+            .payload)
     }
 }
 

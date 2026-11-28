@@ -342,10 +342,9 @@ async fn observed_namespace_retirement(fake: &Path) {
         // An actual bounded reply proves the command consumed the input before
         // we cancel the outer monitor. The descendant has already been spawned.
         let reply: Envelope<ContentResponse> =
-            nuschl_ipc::read_frame_async(&mut output, preview::MAX_RESPONSE_FRAME_BYTES)
+            nuschl_ipc::read_reply(&mut output, preview::MAX_RESPONSE_FRAME_BYTES, 1)
                 .await
                 .unwrap();
-        assert_eq!(reply.request_id, 1);
         assert!(matches!(
             reply.payload,
             ContentResponse::Preview(Response::Metadata { .. })

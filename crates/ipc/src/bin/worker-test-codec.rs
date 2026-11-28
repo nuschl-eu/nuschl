@@ -7,7 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use nuschl_ipc::{
     ContentRequest, ContentResponse, Envelope, LiveMediaEvent, LiveMediaRequest, MAX_FRAME_BYTES,
     MediaRequest, MediaResponse, StorageRequest, StorageResponse, TransferEvent, TransferRequest,
-    call_audio, math, read_frame_within, write_frame_within,
+    call_audio, math, read_reply_within, write_frame_within,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -77,10 +77,9 @@ impl Request {
             Direction::Decode { frame } => {
                 let bytes = STANDARD.decode(frame)?;
                 let mut input = bytes.as_slice();
-                let reply = read_frame_within::<FromWorker>(&mut input, maximum)?
-                    .ok_or("missing worker reply")?;
-                if reply.request_id != self.request_id || !input.is_empty() {
-                    return Err("unexpected worker reply ID or trailing data".into());
+                let reply = read_reply_within::<FromWorker>(&mut input, maximum, self.request_id)?;
+                if !input.is_empty() {
+                    return Err("unexpected trailing data after the worker reply".into());
                 }
                 Ok(serde_json::to_value(reply.payload)?)
             }

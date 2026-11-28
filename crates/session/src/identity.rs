@@ -18,7 +18,7 @@ use nuschl_ipc::{
         ContactView, CryptoRequest, CryptoResponse, CryptoServer, HeadOutcome, IdentityView,
         KeyTransparencySettings, KtRecordBytes, MonitorOutcome, call,
     },
-    read_frame_async, write_frame,
+    write_frame,
 };
 use nuschl_protocol::nuschl::{
     kind,
@@ -360,10 +360,8 @@ async fn exchange(worker: &mut Running, id: u64, job: &Job) -> Result<CryptoResp
     } else {
         MAX_FRAME_BYTES
     };
-    let envelope: Envelope<CryptoResponse> = read_frame_async(&mut worker.output, bound).await?;
-    if envelope.request_id != id {
-        return Err(Error::Worker("crypto worker protocol mismatch".into()));
-    }
+    let envelope: Envelope<CryptoResponse> =
+        nuschl_ipc::read_reply(&mut worker.output, bound, id).await?;
     match (request, &envelope.payload) {
         (CryptoRequest::Call(request), CryptoResponse::Call(reply)) if reply.matches(request) => {}
         (CryptoRequest::Call(_), CryptoResponse::Rejected(_)) => {}
