@@ -39,7 +39,7 @@ impl Query {
                     }
                 };
                 rest = after.trim_start();
-                let name = name.trim().to_lowercase();
+                let name = fold(name.trim());
                 if !name.is_empty() {
                     query.from = Some(name);
                 }
@@ -50,8 +50,7 @@ impl Query {
             rest = after.trim_start();
             // Still being typed: nothing (not even a space) follows.
             let open = open && !word.ends_with(char::is_whitespace);
-            let lowercase = word.to_lowercase();
-            let phrase: Vec<String> = tokens(&lowercase).map(|(_, token)| token).collect();
+            let phrase: Vec<String> = tokens(word).map(|(_, token)| token).collect();
             if !phrase.is_empty() {
                 query.phrases.push(phrase);
                 query.prefix = open;
@@ -102,22 +101,115 @@ fn next_word(text: &str) -> (&str, bool, bool, &str) {
     }
 }
 
-/// Words as full-text search sees them: runs of letters and digits,
-/// lowercased, with their byte ranges in `text`.
+/// Words as full-text search sees them: runs of letters and digits, lowercased
+/// with accents folded, and the characters of a script written without spaces
+/// each on their own, with their byte ranges in `text`.
 pub fn tokens(text: &str) -> impl Iterator<Item = (Range<usize>, String)> + '_ {
     let mut chars = text.char_indices().peekable();
     std::iter::from_fn(move || {
-        let (start, _) = chars.find(|(_, c)| c.is_alphanumeric())?;
-        let mut end = text.len();
+        let (start, first) = chars.find(|(_, c)| c.is_alphanumeric())?;
+        if unspaced(first) {
+            let end = start + first.len_utf8();
+            return Some((start..end, folded(text, start..end)));
+        }
+        let mut end = start + first.len_utf8();
         while let Some(&(index, c)) = chars.peek() {
-            if !c.is_alphanumeric() {
+            // A separator, or a character that is a word of its own, ends this
+            // word here and starts the next one there.
+            if !c.is_alphanumeric() || unspaced(c) {
                 end = index;
                 break;
             }
             chars.next();
+            end = index + c.len_utf8();
         }
-        Some((start..end, text[start..end].to_lowercase()))
+        Some((start..end, folded(text, start..end)))
     })
+}
+
+/// `text` as full-text storage keeps it: its words, separated by spaces (see
+/// [`tokens`]). Searching folds a query the same way, so the two always agree.
+pub fn fold(text: &str) -> String {
+    tokens(text)
+        .map(|(_, token)| token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The folded letters of `text[start..end]`, which holds one word.
+fn folded(text: &str, range: Range<usize>) -> String {
+    let mut folded = String::with_capacity(range.len());
+    for c in text[range].chars() {
+        fold_char(&mut folded, c);
+    }
+    folded
+}
+
+/// A script that runs words together, so search counts each character as a
+/// word: Han (with the iteration and numbering marks, the compatibility block
+/// and the supplementary planes), kana (also halfwidth and the extensions) and
+/// Hangul (syllables and jamo).
+fn unspaced(c: char) -> bool {
+    matches!(
+        c,
+        '\u{1100}'..='\u{11ff}'
+            | '\u{3005}'..='\u{3007}'
+            | '\u{303b}'
+            | '\u{3040}'..='\u{30ff}'
+            | '\u{3130}'..='\u{318f}'
+            | '\u{31f0}'..='\u{31ff}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{a960}'..='\u{a97f}'
+            | '\u{ac00}'..='\u{d7af}'
+            | '\u{d7b0}'..='\u{d7ff}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{ff66}'..='\u{ff9f}'
+            | '\u{1b000}'..='\u{1b16f}'
+            | '\u{20000}'..='\u{2fa1f}'
+    )
+}
+
+/// Append the lowercase base letters of `c`: a message with "Café" is found by
+/// typing "cafe". The table covers the Latin letters with diacritics (Latin-1
+/// and Latin Extended-A, the set `unaccent` folds); other letters are appended
+/// lowercased.
+fn fold_char(out: &mut String, c: char) {
+    out.push_str(match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å'
+        | 'Ā' | 'Ă' | 'Ą' => "a",
+        'æ' | 'Æ' => "ae",
+        'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' | 'Ç' | 'Ć' | 'Ĉ' | 'Ċ' | 'Č' => "c",
+        'ď' | 'đ' | 'Ď' | 'Đ' | 'Ð' | 'ð' => "d",
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' | 'È' | 'É' | 'Ê' | 'Ë' | 'Ē' | 'Ĕ'
+        | 'Ė' | 'Ę' | 'Ě' => "e",
+        'ĝ' | 'ğ' | 'ġ' | 'ģ' | 'Ĝ' | 'Ğ' | 'Ġ' | 'Ģ' => "g",
+        'ĥ' | 'ħ' | 'Ĥ' | 'Ħ' => "h",
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' | 'Ì' | 'Í' | 'Î' | 'Ï' | 'Ĩ' | 'Ī'
+        | 'Ĭ' | 'Į' | 'İ' => "i",
+        'ĳ' | 'Ĳ' => "ij",
+        'ĵ' | 'Ĵ' => "j",
+        'ķ' | 'Ķ' => "k",
+        'ĺ' | 'ļ' | 'ľ' | 'ł' | 'Ĺ' | 'Ļ' | 'Ľ' | 'Ł' => "l",
+        'ñ' | 'ń' | 'ņ' | 'ň' | 'Ñ' | 'Ń' | 'Ņ' | 'Ň' => "n",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø'
+        | 'Ō' | 'Ŏ' | 'Ő' => "o",
+        'œ' | 'Œ' => "oe",
+        'ŕ' | 'ŗ' | 'ř' | 'Ŕ' | 'Ŗ' | 'Ř' => "r",
+        'ś' | 'ŝ' | 'ş' | 'š' | 'Ś' | 'Ŝ' | 'Ş' | 'Š' => "s",
+        'ß' | 'ẞ' => "ss",
+        'ţ' | 'ť' | 'ŧ' | 'Ţ' | 'Ť' | 'Ŧ' => "t",
+        'þ' | 'Þ' => "th",
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' | 'Ù' | 'Ú' | 'Û' | 'Ü' | 'Ũ'
+        | 'Ū' | 'Ŭ' | 'Ů' | 'Ű' | 'Ų' => "u",
+        'ŵ' | 'Ŵ' => "w",
+        'ý' | 'ÿ' | 'ŷ' | 'Ý' | 'Ÿ' | 'Ŷ' => "y",
+        'ź' | 'ż' | 'ž' | 'Ź' | 'Ż' | 'Ž' => "z",
+        other => {
+            out.extend(other.to_lowercase());
+            return;
+        }
+    });
 }
 
 /// Where the next page of results starts: after the last result shown,
@@ -144,7 +236,7 @@ pub struct SearchPage {
 
 #[cfg(test)]
 mod tests {
-    use super::{Query, tokens};
+    use super::{Query, fold, tokens};
 
     fn phrases(query: &Query) -> Vec<Vec<&str>> {
         query
@@ -178,11 +270,80 @@ mod tests {
     }
 
     #[test]
+    fn accents_fold_both_ways() {
+        assert_eq!(
+            tokens("Café crème, Straße, Ægir, Œuvre")
+                .map(|(_, token)| token)
+                .collect::<Vec<_>>(),
+            ["cafe", "creme", "strasse", "aegir", "oeuvre"]
+        );
+        // Either spelling matches, and the word is highlighted as written.
+        for typed in ["café", "cafe"] {
+            let query = Query::parse(typed);
+            assert_eq!(phrases(&query), [vec!["cafe"]]);
+            let text = "Le Café du coin";
+            let found: Vec<&str> = query
+                .highlights(text)
+                .into_iter()
+                .map(|range| &text[range])
+                .collect();
+            assert_eq!(found, ["Café"]);
+        }
+        assert_eq!(fold("Crème Brûlée"), "creme brulee");
+    }
+
+    #[test]
+    fn cjk_text_matches_inside_a_run() {
+        // A word before the run keeps its own range.
+        let mixed: Vec<_> = tokens("abc你好").collect();
+        assert_eq!(
+            mixed
+                .iter()
+                .map(|(range, token)| (&"abc你好"[range.clone()], token.as_str()))
+                .collect::<Vec<_>>(),
+            [("abc", "abc"), ("你", "你"), ("好", "好")]
+        );
+        let ranges: Vec<_> = tokens("你好世界").collect();
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|(_, token)| token.as_str())
+                .collect::<Vec<_>>(),
+            ["你", "好", "世", "界"]
+        );
+        assert_eq!(ranges[1].0, 3..6, "each character keeps its own range");
+        // A word from inside the run matches and highlights what was typed.
+        let query = Query::parse("好世");
+        assert_eq!(phrases(&query), [vec!["好", "世"]]);
+        let text = "你好世界";
+        let found: Vec<&str> = query
+            .highlights(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(found, ["好", "世"]);
+        assert_eq!(fold("你好世界 ok"), "你 好 世 界 ok");
+        // Kana and Hangul are counted the same way.
+        assert_eq!(
+            tokens("ひらがな 한글")
+                .map(|(_, token)| token)
+                .collect::<Vec<_>>(),
+            ["ひ", "ら", "が", "な", "한", "글"]
+        );
+        // Kana's halfwidth block and extensions, Hangul's jamo and the Han
+        // planes above the basic one split the same way.
+        assert_eq!(fold("ﾊﾛｰ"), "ﾊ ﾛ ｰ");
+        assert_eq!(fold("ㇱㇲ"), "ㇱ ㇲ");
+        assert_eq!(fold("한"), "ᄒ ᅡ ᆫ");
+        assert_eq!(fold("𠀁𠀂"), "𠀁 𠀂");
+    }
+
+    #[test]
     fn highlights_follow_tokens() {
         let text = "Ärger mit dem Server, servers and SERVE";
         assert_eq!(
             tokens(text).map(|(_, token)| token).collect::<Vec<_>>(),
-            ["ärger", "mit", "dem", "server", "servers", "and", "serve"]
+            ["arger", "mit", "dem", "server", "servers", "and", "serve"]
         );
         let query = Query::parse("ärger serv");
         let found: Vec<&str> = query

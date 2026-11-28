@@ -92,6 +92,12 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
   people are inside; branches with people open on connect.
 - Search (Ctrl+F) finds messages saved on this device. History and the channel
   trees survive restarts, so you can browse offline.
+- Search matches words and "quoted phrases", with `from:name` for the author.
+  Diacritics on Latin letters do not have to be typed: `cafe` finds `Café`,
+  `strasse` finds `Straße`. Text written without spaces, such as Chinese,
+  Japanese and Korean, matches a word from inside a sentence. The index of a
+  profile from an earlier version is rebuilt in the background on the next
+  start; until it is done, results say so.
 
 ### Messages
 
