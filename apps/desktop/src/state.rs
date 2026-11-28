@@ -196,6 +196,9 @@ pub struct Desktop {
     /// Packet loss over time, per server: what arrived and what the server
     /// counted of ours (loss.rs).
     pub loss: BTreeMap<String, crate::loss::Loss>,
+    /// When each server's own stats were last asked for, so the ring of what
+    /// the server received from us keeps moving (loss.rs).
+    stats_asked: BTreeMap<String, u64>,
     pub history_enabled: bool,
     /// The native driver (the client's platform), for what the client does
     /// not model yet: administration, identities, settings, push-to-talk.
@@ -538,6 +541,7 @@ impl Desktop {
             ui,
             presentation: Default::default(),
             loss: BTreeMap::new(),
+            stats_asked: BTreeMap::new(),
             history_enabled: true,
             notes: crate::notify::start(&handle),
             driver,
@@ -1027,32 +1031,53 @@ impl Desktop {
         self.server_motion.cancel();
         self.server_scroll.scroll_to_item(slot);
     }
-    /// Take each server's packet counters into its loss ring (loss.rs). The
-    /// counters only grow while a connection lives, so a frame that finds
-    /// nothing new counts nothing.
+    /// Take each server's packet counters into its loss ring (loss.rs). What
+    /// arrived is what our own counters counted; only the server knows what of
+    /// ours it received, and it reports that when asked, so a connection asks
+    /// once per bucket. Counters that do not move count nothing.
     pub fn sample_loss(&mut self) {
         let now = monotonic_ms();
-        for server in &self.client.servers {
+        // A connection that ended keeps no strip: what it counted belongs to it.
+        self.loss.retain(|id, _| {
+            self.client
+                .servers
+                .iter()
+                .any(|server| &server.id == id && server.transport.is_some())
+        });
+        let mut asked = Vec::new();
+        for index in 0..self.client.servers.len() {
+            let server = &self.client.servers[index];
             let Some(received) = &server.transport else {
                 continue;
             };
-            // What arrived is what our own counters counted; only the server
-            // knows what of ours it received, and it says so in its replies.
-            let received = (received.good, received.late, received.lost);
+            let received = crate::loss::Counts::new(received.good, received.late, received.lost);
             let sent = server
                 .own_session
                 .and_then(|session| server.stats.get(&session))
                 .and_then(|stats| stats.from_client.as_ref())
-                .map_or((0, 0, 0), |counters| {
-                    (counters.good, counters.late, counters.lost)
+                .map_or(crate::loss::Counts::default(), |counters| {
+                    crate::loss::Counts::new(counters.good, counters.late, counters.lost)
                 });
-            self.loss
-                .entry(server.id.clone())
-                .or_default()
-                .sample(received, sent, now);
+            let due = self
+                .stats_asked
+                .get(&server.id)
+                .is_none_or(|asked| now.saturating_sub(*asked) >= crate::loss::SLOT_MS);
+            if due && let Some(session) = server.own_session {
+                self.stats_asked.insert(server.id.clone(), now);
+                asked.push((index, session));
+            }
+            self.loss.entry(server.id.clone()).or_default().sample(
+                server.generation,
+                received,
+                sent,
+                now,
+            );
         }
-        self.loss
+        self.stats_asked
             .retain(|id, _| self.client.servers.iter().any(|server| &server.id == id));
+        for (index, session) in asked {
+            self.run(index, Command::RequestStats(session));
+        }
     }
     /// Direct manipulation replaces easing before the first thumb movement.
     pub fn cancel_modal_scroll(&mut self) {

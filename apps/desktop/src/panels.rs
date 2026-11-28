@@ -88,10 +88,10 @@ fn loss_histogram(loss: &crate::loss::Loss) -> AnyElement {
             .bars()
             .map(|percent| {
                 let height = 3. + f32::from(percent) * 0.25;
-                let colour = match percent {
-                    0 => SUCCESS,
-                    1..=9 => WARNING,
-                    _ => DANGER,
+                let colour = match crate::loss::Health::of(percent) {
+                    crate::loss::Health::Good => SUCCESS,
+                    crate::loss::Health::Lossy => WARNING,
+                    crate::loss::Health::Poor => DANGER,
                 };
                 div()
                     .w(px(6.))
