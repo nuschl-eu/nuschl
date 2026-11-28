@@ -198,6 +198,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for moved in profile.moved() {
         tracing::info!("{moved}");
     }
+    // Staged copies past their offer, from an earlier run, before this one
+    // stages anything.
+    match attachments::reap(&profile.layout().offers()) {
+        Ok(reaped) if reaped.copies > 0 => tracing::info!(
+            copies = reaped.copies,
+            bytes = reaped.bytes,
+            "removed staged image copies an earlier run left behind"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not clear the staged image copies"),
+    }
     update::remember_state(profile.update_state_path());
     let loaded = profile.load();
     for problem in &loaded.problems {

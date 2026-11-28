@@ -121,6 +121,9 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
     metadata** ticked, the file loses its metadata and keeps its format,
     pixels, orientation and colour profile (JPEG, PNG, WebP, GIF, BMP up to
     8 MB); without the file transfer, it goes as High.
+    A copy Nuschl stages in its cache goes with the offer it belongs to; one
+    that a run leaves behind goes on the next start, once its offer would have
+    ended.
 
   With Strip metadata ticked, an image that cannot go so, such as one over
   8 MB or a HEIC, AVIF, TIFF, JPEG XL or SVG file, stays unsent with a note.
