@@ -562,14 +562,12 @@ pub const MAX_PEOPLE: usize = 1024;
 /// Longest friend name or nickname, in characters.
 pub const MAX_PERSON_NAME: usize = 64;
 
-/// A name on one line, trimmed and bounded.
+/// A name on one line, cleaned like a server's name and bounded.
 fn clean_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !c.is_control())
+    nuschl_core::text::clean_name(name)
+        .chars()
         .take(MAX_PERSON_NAME)
-        .collect::<String>()
-        .trim()
-        .to_string()
+        .collect()
 }
 
 fn insert_name(

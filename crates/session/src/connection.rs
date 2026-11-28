@@ -967,15 +967,28 @@ fn nuschl_event(frame: &ControlFrame) -> Result<Option<NuschlEvent>, Error> {
             {
                 return Err(invalid());
             }
+            let mut event = event;
+            if let Some(author) = &mut event
+                .message
+                .as_mut()
+                .and_then(|message| message.author.as_mut())
+            {
+                author.name = nuschl_core::text::clean_name(&author.name);
+            }
             NuschlEvent::Chat(event)
         }
         kind::HISTORY_PAGE => {
-            let page: v1::HistoryPage = decode(frame)?;
+            let mut page: v1::HistoryPage = decode(frame)?;
             if !id(&page.conversation)
                 || page.messages.len() > nuschl::MAX_PAGE_MESSAGES
                 || !page.messages.iter().all(nuschl::valid_message)
             {
                 return Err(invalid());
+            }
+            for message in &mut page.messages {
+                if let Some(author) = &mut message.author {
+                    author.name = nuschl_core::text::clean_name(&author.name);
+                }
             }
             NuschlEvent::Page(page)
         }
@@ -997,7 +1010,7 @@ fn nuschl_event(frame: &ControlFrame) -> Result<Option<NuschlEvent>, Error> {
         kind::DIRECT_OPENED => {
             let mut opened: v1::DirectOpened = decode(frame)?;
             if let Some(direct) = &mut opened.direct {
-                direct.name = bounded(std::mem::take(&mut direct.name), nuschl::MAX_NAME_BYTES);
+                direct.name = shown_name(std::mem::take(&mut direct.name), nuschl::MAX_NAME_BYTES);
             }
             NuschlEvent::DirectOpened(opened)
         }
@@ -1005,7 +1018,7 @@ fn nuschl_event(frame: &ControlFrame) -> Result<Option<NuschlEvent>, Error> {
             let mut list: v1::DirectList = decode(frame)?;
             list.directs.truncate(nuschl::MAX_DIRECTS);
             for direct in &mut list.directs {
-                direct.name = bounded(std::mem::take(&mut direct.name), nuschl::MAX_NAME_BYTES);
+                direct.name = shown_name(std::mem::take(&mut direct.name), nuschl::MAX_NAME_BYTES);
             }
             NuschlEvent::DirectList(list)
         }
@@ -3798,7 +3811,7 @@ impl State {
                                     v1::Direct {
                                         conversation: id.to_vec(),
                                         user_id: author.user_id,
-                                        name: author.name,
+                                        name: nuschl_core::text::clean_name(&author.name),
                                         account: author.account,
                                         ..Default::default()
                                     },
@@ -4263,7 +4276,7 @@ impl State {
                     channel.parent = Some(parent);
                 }
                 if let Some(name) = update.name {
-                    channel.name = bounded(name, 512);
+                    channel.name = shown_name(name, 512);
                 }
                 if let Some(hash) = &update.description_hash {
                     channel.set_description_hash(hash);
@@ -4658,7 +4671,7 @@ impl State {
                             .take(100_000)
                             .map(|user| RegisteredUser {
                                 user_id: user.user_id,
-                                name: user.name.map(|name| bounded(name, 512)),
+                                name: user.name.map(|name| shown_name(name, 512)),
                                 last_seen: user.last_seen.map(|text| bounded(text, 64)),
                                 last_channel: user.last_channel,
                             })
@@ -4678,7 +4691,7 @@ impl State {
                             .map(|ban| Ban {
                                 address: ban.address,
                                 mask: ban.mask,
-                                name: ban.name.map(|text| bounded(text, 512)),
+                                name: ban.name.map(|text| shown_name(text, 512)),
                                 hash: ban.hash.map(|text| bounded(text, 128)),
                                 reason: ban.reason.map(|text| bounded(text, 1024)),
                                 start: ban.start.map(|text| bounded(text, 64)),
@@ -4793,7 +4806,7 @@ impl State {
                             .zip(query.names)
                             .filter(|(id, _)| *id != u32::MAX)
                             .take(4096)
-                            .map(|(id, name)| (id, bounded(name, 512)))
+                            .map(|(id, name)| (id, shown_name(name, 512)))
                             .collect(),
                     ),
                 )
@@ -4849,7 +4862,7 @@ impl State {
         let held = self.blob_bytes - previous.blob_bytes();
         let mut over_budget = false;
         if let Some(name) = update.name {
-            user.name = bounded(name, 512);
+            user.name = shown_name(name, 512);
         }
         if let Some(id) = update.user_id {
             user.user_id = Some(id);
@@ -5130,6 +5143,11 @@ fn format_address(address: &[u8]) -> Option<String> {
     })
 }
 
+/// A name from the server, cleaned for display and bounded like other text.
+fn shown_name(text: String, limit: usize) -> String {
+    bounded(nuschl_core::text::clean_name(&text), limit)
+}
+
 fn bounded(mut text: String, limit: usize) -> String {
     if text.len() > limit {
         let mut end = limit;
@@ -5318,6 +5336,13 @@ pub mod fuzzing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_from_the_server_arrives_cleaned_and_bounded() {
+        assert_eq!(shown_name("Ada\u{7}Lovelace".into(), 512), "Ada Lovelace");
+        assert_eq!(shown_name("Ada\u{202E}ecalp".into(), 512), "Ada ecalp");
+        assert_eq!(shown_name("ada".repeat(200), 10), "adaadaadaa");
+    }
 
     #[tokio::test]
     async fn text_send_policy_counts_utf16_and_html_total_before_any_wire_or_echo() {

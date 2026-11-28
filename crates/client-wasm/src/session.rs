@@ -1107,7 +1107,7 @@ impl Session {
                     channel.parent = Some(parent);
                 }
                 if let Some(name) = state.name {
-                    channel.name = bounded(name);
+                    channel.name = bounded(nuschl_core::text::clean_name(&name));
                 }
                 if let Some(position) = state.position {
                     channel.position = position;
@@ -1285,7 +1285,7 @@ impl Session {
                     ..User::default()
                 });
                 if let Some(name) = state.name {
-                    user.name = bounded(name);
+                    user.name = bounded(nuschl_core::text::clean_name(&name));
                 }
                 if let Some(channel) = state.channel_id {
                     user.channel = channel;

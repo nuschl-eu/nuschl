@@ -253,12 +253,7 @@ pub fn save_name(name: &str) -> String {
     }
 }
 
-fn invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
-    )
-}
+use crate::text::invisible;
 
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

@@ -47,6 +47,7 @@ pub mod percent;
 pub mod preview;
 pub mod search;
 pub mod share;
+pub mod text;
 pub mod transfer;
 
 pub use history::{HistoryEdit, HistorySnapshot, history_replacement_allowed};
