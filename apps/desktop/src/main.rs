@@ -25,6 +25,7 @@ mod identity;
 mod images;
 mod layout;
 mod link_preview;
+mod loss;
 mod math;
 mod menus;
 mod motion;

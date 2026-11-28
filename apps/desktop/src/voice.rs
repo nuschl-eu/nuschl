@@ -8,6 +8,7 @@ use crate::{
     assets::icon,
     dialogs::{Tone, mix, modal, styled_button},
     layout,
+    loss::Health,
     motion::Ease,
     state::{Desktop, ServerView, Status},
     theme::*,
@@ -499,13 +500,34 @@ fn place_link(place: &Place, cx: &mut Context<Desktop>) -> AnyElement {
 /// Every connected/pending voice context you hear ([`shown`]), independent of
 /// text navigation. Each hang-up names and targets its own connection (voice AND chat).
 pub fn card(
-    _this: &Desktop,
+    this: &Desktop,
     places: &[Place],
     window: &mut Window,
     cx: &mut Context<Desktop>,
 ) -> Option<AnyElement> {
     let (rows, heading, connected) = shown(places)?;
-    let text = summary(rows.iter().copied());
+    // The worst loss among the servers shown, and that server: the signal takes
+    // its colour from the loss and opens its connection info.
+    let worst = rows
+        .iter()
+        .filter_map(|place| Some((place, this.loss.get(&place.target.server)?)))
+        .min_by_key(|(_, loss)| match loss.health() {
+            Health::Good => 0,
+            Health::Lossy => 1,
+            Health::Poor => 2,
+        });
+    let signal = match worst.map(|(_, loss)| loss.health()) {
+        Some(Health::Lossy) => (WARNING, "Voice quality: some packet loss"),
+        Some(Health::Poor) => (DANGER, "Voice quality: heavy packet loss"),
+        Some(Health::Good) => (SUCCESS, "Voice quality: good"),
+        None if connected => (SUCCESS, "Voice connected"),
+        None => (TEXT_MUTED, "Voice not connected"),
+    };
+    let open = worst.map(|(place, _)| place.target.server.clone());
+    let text = match worst.map(|(_, loss)| loss.label()) {
+        Some(loss) => format!("{} {loss}", summary(rows.iter().copied())),
+        None => summary(rows.iter().copied()),
+    };
     let rows = rows
         .into_iter()
         .map(|place| {
@@ -619,11 +641,29 @@ pub fn card(
             .child(
                 layout::row()
                     .items_center()
-                    .child(layout::fixed().child(icon(
-                        "signal",
-                        18.,
-                        color(if connected { SUCCESS } else { TEXT_MUTED }),
-                    )))
+                    .child(layout::fixed().child(match open {
+                        Some(server) => crate::dialogs::icon_button(
+                            "voice-signal",
+                            "signal",
+                            signal.1,
+                            signal.0,
+                            None,
+                            move |this, _, cx| {
+                                if let Some(index) = this.client.server_index(&server) {
+                                    this.panel = Some(crate::panels::Panel::Connection {
+                                        server: index,
+                                        origin: crate::menus::ActionOrigin::capture(
+                                            &this.client.servers[index],
+                                            crate::menus::MenuTarget::Server,
+                                        ),
+                                    });
+                                    cx.notify();
+                                }
+                            },
+                            cx,
+                        ),
+                        None => icon("signal", 18., color(signal.0)).into_any_element(),
+                    }))
                     .child(
                         div()
                             .min_w_0()
