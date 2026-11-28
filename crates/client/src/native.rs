@@ -21,7 +21,7 @@ use nuschl_core::audio::{
 use nuschl_core::bitrate::{VoiceBitrate, voice_frame_fits};
 use nuschl_core::{ChatMessage, ContentBlock, HistoryPage, MessageDocument};
 use nuschl_ipc::{LiveMediaEvent, LiveMediaRequest};
-use nuschl_protocol::nuschl::v1;
+use nuschl_protocol::nuschl::{self, v1};
 pub use nuschl_session::sfu;
 use nuschl_session::{
     Error,
@@ -74,8 +74,13 @@ const MAX_PENDING: usize = 64;
 /// What a fitting answer failed with when it named another conversation.
 const OTHER_CONVERSATION: &str = "The server answered for another conversation.";
 
-/// A history page asked for: the ticket and cursor it answers, and where it
-/// is kept in local history.
+/// Rows one page of the desktop's timeline asks for; the server caps it at
+/// `MAX_PAGE_MESSAGES`.
+const PAGE_LIMIT: u32 = 50;
+
+/// A history page asked for: the ticket and cursor it answers, where it is kept
+/// in local history, how often the server refused it for now, and whether the
+/// crypto worker already holds it.
 struct PagePending {
     server: String,
     generation: u64,
@@ -83,6 +88,8 @@ struct PagePending {
     ticket: HistoryTicket,
     page: Page,
     cache: Option<CacheKey>,
+    attempts: usize,
+    decrypting: bool,
 }
 
 /// An edit or deletion asked for.
@@ -199,6 +206,19 @@ impl PendingReplies {
         self.page_epochs.get(server) == Some(&(generation, epoch))
     }
 
+    /// A retried page is recorded only for the epoch the driver still holds: a
+    /// late retry never revives an ended connection.
+    fn insert_again(&mut self, request_id: u64, page: PagePending) -> bool {
+        let epoch = page.ticket.owner.as_ref().map(|owner| owner.epoch);
+        if epoch.is_none()
+            || self.page_epochs.get(&page.server).copied()
+                != epoch.map(|epoch| (page.generation, epoch))
+        {
+            return false;
+        }
+        self.insert(request_id, Tracked::Page(page))
+    }
+
     fn cancel_pages(&mut self, owner: Owner<'_>, epoch: u64) {
         let current = self
             .page_epochs
@@ -249,6 +269,14 @@ impl PendingReplies {
     /// pages and this one is not decrypted yet. The owner and the
     /// conversation are checked before anything is decrypted or rendered,
     /// and again when the decrypted page comes back.
+    /// The page the crypto worker already holds: a refusal now comes from the
+    /// local queue, so the server is asked nothing.
+    fn awaiting_decryption(&mut self, request_id: u64) {
+        if let Some(page) = self.pages.get_mut(&request_id) {
+            page.decrypting = true;
+        }
+    }
+
     fn page(&mut self, from: Owner<'_>, page: &v1::HistoryPage, decrypt: bool) -> PageRoute {
         use std::collections::btree_map::Entry;
         let Entry::Occupied(entry) = self.pages.entry(page.request_id) else {
@@ -1187,21 +1215,12 @@ impl Driver {
         (ticket, cache): (HistoryTicket, Option<CacheKey>),
         page: Page,
     ) -> Result<(), String> {
-        use v1::history_request::Anchor;
         let request_id = request_id();
-        let seq = |seq: i64| seq.max(0) as u64;
-        let anchor = match page {
-            Page::Before(Some(before)) => Anchor::Before(seq(before)),
-            Page::Before(None) => Anchor::Latest(true),
-            Page::After(after) => Anchor::After(seq(after)),
-            Page::Around(around) => Anchor::Around(seq(around)),
-        };
-        let command = Command::Nuschl(NuschlRequest::History(v1::HistoryRequest {
+        let command = Command::Nuschl(NuschlRequest::History(page_request(
             request_id,
-            conversation: conversation.to_vec(),
-            anchor: Some(anchor),
-            limit: 50,
-        }));
+            conversation,
+            page,
+        )));
         enqueue_tracked(
             self as *const Self as usize,
             &self.connections,
@@ -1216,6 +1235,8 @@ impl Driver {
                     ticket,
                     page,
                     cache,
+                    attempts: 0,
+                    decrypting: false,
                 })
             },
         )
@@ -2084,7 +2105,7 @@ async fn connect_once(
                     reply_ack(pending, Owner { server: &id, generation }, ack, (events, content)).await;
                 },
                 SessionEvent::Nuschl(NuschlEvent::Error(error)) => {
-                    reply_error(pending, Owner { server: &id, generation }, error, events).await;
+                    reply_error(pending, Owner { server: &id, generation }, error, events, &session_commands).await;
                 },
                 SessionEvent::Nuschl(NuschlEvent::Chat(chat)) => {
                     // New messages arrive as `Text`; edits and deletions here.
@@ -2388,6 +2409,24 @@ async fn mark_talking(
     }
 }
 
+/// The request for one page of a conversation.
+fn page_request(request_id: u64, conversation: [u8; 16], page: Page) -> v1::HistoryRequest {
+    use v1::history_request::Anchor;
+    let seq = |seq: i64| seq.max(0) as u64;
+    let anchor = match page {
+        Page::Before(Some(before)) => Anchor::Before(seq(before)),
+        Page::Before(None) => Anchor::Latest(true),
+        Page::After(after) => Anchor::After(seq(after)),
+        Page::Around(around) => Anchor::Around(seq(around)),
+    };
+    v1::HistoryRequest {
+        request_id,
+        conversation: conversation.to_vec(),
+        anchor: Some(anchor),
+        limit: PAGE_LIMIT,
+    }
+}
+
 /// A history page arrived on connection `from` (`decrypt`: it still needs
 /// decrypting there). Only the request this connection made for this
 /// conversation takes it: decrypted first where needed (the request waits
@@ -2410,6 +2449,7 @@ async fn reply_page(
     match route {
         PageRoute::Missing | PageRoute::Foreign => {}
         PageRoute::Decrypt => {
+            pending_replies(pending).awaiting_decryption(page.request_id);
             let _ = session
                 .send(Command::Mls(nuschl_session::mls::MlsCommand::DecryptPage {
                     page,
@@ -2743,23 +2783,33 @@ async fn reply_ack(
 
 /// An error arrived on connection `from`: this connection's page or change
 /// fails with it; one for the client's own requests (share links, direct
-/// conversations) is passed on; another connection's changes nothing.
+/// conversations) is passed on; another connection's changes nothing. A page
+/// the server refused for now is asked again once its hint allows it.
 async fn reply_error(
     pending: &Pending,
     from: Owner<'_>,
     error: v1::Error,
     events: &mpsc::Sender<Event>,
+    session: &mpsc::Sender<Command>,
 ) {
     let route = {
         let mut replies = pending_replies(pending);
         replies.error(from, error.request_id)
     };
     let event = match route {
-        ErrorRoute::Page(asked) => Event::HistoryFailed {
-            server: asked.server,
-            ticket: asked.ticket,
-            reason: error.detail,
-        },
+        ErrorRoute::Page(asked) => {
+            if !asked.decrypting
+                && let Some(delay) = nuschl::page_retry(&error, asked.attempts)
+            {
+                retry_page(pending, session, events, asked, delay);
+                return;
+            }
+            Event::HistoryFailed {
+                server: asked.server,
+                ticket: asked.ticket,
+                reason: error.detail,
+            }
+        }
         ErrorRoute::Change(asked) => Event::ChangeFailed {
             server: asked.change.server,
             delete: asked.change.content.is_none(),
@@ -2773,6 +2823,49 @@ async fn reply_error(
         },
     };
     let _ = events.send(event).await;
+}
+
+/// Asks for `asked`'s page again once the server's hint allows it, under a
+/// fresh request id this driver waits for.
+fn retry_page(
+    pending: &Pending,
+    session: &mpsc::Sender<Command>,
+    events: &mpsc::Sender<Event>,
+    mut asked: PagePending,
+    delay: std::time::Duration,
+) {
+    let (pending, session, events) = (pending.clone(), session.clone(), events.clone());
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            // The connection ended: nothing is asked again on its behalf.
+            () = session.closed() => return,
+        }
+        asked.attempts += 1;
+        let request_id = request_id();
+        let request = page_request(request_id, asked.conversation, asked.page);
+        let (server, generation) = (asked.server.clone(), asked.generation);
+        let failed = Event::HistoryFailed {
+            server: server.clone(),
+            ticket: asked.ticket.clone(),
+            reason: "The page could not be asked again: the connection is gone.".into(),
+        };
+        let sent = pending_replies(&pending).insert_again(request_id, asked)
+            && session
+                .send(Command::Nuschl(NuschlRequest::History(request)))
+                .await
+                .is_ok();
+        if !sent {
+            pending_replies(&pending).forget(
+                request_id,
+                Owner {
+                    server: &server,
+                    generation,
+                },
+            );
+            let _ = events.send(failed).await;
+        }
+    });
 }
 
 /// An edit or deletion joins the messages on their way to the timeline.
@@ -4634,6 +4727,8 @@ mod reply_owner_tests {
             ticket,
             page: Page::Before(None),
             cache: None,
+            attempts: 0,
+            decrypting: false,
         })
     }
     fn change_asked(server: &str, generation: u64, content: Option<&str>) -> Tracked {
@@ -4705,7 +4800,7 @@ mod reply_owner_tests {
             reply_ack(pending, from, ack, (&self.events.0, &self.content.0)).await;
         }
         async fn error(&self, pending: &Pending, from: Owner<'_>, error: v1::Error) {
-            reply_error(pending, from, error, &self.events.0).await;
+            reply_error(pending, from, error, &self.events.0, &self.session.0).await;
         }
         /// Nothing was shown, kept, decrypted or applied (spawned work included).
         async fn quiet(&mut self) -> bool {
@@ -4721,6 +4816,13 @@ mod reply_owner_tests {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| panic!("no event"))
+        }
+        async fn command(&mut self) -> Command {
+            tokio::time::timeout(Duration::from_secs(5), self.session.1.recv())
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| panic!("no command"))
         }
     }
 
@@ -4872,6 +4974,105 @@ mod reply_owner_tests {
         assert!(matches!(sinks.event().await,
             Event::Protocol { server, generation: 3, event: SessionEvent::Nuschl(NuschlEvent::Ack(ack)) }
                 if server == "b" && ack.request_id == 78));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_page_is_asked_again_after_its_hint() {
+        let pending = Pending::default();
+        let mut sinks = Sinks::new();
+        pending_replies(&pending).insert(41, page_asked("a", 7));
+        let mut refusal = error(41);
+        refusal.code = v1::error::Code::RateLimited as i32;
+        refusal.retry_after_ms = 250;
+        sinks.error(&pending, from("a", 7), refusal).await;
+        // Nothing is asked before the hint has passed.
+        tokio::time::advance(Duration::from_millis(249)).await;
+        assert!(sinks.session.1.try_recv().is_err(), "asked too early");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        // The same page, under a fresh request id this driver waits for.
+        let Command::Nuschl(NuschlRequest::History(request)) = sinks.command().await else {
+            panic!("not a history request");
+        };
+        assert_eq!(request.conversation, ASKED.to_vec());
+        assert_ne!(request.request_id, 41);
+        assert_eq!(
+            request.anchor,
+            Some(v1::history_request::Anchor::Latest(true))
+        );
+        assert_eq!(
+            pending_replies(&pending).pages[&request.request_id].attempts,
+            1
+        );
+        assert!(!has_page(&pending, 41));
+        assert!(sinks.quiet().await, "no failure is shown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_does_not_revive_an_ended_connection() {
+        let pending = Pending::default();
+        let mut sinks = Sinks::new();
+        pending_replies(&pending).insert(41, page_asked("a", 7));
+        let mut refusal = error(41);
+        refusal.code = v1::error::Code::RateLimited as i32;
+        refusal.retry_after_ms = 250;
+        sinks.error(&pending, from("a", 7), refusal).await;
+        // The retry waits while the connection ends and its epoch is dropped.
+        tokio::task::yield_now().await;
+        pending_replies(&pending).forget_pages(from("a", 7));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(sinks.events.1.try_recv(), Ok(Event::HistoryFailed { server, .. }) if server == "a"),
+            "the page fails"
+        );
+        assert!(
+            sinks.session.1.try_recv().is_err(),
+            "nothing is asked on a dead connection"
+        );
+        assert!(pending_replies(&pending).page_epochs.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_page_the_crypto_worker_holds_is_not_asked_again() {
+        let pending = Pending::default();
+        let mut sinks = Sinks::new();
+        pending_replies(&pending).insert(41, page_asked("a", 7));
+        // Encrypted: the page waits on the crypto worker, and a full decrypt
+        // queue answers with a `BUSY` refusal of its own under the same id.
+        sinks
+            .page(&pending, from("a", 7), page(41, &ASKED), true)
+            .await;
+        assert!(matches!(sinks.command().await, Command::Mls(_)));
+        let mut refusal = error(41);
+        refusal.code = v1::error::Code::Busy as i32;
+        refusal.retry_after_ms = 1000;
+        sinks.error(&pending, from("a", 7), refusal).await;
+        assert!(matches!(
+            sinks.event().await,
+            Event::HistoryFailed { server, .. } if server == "a"
+        ));
+        assert!(sinks.quiet().await, "the server is asked nothing");
+    }
+
+    #[tokio::test]
+    async fn a_page_refused_after_its_retries_fails() {
+        let pending = Pending::default();
+        let mut sinks = Sinks::new();
+        let Tracked::Page(mut asked) = page_asked("a", 7) else {
+            panic!("not a page");
+        };
+        asked.attempts = nuschl::PAGE_RETRIES;
+        pending_replies(&pending).insert(41, Tracked::Page(asked));
+        let mut refusal = error(41);
+        refusal.code = v1::error::Code::Busy as i32;
+        refusal.retry_after_ms = 100;
+        sinks.error(&pending, from("a", 7), refusal).await;
+        assert!(matches!(
+            sinks.event().await,
+            Event::HistoryFailed { server, .. } if server == "a"
+        ));
+        assert!(sinks.quiet().await, "nothing is asked again");
     }
 
     fn connection(

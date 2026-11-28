@@ -59,13 +59,11 @@ const MAX_PAGES: usize = 64;
 const MAX_UPLOAD_ATTEMPTS: u32 = 8;
 /// Attempts of one commit or message while the server answers `BUSY`.
 const MAX_BUSY_RETRIES: usize = 5;
-
-/// How long to wait before retrying, if the server answered `BUSY`.
+/// How long to wait before asking again, if the server answered `BUSY` with a
+/// hint.
 fn busy_delay(reply: &Reply) -> Option<Duration> {
     match reply {
-        Reply::Error(error) if error.code == Code::Busy as i32 => {
-            Some(Duration::from_millis(error.retry_after_ms.clamp(100, 2000)))
-        }
+        Reply::Error(error) => nuschl::busy_delay(error),
         _ => None,
     }
 }
@@ -779,23 +777,52 @@ impl Context {
         self.mls_add_missing(conversation).await
     }
 
+    /// One history page, asked again while the server answers `BUSY` or
+    /// `RATE_LIMITED`, for the delay its hint names (docs/extension.md §6).
+    /// `asked` counts the retries of the catch-up or history call this page
+    /// belongs to, so a run of pages shares one budget.
+    async fn history_page(
+        &mut self,
+        conversation: [u8; 16],
+        anchor: v1::history_request::Anchor,
+        asked: &mut usize,
+    ) -> Result<Reply, crate::Error> {
+        loop {
+            let reply = self
+                .ask(kind::HISTORY_REQUEST, |request_id| {
+                    v1::HistoryRequest {
+                        request_id,
+                        conversation: conversation.to_vec(),
+                        anchor: Some(anchor),
+                        limit: nuschl::MAX_PAGE_MESSAGES as u32,
+                    }
+                    .encode_to_vec()
+                })
+                .await?;
+            match &reply {
+                Reply::Error(error) if let Some(delay) = nuschl::page_retry(error, *asked) => {
+                    *asked += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                _ => return Ok(reply),
+            }
+        }
+    }
+
     /// Rows after the cursor up to `until`, in order.
     async fn mls_rows(&mut self, conversation: [u8; 16], until: u64) -> Result<(), crate::Error> {
+        let mut asked = 0;
         for _ in 0..MAX_PAGES {
             let after = self.mls().cursors.get(&conversation).copied().unwrap_or(0);
             if after >= until {
                 return Ok(());
             }
             let reply = self
-                .ask(kind::HISTORY_REQUEST, move |request_id| {
-                    v1::HistoryRequest {
-                        request_id,
-                        conversation: conversation.to_vec(),
-                        anchor: Some(v1::history_request::Anchor::After(after)),
-                        limit: nuschl::MAX_PAGE_MESSAGES as u32,
-                    }
-                    .encode_to_vec()
-                })
+                .history_page(
+                    conversation,
+                    v1::history_request::Anchor::After(after),
+                    &mut asked,
+                )
                 .await?;
             let page = match reply {
                 Reply::Frame(kind::HISTORY_PAGE, payload) => v1::HistoryPage::decode(payload)
@@ -1080,20 +1107,12 @@ impl Context {
                 conversation,
                 before,
             } => {
-                let reply = self
-                    .ask(kind::HISTORY_REQUEST, |request_id| {
-                        v1::HistoryRequest {
-                            request_id,
-                            conversation: conversation.to_vec(),
-                            anchor: Some(match before {
-                                Some(seq) => v1::history_request::Anchor::Before(seq),
-                                None => v1::history_request::Anchor::Latest(true),
-                            }),
-                            limit: nuschl::MAX_PAGE_MESSAGES as u32,
-                        }
-                        .encode_to_vec()
-                    })
-                    .await?;
+                let anchor = match before {
+                    Some(seq) => v1::history_request::Anchor::Before(seq),
+                    None => v1::history_request::Anchor::Latest(true),
+                };
+                let mut asked = 0;
+                let reply = self.history_page(conversation, anchor, &mut asked).await?;
                 if let Reply::Frame(kind::HISTORY_PAGE, payload) = reply {
                     let page = v1::HistoryPage::decode(payload).map_err(|_| {
                         crate::Error::Protocol("invalid encrypted history page".into())
