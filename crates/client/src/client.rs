@@ -3157,7 +3157,10 @@ impl Client {
             }
             ServerEvent::ContextActions(actions) => server.context_actions = actions,
             ServerEvent::RegisteredUsers(users) => server.registered_users = Some(users),
-            ServerEvent::Bans(bans) => server.bans = Some(bans),
+            ServerEvent::Bans(bans) => match &mut server.bans {
+                Some(draft) => draft.replace(bans),
+                None => server.bans = Some(nuschl_core::admin::BanDraft::new(bans)),
+            },
             ServerEvent::AccountReply(reply) => server.account_reply = Some(reply),
             ServerEvent::AclReply(reply) => {
                 if let Ok(acl) = &reply.result {
@@ -3540,7 +3543,7 @@ mod tests {
     use crate::server::{CANT_SPEAK_HERE, NO_BANDWIDTH};
     use crate::{
         HistoryTicket,
-        model::{Channel, User},
+        model::{Ban, Channel, User},
         timeline::IncomingMessage,
     };
     use nuschl_core::{ChatMessage, model::permission as perm};
@@ -7015,6 +7018,39 @@ mod tests {
             client.servers[0].channels[position].instance
         );
     }
+    /// A second reply goes into the open draft, which keeps the rows of the
+    /// entries it still lists.
+    #[test]
+    fn a_ban_reply_reaches_the_open_draft() {
+        let (mut client, _, id) = connected();
+        let ban = |last: u8, name: &str| Ban {
+            address: vec![192, 0, 2, last],
+            mask: 120,
+            name: Some(name.into()),
+            hash: None,
+            reason: None,
+            start: None,
+            duration: None,
+        };
+        let bans = |bans: Vec<Ban>| Input::Server {
+            server: id.clone(),
+            generation: 1,
+            event: ServerEvent::Bans(bans),
+        };
+        client.handle(bans(vec![ban(1, "Ada"), ban(2, "Bob")]));
+        let draft = client.servers[0].bans.as_ref().unwrap();
+        let bob = draft.rows()[1].id;
+        client.handle(bans(vec![ban(2, "Bob"), ban(3, "Cy")]));
+        let draft = client.servers[0].bans.as_mut().unwrap();
+        assert_eq!(draft.rows().len(), 2);
+        assert_eq!(draft.rows()[0].id, bob);
+        assert_eq!(
+            draft.remove(bob).unwrap().len(),
+            1,
+            "the list to send drops the row and keeps the other entry"
+        );
+    }
+
     #[test]
     fn explicit_disconnect_during_recovery_can_still_open_local_offline_history() {
         let (mut client, recorder, id) = recovery_client();

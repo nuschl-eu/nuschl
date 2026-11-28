@@ -160,6 +160,12 @@ from this wire representation. Account IDs identify registered users,
 including offline users, and must never be populated from presence/session IDs.
 Unedited model fields and unknown permission bits survive edits.
 
+A ban row keeps its ID while a reply still lists its entry, so **Remove** sends
+the latest list without the row it showed; a control for a row the latest reply
+dropped sends nothing. `nuschl_core::admin::BanDraft` holds those rows. nuschld
+stores a ban update without answering it, so the panel reads the list back after
+sending one; an entry the server keeps comes back as a row again.
+
 `AclEditorState::new(channel)` manages load, explicit reload, pre-save conflict
 checks, and post-save verification. A frontend supplies distinct request tickets
 and preserves its original connection/channel authority. It must forward only

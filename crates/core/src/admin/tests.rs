@@ -612,3 +612,50 @@ fn baseline_ignores_group_set_order_but_preserves_members_flags_and_rule_order()
     changed.entries[0].grant |= 0x8000_0000;
     assert!(!draft.baseline_matches(&changed));
 }
+
+fn ban(last: u8, name: &str) -> Ban {
+    Ban {
+        address: vec![192, 0, 2, last],
+        mask: 120,
+        name: Some(name.into()),
+        hash: None,
+        reason: Some("reason".into()),
+        start: None,
+        duration: None,
+    }
+}
+
+/// A row that a reply still lists keeps its ID, so a control removes the entry
+/// it showed even when the list changed since.
+#[test]
+fn ban_rows_follow_their_entry_across_replies() {
+    let mut draft = BanDraft::new(vec![ban(1, "Ada"), ban(2, "Bob")]);
+    let ada = draft.rows()[0].id;
+    let bob = draft.rows()[1].id;
+    // Another administrator unbanned Ada, banned Cy, and edited Bob's reason.
+    let mut edited = ban(2, "Bob");
+    edited.reason = Some("spam".into());
+    draft.replace(vec![edited, ban(3, "Cy")]);
+    assert_eq!(draft.rows()[0].id, bob);
+    assert_ne!(draft.rows()[1].id, bob);
+    let left = draft.remove(bob).unwrap();
+    assert_eq!(
+        left.iter().map(|ban| ban.name.clone()).collect::<Vec<_>>(),
+        [Some("Cy".into())]
+    );
+    assert_eq!(draft.rows().len(), 1);
+    // A control whose entry a reply dropped sends nothing.
+    assert!(draft.remove(ada).is_none());
+}
+
+#[test]
+fn identical_ban_entries_keep_their_own_rows() {
+    let mut draft = BanDraft::new(vec![ban(1, "Ada"), ban(1, "Ada")]);
+    let (first, second) = (draft.rows()[0].id, draft.rows()[1].id);
+    assert_ne!(first, second);
+    draft.replace(vec![ban(1, "Ada")]);
+    assert_eq!(draft.rows()[0].id, first);
+    let left = draft.remove(first).unwrap();
+    assert!(left.is_empty());
+    assert!(draft.remove(second).is_none());
+}
