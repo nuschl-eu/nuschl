@@ -371,6 +371,18 @@ impl Drop for Desktop {
         }
     }
 }
+/// The channels that must be open for `channel`'s row to show, nearest parent
+/// first (a channel list nests; a parent that points at itself ends the walk).
+fn ancestors(parents: &BTreeMap<u32, Option<u32>>, channel: u32) -> Vec<u32> {
+    let mut open = Vec::new();
+    let mut parent = parents.get(&channel).copied().flatten();
+    while let Some(id) = parent.filter(|id| !open.contains(id)) {
+        open.push(id);
+        parent = parents.get(&id).copied().flatten();
+    }
+    open
+}
+
 impl Desktop {
     pub fn new(
         profile: Profile,
@@ -1022,6 +1034,27 @@ impl Desktop {
     pub fn reveal_server(&mut self, slot: usize) {
         self.server_motion.cancel();
         self.server_scroll.scroll_to_item(slot);
+    }
+
+    /// Bring `channel` of the server at `index` into the channel list: its
+    /// parents open, its row in sight, so a jump from the switcher or an unread
+    /// hint lands where the reader can see it.
+    pub fn reveal_channel(&mut self, index: usize, channel: u32) {
+        let Some(server) = self.client.servers.get_mut(index) else {
+            return;
+        };
+        let parents: BTreeMap<u32, Option<u32>> = server
+            .channels
+            .iter()
+            .map(|entry| (entry.id, entry.parent))
+            .collect();
+        for parent in ancestors(&parents, channel) {
+            server.expansion.insert(parent, true);
+        }
+        if let Some(slot) = crate::unread::channel_slot(server, channel) {
+            self.cancel_channel_scroll();
+            self.channel_scroll.scroll_to_item(slot);
+        }
     }
     /// Direct manipulation replaces easing before the first thumb movement.
     pub fn cancel_modal_scroll(&mut self) {
@@ -3103,5 +3136,29 @@ mod server_writes_tests {
         writes.write(&profile, 3, &[]).unwrap();
         assert!(profile.load_servers(None).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::ancestors;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn opening_a_nested_channel_opens_the_parents_it_hides_under() {
+        let parents = BTreeMap::from([
+            (1, None),
+            (2, Some(1)),
+            (3, Some(2)),
+            // A parent that names itself, and one the server never sent.
+            (4, Some(4)),
+            (5, Some(99)),
+        ]);
+        assert!(ancestors(&parents, 1).is_empty());
+        assert_eq!(ancestors(&parents, 3), [2, 1]);
+        assert_eq!(ancestors(&parents, 4), [4]);
+        assert_eq!(ancestors(&parents, 5), [99]);
+        // A channel the list does not hold opens nothing.
+        assert!(ancestors(&parents, 9).is_empty());
     }
 }
