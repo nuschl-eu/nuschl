@@ -908,7 +908,15 @@ fn up_in_the_empty_composer_edits_the_last_own_message_on_a_nuschl_server() {
     app.settle();
     app.browse(0, 1);
     let mut mine = message(&id, 1, "Ada", "Typo hree", None);
-    if let Input::Message { message, .. } = &mut mine {
+    if let Input::Message {
+        storage_key,
+        message,
+        ..
+    } = &mut mine
+    {
+        // The channel's rows are kept under its conversation.
+        *storage_key = nuschl_client::server::conversation_key(&[7; 16]);
+        message.message.channel = storage_key.clone();
         message.seq = Some(5);
         message.id = Some(5);
         message.author_id = Some(11);
