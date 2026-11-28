@@ -2579,6 +2579,7 @@ impl Desktop {
                             Input::AudioStatus { .. } => Some("input_audio_status"),
                             Input::AudioDevices { .. } => Some("input_audio_devices"),
                             Input::AudioHealth { .. } => Some("input_audio_health"),
+                            Input::AudioPlayout { .. } => Some("input_audio_playout"),
                             _ => None,
                         };
                         if let Some(kind) = kind {

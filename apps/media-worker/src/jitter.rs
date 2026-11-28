@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Native clock adapter for the shared, platform-independent jitter policy.
-pub use nuschl_audio_jitter::Pull;
 #[cfg(test)]
 use nuschl_audio_jitter::{CATCH_UP_MS, MAX_SEQUENCE};
+pub use nuschl_audio_jitter::{Counters, Pull};
 use std::time::Instant;
 
 pub struct JitterBuffer<P = Vec<u8>> {
@@ -34,13 +34,16 @@ impl<P: Clone> JitterBuffer<P> {
     pub fn is_playing(&self) -> bool {
         self.inner.is_playing()
     }
-    #[cfg(test)]
     pub fn target_ms(&self) -> f32 {
         self.inner.target_ms()
     }
-    #[cfg(test)]
     pub fn buffered_ms(&self) -> f32 {
         self.inner.buffered_ms()
+    }
+    /// What this buffer did with the packets it was given, cleared for the
+    /// next window.
+    pub fn take_counters(&mut self) -> Counters {
+        self.inner.take_counters()
     }
 }
 

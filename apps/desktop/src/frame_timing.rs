@@ -9,7 +9,8 @@
 //! line, `origin Instant { tv_sec: …, tv_nsec: … }`, places startup on the
 //! monotonic clock, to line events up with the compositor's. Constant native
 //! notification kinds (`input_transport`, `input_audio_status`,
-//! `input_audio_devices`, `input_audio_health`) use `<start> 0`; no input payload
+//! `input_audio_devices`, `input_audio_health`, `input_audio_playout`) use
+//! `<start> 0`; no input payload
 //! is logged. Existing phase summaries ignore these additional event kinds.
 use gpui_profiler::{FrameEvent, FrameTimingCollector, set_trace_enabled};
 use std::{

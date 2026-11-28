@@ -68,6 +68,15 @@ automatic gain control, all in Rust:
 - An adaptive controller watches for playback stutters, residual echo and a clipping
   microphone. It adjusts only Nuschl's own buffer and voice gate, and tells you what
   it cannot fix.
+- **Settings → Diagnostics** counts the voice path in two groups: the connection
+  since it started (voice transport, UDP and TCP ping, and the packets the
+  server sent: good, late, lost, resync) above this device over the last two
+  seconds (packets queued, late, duplicate and caught up; frames rebuilt from
+  in-band FEC or concealed; dry talkspurts; the jitter buffer's delay of its
+  target; output-device buffer, dropouts and decoder errors). Each group reports
+  its own stage: the connection covers the network path up to this machine,
+  while the buffers, decoder and output device below it count what they did with
+  the packets that arrived.
 - If the audio service fails, only the media worker restarts; the connection and
   mute state stay. Volume mixers name each stream (microphone, voice chat, echo
   reference).

@@ -222,6 +222,13 @@ pub enum Input {
         generation: u64,
         health: AudioHealth,
     },
+    /// What this device's playout did in its last two-second window (issue
+    /// #17).
+    AudioPlayout {
+        server: String,
+        generation: u64,
+        playout: nuschl_core::audio::AudioPlayout,
+    },
 }
 
 /// What a server said (the session's events the client models).

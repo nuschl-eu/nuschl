@@ -626,6 +626,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 underruns
             };
             stats.underruns(underruns);
+            // Playout and transport counters explain different failures
+            // (issue #17): report what this device did every window.
+            emit(&mut output, LiveMediaEvent::Playout(mixer.playout()))?;
             let residual = pipeline
                 .as_ref()
                 .filter(|chain| chain.echo_cancellation())

@@ -13,6 +13,7 @@ use crate::{
     jitter::{JitterBuffer, Pull},
 };
 use nuschl_audio_jitter::UnderrunFade;
+use nuschl_core::audio::AudioPlayout;
 use opus_rs::{OpusDecoder, packet};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -72,6 +73,9 @@ struct EncodedPacket {
 
 struct Speaker {
     decoder: OpusDecoder,
+    /// What this speaker's playout did since the last [`Mixer::playout`]
+    /// (issue #17).
+    counters: AudioPlayout,
     /// Last successfully decoded packet uses SILK or Hybrid.
     neural_plc: bool,
     jitter: JitterBuffer<EncodedPacket>,
@@ -90,6 +94,7 @@ impl Speaker {
         decoder.set_complexity(NEURAL_COMPLEXITY)?;
         Ok(Self {
             decoder,
+            counters: AudioPlayout::default(),
             neural_plc: false,
             jitter: JitterBuffer::default(),
             pcm: VecDeque::with_capacity(MAX_DECODED),
@@ -132,16 +137,21 @@ impl Speaker {
             match self.jitter.pull() {
                 Pull::Packet { opus, end } => {
                     let plays = !end || self.fade.end();
-                    if let Ok(count) = self.decoder.decode(&opus.opus, MAX_PACKET_SAMPLES, scratch)
-                    {
-                        // The TOC's high bit distinguishes CELT-only packets
-                        // from SILK and Hybrid (RFC 6716 section 3.1).
-                        self.neural_plc = opus.opus.first().is_some_and(|toc| toc & 0x80 == 0);
-                        self.jitter.observe_frames((count / FRAME) as u64);
-                        self.volume = opus.gain;
-                        if plays {
-                            self.fade.play(&mut scratch[..2 * count]);
-                            self.extend(&scratch[..2 * count]);
+                    match self.decoder.decode(&opus.opus, MAX_PACKET_SAMPLES, scratch) {
+                        Ok(count) => {
+                            // The TOC's high bit distinguishes CELT-only packets
+                            // from SILK and Hybrid (RFC 6716 section 3.1).
+                            self.neural_plc = opus.opus.first().is_some_and(|toc| toc & 0x80 == 0);
+                            self.jitter.observe_frames((count / FRAME) as u64);
+                            self.volume = opus.gain;
+                            if plays {
+                                self.fade.play(&mut scratch[..2 * count]);
+                                self.extend(&scratch[..2 * count]);
+                            }
+                        }
+                        Err(_) => {
+                            self.counters.decoder_errors =
+                                self.counters.decoder_errors.saturating_add(1);
                         }
                     }
                     if end {
@@ -150,22 +160,51 @@ impl Speaker {
                 }
                 Pull::Lost { fec, frames } => {
                     let size = (frames as usize * FRAME).min(MAX_PACKET_SAMPLES);
+                    // Only a SILK or Hybrid packet carries in-band FEC for the
+                    // missing one, and libopus conceals when there is none.
+                    // The TOC's high bit marks CELT-only packets (RFC 6716 3.1).
+                    let recovered = fec
+                        .as_ref()
+                        .is_some_and(|next| next.opus.first().is_some_and(|toc| toc & 0x80 == 0));
                     let decoded = self.conceal(budget, |decoder| match fec {
                         Some(next) => decoder.decode_fec(&next.opus, size, scratch),
                         None => decoder.decode(&[], size, scratch),
                     });
-                    if let Ok(count) = decoded {
-                        self.fade.play(&mut scratch[..2 * count]);
-                        self.extend(&scratch[..2 * count]);
-                    } else {
-                        break;
+                    match decoded {
+                        Ok(count) => {
+                            let frames = (count / FRAME) as u32;
+                            if recovered {
+                                self.counters.recovered_frames =
+                                    self.counters.recovered_frames.saturating_add(frames);
+                            } else {
+                                self.counters.concealed_frames =
+                                    self.counters.concealed_frames.saturating_add(frames);
+                            }
+                            self.fade.play(&mut scratch[..2 * count]);
+                            self.extend(&scratch[..2 * count]);
+                        }
+                        Err(_) => {
+                            self.counters.decoder_errors =
+                                self.counters.decoder_errors.saturating_add(1);
+                            break;
+                        }
                     }
                 }
                 Pull::Idle => {
+                    // The buffer stopped while it was playing: its audio ran
+                    // out before the next packet arrived.
+                    if was_playing {
+                        self.counters.dry_talkspurts =
+                            self.counters.dry_talkspurts.saturating_add(1);
+                    }
                     if self.fade.ran_dry(was_playing)
                         && let Ok(count) =
                             self.conceal(budget, |decoder| decoder.decode(&[], FRAME, scratch))
                     {
+                        self.counters.concealed_frames = self
+                            .counters
+                            .concealed_frames
+                            .saturating_add((count / FRAME) as u32);
                         self.fade.fade_out(&mut scratch[..2 * count]);
                         self.extend(&scratch[..2 * count]);
                     }
@@ -173,6 +212,23 @@ impl Speaker {
                 }
             }
         }
+    }
+
+    /// Fold this window's counters into `into`, with this buffer's latency
+    /// when it holds audio. Clears the per-window counts.
+    fn playout(&mut self, into: &mut AudioPlayout) {
+        let mut window = std::mem::take(&mut self.counters);
+        let counters = self.jitter.take_counters();
+        window.received = counters.received;
+        window.late = counters.late;
+        window.duplicate = counters.duplicate;
+        window.caught_up = counters.caught_up;
+        let buffered = self.jitter.buffered_ms();
+        if buffered > 0. {
+            window.buffered_ms = buffered as u32;
+            window.target_ms = self.jitter.target_ms() as u32;
+        }
+        into.add(&window);
     }
 
     fn extend(&mut self, samples: &[f32]) {
@@ -305,6 +361,19 @@ impl Mixer {
         }
     }
 
+    /// What playout on this device did since the previous call (issue #17),
+    /// over every stream the worker mixes. Latency is the fullest buffer's and
+    /// zero while nothing is buffered: a starved or stuck device shows here
+    /// with the transport counters quiet.
+    pub fn playout(&mut self) -> AudioPlayout {
+        let mut playout = AudioPlayout::default();
+        for speaker in self.speakers.values_mut() {
+            speaker.playout(&mut playout);
+        }
+        playout.speakers = self.speakers.len() as u32;
+        playout
+    }
+
     /// Drop speakers silent for a while.
     pub fn cleanup(&mut self, now: Instant) {
         self.speakers.retain(|_, speaker| {
@@ -420,6 +489,54 @@ mod tests {
                 packet[..size].to_vec()
             })
             .collect()
+    }
+
+    #[test]
+    fn playout_reports_a_missing_packet_and_the_buffer_that_held_it() {
+        let packets = tone(6, 0.5);
+        let start = Instant::now();
+        let mut mixer = Mixer::default();
+        mixer.budget.limit = Duration::from_secs(3600);
+        // Sequence 2 (the second packet) never arrives.
+        for index in [0_usize, 2, 3] {
+            let voice = Voice {
+                stream: 1,
+                sender: 1,
+                sequence: 2 * index as u64,
+                opus: packets[index].clone(),
+                end: false,
+                volume: 1.,
+            };
+            mixer.push(voice, start).unwrap();
+        }
+        // Two frames of the first packet, then the gap; packets 4 and 6 stay
+        // queued, so latency still has something to report.
+        for _ in 0..4 {
+            let mut frame = [[0.; 2]; FRAME];
+            mixer.mix(&mut frame);
+        }
+        let playout = mixer.playout();
+        assert_eq!(playout.received, 3);
+        assert_eq!(
+            (playout.late, playout.duplicate, playout.caught_up),
+            (0, 0, 0)
+        );
+        // The gap and the fade-out that follows it are concealment; in-band
+        // FEC from the following packet may rebuild part of it instead.
+        assert!(
+            playout.concealed_frames + playout.recovered_frames >= 2,
+            "{playout:?}"
+        );
+        assert_eq!(playout.decoder_errors, 0);
+        assert_eq!(playout.speakers, 1);
+        assert!(playout.buffered_ms > 0);
+        assert!(playout.target_ms >= 40, "the buffer's minimum target");
+        let next = mixer.playout();
+        assert_eq!(
+            (next.received, next.concealed_frames + next.recovered_frames),
+            (0, 0),
+            "taking the counters clears them"
+        );
     }
 
     fn feed(mixer: &mut Mixer, stream: u32, sender: u32, packets: &[Vec<u8>], volume: f32) {

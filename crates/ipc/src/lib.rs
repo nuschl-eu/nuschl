@@ -346,6 +346,34 @@ mod tests {
     }
 
     #[test]
+    fn playout_counters_cross_the_frame_boundary_whole() -> Result<(), Error> {
+        let playout = nuschl_core::audio::AudioPlayout {
+            received: 1206,
+            late: 3,
+            duplicate: 1,
+            caught_up: 1,
+            concealed_frames: 5,
+            recovered_frames: 3,
+            dry_talkspurts: 1,
+            decoder_errors: 2,
+            buffered_ms: 60,
+            target_ms: 60,
+            speakers: 2,
+        };
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &Envelope::new(7, LiveMediaEvent::Playout(playout)),
+        )?;
+        let read: Envelope<LiveMediaEvent> = read_frame(&mut &bytes[..])?.expect("one frame");
+        let LiveMediaEvent::Playout(read) = read.payload else {
+            panic!("a playout event must read back as one");
+        };
+        assert_eq!(read, playout);
+        Ok(())
+    }
+
+    #[test]
     fn failed_serialization_does_not_partially_write_a_frame() {
         let mut output = Vec::new();
         let value = Envelope::new(1, "x".repeat(MAX_FRAME_BYTES));
@@ -469,6 +497,9 @@ pub enum LiveMediaEvent {
         residual_likelihood: Option<f32>,
         delay_ms: Option<i32>,
     },
+    /// What this device's playout did in the last two-second window (issue
+    /// #17), beside the transport's own packet counters.
+    Playout(nuschl_core::audio::AudioPlayout),
     /// The adaptive controller's view of the live graph, sent when it changes.
     Health {
         /// The microphone reaches full scale before Nuschl receives it.
