@@ -345,21 +345,65 @@ pub fn settle(
 }
 
 /// Write `bytes` to `path`, in the staging folder, for the transfer worker to
-/// offer. Copies that earlier runs left there over a day ago, after their
-/// offers ended, go.
+/// offer.
 pub fn stage(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let folder = path.parent().ok_or("no staging folder")?;
     nuschl_session::layout::create_private_dir(folder)
         .and_then(|()| std::fs::write(path, bytes))
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-    let old = SystemTime::now() - crate::transfer::OFFER_LIFETIME - Duration::from_secs(3600);
-    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
-        let modified = entry.metadata().and_then(|metadata| metadata.modified());
-        if modified.is_ok_and(|modified| modified < old) {
-            let _ = std::fs::remove_file(entry.path());
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// How long past its offer a staged copy still counts as live: the hour covers
+/// a run that crashed between staging one and offering it.
+const STALE_MARGIN: Duration = Duration::from_secs(3600);
+/// Entries one start reads, so a folder that collected many copies does not
+/// hold the window up.
+const ENTRIES_PER_START: usize = 20_000;
+
+/// What a pass over a staging folder took out.
+pub struct Reaped {
+    /// The copies removed.
+    pub copies: usize,
+    /// Their bytes.
+    pub bytes: u64,
+}
+
+/// Remove the copies in a staging folder that an earlier run left behind: the
+/// ordinary files that outlive an offer by [`STALE_MARGIN`]. A run offers its
+/// copies while it runs and takes them with it, so a start finds the ones a
+/// crash left, and at most [`ENTRIES_PER_START`] of anything.
+pub fn reap(folder: &Path) -> std::io::Result<Reaped> {
+    let old = SystemTime::now()
+        .checked_sub(crate::transfer::OFFER_LIFETIME + STALE_MARGIN)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut reaped = Reaped {
+        copies: 0,
+        bytes: 0,
+    };
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(reaped),
+        Err(error) => return Err(error),
+    };
+    for entry in entries.take(ENTRIES_PER_START) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        // `DirEntry::metadata` reads the entry itself, so a symlink is no file
+        // here and stays with whatever it points at. Staged copies are files.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.modified().is_ok_and(|modified| modified >= old) {
+            continue;
         }
+        if std::fs::remove_file(entry.path()).is_err() {
+            continue;
+        }
+        reaped.copies += 1;
+        reaped.bytes += metadata.len();
     }
-    Ok(())
+    Ok(reaped)
 }
 
 /// Read an attached image, refusing one that has grown past the limit.
@@ -762,6 +806,44 @@ mod tests {
         drop(offered);
         assert!(!staged.exists());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_start_takes_the_copies_an_earlier_run_left_and_keeps_the_rest() {
+        let directory = nuschl_testkit::temp_dir();
+        let offers = directory.path().join("offers");
+        std::fs::create_dir_all(&offers).unwrap();
+        let crashed =
+            SystemTime::now() - crate::transfer::OFFER_LIFETIME - Duration::from_secs(2 * 3600);
+        let stale = offers.join("1-1");
+        std::fs::write(&stale, b"left behind").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(crashed)
+            .unwrap();
+        let live = offers.join("1-2");
+        std::fs::write(&live, b"staged now").unwrap();
+        std::fs::create_dir(offers.join("nested")).unwrap();
+        #[cfg(unix)]
+        let link = offers.join("1-3");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&live, &link).unwrap();
+
+        let reaped = reap(&offers).unwrap();
+        assert_eq!(reaped.copies, 1);
+        assert_eq!(reaped.bytes, b"left behind".len() as u64);
+        assert!(!stale.exists());
+        assert!(live.exists());
+        assert!(offers.join("nested").is_dir());
+        // A copy inside an offer's life stays for it, and a link is no copy.
+        assert_eq!(reap(&offers).unwrap().copies, 0);
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+
+        // A folder that is not there has nothing to take.
+        assert_eq!(reap(&directory.path().join("missing")).unwrap().copies, 0);
     }
 
     #[test]
