@@ -336,6 +336,75 @@ fn connected() -> (App, Arc<Recorder>, String) {
     (app, recorder, id)
 }
 
+/// A guest session on one server that sent no hello policy: with `history/1`
+/// it keeps its history for registered accounts.
+fn guest(history: bool) -> App {
+    let recorder = Arc::new(Recorder::default());
+    let mut bookmark = ServerBookmark::new("Test", "localhost", 64738, "Ada").unwrap();
+    bookmark.certificate_sha256 = Some("ab".repeat(32));
+    let id = bookmark.id.clone();
+    let client = Client::new(Box::new(recorder), vec![bookmark], Default::default());
+    let mut app = App::new(client, None, options());
+    app.tz = jiff::tz::TimeZone::UTC;
+    app.client.connect(0, None, false);
+    let event = |event| Input::Server {
+        server: id.clone(),
+        generation: 1,
+        event,
+    };
+    for input in [
+        event(ServerEvent::Negotiated {
+            capabilities: history.then(|| "history/1".into()).into_iter().collect(),
+            policy: None,
+        }),
+        event(ServerEvent::Channel(Channel {
+            id: 1,
+            parent: Some(0),
+            name: "Lobby".into(),
+            ..Default::default()
+        })),
+        event(ServerEvent::User(User {
+            session: 1,
+            name: "Ada".into(),
+            channel: 1,
+            self_muted: true,
+            self_deafened: true,
+            ..Default::default()
+        })),
+        event(ServerEvent::Connected { session: 1 }),
+    ] {
+        app.client.handle(input);
+    }
+    app.settle();
+    app
+}
+
+fn history_notes(app: &App) -> Vec<String> {
+    app.notes
+        .iter()
+        .map(|note| note.text.clone())
+        .filter(|text| text.contains("registered accounts"))
+        .collect()
+}
+
+#[test]
+fn a_guest_hears_once_per_server_that_history_is_for_registered_accounts() {
+    let mut app = guest(true);
+    let notes = history_notes(&app);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    // Said once, however often the pass runs or the conversation changes.
+    app.settle();
+    app.browse(0, 1);
+    app.settle();
+    assert_eq!(history_notes(&app).len(), 1);
+}
+
+#[test]
+fn a_stock_server_says_nothing_about_registered_accounts() {
+    let app = guest(false);
+    assert!(history_notes(&app).is_empty(), "{:?}", history_notes(&app));
+}
+
 fn message(
     server: &str,
     channel: u32,

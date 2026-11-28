@@ -5106,6 +5106,19 @@ mod reply_owner_tests {
         server.status = crate::server::Status::Connected;
         server.deafened = true;
         server.history_source = HistorySource::ServerArchive;
+        // Our own session is a guest: the server serves it history.
+        server.own_session = Some(1);
+        server.users.insert(
+            1,
+            crate::model::User {
+                session: 1,
+                ..Default::default()
+            },
+        );
+        server.policy = Some(v1::Policy {
+            guests: v1::policy::Guests::Full as i32,
+            ..Default::default()
+        });
         server
             .channels
             .push(crate::conversation::ConversationState::channel(
@@ -5180,6 +5193,11 @@ mod reply_owner_tests {
                 channel: 2,
                 conversation: Some(ASKED),
             },
+            // Our own user state, as the server sends it before the sync.
+            ServerEvent::User(crate::model::User {
+                session: 1,
+                ..Default::default()
+            }),
             ServerEvent::Connected { session: 1 },
         ] {
             client.handle(Input::Server {

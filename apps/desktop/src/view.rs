@@ -17,7 +17,11 @@ use crate::{
 };
 use gpui_kit::{base::input::Textarea, prelude::*, *};
 use nuschl_client::{
-    HistorySource, SessionSecurity, client::Call, conversation::Entry, timeline::Message,
+    SessionSecurity,
+    client::Call,
+    conversation::Entry,
+    server::{HISTORY_FOR_ACCOUNTS, HISTORY_FOR_ACCOUNTS_HOW},
+    timeline::Message,
     tree::TreeKey,
 };
 use nuschl_core::{ContentBlock, TextRole};
@@ -2753,15 +2757,10 @@ fn timeline_intro(
                 .child(text!(format!("Welcome to {}", channel.name)).with_id("timeline-heading")),
         )
         .child(
-            div().text_sm().text_color(color(TEXT_MUTED)).child(
-                // Honest per conversation: stock direct messages on a Nuschl
-                // server are what this device saw.
-                text!(match server.history_source {
-                    HistorySource::ServerArchive if server.archived(channel) => "Server history",
-                    _ => "Local history · messages seen on this device",
-                })
-                .with_id("history-source"),
-            ),
+            div()
+                .text_sm()
+                .text_color(color(TEXT_MUTED))
+                .child(text!(history_line(server, channel)).with_id("history-source")),
         )
         .when_some(
             this.ui
@@ -2834,6 +2833,24 @@ fn timeline_intro(
             |view| view.child(history_start(server.archived(channel))),
         )
         .into_any_element()
+}
+
+/// What a timeline says about where its messages come from. Honest per
+/// conversation: stock direct messages on a Nuschl server are what this
+/// device saw, and a guest reads the server's history only where the server
+/// serves guests (`history.guests`, docs/extension.md).
+fn history_line(server: &ServerView, channel: &crate::state::ChannelView) -> &'static str {
+    if !server.archived(channel) {
+        return "Local history, messages seen on this device";
+    }
+    if !server.history_needs_account() {
+        return "Server history";
+    }
+    if server.may_try(0, nuschl_core::model::permission::SELF_REGISTER) {
+        HISTORY_FOR_ACCOUNTS_HOW
+    } else {
+        HISTORY_FOR_ACCOUNTS
+    }
 }
 
 /// Where local history starts: nothing older was seen on this device.
@@ -3026,11 +3043,7 @@ fn entry_label(
         if channel.timeline.next_before.is_some() {
             return Some("Older messages".into());
         }
-        let source = if server.archived(channel) {
-            "Server history"
-        } else {
-            "Local history, messages seen on this device"
-        };
+        let source = history_line(server, channel);
         let start = match (channel.timeline.beginning, server.archived(channel)) {
             (true, true) => ". Beginning of server history",
             (true, false) => ". Beginning of local history",

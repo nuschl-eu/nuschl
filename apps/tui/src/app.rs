@@ -231,6 +231,8 @@ pub struct App {
     registered: BTreeSet<String>,
     /// Local history failed and has not said it works again.
     local_history_failed: bool,
+    /// Servers that already said their history is for registered people.
+    guest_history_noted: BTreeSet<String>,
     requests: u64,
     /// The requested voice bitrate (`/bitrate`).
     pub bitrate: Bitrate,
@@ -264,6 +266,7 @@ impl App {
             prompted: BTreeSet::new(),
             registered: BTreeSet::new(),
             local_history_failed: false,
+            guest_history_noted: BTreeSet::new(),
             requests: 0,
             bitrate: Bitrate::default(),
         }
@@ -411,21 +414,35 @@ impl App {
                 }
             }
         }
+        let mut notes = Vec::new();
         for index in 0..self.client.servers.len() {
             let server = &self.client.servers[index];
             let registered = server.own_user_id().is_some();
             let id = server.id.clone();
             if registered && self.registered.insert(id.clone()) {
-                let text = format!(
-                    "You are registered on {} as {}.",
-                    server.name, server.bookmark.username
-                );
                 if server.status == Status::Connected {
-                    self.say(text);
+                    notes.push(format!(
+                        "You are registered on {} as {}.",
+                        server.name, server.bookmark.username
+                    ));
                 }
             } else if !registered && server.status == Status::Connected {
                 self.registered.remove(&id);
             }
+            // A guest hears once per server how the server keeps its history.
+            if server.history_needs_account() && !self.guest_history_noted.contains(&id) {
+                let may_register = server.may_try(0, nuschl_core::model::permission::SELF_REGISTER);
+                let history = nuschl_client::server::HISTORY_FOR_ACCOUNTS;
+                notes.push(if may_register {
+                    format!("{}: {history}: /register.", server.name)
+                } else {
+                    format!("{}: {history}.", server.name)
+                });
+                self.guest_history_noted.insert(id);
+            }
+        }
+        for text in notes {
+            self.say(text);
         }
         self.prompted.retain(|id| {
             self.client
@@ -433,6 +450,8 @@ impl App {
                 .iter()
                 .any(|server| &server.id == id && server.certificate.is_some())
         });
+        self.guest_history_noted
+            .retain(|id| self.client.servers.iter().any(|server| &server.id == id));
         self.follow();
     }
 
@@ -522,21 +541,8 @@ impl App {
                     _ => {}
                 },
                 Update::HistoryFailed(error) => {
-                    let guest = self.selected().is_some_and(|(server, _)| {
-                        let server = &self.client.servers[server];
-                        server.status == Status::Connected && server.own_user_id().is_none()
-                    });
-                    if error.starts_with("Server history") && guest {
-                        // nuschld keeps its history for registered people
-                        // unless it lets guests read it.
-                        self.warn(format!(
-                            "{error} This server may show its history to registered people \
-                             only: /register registers your name."
-                        ));
-                    } else {
-                        self.local_history_failed |= error.starts_with("Local history");
-                        self.warn(error);
-                    }
+                    self.local_history_failed |= error.starts_with("Local history");
+                    self.warn(error);
                 }
                 Update::HistoryRecovered => {
                     if std::mem::take(&mut self.local_history_failed) {

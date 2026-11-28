@@ -1285,6 +1285,13 @@ impl Client {
         };
         // Stock direct messages on a Nuschl server are local observations.
         let archived = server.archived(&server.channels[position]);
+        // Our own user state arrives after the channel tree, and a guest the
+        // server keeps its history from reads none:
+        // `ServerState::may_read_history` decides, and `server_event` asks for
+        // the page once we are known.
+        if archived && !server.may_read_history() {
+            return Ok(());
+        }
         let source = server.history_source;
         let channel = &mut server.channels[position];
         channel.timeline.loading = true;
@@ -2785,6 +2792,10 @@ impl Client {
                 | ServerEvent::ChannelInfo { .. }
                 | ServerEvent::DirectList(_)
         );
+        let known_before = self.servers[index]
+            .own_session
+            .is_some_and(|session| self.servers[index].users.contains_key(&session));
+        let was_registered = self.servers[index].own_user_id().is_some();
         let fresh_directs: Vec<_> = match &event {
             ServerEvent::DirectList(directs) => directs
                 .iter()
@@ -3353,7 +3364,17 @@ impl Client {
         if server.status == Status::Connected && server.speech_blocked().is_some() {
             self.hold_voice(index);
         }
-        if refresh_history {
+        // Our own user state arrives after the channel tree, so the first page
+        // of an open conversation, and a recovery, are asked for once it names
+        // us and once it carries our registration number; a session the server
+        // keeps its history from asks for nothing
+        // (`ServerState::may_read_history`).
+        let named = self.servers[index]
+            .own_session
+            .is_some_and(|session| self.servers[index].users.contains_key(&session))
+            && !known_before;
+        let registered = !was_registered && self.servers[index].own_user_id().is_some();
+        if refresh_history || named || registered {
             let server = &mut self.servers[index];
             for progress in server.history_progress.values_mut() {
                 if fresh_directs.contains(&progress.conversation) {
@@ -3362,9 +3383,24 @@ impl Client {
             }
             if let Some((selected, position)) = self.selected_indices()
                 && selected == index
-                && let Err(error) = self.resume_history(index, position, false)
             {
-                self.updates.push(Update::HistoryFailed(error));
+                if let Err(error) = self.resume_history(index, position, false) {
+                    self.updates.push(Update::HistoryFailed(error));
+                }
+                // A conversation whose newest page was never asked for (no
+                // recovery in progress) asks for it now.
+                let fresh = {
+                    let server = &self.servers[index];
+                    let channel = &server.channels[position];
+                    server.archived(channel)
+                        && !channel.timeline.loaded
+                        && !channel.timeline.loading
+                        && channel.timeline.next_after.is_none()
+                        && !server.history_progress.contains_key(&channel.id)
+                };
+                if fresh && let Err(error) = self.load_history(None) {
+                    self.updates.push(Update::HistoryFailed(error));
+                }
             }
         }
         if fetch_description {
@@ -4554,6 +4590,132 @@ mod tests {
             reason: "owned permission fixture".into(),
         });
         assert!(client.servers[0].permission_queries.is_empty());
+    }
+
+    #[test]
+    fn a_guest_asks_no_server_that_keeps_its_history_for_accounts() {
+        let (mut client, recorder, id) = connected();
+        let input = |event| Input::Server {
+            server: id.clone(),
+            generation: 1,
+            event,
+        };
+        client.handle(input(ServerEvent::Negotiated {
+            capabilities: vec!["history/1".into()],
+            policy: Some(v1::Policy {
+                guests: v1::policy::Guests::None as i32,
+                ..Default::default()
+            }),
+        }));
+        client.handle(input(ServerEvent::ChannelInfo {
+            channel: 2,
+            conversation: Some([1; 16]),
+        }));
+        recorder.pages.lock().unwrap().clear();
+        assert!(client.servers[0].own_user_id().is_none(), "a guest");
+        client.open(0, 2).unwrap();
+        assert!(
+            recorder.pages.lock().unwrap().is_empty(),
+            "a guest asked for a history the server keeps for accounts"
+        );
+        // Registering reads it at once, without reopening the conversation.
+        client.handle(input(ServerEvent::User(User {
+            session: 1,
+            name: "andi".into(),
+            channel: 2,
+            user_id: Some(5),
+            ..Default::default()
+        })));
+        assert_eq!(recorder.pages.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_session_reads_its_first_page_once_its_own_user_state_arrives() {
+        let (mut client, recorder, id) = connected();
+        let input = |event| Input::Server {
+            server: id.clone(),
+            generation: 1,
+            event,
+        };
+        client.handle(input(ServerEvent::Negotiated {
+            capabilities: vec!["history/1".into()],
+            policy: Some(v1::Policy {
+                guests: v1::policy::Guests::None as i32,
+                ..Default::default()
+            }),
+        }));
+        client.handle(input(ServerEvent::ChannelInfo {
+            channel: 2,
+            conversation: Some([1; 16]),
+        }));
+        // The channel tree arrives before our own user state, so nothing is
+        // asked for yet, whoever we turn out to be.
+        client.servers[0].users.remove(&1);
+        recorder.pages.lock().unwrap().clear();
+        assert!(!client.servers[0].may_read_history(), "not named yet");
+        client.open(0, 2).unwrap();
+        assert!(recorder.pages.lock().unwrap().is_empty());
+        // A registered account's page arrives with its user state.
+        client.handle(input(ServerEvent::User(User {
+            session: 1,
+            name: "andi".into(),
+            channel: 2,
+            user_id: Some(5),
+            ..Default::default()
+        })));
+        let pages = recorder.pages.lock().unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].1.owner.as_ref().and_then(|owner| owner.archive),
+            Some([1; 16])
+        );
+    }
+
+    #[test]
+    fn a_first_page_follows_the_servers_order_tree_then_users_then_sync() {
+        let (mut client, recorder, id) = connected();
+        // A fresh connection: nothing of this session is known yet.
+        client.servers[0].own_session = None;
+        client.servers[0].users.clear();
+        client.servers[0].status = Status::Connecting;
+        let input = |event| Input::Server {
+            server: id.clone(),
+            generation: 1,
+            event,
+        };
+        client.handle(input(ServerEvent::Negotiated {
+            capabilities: vec!["history/1".into()],
+            policy: Some(v1::Policy {
+                guests: v1::policy::Guests::None as i32,
+                ..Default::default()
+            }),
+        }));
+        client.handle(input(ServerEvent::ChannelInfo {
+            channel: 2,
+            conversation: Some([1; 16]),
+        }));
+        // The app browses the remembered conversation before it connects.
+        client.open(0, 2).unwrap();
+        recorder.pages.lock().unwrap().clear();
+        assert!(recorder.pages.lock().unwrap().is_empty(), "asked too early");
+        client.handle(input(ServerEvent::User(User {
+            session: 1,
+            name: "andi".into(),
+            channel: 2,
+            user_id: Some(5),
+            ..Default::default()
+        })));
+        assert!(
+            recorder.pages.lock().unwrap().is_empty(),
+            "asked before the sync named our session"
+        );
+        client.handle(input(ServerEvent::Connected { session: 1 }));
+        let pages = recorder.pages.lock().unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].1.owner.as_ref().and_then(|owner| owner.archive),
+            Some([1; 16])
+        );
     }
 
     #[test]
@@ -6395,7 +6557,11 @@ mod tests {
             generation: 1,
             event: ServerEvent::Negotiated {
                 capabilities: vec!["history/1".into()],
-                policy: None,
+                // This session is a guest: the server serves it history.
+                policy: Some(v1::Policy {
+                    guests: v1::policy::Guests::Full as i32,
+                    ..Default::default()
+                }),
             },
         });
         client.handle(Input::Server {
@@ -6439,11 +6605,25 @@ mod tests {
                 conversation: Some([2; 16]),
             },
         };
+        // Our own user state, as the server sends it: after the channel tree
+        // and before the sync, on every connection.
+        let ourselves = || Input::Server {
+            server: id.into(),
+            generation: 1,
+            event: ServerEvent::User(User {
+                session: 1,
+                name: "andi".into(),
+                channel: 2,
+                ..Default::default()
+            }),
+        };
         if connected_first {
             client.handle(connected());
             client.handle(named());
+            client.handle(ourselves());
         } else {
             client.handle(named());
+            client.handle(ourselves());
             client.handle(connected());
         }
     }

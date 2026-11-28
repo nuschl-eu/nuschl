@@ -566,14 +566,11 @@ class Run:
         self.start_bob()
         self.start_ada()
         until(lambda: self.ada_session(), "Bob to see Ada", 20, (self.ada,))
-        # Guests read no history: the page Ada asked for before registering
-        # was refused. Reopened as a registered member, Lobby loads from the
-        # server, so every loss below starts from a loaded timeline.
+        # Guests read no history, so Ada asks for no page before registering.
+        # Registering loads Lobby's history from the server; reopening prints
+        # it in order, so every loss below starts from a loaded timeline.
         refused = "Server history:"
-        if refused in self.ada.output:
-            self.checks.note("Ada's first Lobby page, asked for before /register, was refused (guests read no "
-                             "history); registering does not reload the open conversation until it is reopened: "
-                             + next(l for l in text_lines(self.ada.output) if refused in l))
+        assert refused not in self.ada.output, text_lines(self.ada.output)
         offset = len(self.ada.output)
         self.reopen_lobby()
         assert refused not in self.ada.output[offset:], text_lines(self.ada.output[offset:])

@@ -214,6 +214,9 @@ messages your device saw, not those sent while you were offline.
 
 On a Nuschl server, history comes from the server: all of it that you may read,
 including messages from before you joined, fetched in bounded pages as you scroll.
+A guest reads it where the server offers history to guests
+(`history.guests = "full"`). Where the server keeps it for registered accounts, the
+conversation says so, and registering your name loads it.
 Pages you fetched are kept on your device by their sequence number for offline
 reading and search: edits overwrite them, deleted messages stay as tombstones
 without text.
