@@ -227,6 +227,41 @@ message Message {
   // With MLS_APPLICATION: the archive record the sender sealed under the
   // conversation's history key (docs/e2ee.md §6.6), for members who join later.
   bytes archive = 14;
+  // The carried preview of this message (docs/link-previews.md). Typed and
+  // bounded; a receiver never fetches what it names. It travels with the text
+  // through edits, deletion and history pages.
+  Preview preview = 15;
+}
+
+// A preview the sender fetched, carried for whoever may read the message. Every
+// field is inert data: a URL to show, text to display and image bytes for the
+// content worker.
+message Preview {
+  uint32 version = 1;
+  Provider provider = 2;
+  // The sender's actual URL, canonicalized; never a redirect target.
+  string url = 3;
+  string title = 4;
+  string description = 5;
+  Image image = 6;
+
+  enum Provider {
+    OPEN_GRAPH_V1 = 0;
+  }
+
+  message Image {
+    Mime mime = 1;
+    // Encoded PNG or JPEG bytes, at most 32 KiB; never pixels, never a URL.
+    bytes data = 2;
+    uint32 width = 3;
+    uint32 height = 4;
+    string alt = 5;
+
+    enum Mime {
+      PNG = 0;
+      JPEG = 1;
+    }
+  }
 }
 
 // 0x4E01 -> ChatAck or Error.
@@ -239,6 +274,9 @@ message ChatSend {
   string content = 5;
   // A `seq` in the same conversation, at most its head; 0 for none.
   uint64 reply_to = 6;
+  // The preview the sender fetched for this text (docs/link-previews.md). Only a
+  // Nuschl server carries it; a stock server gets the legacy HTML projection.
+  Preview preview = 7;
 }
 
 // 0x4E02, once the message (or edit, deletion) is durably stored.

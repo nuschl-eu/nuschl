@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 aes = "0.8"
+# The carried preview value its wire message converts to (docs/link-previews.md).
+nuschl-core.workspace = true
 bytes = "1.12.1"
 hex = "0.4.3"
 prost = "0.14.4"

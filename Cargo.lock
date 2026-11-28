@@ -7849,6 +7849,7 @@ dependencies = [
  "aes 0.8.4",
  "bytes",
  "hex",
+ "nuschl-core",
  "prost",
  "prost-build",
  "semver",
@@ -7975,6 +7976,7 @@ version = "0.3.0"
 dependencies = [
  "clap",
  "landlock",
+ "nuschl-core",
  "nuschl-ipc",
  "nuschl-sandbox-windows",
  "nuschl-storage",

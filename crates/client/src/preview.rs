@@ -430,6 +430,28 @@ impl Client {
         }
     }
 
+    /// The carried preview to send on a Nuschl conversation, bound to the
+    /// draft the composer shows for this exact text.
+    pub(crate) fn link_preview_card(
+        &self,
+        body: &str,
+    ) -> Option<(Context, u64, nuschl_core::preview::Preview)> {
+        let source = self.previews.current.as_ref()?;
+        let (context, connection, carry) = self.preview_destination()?;
+        if context != source.context
+            || connection != source.connection
+            || carry.is_err()
+            || source.text != body
+        {
+            return None;
+        }
+        let card = self.previews.drafts.for_send(source.draft())?;
+        self.previews
+            .drafts
+            .submission_token(&context, connection, body)?;
+        Some((context, connection, card.to_preview()))
+    }
+
     pub(crate) fn link_preview_submission(&self, body: &str) -> Option<(Context, SubmissionToken)> {
         let current = self.previews.current.as_ref()?;
         let (context, connection, _) = self.preview_destination()?;
@@ -461,6 +483,25 @@ impl Client {
         self.cancel_preview(cancel);
         self.previews.revision = self.previews.revision.saturating_add(1);
         true
+    }
+}
+
+/// A carried preview rendered as the same inert card the sender's projection
+/// produces, for a message whose text arrived typed (docs/link-previews.md).
+/// `None` when the card cannot be shown, so the text alone is displayed. The
+/// receiver's own display is not bound by a server's message limits: the
+/// carried value's bounds already apply.
+pub fn carried_card_html(body: &str, preview: &nuschl_core::preview::Preview) -> Option<String> {
+    let card = Card::from_preview(preview).ok()?;
+    let limits = nuschl_core::model::ServerLimits {
+        allow_html: true,
+        message_length: 0,
+        image_message_length: 0,
+        ..nuschl_core::model::ServerLimits::default()
+    };
+    match projection::project(body, &card, &limits) {
+        Projection::Card { html, .. } => Some(html),
+        Projection::TextOnly(_) => None,
     }
 }
 

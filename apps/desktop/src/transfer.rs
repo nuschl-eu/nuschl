@@ -665,6 +665,7 @@ impl Desktop {
             Command::SendText {
                 target,
                 body: message.text,
+                preview: None,
                 expected_peer,
             }
         };

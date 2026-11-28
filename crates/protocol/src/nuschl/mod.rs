@@ -12,6 +12,7 @@ pub mod v1 {
     mod redacted;
 }
 
+pub mod preview_wire;
 pub mod version;
 
 use v1::error::Code;
@@ -136,6 +137,11 @@ pub mod kind {
 pub const MAX_OUTSTANDING: usize = 16;
 /// Message text, in bytes of UTF-8.
 pub const MAX_CONTENT_BYTES: usize = 64 * 1024;
+/// A carried preview in `ChatSend` and `Message`: a 2 KiB URL, a 512-byte
+/// title, a 2 KiB description, a 512-byte alternative text, a 32 KiB encoded
+/// image and the enum and length framing. `nuschl_core::preview` bounds the
+/// values themselves; `crates/session/src/preview_wire.rs` checks that.
+pub const MAX_PREVIEW_BYTES: usize = 40 * 1024;
 /// A stored stock client's message (Mumble HTML, which may carry inline
 /// images up to the server's image limit); larger ones are not stored.
 pub const MAX_LEGACY_CONTENT_BYTES: usize = 1024 * 1024;
@@ -243,7 +249,9 @@ pub fn client_limit(kind: u16) -> usize {
     use kind::*;
     match kind {
         PRIVACY => 16,
-        CHAT_SEND | CHAT_EDIT => MAX_CONTENT_BYTES + 256,
+        // A send may also carry the typed preview (docs/link-previews.md).
+        CHAT_SEND => MAX_CONTENT_BYTES + MAX_PREVIEW_BYTES + 256,
+        CHAT_EDIT => MAX_CONTENT_BYTES + 256,
         SUBSCRIBE | UNSUBSCRIBE => MAX_SUBSCRIBE_PER_MESSAGE * 18 + 32,
         HISTORY_REQUEST => 128,
         KT_PUBLISH => MAX_KT_PUBLISH_BYTES,
@@ -678,7 +686,8 @@ mod tests {
         );
         assert_eq!(required_capability(kind::CHAT_ACK), None);
         assert_eq!(required_capability(0x4eff), None);
-        assert!(client_limit(kind::CHAT_SEND) > MAX_CONTENT_BYTES);
+        assert!(client_limit(kind::CHAT_SEND) > MAX_CONTENT_BYTES + MAX_PREVIEW_BYTES);
+        assert!(client_limit(kind::CHAT_EDIT) > MAX_CONTENT_BYTES);
         assert_eq!(client_limit(kind::CHAT_ACK), 64);
         for request in [
             kind::KT_STATUS,

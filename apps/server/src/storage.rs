@@ -559,6 +559,7 @@ impl MemoryHistory {
     fn tombstone(row: &mut StoredMessage, deleted_ms: i64, reason: u32) {
         row.content.clear();
         row.reply_to = None;
+        row.preview = None;
         row.deleted_ms = Some(deleted_ms);
         row.delete_reason = Some(reason);
     }
@@ -613,6 +614,8 @@ impl MemoryHistory {
                         row.format = format;
                         row.edited_ms = Some(event.sent_ms);
                         row.edits += 1;
+                        // The card belonged to the text that was sent.
+                        row.preview = None;
                         Response::Done
                     }
                 };

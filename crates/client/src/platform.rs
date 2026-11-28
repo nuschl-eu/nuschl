@@ -24,6 +24,9 @@ pub enum Request {
     SendText {
         target: TextTarget,
         body: String,
+        /// The sender's fetched preview, carried as typed data on a Nuschl
+        /// conversation (docs/link-previews.md).
+        preview: Option<nuschl_core::preview::Preview>,
         expected_peer: Option<u64>,
     },
     /// Establish or refresh the selected encrypted conversation.

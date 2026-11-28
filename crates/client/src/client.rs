@@ -1516,13 +1516,27 @@ impl Client {
             return Err(SendError::TooLong);
         }
         let composer = matches!(destination, TextDestination::Composer(_));
-        let (preview_wire, preview) = if composer {
+        // A Nuschl conversation carries the card as typed data with the text
+        // (docs/link-previews.md). An encrypted one carries text alone until
+        // the structured MLS body exists; stock servers get the projected
+        // HTML message.
+        let typed = composer
+            && !self.servers[server].mls
+            && self.servers[server].history_source == HistorySource::ServerArchive;
+        let (preview_wire, preview) = if composer && !typed {
             (
                 self.link_preview_wire(&body),
                 self.link_preview_submission(&body),
             )
+        } else if typed {
+            (None, self.link_preview_submission(&body))
         } else {
             (None, None)
+        };
+        let carried = if typed {
+            self.link_preview_card(&body).map(|(.., preview)| preview)
+        } else {
+            None
         };
         let server = &mut self.servers[server];
         if server.status != Status::Connected {
@@ -1611,6 +1625,7 @@ impl Client {
             Request::SendText {
                 target,
                 body,
+                preview: carried,
                 expected_peer,
             }
         };
@@ -4291,6 +4306,56 @@ mod tests {
     }
 
     #[test]
+    fn a_nuschl_conversation_carries_the_card_as_typed_data_with_the_text() {
+        let (mut client, recorder, id) = connected();
+        // A negotiated history capability makes this a Nuschl conversation.
+        client.handle(Input::Server {
+            server: id.clone(),
+            generation: 1,
+            event: ServerEvent::Negotiated {
+                capabilities: vec!["history/1".into()],
+                policy: None,
+            },
+        });
+        ready_link(&mut client, &recorder);
+        recorder.requests.lock().unwrap().clear();
+        let original = "https://example.org/ ";
+        client.send_text(original.into()).unwrap();
+        assert!(
+            recorder.preview_sends.lock().unwrap().is_empty(),
+            "a typed send is not projected into one HTML message"
+        );
+        let requests = recorder.requests.lock().unwrap();
+        let [(server, Request::SendText { body, preview, .. })] = requests.as_slice() else {
+            panic!("one typed send required: {requests:?}")
+        };
+        assert_eq!(server, &id);
+        assert_eq!(body, original);
+        let preview = preview.as_ref().expect("the card rides with the text");
+        assert_eq!(preview.title, "Fixture title");
+        assert_eq!(preview.url, "https://example.org/");
+        assert!(preview.validate().is_ok());
+    }
+
+    #[test]
+    fn a_carried_card_renders_as_the_inert_projection_or_not_at_all() {
+        let preview = nuschl_core::preview::Preview {
+            version: nuschl_core::preview::VERSION,
+            provider: nuschl_core::preview::ProviderId::OpenGraphV1,
+            url: "https://example.org/".into(),
+            title: "A title".into(),
+            description: "A description".into(),
+            image: None,
+        };
+        let html = crate::preview::carried_card_html("look", &preview).expect("a card");
+        assert!(html.contains("A title"));
+        assert!(html.contains("example.org"));
+        let mut invalid = preview.clone();
+        invalid.version = 2;
+        assert_eq!(crate::preview::carried_card_html("look", &invalid), None);
+    }
+
+    #[test]
     fn preview_failure_settles_only_matching_submission_and_never_retries_text() {
         let (mut client, recorder, server) = connected();
         ready_link(&mut client, &recorder);
@@ -4701,7 +4766,7 @@ mod tests {
         );
         client.send_text("still here".into()).unwrap();
         assert!(recorder.requests.lock().unwrap().iter().any(|(_, request)| matches!(request,
-            Request::SendText { target: TextTarget::Direct(9), expected_peer: Some(11), body } if body == "still here")));
+            Request::SendText { target: TextTarget::Direct(9), expected_peer: Some(11), body, .. } if body == "still here")));
         assert_eq!(client.navigation.selection().unwrap().channel, channel);
     }
 
@@ -5253,6 +5318,7 @@ mod tests {
             Request::SendText {
                 target: TextTarget::Channel(3),
                 body: "hello".into(),
+                preview: None,
                 expected_peer: None,
             }
         )));
@@ -5425,6 +5491,7 @@ mod tests {
             Request::SendText {
                 target: TextTarget::Direct(4),
                 body: invite.clone(),
+                preview: None,
                 expected_peer: Some(10)
             },
         )));

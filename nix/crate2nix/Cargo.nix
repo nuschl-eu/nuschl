@@ -26183,6 +26183,10 @@ rec {
             packageId = "hex";
           }
           {
+            name = "nuschl-core";
+            packageId = "nuschl-core";
+          }
+          {
             name = "prost";
             packageId = "prost";
           }
@@ -26653,6 +26657,10 @@ rec {
           }
         ];
         devDependencies = [
+          {
+            name = "nuschl-core";
+            packageId = "nuschl-core";
+          }
           {
             name = "tempfile";
             packageId = "tempfile";

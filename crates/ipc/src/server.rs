@@ -156,6 +156,13 @@ pub struct StoredMessage {
     pub idempotency_key: Option<String>,
     /// SHA-256 of what the key was used for, to detect conflicting retries.
     pub body_hash: Option<String>,
+    /// The message's carried preview (docs/link-previews.md): a card the
+    /// sender fetched, stored with its message and served again in history
+    /// pages. Storage moves it; the server validates it at the wire boundary.
+    /// Written even when absent: the worker's framing is postcard, which
+    /// cannot skip a field and read the rest.
+    #[serde(default)]
+    pub preview: Option<nuschl_core::preview::Preview>,
 }
 
 impl StoredMessage {
@@ -407,7 +414,7 @@ pub async fn page<S: SeqRows>(store: &mut S, query: &PageQuery) -> Result<Stored
         }
     };
     // The byte cap: drop from the far ends, never the row nearest the anchor.
-    let size = |rows: &[StoredMessage]| rows.iter().map(|row| row.content.len()).sum::<usize>();
+    let size = |rows: &[StoredMessage]| rows.iter().map(row_bytes).sum::<usize>();
     let cap = query.max_bytes as usize;
     while size(&older) + size(&newer) > cap && older.len() + newer.len() > 1 {
         if !newer.is_empty() && (newer.len() >= older.len() || older.len() <= 1) {
@@ -429,6 +436,22 @@ pub async fn page<S: SeqRows>(store: &mut S, query: &PageQuery) -> Result<Stored
         more_before,
         more_after,
     })
+}
+
+/// What a page carries of one row: its text and its preview, which travel
+/// with it.
+fn row_bytes(row: &StoredMessage) -> usize {
+    let preview = row.preview.as_ref().map_or(0, |preview| {
+        preview.url.len()
+            + preview.title.len()
+            + preview.description.len()
+            + 64
+            + preview
+                .image
+                .as_ref()
+                .map_or(0, |image| image.data.len() + image.alt.len() + 32)
+    });
+    row.content.len() + preview
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
