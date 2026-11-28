@@ -448,15 +448,19 @@ Stock Murmur silently rate-limits these controls alongside text and Version
 messages. The session retries only the latest desired state at intervals of at
 least 1.1 seconds, with at most five automatic retries. An exhausted retry budget
 produces a notice and keeps capture blocked; a timeout never grants permission.
-The call UI invokes audio gestures before awaiting commands and serializes mute
-and deafen controls until the shared SDK's matching local-intent snapshot arrives.
-A newer gesture cannot silently restore an old capture stream.
+The call UI invokes audio gestures before awaiting commands and offers a mute or
+deafen control only while the view it would name is the current one: after a
+click it waits for a voice view whose `voice_generation` moved past the one the
+click carried, and it offers nothing while `state.voice.settling` is true. A
+click's wait ends at the latest after two seconds, so an exhausted self-state
+retry budget never locks the control. A newer gesture cannot silently restore an
+old capture stream.
 
 The worker posts `state.voice` as `null` or:
 
 ```text
 {server_id, connection_generation, voice_generation, channel_id,
- joined, muted, deafened, can_transmit}
+ joined, muted, deafened, can_transmit, settling}
 ```
 
 Generations and packet sequences are decimal strings, preserving values beyond
