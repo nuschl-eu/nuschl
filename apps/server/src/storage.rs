@@ -22,7 +22,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -32,6 +32,20 @@ use tokio::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Restarts after which the worker stays down for a cooldown: a worker that
+/// dies with every request is not started again for each of them.
+const MAX_RESTARTS: u32 = 5;
+/// How long a worker has to run before a failure counts as the first again.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
+/// The wait before the first restart; each further one doubles up to the
+/// longest.
+const FIRST_RESTART: Duration = Duration::from_secs(1);
+const LONGEST_RESTART: Duration = Duration::from_secs(30);
+/// After the budget is spent, one more start is tried after this long, so a
+/// cause that clears (a released lock, a restored database file) recovers.
+const COOLDOWN: Duration = Duration::from_mins(5);
+/// Added to a wait, so supervisors that fail together do not start together.
+const JITTER: Duration = Duration::from_millis(500);
 
 enum Job {
     Write(Request),
@@ -310,6 +324,7 @@ async fn run(
     failures: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut worker: Option<Worker> = None;
+    let mut restarts = Restarts::default();
     let mut request_id = 0_u64;
     while let Some(job) = jobs.recv().await {
         let (request, reply) = match job {
@@ -338,32 +353,53 @@ async fn run(
                 path,
             } => {
                 let url = matches!(backend, Backend::UrlFile { .. });
-                // One retry with a fresh worker if it died.
+                // A worker that keeps dying waits out its budget instead of
+                // being started again for this request.
+                if worker.is_none() && restarts.may_start(Instant::now()) {
+                    match Worker::spawn(executable, path, url, lock) {
+                        Ok(spawned) => {
+                            restarts.started(Instant::now());
+                            worker = Some(spawned);
+                        }
+                        Err(error) => {
+                            let wait = restarts.failed(Instant::now());
+                            tracing::error!(
+                                %error,
+                                in_seconds = wait.as_secs(),
+                                "cannot start the storage worker"
+                            );
+                        }
+                    }
+                }
                 let mut response = None;
-                for _ in 0..2 {
-                    if worker.is_none() {
-                        match Worker::spawn(executable, path, url, lock) {
-                            Ok(spawned) => worker = Some(spawned),
-                            Err(error) => {
-                                tracing::error!(%error, "cannot start the storage worker");
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                continue;
-                            }
-                        }
-                    }
-                    let Some(current) = worker.as_mut() else {
-                        continue;
-                    };
+                if let Some(current) = worker.as_mut() {
                     request_id += 1;
-                    match timeout(REQUEST_TIMEOUT, current.exchange(request_id, &request)).await {
-                        Ok(Ok(answer)) => {
-                            response = Some(answer);
-                            break;
+                    let attempt = timeout(REQUEST_TIMEOUT, current.exchange(request_id, &request));
+                    match attempt.await {
+                        Ok(Ok(answer)) => response = Some(answer),
+                        Ok(Err(error)) => {
+                            let wait = restarts.failed(Instant::now());
+                            tracing::error!(
+                                %error,
+                                in_seconds = wait.as_secs(),
+                                "storage worker failed"
+                            );
                         }
-                        Ok(Err(error)) => tracing::error!(%error, "storage worker failed"),
-                        Err(_) => tracing::error!("storage worker timed out"),
+                        Err(_) => {
+                            let wait = restarts.failed(Instant::now());
+                            tracing::error!(
+                                in_seconds = wait.as_secs(),
+                                "storage worker timed out"
+                            );
+                        }
                     }
-                    worker = None;
+                    if response.is_none()
+                        && let Some(retired) = worker.take()
+                    {
+                        // Reaped here, before the budget allows a replacement:
+                        // the next worker starts on a database this one let go.
+                        retired.stop().await;
+                    }
                 }
                 response
             }
@@ -385,12 +421,66 @@ async fn run(
     }
 }
 
+/// The wait before the storage worker's next start, and when it stops being
+/// started at all: a worker that dies with every request would otherwise be
+/// respawned for each of them.
+#[derive(Default)]
+struct Restarts {
+    /// Failures since the worker last ran a healthy length of time.
+    failures: u32,
+    /// The worker may not start before this.
+    not_before: Option<Instant>,
+    /// When the current worker started.
+    started: Option<Instant>,
+}
+
+impl Restarts {
+    /// The worker started at `now`; a run of [`HEALTHY_RUN`] makes a later
+    /// failure count as the first again.
+    fn started(&mut self, now: Instant) {
+        self.started = Some(now);
+    }
+
+    /// The worker failed at `now`: how long before it may start again. Once
+    /// the budget is spent, it waits a cooldown and then tries once more, so a
+    /// cause that clears recovers without a restart of the server.
+    fn failed(&mut self, now: Instant) -> Duration {
+        if self
+            .started
+            .is_some_and(|started| now.duration_since(started) >= HEALTHY_RUN)
+        {
+            self.failures = 0;
+        }
+        self.started = None;
+        self.failures = self.failures.saturating_add(1);
+        let wait = if self.failures > MAX_RESTARTS {
+            COOLDOWN
+        } else {
+            (FIRST_RESTART * 2_u32.pow(self.failures - 1)).min(LONGEST_RESTART)
+        } + jitter();
+        self.not_before = Some(now + wait);
+        wait
+    }
+
+    /// Whether the worker may start at `now`.
+    fn may_start(&self, now: Instant) -> bool {
+        self.not_before.is_none_or(|at| now >= at)
+    }
+}
+
+/// Spread the restarts of supervisors whose worker fails at the same time.
+fn jitter() -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    Duration::from_nanos(u64::from(nanos) % JITTER.as_nanos() as u64)
+}
+
 struct Worker {
-    _child: Child,
+    child: Child,
     input: ChildStdin,
     output: ChildStdout,
 }
-
 impl Worker {
     fn spawn(
         executable: &PathBuf,
@@ -425,10 +515,17 @@ impl Worker {
             .take()
             .ok_or_else(|| std::io::Error::other("worker stdout missing"))?;
         Ok(Self {
-            _child: child,
+            child,
             input,
             output,
         })
+    }
+
+    /// Kill the worker and reap it: the replacement starts once this process
+    /// is gone, which its open pipes would otherwise outlive.
+    async fn stop(mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
     }
 
     async fn exchange(&mut self, id: u64, request: &Request) -> std::io::Result<Response> {
@@ -965,5 +1062,63 @@ impl MemoryStore {
             }
             history => self.history.apply(history),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COOLDOWN, FIRST_RESTART, HEALTHY_RUN, JITTER, Restarts};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn each_restart_waits_longer_until_the_budget_is_spent() {
+        let mut restarts = Restarts::default();
+        let now = Instant::now();
+        // Jitter stays under a second, so whole seconds are the schedule.
+        let waits: Vec<u64> = (0..6).map(|_| restarts.failed(now).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 300]);
+        // The spent budget waits a cooldown before it tries once more.
+        assert!(!restarts.may_start(now));
+        assert!(restarts.may_start(now + COOLDOWN + JITTER));
+    }
+
+    #[test]
+    fn a_worker_may_start_at_once_until_it_fails() {
+        let mut restarts = Restarts::default();
+        let now = Instant::now();
+        assert!(restarts.may_start(now));
+        restarts.failed(now);
+        assert!(!restarts.may_start(now));
+        assert!(restarts.may_start(now + FIRST_RESTART + JITTER));
+    }
+
+    #[test]
+    fn a_long_run_resets_the_budget_and_a_short_one_does_not() {
+        let now = Instant::now();
+        let mut restarts = Restarts::default();
+        restarts.failed(now);
+        restarts.started(now);
+        assert_eq!(
+            restarts.failed(now + HEALTHY_RUN).as_secs(),
+            1,
+            "a worker that ran for a minute is trusted with the database again"
+        );
+        let mut restarts = Restarts::default();
+        restarts.failed(now);
+        restarts.started(now);
+        assert_eq!(
+            restarts.failed(now + Duration::from_secs(30)).as_secs(),
+            2,
+            "a worker that died before a minute counts against the budget"
+        );
+    }
+
+    #[test]
+    fn jitter_spreads_the_wait_within_a_second() {
+        let mut restarts = Restarts::default();
+        let now = Instant::now();
+        let wait = restarts.failed(now);
+        assert!(wait >= FIRST_RESTART && wait < FIRST_RESTART + JITTER);
+        assert_eq!(JITTER, Duration::from_millis(500));
     }
 }
