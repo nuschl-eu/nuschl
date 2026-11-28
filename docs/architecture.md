@@ -130,6 +130,14 @@ its configured database and that database's credential. No worker request can se
 another database or execute SQL. Keep database credentials outside command lines and
 Nix store values; the server module uses systemd LoadCredential.
 
+`nuschld` kills and reaps a failed or timed-out storage worker before it starts
+another, so the next one opens a database the previous process let go. It starts the
+worker again after a failed request, waiting 1, 2, 4, 8 and 16 seconds between
+attempts; a worker that ran for a minute before it failed counts as the first again.
+After five restarts in a row the worker stays down and one more start is tried after
+five minutes, so a crash loop costs the requests it touches instead of a fresh process
+for each of them. A request that found no worker fails and is logged as not persisted.
+
 ## Audio configuration and recovery
 
 Audio policy operates on observations of the selected capture and playback path.
