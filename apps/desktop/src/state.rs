@@ -193,6 +193,9 @@ pub struct Desktop {
     pub ui: BTreeMap<String, ServerUi>,
     /// What drawing derives from the timelines' messages (presentation.rs).
     pub presentation: crate::presentation::Presentation,
+    /// Servers whose connection should bring its joined channel into view
+    /// (#600): set while a connect is recent, cleared by browsing.
+    follow_join: BTreeSet<String>,
     pub history_enabled: bool,
     /// The native driver (the client's platform), for what the client does
     /// not model yet: administration, identities, settings, push-to-talk.
@@ -534,6 +537,7 @@ impl Desktop {
             client,
             ui,
             presentation: Default::default(),
+            follow_join: BTreeSet::new(),
             history_enabled: true,
             notes: crate::notify::start(&handle),
             driver,
@@ -878,6 +882,10 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(server) = self.client.servers.get(index) {
+            // A conversation the user opened wins over the one a connect joins.
+            self.follow_join.remove(&server.id);
+        }
         if let Some(selected) = self.client.navigation.selection().cloned() {
             // An edit in progress ends; what it replaced is the draft.
             let draft = self
@@ -1393,6 +1401,9 @@ impl Desktop {
     /// Connect self-muted; automatic connections at startup are deafened too,
     /// so nobody hears a session that began without the user present.
     fn connect_as(&mut self, index: usize, password: Option<String>, deafened: bool) {
+        if let Some(server) = self.client.servers.get(index) {
+            self.follow_join.insert(server.id.clone());
+        }
         self.client.connect(index, password, deafened);
     }
     /// The user's explicit reset of a server's sticky security record, then
@@ -2985,6 +2996,42 @@ impl Desktop {
         let (profile, writes) = (self.profile.clone(), self.server_writes.clone());
         move || writes.write(&profile, generation, &servers)
     }
+    /// Bring the channel a connection joined into view, once the server has us
+    /// in it (#600). A conversation the user opened meanwhile wins.
+    fn show_joined_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.follow_join.is_empty() {
+            return;
+        }
+        self.follow_join.retain(|id| {
+            self.client
+                .servers
+                .iter()
+                .any(|server| &server.id == id && server.status != Status::Disconnected)
+        });
+        let mut joined = Vec::new();
+        for server in &self.client.servers {
+            if !self.follow_join.contains(&server.id) {
+                continue;
+            }
+            let selected = self
+                .client
+                .navigation
+                .selection()
+                .filter(|selection| selection.server == server.id)
+                .map(|selection| selection.channel);
+            if let Some(channel) = followed_channel(server, selected) {
+                joined.push((server.id.clone(), channel, selected != Some(channel)));
+            }
+        }
+        for (server, channel, browse) in joined {
+            self.follow_join.remove(&server);
+            if let Some(index) = self.client.server_index(&server)
+                && browse
+            {
+                self.browse_channel(index, channel, window, cx);
+            }
+        }
+    }
     pub fn reconcile_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((index, kind, reason)) = self.pending_retry.take()
             && index < self.client.servers.len()
@@ -3016,6 +3063,7 @@ impl Desktop {
         {
             self.browse_channel(index, channel, window, cx);
         }
+        self.show_joined_channel(window, cx);
         if self.selected_indices().is_none() && !self.client.servers.is_empty() {
             let index = self
                 .client
@@ -3031,6 +3079,23 @@ impl Desktop {
             self.browse_server(index, window, cx);
         }
     }
+}
+
+/// The channel a connection shows on its own: the one the server joined us to,
+/// while the open conversation is still the root the server was browsed at.
+fn followed_channel(server: &ServerView, selected: Option<u32>) -> Option<u32> {
+    let joined = server
+        .own_session
+        .and_then(|session| server.users.get(&session))?
+        .channel;
+    if selected.is_some_and(|selected| selected != 0 && selected != joined) {
+        return None;
+    }
+    server
+        .channels
+        .iter()
+        .any(|channel| channel.id == joined)
+        .then_some(joined)
 }
 
 /// Keep the volumes and mutes of users without a certificate while a server
@@ -3103,5 +3168,51 @@ mod server_writes_tests {
         writes.write(&profile, 3, &[]).unwrap();
         assert!(profile.load_servers(None).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::{ServerView, followed_channel};
+    use nuschl_core::bookmark::CachedChannel;
+    use nuschl_session::{config::ServerBookmark, connection::User};
+
+    /// A server that cached the root and `Lounge`, with us in `joined`.
+    fn server_in(joined: Option<u32>) -> ServerView {
+        let mut bookmark = ServerBookmark::new("Hackspace", "localhost", 64738, "andi").unwrap();
+        bookmark.cached_channels = vec![CachedChannel {
+            id: 5,
+            parent: Some(0),
+            name: "Lounge".into(),
+            position: 1,
+        }];
+        let mut server = ServerView::new(bookmark);
+        if let Some(channel) = joined {
+            server.own_session = Some(1);
+            server.users.insert(
+                1,
+                User {
+                    session: 1,
+                    channel,
+                    ..User::default()
+                },
+            );
+        }
+        server
+    }
+
+    #[test]
+    fn a_join_into_a_cached_channel_is_shown_while_the_root_is_open() {
+        let server = server_in(Some(5));
+        assert_eq!(followed_channel(&server, None), Some(5));
+        assert_eq!(followed_channel(&server, Some(0)), Some(5));
+        // Once it is open there is nothing left to do, and a conversation the
+        // user opened meanwhile wins.
+        assert_eq!(followed_channel(&server, Some(5)), Some(5));
+        assert_eq!(followed_channel(&server, Some(7)), None);
+        // A server that joined us nowhere yet, or into a channel its tree does
+        // not know, changes nothing.
+        assert_eq!(followed_channel(&server_in(None), Some(0)), None);
+        assert_eq!(followed_channel(&server_in(Some(9)), Some(0)), None);
     }
 }
