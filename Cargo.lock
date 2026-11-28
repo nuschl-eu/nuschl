@@ -8062,6 +8062,7 @@ dependencies = [
  "blocking",
  "futures",
  "magic-wormhole",
+ "nuschl-core",
  "nuschl-ipc",
  "nuschl-sandbox-windows",
 ]

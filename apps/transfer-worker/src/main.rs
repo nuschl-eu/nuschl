@@ -8,7 +8,6 @@
 //! neither chooses a path.
 
 use std::{
-    borrow::Cow,
     cell::Cell,
     fs::File,
     io,
@@ -32,13 +31,9 @@ use magic_wormhole::{
 use nuschl_ipc::{
     Envelope, TransferEvent, TransferRequest, WormholeServers, read_frame, write_frame,
 };
-
-/// Pickups of one offer that run at once; the next code waits for a free slot.
-const MAX_PICKUPS: usize = 4;
-/// Received bytes per `Data` event.
-const CHUNK: usize = 256 * 1024;
-/// Words in a code ("7-guitarist-revenge"), as other wormhole clients make them.
-const CODE_WORDS: usize = 2;
+use nuschl_transfer_worker::{
+    Budget, CHUNK, CODE_WORDS, MAX_PICKUPS, Throttle, abilities, config, relay_hints, retry_delay,
+};
 
 /// Resolves once the supervisor cancels or goes away.
 type Cancel = Shared<BoxFuture<'static, ()>>;
@@ -132,8 +127,7 @@ async fn offer(
             // waits longer each time, so the conversation does not fill up
             // with fresh codes.
             if failures > 0 {
-                let seconds = 5_u64 << failures.min(6);
-                async_io::Timer::after(Duration::from_secs(seconds)).await;
+                async_io::Timer::after(retry_delay(failures)).await;
             }
             let connected = async {
                 let mailbox = MailboxConnection::create(config(&servers), CODE_WORDS).await?;
@@ -257,7 +251,9 @@ async fn receive(
         let _ = request.reject().await;
         return Err("The file is larger than its offer said.".into());
     }
-    let name = request.file_name().chars().take(1024).collect();
+    // The other side supplies this text: word it as Nuschl shows every file
+    // name, without control or text-direction characters.
+    let name = nuschl_core::transfer::display_name(&request.file_name());
     emit(TransferEvent::Started {
         peer: 0,
         name,
@@ -265,13 +261,13 @@ async fn receive(
     });
     let mut sink = Sink {
         buffer: Vec::with_capacity(CHUNK),
-        remaining: size,
+        budget: Budget::new(size),
     };
     request
         .accept(|_| {}, progress(0), &mut sink, cancel)
         .await
         .map_err(|error| failure(&error))?;
-    if sink.remaining > 0 {
+    if !sink.budget.complete() {
         return Err("Cancelled.".into());
     }
     emit(TransferEvent::Done { peer: 0 });
@@ -281,7 +277,7 @@ async fn receive(
 /// Received bytes on their way to the supervisor, never more than announced.
 struct Sink {
     buffer: Vec<u8>,
-    remaining: u64,
+    budget: Budget,
 }
 
 impl Sink {
@@ -301,10 +297,9 @@ impl AsyncWrite for Sink {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let Some(remaining) = this.remaining.checked_sub(bytes.len() as u64) else {
-            return Poll::Ready(Err(io::Error::other("more data than the offer announced")));
-        };
-        this.remaining = remaining;
+        if let Err(reason) = this.budget.take(bytes.len()) {
+            return Poll::Ready(Err(io::Error::other(reason)));
+        }
         this.buffer.extend_from_slice(bytes);
         if this.buffer.len() >= CHUNK {
             this.send();
@@ -324,33 +319,11 @@ impl AsyncWrite for Sink {
 
 /// Progress about four times a second, and at the end.
 fn progress(peer: u32) -> impl FnMut(u64, u64) + 'static {
-    let mut last: Option<Instant> = None;
+    let mut throttle = Throttle::default();
     move |done, total| {
-        if done == total || last.is_none_or(|at| at.elapsed() >= Duration::from_millis(250)) {
-            last = Some(Instant::now());
+        if throttle.admit(done, total, Instant::now()) {
             emit(TransferEvent::Progress { peer, done, total });
         }
-    }
-}
-
-fn config(servers: &WormholeServers) -> magic_wormhole::AppConfig<transfer::AppVersion> {
-    transfer::APP_CONFIG.rendezvous_url(Cow::Owned(servers.rendezvous.clone()))
-}
-
-fn relay_hints(servers: &WormholeServers) -> Result<Vec<transit::RelayHint>, String> {
-    let url = servers
-        .relay
-        .parse()
-        .map_err(|_| "The transit relay address is invalid.")?;
-    let hint = transit::RelayHint::from_urls(None, [url]).map_err(|error| error.to_string())?;
-    Ok(vec![hint])
-}
-
-fn abilities(servers: &WormholeServers) -> transit::Abilities {
-    if servers.direct {
-        transit::Abilities::ALL
-    } else {
-        transit::Abilities::FORCE_RELAY
     }
 }
 
