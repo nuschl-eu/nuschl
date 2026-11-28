@@ -185,6 +185,46 @@ struct Outgoing {
     choice: crate::attachments::Choice,
 }
 
+/// One dialog's scrolling: its handle, and the easing a wheel run gives it.
+#[derive(Default)]
+struct DialogScroll {
+    handle: ScrollHandle,
+    motion: SmoothScroll,
+}
+
+/// The dialogs' scrolling, by dialog id. A dialog that stays behind keeps its
+/// own handle and easing; a dialog the last frame did not draw starts at the
+/// top when it comes to the front.
+#[derive(Default)]
+struct DialogScrolls {
+    by_id: BTreeMap<&'static str, DialogScroll>,
+    /// The ids the last frame drew, and the ids this frame has drawn so far.
+    drawn: BTreeSet<&'static str>,
+    drawing: BTreeSet<&'static str>,
+}
+
+impl DialogScrolls {
+    /// The scrolling of the dialog `id` for this frame.
+    fn open(&mut self, id: &'static str) -> ScrollHandle {
+        let fresh = !self.drawn.contains(id);
+        let dialog = self.by_id.entry(id).or_default();
+        if fresh {
+            dialog.handle.set_offset(point(px(0.), px(0.)));
+        }
+        self.drawing.insert(id);
+        dialog.handle.clone()
+    }
+    /// Whether the last frame drew the dialog `id`.
+    fn drawn_before(&self, id: &'static str) -> bool {
+        self.drawn.contains(id)
+    }
+    /// What this frame drew becomes what the last frame drew.
+    fn settle(&mut self) {
+        std::mem::swap(&mut self.drawn, &mut self.drawing);
+        self.drawing.clear();
+    }
+}
+
 pub struct Desktop {
     /// The client SDK: servers, conversations and their timelines, and what
     /// to do about what the driver reports.
@@ -225,14 +265,16 @@ pub struct Desktop {
     chat_motion: SmoothScroll,
     channel_motion: SmoothScroll,
     server_motion: SmoothScroll,
-    /// The open dialog's scrolling (one dialog at a time), and which dialog
-    /// this and the previous frame showed, so a newly opened one starts at the top.
-    pub modal_scroll: ScrollHandle,
-    modal_motion: SmoothScroll,
+    /// Each dialog's scrolling, by dialog id (`DialogScrolls`). Nothing that
+    /// borrows this map may run under the borrow: the calls below touch only a
+    /// dialog's own handle, whose offset changes never re-enter here.
+    dialog_scrolls: std::cell::RefCell<DialogScrolls>,
+    /// Which dialog the last frame showed, so the keys and the pointer act on
+    /// the one in front.
+    pub modal_seen: std::cell::Cell<Option<&'static str>>,
     /// Lists that scroll inside the open dialog.
     pub nested: Nested,
     pub modal_shown: std::cell::Cell<Option<&'static str>>,
-    pub modal_seen: std::cell::Cell<Option<&'static str>>,
     /// The window's rounded corners this frame (chrome::corner_radii): what paints
     /// into a window corner, like a dialog's backdrop, is rounded by them.
     pub window_corners: Corners<Pixels>,
@@ -560,8 +602,7 @@ impl Desktop {
             chat_motion: SmoothScroll::default(),
             channel_motion: SmoothScroll::default(),
             server_motion: SmoothScroll::default(),
-            modal_scroll: ScrollHandle::new(),
-            modal_motion: SmoothScroll::default(),
+            dialog_scrolls: Default::default(),
             nested: Nested::default(),
             modal_shown: Default::default(),
             modal_seen: Default::default(),
@@ -1023,10 +1064,34 @@ impl Desktop {
         self.server_motion.cancel();
         self.server_scroll.scroll_to_item(slot);
     }
-    /// Direct manipulation replaces easing before the first thumb movement.
+    /// Direct manipulation replaces the easing of every dialog before the
+    /// first thumb movement.
     pub fn cancel_modal_scroll(&mut self) {
-        self.modal_motion.cancel();
+        self.cancel_dialog_scroll();
         self.nested.cancel();
+    }
+    fn cancel_dialog_scroll(&mut self) {
+        for dialog in self.dialog_scrolls.borrow_mut().by_id.values_mut() {
+            dialog.motion.cancel();
+        }
+    }
+    /// The scrolling of the dialog `id`, for drawing it: its own handle, at the
+    /// top when the last frame did not draw it.
+    pub fn dialog_scroll(&self, id: &'static str) -> ScrollHandle {
+        self.dialog_scrolls.borrow_mut().open(id)
+    }
+    /// Whether the last frame drew the dialog `id`, so this one starts it.
+    pub fn dialog_is_new(&self, id: &'static str) -> bool {
+        !self.dialog_scrolls.borrow().drawn_before(id)
+    }
+    /// Close the frame: the dialogs it drew are the ones the next frame keeps.
+    pub fn settle_dialogs(&mut self) {
+        self.dialog_scrolls.borrow_mut().settle();
+    }
+    /// The dialog a wheel moves: the one that drew itself last this frame, so a
+    /// prompt over Settings scrolls the prompt.
+    fn front_dialog(&self) -> Option<&'static str> {
+        self.modal_shown.get()
     }
     /// Closing the sheet retires its wheel transaction and easing.
     pub fn close_channels(&mut self) {
@@ -1052,14 +1117,20 @@ impl Desktop {
         let reduce_motion = cx.reduce_motion();
         match self.nested.route(list, delta, std::time::Instant::now()) {
             Scroller::List(id) => {
-                self.modal_motion.cancel();
+                self.cancel_dialog_scroll();
                 self.nested.scroll(id, event, line_height, reduce_motion);
             }
             Scroller::Dialog => {
                 self.nested.cancel_motion();
+                let Some(front) = self.front_dialog() else {
+                    cx.stop_propagation();
+                    return;
+                };
+                let mut dialogs = self.dialog_scrolls.borrow_mut();
+                let dialog = dialogs.by_id.entry(front).or_default();
                 scrolling::scroll_by(
-                    &mut self.modal_motion,
-                    &self.modal_scroll,
+                    &mut dialog.motion,
+                    &dialog.handle,
                     event,
                     line_height,
                     reduce_motion,
@@ -1075,7 +1146,12 @@ impl Desktop {
             || !(self.chat_motion.active()
                 || self.channel_motion.active()
                 || self.server_motion.active()
-                || self.modal_motion.active()
+                || self
+                    .dialog_scrolls
+                    .borrow()
+                    .by_id
+                    .values()
+                    .any(|dialog| dialog.motion.active())
                 || self.nested.active())
         {
             return;
@@ -1087,11 +1163,13 @@ impl Desktop {
                 entity.update(cx, |this, cx| {
                     this.scroll_frame_pending = false;
                     this.chat_motion.shift(this.anchor.take_shift());
-                    let changed = this.chat_motion.advance(&this.scroll)
+                    let mut changed = this.chat_motion.advance(&this.scroll)
                         | this.channel_motion.advance(&this.channel_scroll)
                         | this.server_motion.advance(&this.server_scroll)
-                        | this.modal_motion.advance(&this.modal_scroll)
                         | this.nested.advance();
+                    for dialog in this.dialog_scrolls.borrow_mut().by_id.values_mut() {
+                        changed |= dialog.motion.advance(&dialog.handle);
+                    }
                     if changed {
                         cx.notify();
                     }
@@ -3103,5 +3181,32 @@ mod server_writes_tests {
         writes.write(&profile, 3, &[]).unwrap();
         assert!(profile.load_servers(None).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dialog_scroll_tests {
+    use super::DialogScrolls;
+    use gpui_kit::{point, px};
+
+    #[test]
+    fn a_dialog_that_stays_behind_keeps_its_place() {
+        let mut scrolls = DialogScrolls::default();
+        // A frame with the settings dialog alone, scrolled down.
+        let settings = scrolls.open("server-dialog");
+        settings.set_offset(point(px(0.), px(-120.)));
+        scrolls.settle();
+        // Two frames with a prompt over it: the prompt comes and the settings
+        // dialog keeps its place, and the prompt starts at the top.
+        for _ in 0..2 {
+            scrolls.open("server-dialog");
+            let prompt = scrolls.open("prompt-dialog");
+            assert_eq!(f32::from(prompt.offset().y), 0.);
+            scrolls.settle();
+        }
+        assert_eq!(f32::from(scrolls.open("server-dialog").offset().y), -120.);
+        // A dialog the last frame did not draw starts at the top.
+        scrolls.settle();
+        assert_eq!(f32::from(scrolls.open("prompt-dialog").offset().y), 0.);
     }
 }

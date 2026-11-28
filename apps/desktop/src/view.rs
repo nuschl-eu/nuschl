@@ -118,8 +118,10 @@ impl Render for Desktop {
         }
         self.ease_voice_toggles(window, cx);
         crate::acl_editor::follow_jump(self, window, cx);
-        // Which dialog the last frame showed (see dialogs::modal).
+        // Which dialog the last frame showed (see dialogs::modal), and which
+        // dialogs it drew, so this frame starts the others at the top.
         self.modal_seen.set(self.modal_shown.take());
+        self.settle_dialogs();
         let line = self
             .composer
             .read(cx)
