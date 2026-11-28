@@ -185,6 +185,32 @@ struct Outgoing {
     choice: crate::attachments::Choice,
 }
 
+/// What the line under the composer says while text waits for a message with
+/// images on the same server (`Desktop::held`): `here` when the waiting
+/// message comes from this conversation, and otherwise `place`, naming the
+/// conversation it comes from.
+fn held_line(here: bool, place: Option<String>) -> String {
+    let waiting = if here {
+        "this conversation's message with images".to_string()
+    } else {
+        format!(
+            "the message with images in {}",
+            place.unwrap_or_else(|| "another conversation".into())
+        )
+    };
+    format!("Waiting for {waiting}…")
+}
+
+/// How the composer names a conversation: `#name` for a channel, and who a
+/// direct conversation is with.
+fn place_name(name: &str, direct: bool, peer: Option<&str>) -> String {
+    match (direct, peer) {
+        (false, _) => format!("#{name}"),
+        (true, Some(peer)) => format!("the direct conversation with {peer}"),
+        (true, None) => "another conversation".into(),
+    }
+}
+
 pub struct Desktop {
     /// The client SDK: servers, conversations and their timelines, and what
     /// to do about what the driver reports.
@@ -1829,7 +1855,9 @@ impl Desktop {
         let Some((server, _)) = self.selected_indices() else {
             return;
         };
-        // Text waits behind attachments still being prepared for this server.
+        // Text waits behind images still being prepared for this server, in
+        // whichever conversation they were attached; the composer's status
+        // line says whose (sending_status).
         let server_id = &self.client.servers[server].id;
         if self.client.sending() || self.outgoing.iter().any(|batch| &batch.key.0 == server_id) {
             return;
@@ -1873,8 +1901,40 @@ impl Desktop {
             Some((sent, total)) => Some(format!("Sending {} of {total}…", sent + 1)),
             None if preparing == 1 => Some("Preparing the image…".into()),
             None if preparing > 1 => Some(format!("Preparing {preparing} images…")),
+            None => self.held(&key),
+        }
+    }
+    /// The line under the composer while text sent from `key` waits for a
+    /// message with images on the same server, which the send queue takes
+    /// whole (`send_message`).
+    fn held(&self, key: &(String, u32)) -> Option<String> {
+        match self.outgoing.iter().find(|batch| batch.key.0 == key.0) {
+            Some(batch) => Some(held_line(
+                batch.key == *key,
+                self.place(&key.0, batch.key.1),
+            )),
+            None if self.client.sending() => Some("The previous message is on its way…".into()),
             None => None,
         }
+    }
+    /// How the composer names a conversation of `server` (see `place_name`).
+    fn place(&self, server: &str, channel: u32) -> Option<String> {
+        let conversation = self
+            .client
+            .servers
+            .iter()
+            .find(|state| state.id == server)?
+            .channels
+            .iter()
+            .find(|conversation| conversation.id == channel)?;
+        Some(place_name(
+            &conversation.name,
+            conversation.is_direct(),
+            conversation
+                .direct_peer
+                .as_ref()
+                .map(|peer| crate::names::display_name(peer, &self.settings)),
+        ))
     }
     /// Ctrl+V with only an image on the clipboard attaches it. Holding the
     /// keys repeats the paste: the same image again within two seconds is ignored.
@@ -3103,5 +3163,36 @@ mod server_writes_tests {
         writes.write(&profile, 3, &[]).unwrap();
         assert!(profile.load_servers(None).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::{held_line, place_name};
+
+    #[test]
+    fn a_waiting_send_names_the_conversation_its_images_come_from() {
+        assert_eq!(
+            held_line(false, Some("#general".into())),
+            "Waiting for the message with images in #general…"
+        );
+        assert_eq!(
+            held_line(false, None),
+            "Waiting for the message with images in another conversation…"
+        );
+        assert_eq!(
+            held_line(true, None),
+            "Waiting for this conversation's message with images…"
+        );
+    }
+
+    #[test]
+    fn a_conversation_is_named_by_its_channel_or_its_peer() {
+        assert_eq!(place_name("general", false, None), "#general");
+        assert_eq!(
+            place_name("alice", true, Some("alice")),
+            "the direct conversation with alice"
+        );
+        assert_eq!(place_name("alice", true, None), "another conversation");
     }
 }

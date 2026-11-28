@@ -127,6 +127,9 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
   Unticked, it goes as its original file. A message sent while its images
   are prepared keeps its text in the composer until it goes; when one of
   them cannot go, the message comes back to the composer with the note.
+  A message with images that is being prepared holds text from the server's
+  other conversations too; the line under the composer says which
+  conversation its images come from.
   The tray shows the size each attachment sends. Each new message starts
   with the box ticked and the quality from **Settings → Images** (High
   unless changed); a message keeps its choice until it is sent or cleared.
