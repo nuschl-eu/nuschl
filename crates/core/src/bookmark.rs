@@ -12,6 +12,10 @@ pub struct CachedChannel {
     pub parent: Option<u32>,
     pub name: String,
     pub position: i32,
+    /// What the server called this channel's conversation; its rows are kept
+    /// under it, so an offline view finds them and a reused id does not.
+    #[serde(default)]
+    pub conversation: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,6 +137,23 @@ impl ServerBookmark {
         }
     }
 
+    /// Remember the conversation a cached channel's rows are kept under.
+    /// Returns whether the cache changed.
+    pub fn cache_conversation(&mut self, id: u32, conversation: Option<[u8; 16]>) -> bool {
+        let Some(cached) = self
+            .cached_channels
+            .iter_mut()
+            .find(|cached| cached.id == id)
+        else {
+            return false;
+        };
+        if cached.conversation == conversation {
+            return false;
+        }
+        cached.conversation = conversation;
+        true
+    }
+
     /// Pins retain their original certificate namespace. Unpinned connections
     /// require WebPKI, whose identity is the configured origin, not a renewable
     /// leaf. This cache name does not authorize any network connection.
@@ -160,6 +181,39 @@ pub fn webpki_history_identity(host: &str, port: u16) -> String {
 /// Lowercase hex SHA-256.
 pub fn fingerprint(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod cached_channel_tests {
+    use super::*;
+
+    /// A saved channel names the conversation its rows are kept under, so an
+    /// offline view finds them after a restart.
+    #[test]
+    fn a_cached_channel_keeps_its_conversation_across_a_save_and_load() {
+        let mut bookmark: ServerBookmark = serde_json::from_str(
+            r#"{"id":"test","name":"test","host":"voice.test","port":64738,"username":"ada"}"#,
+        )
+        .unwrap();
+        assert!(bookmark.cache_channel(CachedChannel {
+            id: 2,
+            parent: Some(0),
+            name: "Lobby".into(),
+            position: 1,
+            conversation: Some([7; 16]),
+        }));
+        assert!(!bookmark.cache_conversation(2, Some([7; 16])));
+        let stored = serde_json::to_string(&bookmark).unwrap();
+        let loaded: ServerBookmark = serde_json::from_str(&stored).unwrap();
+        assert_eq!(loaded.cached_channels[0].conversation, Some([7; 16]));
+        // An entry written before the field existed names none.
+        let legacy: ServerBookmark = serde_json::from_str(
+            r#"{"id":"test","name":"test","host":"voice.test","port":64738,"username":"fixture",
+                "cached_channels":[{"id":2,"parent":0,"name":"Lobby","position":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.cached_channels[0].conversation, None);
+    }
 }
 
 #[cfg(test)]

@@ -33,6 +33,10 @@ pub enum SessionSecurity {
 pub(crate) struct PageOwner {
     pub generation: u64,
     pub epoch: u64,
+    /// The key the channel's rows were under when the page was asked for: a
+    /// page of another conversation does not belong in the view that
+    /// replaced it.
+    pub key: String,
     pub archive: Option<[u8; 16]>,
     pub identity: String,
 }

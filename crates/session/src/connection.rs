@@ -112,6 +112,8 @@ const BLOBS_NOTICE: &str = "This server sent more than 64 MiB of comments, descr
 #[derive(Clone, Debug)]
 pub struct IncomingText {
     pub target: TextTarget,
+    /// The conversation it belongs to on a Nuschl server, when one is known.
+    pub conversation: Option<[u8; 16]>,
     pub author: String,
     pub peer: Option<User>,
     pub body: String,
@@ -1885,6 +1887,9 @@ struct State {
     /// Our sends in flight by request id, with their attempts.
     sending: BTreeMap<u64, (PendingChat, u32)>,
     subscribed: BTreeSet<u32>,
+    /// Conversations a removed channel owned: a late message for one of them
+    /// is not a new direct conversation.
+    removed_conversations: BTreeSet<[u8; 16]>,
     next_request: u64,
     resend: Vec<PendingChat>,
     plugin_rate: PluginRate,
@@ -1932,6 +1937,7 @@ impl Default for State {
             directs: BTreeMap::new(),
             sending: BTreeMap::new(),
             subscribed: BTreeSet::new(),
+            removed_conversations: BTreeSet::new(),
             next_request: 0,
             resend: Vec::new(),
             plugin_rate: PluginRate::new(),
@@ -3661,6 +3667,7 @@ impl State {
             events,
             SessionEvent::Text(IncomingText {
                 target: pending.target.clone(),
+                conversation: Some(pending.conversation),
                 author,
                 peer,
                 body: pending.content,
@@ -3775,12 +3782,18 @@ impl State {
                 {
                     return Ok(());
                 }
+                let conversation = nuschl::id(&chat.conversation);
                 let target = match self.channel_of(&chat.conversation) {
                     Some(channel) => TextTarget::Channel(channel),
                     None => {
-                        let Some(id) = nuschl::id(&chat.conversation) else {
+                        let Some(id) = conversation else {
                             return Ok(());
                         };
+                        // A channel it belonged to is gone (its id may already
+                        // name a new one): this is not a new direct message.
+                        if self.removed_conversations.contains(&id) {
+                            return Ok(());
+                        }
                         // Not a channel's: one of our direct conversations,
                         // perhaps new (the server delivers those only to
                         // its two accounts). Ask for the list to be sure.
@@ -3835,6 +3848,7 @@ impl State {
                     events,
                     SessionEvent::Text(IncomingText {
                         target,
+                        conversation,
                         author: if author.name.is_empty() {
                             "Deleted user".into()
                         } else {
@@ -3884,6 +3898,15 @@ impl State {
             .values()
             .find(|user| user_id != 0 && user.user_id == Some(user_id))
             .cloned()
+    }
+
+    /// The conversation a stock text belongs to: its channel's, when the
+    /// server names one. A direct session has no durable conversation.
+    fn target_conversation(&self, target: &TextTarget) -> Option<[u8; 16]> {
+        match target {
+            TextTarget::Channel(channel) => self.conversations.get(channel).copied(),
+            _ => None,
+        }
     }
 
     fn channel_of(&self, conversation: &[u8]) -> Option<u32> {
@@ -4041,10 +4064,12 @@ impl State {
             TextTarget::DirectConversation(id) => self.direct_peer(&id),
             _ => None,
         };
+        let conversation = self.target_conversation(&target);
         emit(
             events,
             SessionEvent::Text(IncomingText {
                 target,
+                conversation,
                 author,
                 peer,
                 body,
@@ -4234,6 +4259,15 @@ impl State {
                     self.blob_bytes -= removed.description.len();
                 }
                 self.permissions.remove(&channel.channel_id);
+                // A new channel with the same id is a new conversation: it
+                // subscribes to that one.
+                if let Some(conversation) = self.conversations.remove(&channel.channel_id) {
+                    while self.removed_conversations.len() >= MAX_CHANNELS {
+                        self.removed_conversations.pop_first();
+                    }
+                    self.removed_conversations.insert(conversation);
+                }
+                self.subscribed.remove(&channel.channel_id);
                 for other in self.channels.values_mut() {
                     other.links.remove(&channel.channel_id);
                 }
@@ -4431,10 +4465,12 @@ impl State {
                     );
                 }
                 for target in targets {
+                    let conversation = self.target_conversation(&target);
                     emit(
                         events,
                         SessionEvent::Text(IncomingText {
                             target,
+                            conversation,
                             author: author.clone(),
                             peer: actor.clone(),
                             body: message.message.clone(),
@@ -6561,6 +6597,41 @@ mod tests {
         out
     }
 
+    fn channel_state(id: u32, conversation: [u8; 16]) -> ControlFrame {
+        let state = proto::ChannelState {
+            channel_id: Some(id),
+            ..Default::default()
+        };
+        let extension = v1::ChannelStateExtension {
+            nuschl: Some(v1::ChannelInfo {
+                conversation: conversation.to_vec(),
+                ..Default::default()
+            }),
+        };
+        let mut payload = Vec::new();
+        state.encode_raw(&mut payload);
+        extension.encode_raw(&mut payload);
+        ControlFrame {
+            kind: kind::CHANNEL_STATE,
+            payload: payload.into(),
+        }
+    }
+
+    /// The conversations in the `Subscribe` frames sent since the last call.
+    fn subscribed_conversations(state: &mut State) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        state.outbound.retain(|(kind, payload)| {
+            if *kind != nuschl::kind::SUBSCRIBE {
+                return true;
+            }
+            if let Ok(message) = v1::Subscribe::decode(&payload[..]) {
+                out.extend(message.conversations);
+            }
+            false
+        });
+        out
+    }
+
     fn negotiated(policy: v1::Policy) -> Negotiated {
         Negotiated {
             nuschl: true,
@@ -7589,6 +7660,95 @@ mod tests {
         state.users.get_mut(&7).unwrap().self_muted = false;
         assert_eq!(state.confirm_self(now), None);
         assert!(state.outbound.is_empty() && state.self_check.is_none());
+    }
+
+    /// Mumble reuses a channel id once its channel is gone. The new channel
+    /// is a new conversation, and it subscribes to that one instead of
+    /// waiting for a reconnect.
+    #[tokio::test]
+    async fn a_recreated_channel_subscribes_to_its_new_conversation() {
+        let (events, mut rx) = mpsc::channel(16);
+        let mut state = State {
+            own_session: Some(7),
+            extension: Some(vec![nuschl::capability::SUBSCRIBE.to_owned()]),
+            ..State::default()
+        };
+        state
+            .handle(channel_state(5, [1; 16]), &events)
+            .await
+            .unwrap();
+        assert_eq!(subscribed_conversations(&mut state), vec![vec![1_u8; 16]]);
+        state
+            .handle(
+                frame(kind::CHANNEL_REMOVE, proto::ChannelRemove { channel_id: 5 }),
+                &events,
+            )
+            .await
+            .unwrap();
+        assert!(!state.conversations.contains_key(&5));
+        assert!(!state.subscribed.contains(&5));
+        // The same id comes back as a new channel with a new conversation.
+        state
+            .handle(channel_state(5, [2; 16]), &events)
+            .await
+            .unwrap();
+        assert_eq!(subscribed_conversations(&mut state), vec![vec![2_u8; 16]]);
+        let _ = drain(&mut rx).await;
+    }
+
+    /// A message for the conversation of a removed channel is not a new
+    /// direct conversation, and its rows belong to no one who is here.
+    #[tokio::test]
+    async fn a_late_message_for_a_removed_channels_conversation_is_dropped() {
+        let (events, mut rx) = mpsc::channel(16);
+        let mut state = State {
+            own_session: Some(7),
+            extension: Some(vec![nuschl::capability::SUBSCRIBE.to_owned()]),
+            ..State::default()
+        };
+        state
+            .handle(channel_state(5, [1; 16]), &events)
+            .await
+            .unwrap();
+        state
+            .handle(
+                frame(kind::CHANNEL_REMOVE, proto::ChannelRemove { channel_id: 5 }),
+                &events,
+            )
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        state.outbound.clear();
+        let chat = |conversation: [u8; 16]| {
+            NuschlEvent::Chat(v1::ChatEvent {
+                conversation: conversation.to_vec(),
+                message: Some(v1::Message {
+                    seq: 1,
+                    author: Some(v1::Author {
+                        user_id: 3,
+                        name: "Cy".into(),
+                        ..Default::default()
+                    }),
+                    content: "hello".into(),
+                    format: v1::Format::Text as i32,
+                    ..Default::default()
+                }),
+            })
+        };
+        state.nuschl(chat([1; 16]), &events).await.unwrap();
+        let shown = drain(&mut rx).await;
+        assert!(
+            !shown
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Text(_)))
+        );
+        assert!(!state.directs.contains_key(&[1; 16]));
+        // A conversation this connection never saw is a new direct one.
+        state.nuschl(chat([2; 16]), &events).await.unwrap();
+        let shown = drain(&mut rx).await;
+        assert!(shown.iter().any(|event| matches!(event,
+            SessionEvent::Text(text) if text.target == TextTarget::DirectConversation([2; 16])
+        )));
     }
 
     #[tokio::test]

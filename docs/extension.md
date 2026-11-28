@@ -615,12 +615,16 @@ How the desktop uses the extension, and the decisions taken while the user was a
   empties both and keeps a tombstone that a later copy cannot bring back, and our own
   message gets its seq when acknowledged. Local pages run in time order (ties by row
   id) because pages fetched later hold older messages than rows stored before them.
-  Direct conversations are stored under `conversation:<id>`, channels under their
-  channel id, which Mumble reuses (see TODO.md). Search runs over this local copy; a
-  result in a conversation shown from server history opens by its seq, with the
-  server's page around it (`around`) when it is not loaded, and newer pages
-  (`after`) as the reader scrolls down; a stock message there that the server never
-  stored cannot be opened.
+  Channels and direct conversations are both stored under `conversation:<id>`, the
+  durable identity the server names: rows stay with the conversation that wrote them,
+  so a channel recreated with the same Mumble channel id starts with an empty
+  timeline and the replaced view keeps its own. A stock server names no conversation,
+  and its rows stay under the channel id. The conversation is saved with the cached
+  channel, so an offline view opens its rows. Search runs over this local copy; a result
+  in a conversation shown from server history opens by its seq, with the server's
+  page around it (`around`) when it is not loaded, and newer pages (`after`) as the
+  reader scrolls down; a stock message there that the server never stored cannot be
+  opened.
 
 
 ### Connection address privacy (`privacy/1`)

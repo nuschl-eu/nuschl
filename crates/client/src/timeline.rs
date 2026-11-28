@@ -435,11 +435,16 @@ impl Timeline {
     }
 
     /// Forget the messages: the next opening loads the latest page again
-    /// (another history source, or another server identity).
+    /// (another history source, another server identity, or another
+    /// conversation under the same channel id).
     pub fn reset(&mut self) {
         self.loaded = false;
+        self.loading = false;
         self.messages.clear();
         self.next_before = None;
+        self.next_after = None;
+        self.missed_live = false;
+        self.beginning = false;
     }
 
     /// Our message with idempotency key `key` was acknowledged as `seq`, or
