@@ -328,22 +328,7 @@ impl Desktop {
             self.reveal_server(slot);
             self.browse_server(index, window, cx);
         }
-        let server = &mut self.client.servers[index];
-        let parents: HashMap<_, _> = server
-            .channels
-            .iter()
-            .map(|channel| (channel.id, channel.parent))
-            .collect();
-        let mut parent = parents.get(&target.channel).copied().flatten();
-        let mut seen = HashSet::new();
-        while let Some(id) = parent.filter(|id| seen.insert(*id)) {
-            server.expansion.insert(id, true);
-            parent = parents.get(&id).copied().flatten();
-        }
-        if let Some(slot) = channel_slot(server, target.channel) {
-            self.cancel_channel_scroll();
-            self.channel_scroll.scroll_to_item(slot);
-        }
+        self.reveal_channel(index, target.channel);
         self.browse_channel(index, target.channel, window, cx);
         cx.notify();
     }

@@ -190,6 +190,7 @@ impl Desktop {
         };
         match item.target {
             Target::Channel(id) => {
+                self.reveal_channel(server, id);
                 self.browse_channel(server, id, window, cx);
                 if secondary {
                     self.join_selected();
@@ -201,11 +202,15 @@ impl Desktop {
                     .get(&session)
                     .map(|user| user.channel)
                 {
+                    self.reveal_channel(server, channel);
                     self.browse_channel(server, channel, window, cx);
                 }
             }
             Target::Person(session) => self.open_direct(server, session, window, cx),
-            Target::Direct(id) => self.browse_channel(server, id, window, cx),
+            Target::Direct(id) => {
+                self.reveal_channel(server, id);
+                self.browse_channel(server, id, window, cx);
+            }
         }
         cx.notify();
     }

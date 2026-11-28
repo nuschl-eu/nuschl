@@ -78,7 +78,8 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
 ## Channels and conversations
 
 - Click a channel to open its conversation; double-click it, or use **Join
-  channel**, to move your voice there. Ctrl+K finds a channel or person.
+  channel**, to move your voice there. Ctrl+K finds a channel or person; the
+  channel list opens that channel's parent groups and scrolls its row into view.
 - A conversation is one timeline that follows new messages at the bottom. Scrolling
   up loads older history without moving what is on screen, down to **Beginning of
   local history**; while you read further up, a pill counts new messages and jumps
