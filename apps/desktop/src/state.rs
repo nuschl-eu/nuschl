@@ -372,11 +372,13 @@ impl Drop for Desktop {
     }
 }
 /// The channels that must be open for `channel`'s row to show, nearest parent
-/// first (a channel list nests; a parent that points at itself ends the walk).
+/// first. A channel list nests, so a parent above a parent may hide it; a walk
+/// ends at a parent the list does not hold, or one it has already passed.
 fn ancestors(parents: &BTreeMap<u32, Option<u32>>, channel: u32) -> Vec<u32> {
     let mut open = Vec::new();
+    let mut seen = BTreeSet::from([channel]);
     let mut parent = parents.get(&channel).copied().flatten();
-    while let Some(id) = parent.filter(|id| !open.contains(id)) {
+    while let Some(id) = parent.filter(|id| parents.contains_key(id) && seen.insert(*id)) {
         open.push(id);
         parent = parents.get(&id).copied().flatten();
     }
@@ -1036,16 +1038,17 @@ impl Desktop {
         self.server_scroll.scroll_to_item(slot);
     }
 
-    /// Bring `channel` of the server at `index` into the channel list: its
-    /// parents open, its row in sight, so a jump from the switcher or an unread
-    /// hint lands where the reader can see it.
+    /// Bring `channel` of the server at `index` into view: its parent groups
+    /// opened, its row scrolled into sight.
     pub fn reveal_channel(&mut self, index: usize, channel: u32) {
         let Some(server) = self.client.servers.get_mut(index) else {
             return;
         };
+        // Direct conversations list below the channels and nest under nothing.
         let parents: BTreeMap<u32, Option<u32>> = server
             .channels
             .iter()
+            .filter(|entry| matches!(entry.target, TextTarget::Channel(_)))
             .map(|entry| (entry.id, entry.parent))
             .collect();
         for parent in ancestors(&parents, channel) {
@@ -2500,6 +2503,7 @@ impl Desktop {
         // conversation opens once the server names it; otherwise the stock
         // path's opens now.
         if let Some(id) = self.client.open_direct(index, session) {
+            self.reveal_channel(index, id);
             self.browse_channel(index, id, window, cx);
         }
         cx.notify();
@@ -3047,6 +3051,7 @@ impl Desktop {
                 .iter()
                 .position(|entry| entry.id == server)
         {
+            self.reveal_channel(index, channel);
             self.browse_channel(index, channel, window, cx);
         }
         if self.selected_indices().is_none() && !self.client.servers.is_empty() {
@@ -3156,8 +3161,8 @@ mod reveal_tests {
         ]);
         assert!(ancestors(&parents, 1).is_empty());
         assert_eq!(ancestors(&parents, 3), [2, 1]);
-        assert_eq!(ancestors(&parents, 4), [4]);
-        assert_eq!(ancestors(&parents, 5), [99]);
+        assert!(ancestors(&parents, 4).is_empty());
+        assert!(ancestors(&parents, 5).is_empty());
         // A channel the list does not hold opens nothing.
         assert!(ancestors(&parents, 9).is_empty());
     }
