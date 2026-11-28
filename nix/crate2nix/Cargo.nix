@@ -26919,6 +26919,7 @@ rec {
           }
         ];
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ../../apps/transfer-worker; };
+        libName = "nuschl_transfer_worker";
         dependencies = [
           {
             name = "async-executor";
@@ -26945,6 +26946,10 @@ rec {
             packageId = "magic-wormhole";
             usesDefaultFeatures = false;
             features = [ "transfer" ];
+          }
+          {
+            name = "nuschl-core";
+            packageId = "nuschl-core";
           }
           {
             name = "nuschl-ipc";
