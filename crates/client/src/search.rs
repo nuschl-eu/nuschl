@@ -151,9 +151,10 @@ impl Client {
 
     /// Where stored message `id` (`seq` on a Nuschl server) of conversation
     /// `storage_key` on server `index` is now. Fails with what to tell the
-    /// user.
+    /// user. A direct conversation the server stores opens here, so a result
+    /// in one shows its saved messages while the person is offline.
     pub fn locate(
-        &self,
+        &mut self,
         index: usize,
         storage_key: &str,
         (id, seq): (i64, Option<i64>),
@@ -165,18 +166,30 @@ impl Client {
             .position(|channel| channel.storage_key == storage_key)
         else {
             // An earlier direct conversation, with someone who is online again.
-            return storage_key
-                .strip_prefix("direct:")
-                .and_then(|hash| {
-                    server
-                        .users
-                        .values()
-                        .find(|user| user.certificate_hash.as_deref() == Some(hash))
-                })
-                .map(|user| Located::Reopen {
+            if let Some(user) = storage_key.strip_prefix("direct:").and_then(|hash| {
+                server
+                    .users
+                    .values()
+                    .find(|user| user.certificate_hash.as_deref() == Some(hash))
+            }) {
+                return Ok(Located::Reopen {
                     session: user.session,
+                });
+            }
+            // A direct conversation the server stores: its rows are on this
+            // device, so open it here instead of waiting for the person.
+            let Some(direct) =
+                crate::server::conversation_of(storage_key).and_then(|conversation| {
+                    server
+                        .directs
+                        .get(&conversation)
+                        .map(|direct| (conversation, direct.name.clone()))
                 })
-                .ok_or(OPENS_ONLINE);
+            else {
+                return Err(OPENS_ONLINE);
+            };
+            let position = self.servers[index].direct_view(direct.0, &direct.1, None);
+            return Ok(Located::Found { position, id });
         };
         // A server-history timeline counts in seqs: a kept message is found
         // there by its seq, and pages come from the server.

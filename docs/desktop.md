@@ -91,7 +91,9 @@ The design and its measurements: [architecture.md](architecture.md#audio-configu
 - Drag the channel list's edge to fit long names. Collapsed branches show how many
   people are inside; branches with people open on connect.
 - Search (Ctrl+F) finds messages saved on this device. History and the channel
-  trees survive restarts, so you can browse offline.
+  trees survive restarts, so you can browse offline. A result in a direct
+  conversation the server stores opens its saved messages, also while the other
+  person is offline; a stock direct message opens once they are online again.
 
 ### Messages
 
