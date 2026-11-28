@@ -967,6 +967,14 @@ fn nuschl_event(frame: &ControlFrame) -> Result<Option<NuschlEvent>, Error> {
             {
                 return Err(invalid());
             }
+            let mut event = event;
+            if let Some(author) = &mut event
+                .message
+                .as_mut()
+                .and_then(|message| message.author.as_mut())
+            {
+                author.name = nuschl_core::text::clean_name(&author.name);
+            }
             NuschlEvent::Chat(event)
         }
         kind::HISTORY_PAGE => {
@@ -3803,7 +3811,7 @@ impl State {
                                     v1::Direct {
                                         conversation: id.to_vec(),
                                         user_id: author.user_id,
-                                        name: author.name,
+                                        name: nuschl_core::text::clean_name(&author.name),
                                         account: author.account,
                                         ..Default::default()
                                     },
@@ -4724,7 +4732,7 @@ impl State {
                         .into_iter()
                         .take(1024)
                         .map(|group| AclGroup {
-                            name: shown_name(group.name, 256),
+                            name: bounded(group.name, 256),
                             inherited: group.inherited.unwrap_or(true),
                             inherit: group.inherit.unwrap_or(true),
                             inheritable: group.inheritable.unwrap_or(true),
@@ -4742,7 +4750,7 @@ impl State {
                             apply_subs: entry.apply_subs.unwrap_or(true),
                             inherited: entry.inherited.unwrap_or(true),
                             user_id: entry.user_id,
-                            group: entry.group.map(|group| shown_name(group, 256)),
+                            group: entry.group.map(|group| bounded(group, 256)),
                             grant: entry.grant.unwrap_or(0),
                             deny: entry.deny.unwrap_or(0),
                         })
