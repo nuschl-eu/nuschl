@@ -310,6 +310,46 @@ pub fn detail(code: Code) -> &'static str {
     }
 }
 
+/// Bounds of a refusal's retry hint.
+const RETRY_AFTER_MIN_MS: u64 = 100;
+const RETRY_AFTER_MAX_MS: u64 = 2000;
+
+/// The refusals that carry a wait, and how often a history page is asked again.
+pub const RETRIED: [Code; 2] = [Code::Busy, Code::RateLimited];
+pub const PAGE_RETRIES: usize = 3;
+
+/// The hint one of `codes` names, within the bounds a request may wait.
+fn hint(error: &v1::Error, codes: &[Code]) -> Option<std::time::Duration> {
+    let refusal = Code::try_from(error.code).ok()?;
+    codes.contains(&refusal).then(|| {
+        std::time::Duration::from_millis(
+            error
+                .retry_after_ms
+                .clamp(RETRY_AFTER_MIN_MS, RETRY_AFTER_MAX_MS),
+        )
+    })
+}
+
+/// How long to wait before asking again, if the server refused for now.
+pub fn retry_delay(error: &v1::Error) -> Option<std::time::Duration> {
+    hint(error, &RETRIED)
+}
+
+/// How long to wait before asking again, if the server is busy.
+pub fn busy_delay(error: &v1::Error) -> Option<std::time::Duration> {
+    hint(error, &[Code::Busy])
+}
+
+/// How long to wait before asking a history page again, if the server refused
+/// it for now and it has had `attempts` retries. A hint longer than one page
+/// may wait fails the page now rather than asking again too early.
+pub fn page_retry(error: &v1::Error, attempts: usize) -> Option<std::time::Duration> {
+    if error.retry_after_ms > RETRY_AFTER_MAX_MS {
+        return None;
+    }
+    retry_delay(error).filter(|_| attempts < PAGE_RETRIES)
+}
+
 pub fn error(request_id: u64, code: Code, retry_after_ms: u64) -> v1::Error {
     v1::Error {
         request_id,
@@ -494,6 +534,50 @@ pub fn valid_kt_log(hello: &v1::Hello) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusals_hint_is_taken_for_the_refusals_that_are_retried() {
+        let limited = error(0, Code::RateLimited, 900);
+        assert_eq!(
+            retry_delay(&limited),
+            Some(std::time::Duration::from_millis(900))
+        );
+        assert_eq!(busy_delay(&limited), None);
+        assert_eq!(
+            retry_delay(&error(0, Code::NotFound, 900)),
+            None,
+            "only busy and rate limited carry a wait"
+        );
+    }
+
+    #[test]
+    fn a_page_is_asked_again_while_it_has_attempts_left() {
+        let limited = error(0, Code::RateLimited, 900);
+        assert_eq!(
+            page_retry(&limited, 0),
+            Some(std::time::Duration::from_millis(900))
+        );
+        assert_eq!(
+            page_retry(&limited, PAGE_RETRIES - 1),
+            Some(std::time::Duration::from_millis(900))
+        );
+        assert_eq!(page_retry(&limited, PAGE_RETRIES), None);
+        assert_eq!(page_retry(&error(0, Code::StaleEpoch, 900), 0), None);
+        // A wait the page cannot hold is not shortened: it fails instead.
+        assert_eq!(page_retry(&error(0, Code::RateLimited, 30_000), 0), None);
+    }
+
+    #[test]
+    fn a_hint_outside_one_requests_wait_is_clamped() {
+        assert_eq!(
+            retry_delay(&error(0, Code::Busy, 0)),
+            Some(std::time::Duration::from_millis(100))
+        );
+        assert_eq!(
+            retry_delay(&error(0, Code::Busy, 60_000)),
+            Some(std::time::Duration::from_millis(2000))
+        );
+    }
 
     #[test]
     fn history_page_bytes_counts_canonical_payload_metadata_and_varint_ranges() {
