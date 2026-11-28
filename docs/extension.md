@@ -229,7 +229,8 @@ stock client would silently erase (or, for a deny, open) it.
   outside the Mumble permission bitmask.
 - **Guests.** Unregistered users read no history by default (`history.guests = none`;
   they see live messages, as on any Mumble server). Murmur's defaults give Enter to
-  everyone, and an archive kept forever should not be readable anonymously.
+  everyone, and an archive kept forever should not be readable anonymously. The hello's
+  `Policy.guests` carries that choice; an end-to-end server ignores it (docs/e2ee.md §10).
 - **History visibility** per channel: `members` (default, user decision: members read
   the retained history) or `since_access`, which means the set of intervals in which
   the user could read the channel, not first join (a user removed and later readmitted

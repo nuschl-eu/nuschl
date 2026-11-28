@@ -17,6 +17,12 @@ use nuschl_core::bookmark::ServerBookmark;
 use nuschl_protocol::nuschl::v1;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+/// What a client says where the server keeps its history for accounts.
+pub const HISTORY_FOR_ACCOUNTS: &str = "Server history is for registered accounts";
+/// The same, with the way to read it.
+pub const HISTORY_FOR_ACCOUNTS_HOW: &str =
+    "Server history is for registered accounts: register your name to read it";
+
 /// Why an Unmute stays muted (#199).
 pub(crate) const CANT_SPEAK_HERE: &str = "You can't speak here.";
 pub(crate) const NO_BANDWIDTH: &str = "No bandwidth for voice here.";
@@ -507,11 +513,48 @@ impl ServerState {
         Some(path)
     }
 
-    /// Our registration number, if we are registered.
-    pub fn own_user_id(&self) -> Option<u32> {
+    /// Our own user state, once the server has sent it.
+    pub fn own_user(&self) -> Option<&User> {
         self.own_session
             .and_then(|session| self.users.get(&session))
-            .and_then(|user| user.user_id)
+    }
+
+    /// Our registration number, if we are registered.
+    pub fn own_user_id(&self) -> Option<u32> {
+        self.own_user().and_then(|user| user.user_id)
+    }
+
+    /// Whether the server gives guests its history (`history.guests = "full"`,
+    /// docs/extension.md); an end-to-end server gives guests none (docs/e2ee.md
+    /// §10), and a server that sent no hello policy keeps its history for
+    /// accounts.
+    fn guests_may_read(&self) -> bool {
+        !self.mls
+            && self
+                .policy
+                .as_ref()
+                .is_some_and(|policy| policy.guests == v1::policy::Guests::Full as i32)
+    }
+
+    /// Whether this session may read the server's history: an account, or a
+    /// guest where the server serves guests. Our own user state arrives after
+    /// the channel tree, so a session that is not known yet reads nothing;
+    /// the page is asked for once it is (see `Client::server_event`'s refresh).
+    pub fn may_read_history(&self) -> bool {
+        match self.own_user() {
+            Some(user) => user.user_id.is_some() || self.guests_may_read(),
+            None => false,
+        }
+    }
+
+    /// Whether this connected session is a guest on a server that keeps its
+    /// history for registered accounts: no page loads, and the timeline says
+    /// why.
+    pub fn history_needs_account(&self) -> bool {
+        self.status == Status::Connected
+            && self.history_source == HistorySource::ServerArchive
+            && self.own_user().is_some_and(|user| user.user_id.is_none())
+            && !self.guests_may_read()
     }
 
     /// Whether this conversation's timeline is the server's history (a
@@ -1046,6 +1089,48 @@ mod tests {
         let mut pending = message(5, None, true);
         pending.pending = Some([1; 16]);
         assert!(!server.may_edit(&channel, &pending));
+    }
+
+    #[test]
+    fn a_guest_reads_history_only_where_the_server_offers_it() {
+        let (mut guest, _) = server(false, true, true);
+        assert!(
+            !guest.may_read_history(),
+            "the policy keeps history for accounts"
+        );
+        assert!(guest.history_needs_account());
+        guest.policy.as_mut().unwrap().guests = v1::policy::Guests::Full as i32;
+        assert!(guest.may_read_history());
+        assert!(!guest.history_needs_account());
+        // An end-to-end server serves guests no history (docs/e2ee.md),
+        // whatever the policy says.
+        guest.mls = true;
+        assert!(!guest.may_read_history());
+        assert!(guest.history_needs_account());
+        // A server that sent no hello policy keeps its history for accounts.
+        let (mut silent, _) = server(false, true, true);
+        silent.policy = None;
+        assert!(!silent.may_read_history());
+        let (registered, _) = server(true, true, true);
+        assert!(registered.may_read_history());
+        assert!(!registered.history_needs_account());
+        // Nothing is read before our own user state names us, and a session
+        // it has not named yet is no guest.
+        let (mut unnamed, _) = server(false, true, true);
+        unnamed.users.clear();
+        assert!(!unnamed.may_read_history());
+        assert!(!unnamed.history_needs_account());
+        let (mut unknown, _) = server(false, true, true);
+        unknown.own_session = None;
+        assert!(!unknown.may_read_history());
+        assert!(!unknown.history_needs_account());
+        let (mut offline, _) = server(false, true, true);
+        offline.status = Status::Disconnected;
+        assert!(!offline.history_needs_account());
+        // A stock server keeps no archive at all.
+        let (mut stock, _) = server(false, true, true);
+        stock.history_source = HistorySource::LocalObserved;
+        assert!(!stock.history_needs_account());
     }
 
     #[test]

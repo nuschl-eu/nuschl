@@ -181,6 +181,10 @@ impl Client {
         // A server-history timeline counts in seqs: a kept message is found
         // there by its seq, and pages come from the server.
         let id = match (server.archived(&server.channels[position]), seq) {
+            // A guest reads no page a server keeps for its accounts.
+            (true, Some(_)) if !server.may_read_history() => {
+                return Err(crate::server::HISTORY_FOR_ACCOUNTS);
+            }
             (true, Some(seq)) => seq,
             (true, None) => return Err("That message is not in the server's history."),
             (false, _) => id,
