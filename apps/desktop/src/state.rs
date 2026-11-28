@@ -913,6 +913,12 @@ impl Desktop {
         }
         self.scroll.scroll_to_bottom();
         self.sync_link_preview(cx);
+        // Typing goes to the conversation that just opened (#601), unless a
+        // dialog in front keeps the keyboard.
+        if !self.dialog_open() {
+            self.composer
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
     }
     /// What only drawing needs of the server at `index`.
     pub fn ui_of(&self, index: usize) -> Option<&ServerUi> {
