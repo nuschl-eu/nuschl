@@ -2112,6 +2112,7 @@ mod tests {
                 parent: None,
                 name: "Root".into(),
                 position: 0,
+                conversation: None,
             }];
             server.icon = Some(ServerIcon {
                 width: 1,
@@ -2287,6 +2288,7 @@ mod tests {
             parent: None,
             name: "Root".into(),
             position: 0,
+            conversation: None,
         }];
         profile.save_servers(std::slice::from_ref(&server)).unwrap();
         assert_eq!(fs::metadata(&servers).unwrap().modified().unwrap(), before);
@@ -2336,6 +2338,7 @@ mod tests {
             parent: None,
             name: "Newer root".into(),
             position: 0,
+            conversation: None,
         }];
         fs::create_dir_all(&layout.cache).unwrap();
         fs::write(
@@ -2599,6 +2602,7 @@ mod tests {
             parent: None,
             name: "Root".into(),
             position: 0,
+            conversation: None,
         }];
         profile.save_servers(&[server]).unwrap();
         profile.identity().unwrap();
@@ -2620,6 +2624,7 @@ mod tests {
                 parent: Some(0),
                 name: "\u{1}".repeat(512),
                 position: 0,
+                conversation: None,
             })
             .collect();
         let mut friendly = ServerBookmark::new("", "friendly.invalid", 64738, "me").unwrap();
@@ -2628,6 +2633,7 @@ mod tests {
             parent: None,
             name: "Root\u{7}".into(),
             position: 0,
+            conversation: None,
         }];
         friendly.certificate_sha256 = Some("ab".repeat(32));
         profile.save_servers(&[hostile, friendly]).unwrap();
@@ -3062,6 +3068,7 @@ mod tests {
             parent: None,
             name: "Root".into(),
             position: 0,
+            conversation: None,
         }];
         // An edit to declared fields does not survive the next start.
         team.name = "Renamed".into();

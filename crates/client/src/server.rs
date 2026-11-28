@@ -288,14 +288,19 @@ impl ServerState {
         let mut channels = bookmark
             .cached_channels
             .iter()
-            .map(|channel| ConversationState {
-                topic: "Saved channel history".into(),
-                ..ConversationState::channel(
-                    channel.id,
-                    channel.parent,
-                    channel.name.clone(),
-                    channel.position,
-                )
+            .map(|channel| {
+                let mut view = ConversationState {
+                    topic: "Saved channel history".into(),
+                    ..ConversationState::channel(
+                        channel.id,
+                        channel.parent,
+                        channel.name.clone(),
+                        channel.position,
+                    )
+                };
+                // Its rows are kept under the conversation the server named.
+                view.bind_conversation(channel.conversation);
+                view
             })
             .collect::<Vec<_>>();
         if !channels.iter().any(|channel| channel.id == 0) {
@@ -705,7 +710,7 @@ impl ServerState {
     /// The timeline of durable direct conversation `id`, created if needed
     /// and named `name`; returns its index in `channels`.
     pub fn direct_view(&mut self, id: [u8; 16], name: &str, peer: Option<User>) -> usize {
-        let key = direct_conversation_key(&id);
+        let key = conversation_key(&id);
         if let Some(index) = self
             .channels
             .iter()
@@ -898,9 +903,26 @@ impl ServerState {
     }
 }
 
-/// The local storage key of a direct conversation on a Nuschl server.
-pub fn direct_conversation_key(conversation: &[u8; 16]) -> String {
+/// The local storage key of a conversation on a Nuschl server: a channel's
+/// chat, or a direct conversation. The server never reuses an id, so rows
+/// stay with the conversation that wrote them when a channel id is reused.
+pub fn conversation_key(conversation: &[u8; 16]) -> String {
     format!("conversation:{}", hex::encode(conversation))
+}
+
+/// The local key of a channel's rows: its conversation's, or its id while the
+/// server names none.
+pub fn channel_key(id: u32, conversation: Option<[u8; 16]>) -> String {
+    conversation.map_or_else(|| id.to_string(), |id| conversation_key(&id))
+}
+
+/// The conversation a storage key names, if it names one: the inverse of
+/// [`conversation_key`]. A channel id or a stock direct message's key names
+/// nothing durable.
+pub(crate) fn conversation_of(key: &str) -> Option<[u8; 16]> {
+    let mut conversation = [0; 16];
+    hex::decode_to_slice(key.strip_prefix("conversation:")?, &mut conversation).ok()?;
+    Some(conversation)
 }
 
 #[cfg(test)]

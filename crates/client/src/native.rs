@@ -12,7 +12,7 @@ use crate::{
     HistoryTicket,
     input::{Input, ServerEvent},
     platform::{CacheKey, ChangeRequest, Platform, RenderKey, Request, request_id},
-    server::{AudioHealth, direct_conversation_key},
+    server::{AudioHealth, channel_key, conversation_key},
     timeline::{Change, Deletion, IncomingMessage, Page},
 };
 use nuschl_core::audio::{
@@ -1930,7 +1930,7 @@ async fn connect_once(
     let mut own_session = None;
     let mut own_registration = None;
     // Where each channel's conversation is kept in local history.
-    let mut conversation_keys = BTreeMap::<[u8; 16], String>::new();
+    let mut conversation_keys = BTreeMap::<[u8; 16], u32>::new();
     // Timelines here are the server's history (the extension's history/1).
     let mut server_history = false;
     let mut encrypted_server = false;
@@ -2092,7 +2092,7 @@ async fn connect_once(
                     let Some(conversation) = nuschl_protocol::nuschl::id(&chat.conversation) else { continue };
                     let cache = peer.as_deref().map(|peer| CacheKey {
                         identity: server.history_identity(peer),
-                        channel: conversation_keys.get(&conversation).cloned().unwrap_or_else(|| direct_conversation_key(&conversation)),
+                        channel: conversation_key(&conversation),
                     });
                     let kind = if message.kind == v1::message::Kind::Edit as i32 {
                         ChangeKind::Edit { content: message.content, edited_ms: message.edited_ms }
@@ -2108,7 +2108,7 @@ async fn connect_once(
                     if let Some(conversation) = nuschl_protocol::nuschl::id(&info.conversation)
                         && conversation_keys.len() < 4096
                     {
-                        conversation_keys.insert(conversation, channel.to_string());
+                        conversation_keys.insert(conversation, channel);
                     }
                     let _ = events.send(Event::Protocol { server: id.clone(), generation, event: SessionEvent::ChannelInfo { channel, info } }).await;
                 },
@@ -2247,7 +2247,7 @@ async fn connect_once(
                             let _ = events.send(Event::Input(Input::Server { server: id.clone(), generation, event: ServerEvent::EncryptionGap { conversation: *conversation, reason: "The server supplied unencrypted content in an encrypted conversation; it was refused.".into(), at_ms: nuschl_core::now_ms() } })).await;
                         }
                         MlsEvent::Sent { conversation, seq, key, text } => {
-                            let target = conversation_keys.get(conversation).and_then(|key| key.parse().ok()).map(TextTarget::Channel).unwrap_or(TextTarget::DirectConversation(*conversation));
+                            let target = conversation_keys.get(conversation).copied().map(TextTarget::Channel).unwrap_or(TextTarget::DirectConversation(*conversation));
                             let _ = storage.send(StorageCommand::Acked { key: *key, seq: *seq }).await;
                             let _ = events.send(Event::Sent { server: id.clone(), generation, target, body: text.clone() }).await;
                         }
@@ -2265,9 +2265,9 @@ async fn connect_once(
                                 _ => None,
                             };
                             if let (Some((seq, body, observed_at_ms, outgoing)), Some(peer)) = (visible, peer.as_ref()) {
-                                let target = conversation_keys.get(conversation).and_then(|key| key.parse().ok()).map(TextTarget::Channel).unwrap_or(TextTarget::DirectConversation(*conversation));
+                                let target = conversation_keys.get(conversation).copied().map(TextTarget::Channel).unwrap_or(TextTarget::DirectConversation(*conversation));
                                 let author = if outgoing { server.username.clone() } else if let Received::Message { sender, .. } = received { nuschl_session::mls::authenticated_sender_label(sender) } else { "Encrypted member".into() };
-                                let text = IncomingText { target, author, peer: None, body, html: false, outgoing, observed_at_ms, seq: Some(seq), pending: None };
+                                let text = IncomingText { target, conversation: Some(*conversation), author, peer: None, body, html: false, outgoing, observed_at_ms, seq: Some(seq), pending: None };
                                 let job = ContentJob { server: id.clone(), generation, identity: server.history_identity(peer), nonce: nonce.clone(), text, archived: true };
                                 if content.send(ContentWork::Text(Box::new(job))).await.is_err() { break; }
                             }
@@ -3053,8 +3053,8 @@ async fn storage_loop<F: Future<Output = Result<Storage, Error>>>(
                 document,
             } => {
                 let storage_key = match &job.text.target {
-                    TextTarget::Channel(id) => id.to_string(),
-                    TextTarget::DirectConversation(id) => direct_conversation_key(id),
+                    TextTarget::Channel(id) => channel_key(*id, job.text.conversation),
+                    TextTarget::DirectConversation(id) => conversation_key(id),
                     TextTarget::Direct(id) => job
                         .text
                         .peer
@@ -4622,6 +4622,7 @@ mod reply_owner_tests {
     fn page_asked(server: &str, generation: u64) -> Tracked {
         let mut ticket = ticket();
         ticket.owner = Some(crate::navigation::PageOwner {
+            key: String::new(),
             generation,
             epoch: 0,
             archive: Some(ASKED),
@@ -5466,6 +5467,7 @@ mod storage_loop_tests {
                 nonce: "nonce".into(),
                 text: IncomingText {
                     target: TextTarget::Channel(1),
+                    conversation: None,
                     author: "Ada".into(),
                     peer: None,
                     body: "body".into(),

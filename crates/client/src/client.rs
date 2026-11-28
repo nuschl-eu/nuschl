@@ -15,7 +15,7 @@ use crate::{
     names::{self, Preferences},
     navigation::PageOwner,
     platform::{CacheKey, ChangeRequest, Platform, RenderKey, Request, request_id},
-    server::{CertificatePrompt, HistoryProgress, ServerState, Status},
+    server::{CertificatePrompt, HistoryProgress, ServerState, Status, conversation_of},
     timeline::{Change, MAX_TIMELINE, Page},
     voice::{self, Seat, Unmute, Voice},
 };
@@ -1302,6 +1302,7 @@ impl Client {
         ticket.owner = Some(PageOwner {
             generation: server.generation,
             epoch: server.page_epoch,
+            key: channel.storage_key.clone(),
             archive: channel.conversation.filter(|_| archived),
             identity: identity.clone(),
         });
@@ -1961,6 +1962,9 @@ impl Client {
             && (owner.generation != state.generation
                 || owner.epoch != state.page_epoch
                 || state.history_identity().as_ref() != Some(&owner.identity)
+                || (state.channels[position].storage_key != owner.key
+                    && (conversation_of(&owner.key).is_some()
+                        || state.channels[position].conversation.is_some()))
                 || owner.archive.is_some_and(|id| {
                     ticket.source != HistorySource::ServerArchive
                         || state.history_source != HistorySource::ServerArchive
@@ -2597,39 +2601,52 @@ impl Client {
         if durable.is_some() {
             message.id = None;
         }
-        let position =
-            if let Some(position) = durable {
-                position
-            } else if let Some(position) = server.channels.iter().position(|channel| {
+        // A channel's rows are its conversation's; until this view learned
+        // one, a message stored under its id still finds it.
+        let shows = |channel: &ConversationState| match &target {
+            TextTarget::Channel(_) => {
+                channel.target == target
+                    && (channel.storage_key == storage_key || channel.conversation.is_none())
+            }
+            _ => {
                 channel.storage_key == storage_key
                     || (channel.target == target
                         && channel.storage_key.starts_with("direct:pending:")
                         && channel.direct_peer.as_ref().zip(peer.as_ref()).is_some_and(
                             |(old, new)| old.instance == new.instance && old.session == new.session,
                         ))
-            }) {
-                position
-            } else if let TextTarget::Direct(_) = target {
-                let name = peer
-                    .as_ref()
-                    .map(|peer| names::display_name(peer, &self.preferences))
-                    .unwrap_or("Direct message");
-                server.received_direct(name, target.clone(), peer.clone(), storage_key.clone())
-            } else if let TextTarget::DirectConversation(id) = target {
-                // A durable direct conversation, perhaps new.
-                let name = match &peer {
-                    Some(peer) => names::display_name(peer, &self.preferences).to_string(),
-                    None if message.outgoing => server
-                        .directs
-                        .get(&id)
-                        .map(|direct| direct.name.clone())
-                        .unwrap_or_else(|| "Direct message".into()),
-                    None => message.message.author.clone(),
-                };
-                server.direct_view(id, &name, peer.clone())
-            } else {
-                return None;
+            }
+        };
+        let position = if let Some(position) = durable {
+            position
+        } else if let Some(position) = server.channels.iter().position(shows) {
+            // A channel whose conversation this view had not learned yet
+            // takes the message's, and its rows with it.
+            if let Some(conversation) = conversation_of(&storage_key) {
+                server.channels[position].bind_conversation(Some(conversation));
+            }
+            position
+        } else if let TextTarget::Direct(_) = target {
+            let name = peer
+                .as_ref()
+                .map(|peer| names::display_name(peer, &self.preferences))
+                .unwrap_or("Direct message");
+            server.received_direct(name, target.clone(), peer.clone(), storage_key.clone())
+        } else if let TextTarget::DirectConversation(id) = target {
+            // A durable direct conversation, perhaps new.
+            let name = match &peer {
+                Some(peer) => names::display_name(peer, &self.preferences).to_string(),
+                None if message.outgoing => server
+                    .directs
+                    .get(&id)
+                    .map(|direct| direct.name.clone())
+                    .unwrap_or_else(|| "Direct message".into()),
+                None => message.message.author.clone(),
             };
+            server.direct_view(id, &name, peer.clone())
+        } else {
+            return None;
+        };
         let direct = matches!(
             target,
             TextTarget::Direct(_) | TextTarget::DirectConversation(_)
@@ -2856,6 +2873,26 @@ impl Client {
                         channel.timeline.reset();
                     }
                 }
+                // A server that names no conversations keeps its rows under the
+                // channel id, including one restored from a Nuschl server.
+                if !history {
+                    for channel in &mut server.channels {
+                        channel.bind_conversation(None);
+                    }
+                    let cached: Vec<u32> = server
+                        .bookmark
+                        .cached_channels
+                        .iter()
+                        .map(|channel| channel.id)
+                        .collect();
+                    let mut changed = false;
+                    for id in cached {
+                        changed |= server.bookmark.cache_conversation(id, None);
+                    }
+                    if changed {
+                        self.updates.push(Update::BookmarksChanged);
+                    }
+                }
                 self.updates.push(Update::Negotiated {
                     server: server.id.clone(),
                 });
@@ -2888,8 +2925,11 @@ impl Client {
                         server.history_progress.remove(&channel);
                     }
                 }
+                if server.bookmark.cache_conversation(channel, conversation) {
+                    self.updates.push(Update::BookmarksChanged);
+                }
                 if let Some(view) = server.channel_view(channel) {
-                    view.conversation = conversation;
+                    view.bind_conversation(conversation);
                     view.encryption = encryption;
                     if selected
                         && !view.timeline.loaded
@@ -3037,6 +3077,11 @@ impl Client {
                     parent: update.parent,
                     name: update.name.clone(),
                     position: update.position,
+                    conversation: server
+                        .channels
+                        .iter()
+                        .find(|channel| channel.target == TextTarget::Channel(update.id))
+                        .and_then(|channel| channel.conversation),
                 };
                 // Most updates (descriptions, links, a resent tree) leave the cache as it is.
                 if server.bookmark.cache_channel(cached) {
@@ -3537,7 +3582,7 @@ pub fn preview(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{CANT_SPEAK_HERE, NO_BANDWIDTH};
+    use crate::server::{CANT_SPEAK_HERE, NO_BANDWIDTH, conversation_key};
     use crate::{
         HistoryTicket,
         model::{Channel, User},
@@ -3566,6 +3611,10 @@ mod tests {
         metadata: Mutex<Vec<nuschl_core::model::MetadataAuthority>>,
         requests: Mutex<Vec<(String, Request)>>,
         pages: Mutex<Vec<(String, HistoryTicket, Page)>>,
+        /// The local key each server page was asked for.
+        page_keys: Mutex<Vec<Option<String>>>,
+        /// The local key each local page was asked for.
+        local_keys: Mutex<Vec<String>>,
         sounds: Mutex<Vec<Sound>>,
         rendered: Mutex<Vec<(String, u64, RenderKey, String)>>,
     }
@@ -3624,11 +3673,12 @@ mod tests {
             &self,
             server: String,
             _: String,
-            _: String,
+            channel: String,
             ticket: HistoryTicket,
             page: Page,
         ) -> Result<(), String> {
             self.pages.lock().unwrap().push((server, ticket, page));
+            self.local_keys.lock().unwrap().push(channel);
             Ok(())
         }
         fn server_history(
@@ -3636,10 +3686,14 @@ mod tests {
             server: String,
             _: [u8; 16],
             ticket: HistoryTicket,
-            _: Option<CacheKey>,
+            cache: Option<CacheKey>,
             page: Page,
         ) -> Result<(), String> {
             self.pages.lock().unwrap().push((server, ticket, page));
+            self.page_keys
+                .lock()
+                .unwrap()
+                .push(cache.map(|cache| cache.channel));
             Ok(())
         }
         fn change_message(&self, _: ChangeRequest) -> Result<(), String> {
@@ -6996,7 +7050,14 @@ mod tests {
         live.message.observed_at_ms = -2000; // arrival must not undo the archive's sequence order
         let source = live.message.body.clone();
         let receipt = client
-            .receive_message(&id, 1, TextTarget::Channel(2), "2".into(), None, live)
+            .receive_message(
+                &id,
+                1,
+                TextTarget::Channel(2),
+                conversation_key(&[2; 16]),
+                None,
+                live,
+            )
             .unwrap();
         let shown = &client.servers[0].channels[position].timeline.messages;
         assert_eq!(
@@ -7015,6 +7076,193 @@ mod tests {
             client.servers[0].channels[position].instance
         );
     }
+    /// The `Two` channel's view of the client `connected()` built.
+    fn channel(client: &Client, id: u32) -> usize {
+        client.servers[0]
+            .channels
+            .iter()
+            .position(|channel| channel.id == id)
+            .unwrap()
+    }
+
+    /// A Mumble channel id can be reused by a new channel. Its rows then
+    /// belong to a new conversation: the new view starts over in the new
+    /// key, and nothing for the old conversation reaches it.
+    #[test]
+    fn a_recreated_channel_starts_over_in_its_new_conversation() {
+        let (mut client, recorder, id) = recovery_client();
+        assert_eq!(
+            recorder
+                .page_keys
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_deref(),
+            Some(conversation_key(&[2; 16]).as_str())
+        );
+        let two = channel(&client, 2);
+        assert_eq!(client.servers[0].channels[two].timeline.messages.len(), 3);
+        let stale = recorder.pages.lock().unwrap().last().unwrap().1.clone();
+        // The channel goes and a new one takes its id.
+        client.handle(Input::Server {
+            server: id.clone(),
+            generation: 1,
+            event: ServerEvent::ChannelRemoved(2),
+        });
+        client.handle(Input::Server {
+            server: id.clone(),
+            generation: 1,
+            event: ServerEvent::Channel(Channel {
+                id: 2,
+                instance: 99,
+                parent: Some(0),
+                name: "Two again".into(),
+                ..Default::default()
+            }),
+        });
+        client.handle(Input::Server {
+            server: id.clone(),
+            generation: 1,
+            event: ServerEvent::ChannelInfo {
+                channel: 2,
+                conversation: Some([3; 16]),
+            },
+        });
+        let two = channel(&client, 2);
+        assert_eq!(
+            client.servers[0].channels[two].storage_key,
+            conversation_key(&[3; 16])
+        );
+        assert_eq!(
+            client.servers[0]
+                .bookmark
+                .cached_channels
+                .iter()
+                .find(|cached| cached.id == 2)
+                .unwrap()
+                .conversation,
+            Some([3; 16])
+        );
+        assert!(client.servers[0].channels[two].timeline.messages.is_empty());
+        // A page the old channel asked for does not fill the new one.
+        client.handle(Input::History {
+            server: id.clone(),
+            ticket: stale,
+            before: None,
+            messages: vec![recovery_row(1)],
+            next_before: None,
+        });
+        assert!(client.servers[0].channels[two].timeline.messages.is_empty());
+        // Nor does a live message of the old conversation.
+        assert!(
+            client
+                .receive_message(
+                    &id,
+                    1,
+                    TextTarget::Channel(2),
+                    conversation_key(&[2; 16]),
+                    None,
+                    recovery_row(2),
+                )
+                .is_none()
+        );
+        assert!(
+            client
+                .receive_message(
+                    &id,
+                    1,
+                    TextTarget::Channel(2),
+                    conversation_key(&[3; 16]),
+                    None,
+                    recovery_row(3),
+                )
+                .is_some()
+        );
+        assert_eq!(client.servers[0].channels[two].timeline.messages.len(), 1);
+    }
+
+    /// A saved channel keeps its rows under the conversation the server
+    /// named, so they are still found before the next connection.
+    #[test]
+    fn an_offline_channel_opens_the_rows_of_its_conversation() {
+        let recorder = Arc::new(Recorder::default());
+        let mut bookmark = ServerBookmark::new("Test", "localhost", 64738, "andi").unwrap();
+        bookmark.cached_channels.push(CachedChannel {
+            id: 2,
+            parent: Some(0),
+            name: "Two".into(),
+            position: 0,
+            conversation: Some([2; 16]),
+        });
+        let mut client = Client::new(
+            Box::new(recorder.clone()),
+            vec![bookmark],
+            Preferences::default(),
+        );
+        client.open(0, 2).unwrap();
+        assert_eq!(
+            recorder.local_keys.lock().unwrap().last().unwrap(),
+            &conversation_key(&[2; 16])
+        );
+    }
+
+    /// A server that names no conversations keeps its rows under the channel
+    /// id, including a view restored from a Nuschl server.
+    #[test]
+    fn a_server_without_conversations_keys_its_rows_by_channel_id() {
+        let recorder = Arc::new(Recorder::default());
+        let mut bookmark = ServerBookmark::new("Test", "localhost", 64738, "andi").unwrap();
+        bookmark.cached_channels.push(CachedChannel {
+            id: 2,
+            parent: Some(0),
+            name: "Two".into(),
+            position: 0,
+            conversation: Some([2; 16]),
+        });
+        let id = bookmark.id.clone();
+        let mut client = Client::new(Box::new(recorder), vec![bookmark], Preferences::default());
+        client.connect(0, None, false);
+        client.handle(Input::Server {
+            server: id,
+            generation: 1,
+            event: ServerEvent::Negotiated {
+                capabilities: Vec::new(),
+                policy: None,
+            },
+        });
+        let two = channel(&client, 2);
+        assert_eq!(client.servers[0].channels[two].storage_key, "2");
+        assert_eq!(
+            client.servers[0].bookmark.cached_channels[0].conversation,
+            None
+        );
+    }
+
+    /// A message can reach the client before it names the channel's
+    /// conversation; the view takes the conversation from the message.
+    #[test]
+    fn a_channel_learns_its_conversation_from_the_first_stored_message() {
+        let (mut client, _, id) = connected();
+        assert!(
+            client
+                .receive_message(
+                    &id,
+                    1,
+                    TextTarget::Channel(2),
+                    conversation_key(&[5; 16]),
+                    None,
+                    recovery_row(4),
+                )
+                .is_some()
+        );
+        let two = channel(&client, 2);
+        assert_eq!(
+            client.servers[0].channels[two].storage_key,
+            conversation_key(&[5; 16])
+        );
+    }
+
     #[test]
     fn explicit_disconnect_during_recovery_can_still_open_local_offline_history() {
         let (mut client, recorder, id) = recovery_client();

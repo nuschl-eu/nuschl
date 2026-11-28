@@ -29,7 +29,10 @@ pub struct ConversationState {
     pub target: TextTarget,
     /// The other person of a direct conversation, as last seen.
     pub direct_peer: Option<User>,
-    /// Where local history keeps it.
+    /// Where local history keeps it: a channel's conversation, or its id
+    /// until the server names one ([`bind_conversation`]).
+    ///
+    /// [`bind_conversation`]: Self::bind_conversation
     pub storage_key: String,
     /// The latest page of history, older pages prepended as the reader
     /// scrolls up, and live messages appended.
@@ -47,9 +50,12 @@ pub struct ConversationState {
     pub max_users: u32,
     /// Raw, untrusted Mumble HTML; only the content worker renders it.
     pub description_raw: String,
-    /// Its conversation on a Nuschl server, and the read marker sent last.
+    /// Its conversation on a Nuschl server, which decides [`storage_key`].
+    ///
+    /// [`storage_key`]: Self::storage_key
     pub conversation: Option<[u8; 16]>,
     pub encryption: Option<EncryptionState>,
+    /// The read marker sent last.
     pub read_seq: i64,
     /// Who is typing here (Nuschl servers), by session, and when they last
     /// said so (the platform's monotonic milliseconds).
@@ -137,6 +143,27 @@ impl ConversationState {
             storage_key,
             ..Self::root()
         }
+    }
+
+    /// Bind the view to the conversation its channel currently has.
+    ///
+    /// Mumble reuses a channel id once its channel is gone, so a recreated
+    /// channel's history belongs to a new conversation: it is kept under that
+    /// conversation's key and the timeline starts over in it. A stock server
+    /// names no conversation, and the channel id stays the key.
+    pub fn bind_conversation(&mut self, conversation: Option<[u8; 16]>) {
+        self.conversation = conversation;
+        let key = crate::server::channel_key(self.id, conversation);
+        if key == self.storage_key {
+            return;
+        }
+        self.storage_key = key;
+        self.timeline.reset();
+        self.new_messages = 0;
+        self.unread = 0;
+        self.unread_mention = false;
+        self.read_seq = 0;
+        self.typing.clear();
     }
 
     /// Add an activity line; the oldest go beyond [`MAX_ACTIVITY`].
@@ -289,6 +316,29 @@ mod tests {
             MessageDocument { blocks: Vec::new() },
             false,
         )
+    }
+
+    /// A channel's rows are keyed by the conversation the server named; the
+    /// id is only a stand-in until then, and a new conversation starts over.
+    #[test]
+    fn binding_a_conversation_moves_the_key_and_starts_the_timeline_over() {
+        let mut conversation = ConversationState::channel(2, Some(0), "Two".into(), 0);
+        assert_eq!(conversation.storage_key, "2");
+        conversation.timeline.loaded = true;
+        conversation.new_messages = 3;
+        conversation.bind_conversation(Some([7; 16]));
+        assert_eq!(
+            conversation.storage_key,
+            crate::server::conversation_key(&[7; 16])
+        );
+        assert!(!conversation.timeline.loaded && conversation.new_messages == 0);
+        // The same conversation again changes nothing.
+        conversation.timeline.loaded = true;
+        conversation.bind_conversation(Some([7; 16]));
+        assert!(conversation.timeline.loaded);
+        // A stock server names none, and the channel id stays the key.
+        conversation.bind_conversation(None);
+        assert_eq!(conversation.storage_key, "2");
     }
 
     #[test]
