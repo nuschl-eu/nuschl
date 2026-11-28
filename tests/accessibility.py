@@ -607,7 +607,7 @@ class AccessibilityTest:
                 names = [name for _, _, _, name in snapshot(nuschl)]
                 arrived = {int(match[1]) for name in names
                            if (match := re.match(r"Ada Lovelace: History message (\d+)\b", name))}
-                notices = [name for name in names if "overloaded" in name]
+                notices = [name for name in names if "history" in name.lower()]
                 raise AssertionError(f"the long conversation stopped arriving: {len(arrived)} of {HISTORY} "
                                      f"messages, the newest {newest!r}; notices: {notices}")
             time.sleep(0.5)

@@ -600,19 +600,31 @@ fn skip_columns(text: &str, columns: usize) -> String {
 
 fn draw_status(frame: &mut Frame, app: &App, note_area: Rect, state_area: Rect) {
     let now = crate::app::monotonic_ms();
-    if let Some(note) = app.notes.back().filter(|note| {
+    let warning = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let info = Style::new().fg(Color::Cyan);
+    let fresh = app.notes.back().filter(|note| {
         now.saturating_sub(note.at_ms) < if note.warning { NOTE_MS * 4 } else { NOTE_MS }
-    }) {
-        let style = if note.warning {
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::Cyan)
-        };
-        let text = note.text.replace('\n', " ");
-        frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {text}"), style)),
-            note_area,
-        );
+    });
+    // Content missing from local history stays on the line after the note
+    // that first reported it expires.
+    match fresh {
+        Some(note) => {
+            let style = if note.warning { warning } else { info };
+            let text = note.text.replace('\n', " ");
+            frame.render_widget(
+                Paragraph::new(Line::styled(format!(" {text}"), style)),
+                note_area,
+            );
+        }
+        None => {
+            if let Some(loss) = &app.history_loss {
+                let text = loss.replace('\n', " ");
+                frame.render_widget(
+                    Paragraph::new(Line::styled(format!(" {text}"), warning)),
+                    note_area,
+                );
+            }
+        }
     }
     let mut state = String::new();
     if let Some(index) = app.current_server() {

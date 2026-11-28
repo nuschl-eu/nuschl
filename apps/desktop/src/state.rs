@@ -244,6 +244,10 @@ pub struct Desktop {
     /// Loading older history failed: wait for the reader before trying again.
     pub older_paused: bool,
     pub error: Option<String>,
+    /// Content missing from this device's history. It stays in its own notice
+    /// until the user dismisses it; the notice slot above comes and goes with
+    /// the writer's health.
+    pub history_loss: Option<String>,
     pub title_drag: bool,
     /// Pointer x and sidebar width where a sidebar resize started, and the live width.
     pub sidebar_drag: Option<(f32, f32, f32)>,
@@ -571,6 +575,7 @@ impl Desktop {
             anchor: Anchor::default(),
             older_paused: false,
             error: (!problems.is_empty()).then(|| problems.join("\n")),
+            history_loss: None,
             title_drag: false,
             sidebar_drag: None,
             settings,
@@ -2665,6 +2670,7 @@ impl Desktop {
                     self.older_paused = true;
                     self.error = Some(error);
                 }
+                Update::HistoryLoss(reason) => self.history_loss = Some(reason),
                 Update::HistoryRecovered => {
                     self.older_paused = false;
                     if self

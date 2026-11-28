@@ -3400,6 +3400,31 @@ fn conversation_notices(
             .into_any_element(),
         );
     }
+    if let Some(loss) = this.history_loss.clone() {
+        let dismiss = icon_button(
+            "dismiss-history-loss",
+            "window-close",
+            "Dismiss missing-history notice",
+            WARNING,
+            None,
+            move |this, _, cx| {
+                this.history_loss = None;
+                cx.notify();
+            },
+            cx,
+        );
+        notices.push(
+            layout::notice(
+                "history-loss-banner",
+                WARNING,
+                "alert",
+                layout::text("history-loss", loss),
+                Some(dismiss),
+            )
+            .aria_label("Missing history notice")
+            .into_any_element(),
+        );
+    }
     notices.extend(unmatched_call_card(this, index, channel, cx));
     if let Some(text) = &server.suggestion {
         let ptt = text.contains("push-to-talk");

@@ -124,10 +124,12 @@ while let Some(event) = events.recv().await {
   as are history pages whose ticket is no longer current.
 - **Updates** (`Client::take_updates`): `BookmarksChanged`/`…Now` (save),
   `Browse` (open this conversation), `LoginRefused`, `Sent` (a composer can clear),
-  `PageShown` (scroll to the newest, or to a search result), `HistoryFailed`,
-  `HistoryRecovered`, `OwnMessage`, `Notify`, `Negotiated`, `Gap`,
-  `MessageDeleted`, `SearchResults`, `Rendered` and `Avatar` (content for the UI's
-  own images). GPUI: apply, then `cx.notify()`; ratatui: redraw; UniFFI: a callback
+  `PageShown` (scroll to the newest, or to a search result), `HistoryFailed`
+  (local history could not read or write), `HistoryLoss` (a message or change
+  that never reached local history; keep it visible until the user dismisses
+  it), `HistoryRecovered`, `OwnMessage`, `Notify`, `Negotiated`, `Gap`,
+  `MessageDeleted`, `SearchResults`, `Rendered` and `Avatar` (content for the
+  UI's own images). GPUI: apply, then `cx.notify()`; ratatui: redraw; UniFFI: a callback
   per update that Kotlin and Swift turn into flows; WASM: `postMessage` of the update.
 - **Plain data**: owned strings, enums with data, ids as values (server ids, channel
   ids, 16-byte conversation ids, message serials); no generics or lifetimes on the
