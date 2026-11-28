@@ -7,11 +7,17 @@
 //! their idempotency key. Edits and deletions apply to the message they name
 //! and never overtake it: one that arrives first waits for its message.
 use nuschl_core::{ChatMessage, MessageDocument, transfer::Offer};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 /// Messages a timeline keeps while its reader is at the newest message;
 /// older ones are dropped and load again from history on scrolling up.
 pub const MAX_TIMELINE: usize = 1000;
+
+/// Timeline order: observation time, then id; a row the server has not stored
+/// yet has no id, so it follows the stored rows of the same instant.
+fn order(message: &Message) -> (i64, i64) {
+    (message.observed_at_ms, message.id.unwrap_or(i64::MAX))
+}
 
 /// Admission may count a detached live message without inserting a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,9 +256,29 @@ impl Timeline {
         let message = Message::from(message);
         let serial = message.serial;
         self.messages.push(message);
-        self.messages
-            .sort_by_key(|message| (message.observed_at_ms, message.id.unwrap_or(i64::MAX)));
+        self.messages.sort_by_key(order);
         Some(serial)
+    }
+
+    /// Add the messages of one page. A page carries a hundred rows or more,
+    /// so its ids are collected once and the timeline is ordered once, rather
+    /// than scanned and sorted for every row. Ids the timeline holds are
+    /// skipped, as are repeats within the page; unsaved rows always arrive.
+    fn merge_page(&mut self, messages: Vec<IncomingMessage>) {
+        let mut seen: HashSet<i64> = self.messages.iter().filter_map(|entry| entry.id).collect();
+        let mut added = false;
+        for message in messages {
+            if let Some(id) = message.id
+                && !seen.insert(id)
+            {
+                continue;
+            }
+            self.messages.push(Message::from(message));
+            added = true;
+        }
+        if added {
+            self.messages.sort_by_key(order);
+        }
     }
 
     /// A live message. While older history is shown apart from the newest
@@ -314,9 +340,7 @@ impl Timeline {
             Some(before) if self.next_before != Some(before) => return false,
             Some(_) => {}
         }
-        for message in messages {
-            self.merge(message);
-        }
+        self.merge_page(messages);
         self.next_before = next_before;
         self.beginning = next_before.is_none();
         true
@@ -338,9 +362,7 @@ impl Timeline {
                 self.messages.retain(|message| {
                     next_after.is_none() && message.id.is_none_or(|id| Some(id) > newest)
                 });
-                for message in messages {
-                    self.merge(message);
-                }
+                self.merge_page(messages);
                 self.next_before = next_before;
                 self.beginning = next_before.is_none();
                 self.next_after = next_after;
@@ -349,9 +371,7 @@ impl Timeline {
                 true
             }
             Page::After(after) if self.next_after == Some(after) => {
-                for message in messages {
-                    self.merge(message);
-                }
+                self.merge_page(messages);
                 // A live message left out meanwhile is newer than this page.
                 self.next_after = next_after.or_else(|| {
                     self.missed_live
@@ -679,6 +699,44 @@ mod tests {
     }
 
     #[test]
+    fn a_page_arrives_once_per_row_and_in_timeline_order() {
+        let mut timeline = Timeline::default();
+        timeline.merge(message(Some(5), 5000));
+        timeline.merge(message(Some(7), 7000));
+        // Older rows, one the timeline holds, and a repeat inside the page.
+        let mut first = message(None, 1000);
+        first.message.author = "first".into();
+        let mut second = message(None, 1000);
+        second.message.author = "second".into();
+        let page = vec![
+            message(Some(9), 9000),
+            message(Some(3), 3000),
+            message(Some(5), 5000),
+            message(Some(3), 3000),
+            second,
+            first,
+        ];
+        // An older page continues from the oldest message shown.
+        timeline.next_before = Some(5);
+        assert!(timeline.take_page(Some(5), page, None));
+        assert_eq!(
+            ids(&timeline),
+            [None, None, Some(3), Some(5), Some(7), Some(9)],
+            "each id once, unsaved rows kept, ordered by time"
+        );
+        // Rows of the same instant keep the order the page gave them.
+        assert_eq!(
+            timeline
+                .messages
+                .iter()
+                .take(2)
+                .map(|message| message.author.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+    }
+
+    #[test]
     fn local_pages_follow_time_not_row_ids() {
         // A server page kept after live messages: newer rows, older times.
         let mut timeline = Timeline::default();
@@ -815,6 +873,38 @@ mod tests {
         // Live messages join it directly again.
         assert!(timeline.receive(message(Some(202), 202_000)));
         assert_eq!(timeline.messages.last().and_then(|m| m.id), Some(202));
+    }
+
+    #[test]
+    fn a_later_window_arrives_once_per_row_and_in_timeline_order() {
+        let mut timeline = Timeline::default();
+        timeline.take_page(None, page(1..=5), Some(1));
+        timeline.next_after = Some(5);
+        // Out of order, one repeat, and one row the server has not stored.
+        let mut unsaved = message(None, 6500);
+        unsaved.message.author = "unsaved".into();
+        let later = vec![
+            message(Some(7), 7000),
+            message(Some(6), 6000),
+            message(Some(6), 6000),
+            unsaved,
+        ];
+        assert!(timeline.take_window(Page::After(5), later, (None, None)));
+        assert_eq!(
+            ids(&timeline),
+            [
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                None,
+                Some(7)
+            ]
+        );
+        // The unsaved row sorts by its time, after row 6 of the same minute.
+        assert_eq!(timeline.messages[6].author, "unsaved");
     }
 
     fn edit(text: &str, at: i64) -> Change {
