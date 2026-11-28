@@ -160,7 +160,7 @@ macro_rules! insert {
             .bind(id)
             .bind(&$message.server)
             .bind($author)
-            .bind(visible($body).to_lowercase())
+            .bind(indexed(&visible($body)))
             .execute(&mut *$transaction)
             .await?;
         sqlx::query($index)
@@ -287,13 +287,19 @@ impl BeginWrite for sqlx::PgPool {
     }
 }
 
-/// What search matches and returns: the text without inline image data.
+/// What a page shows of a message: its text without inline image data.
 fn visible(body: &str) -> String {
     body.split(nuschl_core::EMBED)
         .step_by(2)
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A message's text as search stores it, and the name `from:` matches against
+/// (`nuschl_core::search::fold` holds the rule; a query folds the same way).
+fn indexed(body: &str) -> String {
+    nuschl_core::search::fold(body)
 }
 
 fn entry(
@@ -523,23 +529,30 @@ impl History {
     /// smallest indexed ID has its row: an interrupted fill resumes below it,
     /// and a finished one costs two index lookups.
     async fn backfill_search(&self) -> Result<bool, Error> {
-        type Old = (i64, String, String, String);
+        type Old = (i64, String, String, String, Option<i64>);
         with_pool!(&self.pool, |pool| {
             let mut transaction = pool.begin().await?;
             let rows: Vec<Old> = sqlx::query_as(
-                "SELECT id, server, author, body FROM messages WHERE id < (SELECT COALESCE(MIN(id), $1) FROM message_search) ORDER BY id DESC LIMIT $2",
+                "SELECT id, server, author, body, deleted_ms FROM messages WHERE id < (SELECT COALESCE(MIN(id), $1) FROM message_search) ORDER BY id DESC LIMIT $2",
             )
             .bind(i64::MAX)
             .bind(BACKFILL_BATCH)
             .fetch_all(&mut *transaction)
             .await?;
             let found = !rows.is_empty();
-            for (id, server, author, body) in rows {
+            for (id, server, author, body, deleted_ms) in rows {
+                // A tombstone keeps neither its text nor its author in search,
+                // as an index filled at insert time has it.
+                let (author, text) = if deleted_ms.is_some() {
+                    (String::new(), String::new())
+                } else {
+                    (indexed(&author), indexed(&visible(&body)))
+                };
                 sqlx::query(INSERT_SEARCH)
                     .bind(id)
                     .bind(server)
-                    .bind(author.to_lowercase())
-                    .bind(visible(&body).to_lowercase())
+                    .bind(author)
+                    .bind(text)
                     .execute(&mut *transaction)
                     .await?;
             }
@@ -596,7 +609,7 @@ impl History {
                 index,
                 message,
                 message.body.as_str(),
-                message.author.to_lowercase(),
+                indexed(&message.author),
                 (None, None, None)
             );
             transaction.commit().await?;
@@ -644,7 +657,7 @@ impl History {
                         let author = if deleted_ms.is_some() {
                             String::new()
                         } else {
-                            message.author.to_lowercase()
+                            indexed(&message.author)
                         };
                         if deleted_ms.is_some() || current {
                             let body = if deleted_ms.is_some() {
@@ -663,13 +676,7 @@ impl History {
                             .bind(deleted_ms)
                             .execute(&mut *transaction)
                             .await?;
-                            research!(
-                                transaction,
-                                sqlite,
-                                id,
-                                visible(body).to_lowercase(),
-                                author
-                            );
+                            research!(transaction, sqlite, id, indexed(&visible(body)), author);
                         }
                         id
                     }
@@ -677,7 +684,7 @@ impl History {
                         let (body, author) = if record.deleted_ms.is_some() {
                             ("", String::new())
                         } else {
-                            (message.body.as_str(), message.author.to_lowercase())
+                            (message.body.as_str(), indexed(&message.author))
                         };
                         insert!(
                             transaction,
@@ -773,8 +780,8 @@ impl History {
                 transaction,
                 sqlite,
                 id,
-                visible(body).to_lowercase(),
-                author.to_lowercase()
+                indexed(&visible(body)),
+                indexed(&author)
             );
             transaction.commit().await?;
             Ok(true)
@@ -1407,6 +1414,46 @@ mod tests {
         Ok(())
     }
 
+    async fn search_folds_accents_and_finds_words_inside_a_cjk_run(
+        history: &History,
+    ) -> Result<(), Error> {
+        for body in ["Le Café du coin", "你好世界", "ひらがな"] {
+            history.append(&message("folded", "Ada", body)).await?;
+        }
+        // Either spelling of a letter finds the message, which still shows as
+        // it was written.
+        for typed in ["cafe", "café", "CAFÉ"] {
+            assert_eq!(
+                find(history, "folded", typed).await?,
+                ["Le Café du coin"],
+                "{typed}"
+            );
+        }
+        assert_eq!(find(history, "folded", "caf").await?, ["Le Café du coin"]);
+        // A word from inside a run of text written without spaces matches too.
+        for typed in ["好世", "世界", "好世界"] {
+            assert_eq!(
+                find(history, "folded", typed).await?,
+                ["你好世界"],
+                "{typed}"
+            );
+        }
+        assert_eq!(find(history, "folded", "がな").await?, ["ひらがな"]);
+        // Kana's halfwidth block and the Han planes above the basic one split
+        // too, so a word from inside them is found as well.
+        for (body, typed) in [("ﾊﾛｰﾜｰﾙﾄﾞ", "ﾛｰ"), ("𠀁𠀂𠀃", "𠀂")] {
+            history.append(&message("folded", "Ada", body)).await?;
+            assert_eq!(find(history, "folded", typed).await?, [body], "{typed}");
+        }
+        // The author's name folds the same way for `from:`.
+        history.append(&message("folded", "Café", "hello")).await?;
+        assert_eq!(find(history, "folded", "from:cafe").await?, ["hello"]);
+        assert_eq!(find(history, "folded", "from:café").await?, ["hello"]);
+        // Each character is a word of its own, so one finds the message.
+        assert_eq!(find(history, "folded", "好 ").await?, ["你好世界"]);
+        Ok(())
+    }
+
     async fn full_text_matches_words_phrases_and_prefixes(history: &History) -> Result<(), Error> {
         for (channel, author, body) in [
             ("general", "Ada Lovelace", "Deploy the Rust server tonight"),
@@ -1452,10 +1499,15 @@ mod tests {
             1,
             "an open quote too"
         );
+        // An accent is a spelling of the same letter: either one finds it.
         assert_eq!(find(history, "words", "ärger").await?.len(), 1);
-        assert!(
-            find(history, "words", "arger").await?.is_empty(),
-            "diacritics count"
+        assert_eq!(find(history, "words", "arger").await?.len(), 1);
+        assert_eq!(find(history, "words", "arger ").await?.len(), 1);
+        assert_eq!(find(history, "words", "Ärger").await?.len(), 1);
+        assert_eq!(
+            find(history, "words", "arg ").await?.len(),
+            0,
+            "whole words"
         );
         assert_eq!(find(history, "words", "100 done now").await?.len(), 1);
         // Authors by the start of their name; with words, both must match.
@@ -1598,8 +1650,39 @@ mod tests {
         search_pages_within_the_byte_budget(history).await?;
         search_pages_reach_every_match(history).await?;
         full_text_matches_words_phrases_and_prefixes(history).await?;
+        search_folds_accents_and_finds_words_inside_a_cjk_run(history).await?;
         results_rank_relevance_and_recency(history).await?;
-        pages_around_and_after_a_message(history).await
+        pages_around_and_after_a_message(history).await?;
+        // Last: it empties the index and fills it again.
+        a_rebuilt_index_keeps_a_tombstone_anonymous(history).await
+    }
+
+    /// An index rebuilt from the messages keeps a tombstone's author out of
+    /// `from:`, as one filled at the message's insert has it.
+    async fn a_rebuilt_index_keeps_a_tombstone_anonymous(history: &History) -> Result<(), Error> {
+        history
+            .store_server(&[record(1, 100, "kept words"), record(2, 200, "gone words")])
+            .await?;
+        assert!(history.delete("nuschl", "3", 2, 300).await?);
+        with_pool!(&history.pool, |pool| {
+            sqlx::query("DELETE FROM message_search")
+                .execute(pool)
+                .await?;
+            sqlx::query(
+                "UPDATE search_backfill SET below = (SELECT COALESCE(MAX(id), 0) + 1 FROM messages)",
+            )
+            .execute(pool)
+            .await?;
+            Ok::<(), Error>(())
+        })?;
+        while history.backfill().await? {}
+        assert_eq!(find(history, "nuschl", "from:ada").await?, ["kept words"]);
+        if let Pool::Sqlite(pool) = &history.pool {
+            sqlx::query("INSERT INTO message_fts (message_fts) VALUES ('rebuild')")
+                .execute(pool)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Messages in a database at the first schema version, as a search-text
@@ -1654,7 +1737,7 @@ mod tests {
                     .bind(id)
                     .bind("old")
                     .bind("ada")
-                    .bind(visible(&body).to_lowercase())
+                    .bind(indexed(&visible(&body)))
                     .execute(pool)
                     .await?;
             }
