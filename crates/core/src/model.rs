@@ -330,7 +330,28 @@ pub struct Ban {
     pub duration: Option<u32>,
 }
 
+/// What identifies a ban entry across replies. The wire names no ban, so rows
+/// match by these fields; entries a server reports twice are indistinguishable.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BanKey {
+    pub address: Vec<u8>,
+    pub mask: u32,
+    pub name: Option<String>,
+    pub hash: Option<String>,
+}
+
 impl Ban {
+    /// What identifies this entry across replies; the reason, start and
+    /// duration change without making it another ban.
+    pub fn key(&self) -> BanKey {
+        BanKey {
+            address: self.address.clone(),
+            mask: self.mask,
+            name: self.name.clone(),
+            hash: self.hash.clone(),
+        }
+    }
+
     pub fn address_text(&self) -> String {
         match self.address.len() {
             16 if self.address[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] => {

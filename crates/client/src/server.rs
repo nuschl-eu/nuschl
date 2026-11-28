@@ -8,7 +8,7 @@ use crate::{
     HistorySource, SessionSecurity,
     conversation::ConversationState,
     model::{
-        Acl, Ban, ContextAction, RegisteredUser, ServerLimits, TextTarget, TransportStats, User,
+        Acl, ContextAction, RegisteredUser, ServerLimits, TextTarget, TransportStats, User,
         UserStats, permission as perm,
     },
     timeline::{Change, Message, WaitingChanges},
@@ -224,7 +224,8 @@ pub struct ServerState {
     /// Users heard speaking with CELT/Speex, which Nuschl cannot play.
     pub legacy_voice: BTreeSet<u32>,
     pub registered_users: Option<Vec<RegisteredUser>>,
-    pub bans: Option<Vec<Ban>>,
+    /// The ban list being edited; a reply keeps the rows it still lists.
+    pub bans: Option<nuschl_core::admin::BanDraft>,
     pub acl: Option<Acl>,
     /// Only correlated responses can initialize/validate an administrative draft.
     pub acl_reply: Option<nuschl_core::admin::AclReply>,

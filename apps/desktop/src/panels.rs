@@ -583,19 +583,20 @@ pub fn panel(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                     .text_color(color(TEXT_MUTED))
                     .child(text!("Loading…").with_id("loading"))
                     .into_any_element(),
-                Some(bans) if bans.is_empty() => div()
+                Some(draft) if draft.rows().is_empty() => div()
                     .px_6()
                     .pb_6()
                     .text_sm()
                     .text_color(color(TEXT_MUTED))
                     .child(text!("No bans.").with_id("no-bans"))
                     .into_any_element(),
-                Some(bans) => div()
+                Some(draft) => div()
                     .px_6()
                     .pb_6()
                     .flex()
                     .flex_col()
-                    .children(bans.iter().enumerate().take(1000).map(|(position, ban)| {
+                    .children(draft.rows().iter().take(1000).map(|row| {
+                        let ban = &row.value;
                         let detail = [
                             ban.name.clone(),
                             ban.reason.clone(),
@@ -623,36 +624,38 @@ pub fn panel(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
                                     .flex()
                                     .flex_col()
                                     .child(
-                                        text!(ban.address_text())
-                                            .with_id(("ban-address", position)),
+                                        text!(ban.address_text()).with_id(("ban-address", row.id)),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(color(TEXT_FAINT))
-                                            .child(text!(detail).with_id(("ban-detail", position))),
+                                            .child(text!(detail).with_id(("ban-detail", row.id))),
                                     ),
                             )
                             .child(styled_button(
-                                ("unban", position),
+                                ("unban", row.id),
                                 "Remove",
                                 Tone::Ghost,
                                 {
                                     let origin = origin.clone();
+                                    let id = row.id;
                                     move |this, _, cx| {
                                         let Some(index) = origin.live_index(this) else {
                                             return;
                                         };
                                         origin.with_scope(this, |this| {
-                                            if let Some(bans) =
-                                                this.client.servers[index].bans.as_mut()
-                                            {
-                                                if position < bans.len() {
-                                                    bans.remove(position);
-                                                }
-                                                let bans = bans.clone();
-                                                this.run(index, Command::UpdateBans(bans));
-                                            }
+                                            let Some(bans) = this.client.servers[index]
+                                                .bans
+                                                .as_mut()
+                                                .and_then(|draft| draft.remove(id))
+                                            else {
+                                                return;
+                                            };
+                                            // nuschld stores an update without
+                                            // answering it: read the list back.
+                                            this.run(index, Command::UpdateBans(bans));
+                                            this.run(index, Command::QueryBans);
                                             cx.notify();
                                         });
                                     }

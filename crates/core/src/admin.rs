@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! UI-independent ACL drafts. Remote snapshots are never edited in place.
+//! UI-independent administrative drafts: ACLs and the ban list.
 //!
-//! Row keys belong to one draft lifetime and are never reused, including after
-//! explicit reload. Account IDs refer to the registered-user database, not to
-//! online sessions. Wire correlation and connection authority belong to adapters.
-use crate::model::{Acl, AclEntry, AclGroup, permission};
+//! An ACL draft keeps the server's snapshot apart and edits local rows only. A
+//! ban draft edits the rows of the latest reply and reads the list back after a
+//! removal. Row IDs are never reused, including after explicit reload. Account
+//! IDs refer to the registered-user database, not to online sessions. Wire
+//! correlation and connection authority belong to adapters.
+use crate::model::{Acl, AclEntry, AclGroup, Ban, BanKey, permission};
+use std::collections::VecDeque;
 
 /// What Mumble's channel password admits: `#<password>` is granted these and
 /// `@all` denied them, in two local rules that apply in the channel only.
@@ -39,6 +42,64 @@ fn is_password_lock(entry: &AclEntry) -> bool {
 
 pub type RowId = u64;
 
+/// The ban list as the latest reply sent it, with one row ID per entry. A row
+/// that a reply still lists keeps its ID, so a control removes the entry it
+/// showed.
+#[derive(Clone, Debug)]
+pub struct BanDraft {
+    rows: Vec<Row<Ban>>,
+}
+
+impl BanDraft {
+    pub fn new(bans: Vec<Ban>) -> Self {
+        let mut draft = Self { rows: Vec::new() };
+        draft.replace(bans);
+        draft
+    }
+
+    /// A reply replaces the entries; entries it still lists keep their row IDs.
+    pub fn replace(&mut self, bans: Vec<Ban>) {
+        let mut previous: std::collections::BTreeMap<BanKey, VecDeque<RowId>> =
+            std::collections::BTreeMap::new();
+        for row in std::mem::take(&mut self.rows) {
+            previous
+                .entry(row.value.key())
+                .or_default()
+                .push_back(row.id);
+        }
+        let mut rows = Vec::with_capacity(bans.len());
+        for ban in bans {
+            let id = previous
+                .get_mut(&ban.key())
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_else(allocate);
+            rows.push(Row { id, value: ban });
+        }
+        self.rows = rows;
+    }
+
+    pub fn rows(&self) -> &[Row<Ban>] {
+        &self.rows
+    }
+
+    /// Drops row `id` and returns the list to send. `None` once the latest
+    /// reply no longer lists it.
+    pub fn remove(&mut self, id: RowId) -> Option<Vec<Ban>> {
+        let position = self.rows.iter().position(|row| row.id == id)?;
+        self.rows.remove(position);
+        Some(self.rows.iter().map(|row| row.value.clone()).collect())
+    }
+}
+
+/// A row ID no draft has used: an action captured in one draft cannot name a
+/// row of another.
+fn allocate() -> RowId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert_ne!(id, 0, "administrative row ID exhausted");
+    id
+}
+
 /// A locally correlated response. The legacy wire carries no request ID.
 #[derive(Clone, Debug)]
 pub struct AclReply {
@@ -70,7 +131,6 @@ pub struct AclDraft {
     inherit_acls: bool,
     entries: Vec<Row<AclEntry>>,
     groups: Vec<Row<AclGroup>>,
-    next_row: RowId,
 }
 
 impl AclDraft {
@@ -80,7 +140,6 @@ impl AclDraft {
             inherit_acls: acl.inherit_acls,
             entries: Vec::new(),
             groups: Vec::new(),
-            next_row: 1,
         };
         draft.reload(acl);
         draft
@@ -91,14 +150,14 @@ impl AclDraft {
         self.entries.clear();
         self.groups.clear();
         for entry in &acl.entries {
-            let id = self.allocate();
+            let id = allocate();
             self.entries.push(Row {
                 id,
                 value: entry.clone(),
             });
         }
         for group in &acl.groups {
-            let id = self.allocate();
+            let id = allocate();
             self.groups.push(Row {
                 id,
                 value: group.clone(),
@@ -106,12 +165,6 @@ impl AclDraft {
         }
         self.inherit_acls = acl.inherit_acls;
         self.baseline = acl;
-    }
-
-    fn allocate(&mut self) -> RowId {
-        let id = self.next_row;
-        self.next_row = self.next_row.checked_add(1).expect("ACL row ID exhausted");
-        id
     }
 
     pub fn channel(&self) -> u32 {
@@ -173,7 +226,7 @@ impl AclDraft {
         if self.entries.len() >= 4096 {
             return Err("The editor supports at most 4096 rules.");
         }
-        let id = self.allocate();
+        let id = allocate();
         self.entries.push(Row {
             id,
             value: AclEntry {
@@ -251,7 +304,7 @@ impl AclDraft {
         {
             return Err("That group already exists. Select it to edit its local overrides.");
         }
-        let id = self.allocate();
+        let id = allocate();
         self.groups.push(Row {
             id,
             value: AclGroup {
@@ -307,7 +360,7 @@ impl AclDraft {
             ("all".to_owned(), 0, PASSWORD),
             (format!("#{password}"), PASSWORD, 0),
         ] {
-            let id = self.allocate();
+            let id = allocate();
             self.entries.push(Row {
                 id,
                 value: AclEntry {
@@ -358,7 +411,7 @@ impl AclDraft {
         let password: Vec<_> = own.into_iter().filter(password).collect();
         self.entries = inherited;
         for value in rules {
-            let id = self.allocate();
+            let id = allocate();
             self.entries.push(Row { id, value });
         }
         self.entries.extend(password);
