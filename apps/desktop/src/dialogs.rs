@@ -337,10 +337,10 @@ pub fn modal(
     close: impl Fn(&mut Desktop) + 'static,
 ) -> AnyElement {
     this.modal_shown.set(Some(id));
+    let opened = this.dialog_is_new(id);
     let scroll = this.dialog_scroll(id);
-    if this.modal_seen.get() != Some(id) {
-        tracing::debug!(dialog = id, previous = ?this.modal_seen.get(), "reset dialog scroll");
-        scroll.set_offset(point(px(0.), px(0.)));
+    if opened {
+        tracing::debug!(dialog = id, "reset dialog scroll");
         this.nested.forget_all();
     }
     let close = Rc::new(close);

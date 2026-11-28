@@ -55,6 +55,19 @@ pub enum Panel {
 }
 
 impl Panel {
+    /// The dialog id of this panel: each panel keeps its own scroll, so the one
+    /// a menu opens starts at the top.
+    pub(crate) fn dialog(&self) -> &'static str {
+        match self {
+            Self::UserInfo { .. } => "panel-user",
+            Self::IdentityAlarm { .. } => "panel-identity-alarm",
+            Self::Connection { .. } => "panel-connection",
+            Self::RegisteredUsers { .. } => "panel-users",
+            Self::Bans { .. } => "panel-bans",
+            Self::Acl { .. } => "panel-acl",
+            Self::ChannelEdit { .. } => "panel-channel",
+        }
+    }
     pub(crate) fn origin(&self) -> Option<&ActionOrigin> {
         match self {
             Self::UserInfo { origin, .. }
@@ -770,7 +783,7 @@ pub fn panel(this: &Desktop, cx: &mut Context<Desktop>) -> Option<AnyElement> {
     };
     Some(modal(
         this,
-        "panel",
+        panel.dialog(),
         "Details",
         title,
         token,
