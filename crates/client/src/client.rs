@@ -7263,6 +7263,59 @@ mod tests {
         );
     }
 
+    /// A result in a direct conversation the server stores opens here: its
+    /// rows are on this device, so the other person need not be online.
+    #[test]
+    fn a_search_result_opens_a_stored_direct_conversation() {
+        use crate::search::{Located, OPENS_ONLINE};
+        let (mut client, _, _) = connected();
+        let key = conversation_key(&[9; 16]);
+        // The server names one conversation that no view shows yet.
+        let directs = client.servers[0].directs.len();
+        assert_eq!(directs, 0);
+        client.servers[0].directs.insert(
+            [9; 16],
+            nuschl_protocol::nuschl::v1::Direct {
+                conversation: vec![9; 16],
+                user_id: 2,
+                name: "Bob".into(),
+                ..Default::default()
+            },
+        );
+        let Ok(Located::Found { position, id }) = client.locate(0, &key, (7, None)) else {
+            panic!("not opened");
+        };
+        assert_eq!(id, 7);
+        let view = &client.servers[0].channels[position];
+        assert_eq!(view.target, TextTarget::DirectConversation([9; 16]));
+        assert_eq!(view.storage_key, key);
+        assert_eq!(view.name, "@ Bob");
+        // A conversation the server never named does not open as a direct one.
+        assert_eq!(
+            client.locate(0, &conversation_key(&[10; 16]), (1, None)),
+            Err(OPENS_ONLINE)
+        );
+        // Locating again opens the view that is now there.
+        let Ok(Located::Found {
+            position: again, ..
+        }) = client.locate(0, &key, (8, None))
+        else {
+            panic!("not reopened");
+        };
+        assert_eq!(again, position);
+        // A stock direct message still needs the person.
+        assert_eq!(client.locate(0, "direct:ab", (1, None)), Err(OPENS_ONLINE));
+        client.servers[0]
+            .users
+            .get_mut(&1)
+            .unwrap()
+            .certificate_hash = Some("ab".into());
+        assert_eq!(
+            client.locate(0, "direct:ab", (1, None)),
+            Ok(Located::Reopen { session: 1 })
+        );
+    }
+
     #[test]
     fn explicit_disconnect_during_recovery_can_still_open_local_offline_history() {
         let (mut client, recorder, id) = recovery_client();
