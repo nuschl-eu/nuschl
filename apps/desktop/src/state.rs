@@ -185,6 +185,17 @@ struct Outgoing {
     choice: crate::attachments::Choice,
 }
 
+/// One dialog's scrolling: its handle, and the easing a wheel run gives it.
+#[derive(Default)]
+struct DialogScroll {
+    handle: ScrollHandle,
+    motion: SmoothScroll,
+}
+
+/// The dialog a wheel moves while no dialog has drawn itself, such as a
+/// prompt's frame before the dialog did.
+const DIALOG: &str = "dialog";
+
 pub struct Desktop {
     /// The client SDK: servers, conversations and their timelines, and what
     /// to do about what the driver reports.
@@ -225,10 +236,11 @@ pub struct Desktop {
     chat_motion: SmoothScroll,
     channel_motion: SmoothScroll,
     server_motion: SmoothScroll,
-    /// The open dialog's scrolling (one dialog at a time), and which dialog
-    /// this and the previous frame showed, so a newly opened one starts at the top.
-    pub modal_scroll: ScrollHandle,
-    modal_motion: SmoothScroll,
+    /// Each dialog's scrolling, by dialog id: a prompt over Settings keeps its
+    /// own position, and the easing a wheel run gives it. `modal_shown` and
+    /// `modal_seen` say which dialog this and the previous frame showed, so a
+    /// newly opened one starts at the top.
+    modal_scrolls: std::cell::RefCell<BTreeMap<&'static str, DialogScroll>>,
     /// Lists that scroll inside the open dialog.
     pub nested: Nested,
     pub modal_shown: std::cell::Cell<Option<&'static str>>,
@@ -560,8 +572,7 @@ impl Desktop {
             chat_motion: SmoothScroll::default(),
             channel_motion: SmoothScroll::default(),
             server_motion: SmoothScroll::default(),
-            modal_scroll: ScrollHandle::new(),
-            modal_motion: SmoothScroll::default(),
+            modal_scrolls: Default::default(),
             nested: Nested::default(),
             modal_shown: Default::default(),
             modal_seen: Default::default(),
@@ -1025,8 +1036,27 @@ impl Desktop {
     }
     /// Direct manipulation replaces easing before the first thumb movement.
     pub fn cancel_modal_scroll(&mut self) {
-        self.modal_motion.cancel();
+        self.cancel_dialog_scroll();
         self.nested.cancel();
+    }
+    fn cancel_dialog_scroll(&mut self) {
+        for dialog in self.modal_scrolls.borrow_mut().values_mut() {
+            dialog.motion.cancel();
+        }
+    }
+    /// The scrolling of the dialog `id`, for drawing it.
+    pub fn dialog_scroll(&self, id: &'static str) -> ScrollHandle {
+        self.modal_scrolls
+            .borrow_mut()
+            .entry(id)
+            .or_default()
+            .handle
+            .clone()
+    }
+    /// The dialog a wheel or the scroll keys move: the one that drew itself
+    /// last this frame, so a prompt over Settings scrolls the prompt.
+    fn front_dialog(&self) -> &'static str {
+        self.modal_shown.get().unwrap_or(DIALOG)
     }
     /// Closing the sheet retires its wheel transaction and easing.
     pub fn close_channels(&mut self) {
@@ -1052,14 +1082,17 @@ impl Desktop {
         let reduce_motion = cx.reduce_motion();
         match self.nested.route(list, delta, std::time::Instant::now()) {
             Scroller::List(id) => {
-                self.modal_motion.cancel();
+                self.cancel_dialog_scroll();
                 self.nested.scroll(id, event, line_height, reduce_motion);
             }
             Scroller::Dialog => {
                 self.nested.cancel_motion();
+                let front = self.front_dialog();
+                let mut dialogs = self.modal_scrolls.borrow_mut();
+                let dialog = dialogs.entry(front).or_default();
                 scrolling::scroll_by(
-                    &mut self.modal_motion,
-                    &self.modal_scroll,
+                    &mut dialog.motion,
+                    &dialog.handle,
                     event,
                     line_height,
                     reduce_motion,
@@ -1075,7 +1108,11 @@ impl Desktop {
             || !(self.chat_motion.active()
                 || self.channel_motion.active()
                 || self.server_motion.active()
-                || self.modal_motion.active()
+                || self
+                    .modal_scrolls
+                    .borrow()
+                    .values()
+                    .any(|dialog| dialog.motion.active())
                 || self.nested.active())
         {
             return;
@@ -1087,11 +1124,13 @@ impl Desktop {
                 entity.update(cx, |this, cx| {
                     this.scroll_frame_pending = false;
                     this.chat_motion.shift(this.anchor.take_shift());
-                    let changed = this.chat_motion.advance(&this.scroll)
+                    let mut changed = this.chat_motion.advance(&this.scroll)
                         | this.channel_motion.advance(&this.channel_scroll)
                         | this.server_motion.advance(&this.server_scroll)
-                        | this.modal_motion.advance(&this.modal_scroll)
                         | this.nested.advance();
+                    for dialog in this.modal_scrolls.borrow_mut().values_mut() {
+                        changed |= dialog.motion.advance(&dialog.handle);
+                    }
                     if changed {
                         cx.notify();
                     }

@@ -337,9 +337,10 @@ pub fn modal(
     close: impl Fn(&mut Desktop) + 'static,
 ) -> AnyElement {
     this.modal_shown.set(Some(id));
+    let scroll = this.dialog_scroll(id);
     if this.modal_seen.get() != Some(id) {
         tracing::debug!(dialog = id, previous = ?this.modal_seen.get(), "reset dialog scroll");
-        this.modal_scroll.set_offset(point(px(0.), px(0.)));
+        scroll.set_offset(point(px(0.), px(0.)));
         this.nested.forget_all();
     }
     let close = Rc::new(close);
@@ -397,7 +398,7 @@ pub fn modal(
                 // assistive technology may press the close button; the scroll
                 // keys work from the frame too.
                 .track_focus(&this.dialog_focus(id, cx))
-                .on_key_down(crate::layout::scroll_keys(this.modal_scroll.clone()))
+                .on_key_down(crate::layout::scroll_keys(scroll.clone()))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .role(Role::Dialog)
                 .aria_label(label)
@@ -413,7 +414,7 @@ pub fn modal(
                 .shadow_lg()
                 .child(header)
                 .child(
-                    crate::layout::scrollable(id, label, this.modal_scroll.clone())
+                    crate::layout::scrollable(id, label, scroll.clone())
                         .capture_any_mouse_down(cx.listener(
                             |this, event: &MouseDownEvent, _, _| {
                                 if event.button == MouseButton::Left {
@@ -424,7 +425,7 @@ pub fn modal(
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
-                        .track_scroll(&this.modal_scroll)
+                        .track_scroll(&scroll)
                         .child(
                             div()
                                 .id(SharedString::from(format!("{id}-content")))
@@ -432,11 +433,11 @@ pub fn modal(
                         )
                         .child(crate::layout::scrollbar(
                             SharedString::from(format!("{id}-scrollbar")),
-                            &this.modal_scroll,
+                            &scroll,
                             MAIN,
                         ))
                         .child(crate::layout::scroll_before_parent(
-                            this.modal_scroll.clone(),
+                            scroll.clone(),
                             cx.listener(|this, event, window, cx| {
                                 this.scroll_modal(None, event, window, cx)
                             }),
